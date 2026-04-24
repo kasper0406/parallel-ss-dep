@@ -8,3 +8,7 @@ import StateDep.Delta
 import StateDep.HeisenbergD
 import StateDep.Rotor
 import StateDep.Unipotent
+import StateDep.Signature
+import StateDep.Dyck
+import StateDep.Magnus
+import StateDep.GF2Heisenberg

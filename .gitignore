@@ -1,1 +1,4 @@
 StateDep/.lake/
+.venv/
+__pycache__/
+*.pyc

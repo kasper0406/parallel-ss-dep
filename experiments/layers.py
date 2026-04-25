@@ -259,21 +259,41 @@ class OrthogonalScanAttention(nn.Module):
       - SO(n) for n≥3 contains the icosahedral group A₅, which is
         non-solvable. Per Barrington's theorem, scans over non-solvable
         groups are NC¹-complete.
-      - Compare to plain Heisenberg whose transition spec ⊂ {1}: stuck TC⁰.
 
-    State per channel: n² floats. Composition: n×n matmul (fast for small n).
-    For n=4: 16-float state per channel; small enough to fit alongside
-    Heisenberg's d²-state at matched parameter count.
+    Engineering options (matched to DeltaNet's defaults — these are what
+    close the LM PPL gap on real text without touching the algebra):
+      use_short_conv : kernel-`conv_size` 1D causal conv on the input
+                       embedding before the projections (gives the layer
+                       4-gram local context per token, consistent with
+                       fla's `use_short_conv=True`).
+      use_silu_input : SiLU activation on the input before the conv.
+      use_v_norm     : L2-normalise the per-token rotation target vector
+                       (analog of qk_norm="l2" in DeltaNet).
     """
 
     def __init__(self, d_model: int, n_heads: int, d_head: int,
-                 ortho_dim: int = 4):
+                 ortho_dim: int = 4,
+                 use_short_conv: bool = True,
+                 conv_size: int = 4,
+                 use_silu_input: bool = True,
+                 use_v_norm: bool = True):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_head
         self.n = ortho_dim
         self.n_skew = ortho_dim * (ortho_dim - 1) // 2
+        self.use_short_conv = use_short_conv
+        self.conv_size = conv_size
+        self.use_silu_input = use_silu_input
+        self.use_v_norm = use_v_norm
+
+        # Optional kernel-K causal 1D conv before projections.
+        if use_short_conv:
+            self.short_conv = nn.Conv1d(
+                d_model, d_model, kernel_size=conv_size,
+                padding=conv_size - 1, groups=d_model, bias=False,
+            )
 
         # Skew-symmetric generator params per head per token.
         self.W_skew = nn.Linear(d_model, n_heads * self.n_skew, bias=False)
@@ -291,8 +311,21 @@ class OrthogonalScanAttention(nn.Module):
         B, T, _ = x.shape
         H, n = self.n_heads, self.n
 
+        # Optional pre-conv (causal): mixes a kernel-`conv_size` window of
+        # past tokens before the projections, giving the layer local n-gram
+        # context. Same trick as fla's `use_short_conv=True` on DeltaNet.
+        x_in = x
+        if self.use_short_conv:
+            # (B, T, D) → (B, D, T) for Conv1d, then back.
+            x_perm = x.transpose(1, 2)
+            x_conv = self.short_conv(x_perm)              # (B, D, T + conv_size − 1)
+            x_conv = x_conv[..., : T]                     # causal trim
+            x_in = x_conv.transpose(1, 2)
+        if self.use_silu_input:
+            x_in = F.silu(x_in)
+
         # Build skew-symmetric matrix per (B, T, H).
-        skew_flat = self.W_skew(x).view(B, T, H, self.n_skew)
+        skew_flat = self.W_skew(x_in).view(B, T, H, self.n_skew)
         skew = torch.zeros(B, T, H, n, n, device=x.device, dtype=x.dtype)
         skew[..., self._idx_i, self._idx_j] = skew_flat
         skew[..., self._idx_j, self._idx_i] = -skew_flat
@@ -318,7 +351,9 @@ class OrthogonalScanAttention(nn.Module):
                 states[:, t] = O_t[:, t] @ states[:, t - 1]
 
         # Apply accumulated rotation to learned per-token input vector.
-        v = self.W_v(x).view(B, T, H, n)
+        v = self.W_v(x_in).view(B, T, H, n)
+        if self.use_v_norm:
+            v = F.normalize(v, dim=-1, eps=1e-6)
         rotated = (states @ v.unsqueeze(-1)).squeeze(-1)       # (B, T, H, n)
 
         return self.W_o(rotated.reshape(B, T, H * n))

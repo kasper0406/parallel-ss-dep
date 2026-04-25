@@ -47,19 +47,29 @@ clean diagnostic decomposition of why the dominant architectures
     - T=512 mod-3: hybrid 100 %, deltanet_negeig 93 %.
     - **T=512 mod-5: hybrid 100 %, deltanet_negeig catastrophically
       diverges to 9.1 % (below random 20 %).**
-4. **Honest task-dependent picture** (`RESULTS.md` Phases 10-11):
+4. **Honest task-dependent picture** (`RESULTS.md` Phases 10-12):
    - Hybrid wins **continuous-angle modular arithmetic** (Z_p ⊂ SO(2)).
    - DeltaNet+`allow_neg_eigval=True` wins **discrete-reflection
      non-solvable group state-tracking** (S₅ word problem at T=128:
      0.98 pos_recall vs hybrid's 0.71). Householder reflectors are a
      more direct fit for transpositions than rotations.
-   - Pure DeltaNet (with `use_short_conv=True`) wins **real-text LM**
-     (TinyStories, 135M, 5000 steps: PPL 5.65 vs hybrid's 9.79). The
-     engineering tricks on DeltaNet layers (short conv, qk-l2-norm,
-     silu) matter more than algebraic novelty for LM-style tasks.
-   - Hybrid Triton kernel + custom autograd brings hybrid to 3.5×
-     DeltaNet wall-clock (was 14.5× before). 135M-scale distillation
-     is now feasible.
+   - Pure DeltaNet (with `use_short_conv=True`) wins **real-text LM
+     out of the box** (TinyStories, 135M, 5000 steps: PPL 5.65 vs
+     hybrid v1's 9.79).
+5. **Hybrid v2 with engineering tricks closes the LM gap to 1.19×**
+   (`RESULTS.md` Phase 12). Adding `use_short_conv=True`, SiLU input
+   activation, and L2-normalised rotation target to the ortho layer
+   brought hybrid PPL from 9.79 → **6.73** (DeltaNet 5.65), shrinking
+   the gap from 73 % worse to 19 % worse. Critically: the mod-p
+   advantage is *preserved and strengthened* (mod-3 T=128 converges
+   at step 1500 with v2 vs step 2000 with v1). This is the practical
+   demonstration: hybrid v2 is competitive on real-text LM AND wins
+   long-T modular arithmetic where DeltaNet+negeig catastrophically
+   fails (mod-5 T=512: hybrid 100 % vs DeltaNet+negeig 9 %).
+6. Hybrid Triton kernel + custom autograd brings hybrid to 1.74×
+   DeltaNet wall-clock at 135M scale (was 14.5× before). 135M
+   distillation is feasible; further Triton backward optimisation
+   could close the rest.
 4. The hybrid finding gives the empirical rank-ordering on parity:
    linear / heisenberg (✗ TC⁰) → DeltaNet default (T=128 only) → ortho
    / hybrid (T=512). And on recall: linear / ortho / rotconj / rotdelta

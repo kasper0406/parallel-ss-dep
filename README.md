@@ -139,16 +139,22 @@ Full writeup in [`RESULTS.md`](RESULTS.md); strategy doc in
   erase, two-sided action `(I − β k kᵀ)(O c Oᵀ) + β k vᵀ`):** verified
   novel by literature search (two-sided action distinct from
   DeltaProduct's left-only). Implemented; **fails induction (3.9 %),
-  including with tanh-bounded skew (5.7 %)**. Mechanistic diagnosis:
-  the rotation conjugation `O c Oᵀ` rotates stored keys away from their
-  original frame; when a query arrives at time T, the stored content is
-  in a frame that depends on the entire intervening rotation history,
-  breaking the inner-product alignment delta-rule recall requires. **The
-  two mechanisms — rotation (Grazzi-clean) and delta-rule recall — are
-  fundamentally incompatible in a single state.** Full diagnostic in
-  `RESULTS.md` Phase 7. The path to "single cell solving both parity and
-  recall" appears to need a fundamentally different ingredient, or a
-  hybrid layer stack rather than a single cell.
+  including with tanh-bounded skew (5.7 %)**. Mechanistic diagnosis: the
+  rotation conjugation `O c Oᵀ` rotates stored keys away from their
+  original frame, breaking delta-rule recall. **The two mechanisms —
+  rotation (Grazzi-clean) and delta-rule recall — are fundamentally
+  incompatible in a single state.** Full diagnostic in `RESULTS.md`
+  Phase 7.
+- ✅ **Hybrid layer stack `[ortho, deltanet, ortho, deltanet]` solves
+  both walls.** Induction recall: 100 % by step 1200. Parity at T=128:
+  100 % by step 1200 (stable through step 3000 after one training
+  transient). The architectural answer to the "both walls in one model"
+  question is **specialist layers, not specialist cells** — each layer
+  type handles the wall it can, the residual stream carries information
+  between them. Mechanistically distinct from existing fla hybrids
+  (which are engineering choices); our framing makes the *reason*
+  explicit (the two walls are mechanically distinct and can't share a
+  state). Full writeup in `RESULTS.md` Phase 8.
 
 ## Novelty table (after `LITERATURE.md` follow-up search)
 

@@ -69,10 +69,20 @@ class TinyLM(nn.Module):
         d_ff: int | None = None,
         attention_cls: Callable[..., nn.Module] | None = None,
         max_T: int = 0,                       # 0 = no positional encoding
+        attention_cls_per_layer: list[Callable[..., nn.Module]] | None = None,
     ):
         super().__init__()
-        if attention_cls is None:
-            raise ValueError("attention_cls is required")
+        # Per-layer attention class list (for hybrid architectures) takes
+        # precedence over the single attention_cls argument.
+        if attention_cls_per_layer is not None:
+            cls_list = attention_cls_per_layer
+            assert len(cls_list) == n_layers, \
+                f"attention_cls_per_layer has {len(cls_list)} entries but n_layers={n_layers}"
+        else:
+            if attention_cls is None:
+                raise ValueError("attention_cls or attention_cls_per_layer is required")
+            cls_list = [attention_cls] * n_layers
+
         if d_ff is None:
             d_ff = 4 * d_model
         self.embed = nn.Embedding(vocab_size, d_model)
@@ -85,8 +95,8 @@ class TinyLM(nn.Module):
             self.pos_embed = nn.Embedding(max_T, d_model)
         self.blocks = nn.ModuleList([
             Block(d_model=d_model, n_heads=n_heads, d_head=d_head,
-                  d_ff=d_ff, attention_cls=attention_cls)
-            for _ in range(n_layers)
+                  d_ff=d_ff, attention_cls=cls)
+            for cls in cls_list
         ])
         self.out_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)

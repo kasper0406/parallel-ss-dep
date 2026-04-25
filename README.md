@@ -79,6 +79,54 @@ clean diagnostic decomposition of why the dominant architectures
    `unipotent_u4`, and `ortho_son` (matrix-multiplication scan).
    Three kernel bugs found and fixed; no pytorch#176426 segfault.
 
+## How this work relates to AUSSM (and what's actually new)
+
+We discovered mid-session that
+**[AUSSM (Karuvally et al., July 2025, arXiv:2507.05238)][aussm]**
+independently proposed the same skew-symmetric input-dependent matrix-
+exp construction we built as `OrthogonalScanAttention`. They shipped
+it ~3 months before us. Honest accounting of what overlaps and what
+doesn't:
+
+|  | AUSSM | This project |
+|---|---|---|
+| **Cell algebra** (skew → exp → unit-circle eigenvalues) | ✓ | concurrent |
+| **State per channel** | scalar / vector (diagonal SSM, S6 drop-in) | **n×n matrix**, non-commuting transitions across t |
+| **Parity / mod-p / solvable-group automata** | ✓ shown | ✓ shown |
+| **MQAR / associative recall benchmarks** | not evaluated, gap unacknowledged | ✗ ortho fails by construction; addressed via DeltaNet layer in hybrid |
+| **Combined with DeltaNet rank-1 erase** | suggested as future work | **hybrid layer stack tested at LM scale** |
+| **Mechanistic incompatibility theorem** | not stated | **explicit**: rotation ⨯ delta-rule cannot share a state (Phases 7, 12) |
+| **Per-layer specialisation framing** (Krohn-Rhodes / Barrington) | absent | central organising principle |
+| **Engineering tricks on rotation cell** | polar diagonalisation | short_conv + silu + L2 v-norm (hybrid v2) |
+| **Diagnostic per-task scorecard** | small-scale only, "modest scale" admitted | mod-3 / mod-5 / parity / induction / S₅ / LM-PPL on TinyStories + Python |
+| **Triton kernel for sm_120 (Blackwell consumer)** | absent | **ships**, with custom-autograd Triton-backed scan |
+
+**The AUSSM-equivalent piece is `OrthogonalScanAttention`.** That cell
+should not be claimed as a from-scratch novelty; we acknowledge AUSSM
+as concurrent prior art for the construction.
+
+**The new contributions of this project are everything below the cell
+level and everything above it:**
+
+1. The architectural decomposition (rotation specialist + delta-rule
+   specialist + their incompatibility argument) and the empirical
+   scoreboard demonstrating that the hybrid escapes both Grazzi's TC⁰
+   wall (Phase 4-7) and the Zoology recall wall (Phase 8) at the
+   network level.
+2. The mod-p result: hybrid solves T=512 mod-5 at 100 % where
+   `DeltaNet+allow_neg_eigval=True` (the strongest single-cell baseline
+   per Grazzi et al. ICLR'25) catastrophically fails to 9 %
+   (Phase 9). AUSSM does not test this regime.
+3. The 135M-scale practical demonstration: hybrid v2 within 1.19× of
+   DeltaNet PPL on TinyStories while preserving the mod-p win
+   (Phase 11-12). AUSSM admits its evaluation is small-scale only.
+4. The Triton sm_120 kernel for the matmul-scan with custom autograd
+   (4.2× speedup over PyTorch loop). AUSSM uses Mamba's selective-scan
+   kernel.
+5. The Lean library formalising 13 monoids whose associativity gives
+   parallel-scan correctness for free (separate from AUSSM's framing
+   entirely).
+
 ## Approach
 
 ### The reframing

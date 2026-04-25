@@ -707,3 +707,73 @@ empirical separators that distinguish *our* hybrid framing from the
 existing fla / DeltaProduct line. 5.4 is the scale-up that proves the
 finding generalises to LLMs; only worth pursuing once 5.1 / 5.2 give
 signal.
+
+---
+
+## 6. Post-hybrid plan: hunting failure modes + selective rotation
+
+After Phases 4-12 produced hybrid v2 — competitive at LM scale (1.19×
+DeltaNet on TinyStories) and dominant on continuous-angle modular
+arithmetic (mod-5 T=512: 100 % vs DeltaNet+negeig's 9 %) — the next
+work is **systematically finding where hybrid fails and adding the
+missing primitive.** Documented in `NEXT_DIRECTIONS.md` "Next iteration:
+hunting hybrid's failure modes".
+
+### Stress tests, in priority order
+
+1. **Long-T S₅ word problem (T=512)**. Quickest test of whether
+   SO(n)-rotation generalises to long-T non-abelian state-tracking.
+   At T=128 deltanet_negeig wins; T=512 reveals which architecture
+   actually scales.
+2. **Selective copy** (Mamba paper). Sequence with mostly noise + a
+   few signal tokens. Predict signal tokens in order. Predicts hybrid
+   *fails* because ortho rotation is always-on with no skip mechanism.
+3. **Multi-class mod-p with very large p (p ∈ {11, 13, 17})**. Tests
+   the *optimisation regime* of SO(n) rather than expressivity — at
+   small p the rotation angle 2π/p is easy; at p=17 (~21°) it's not.
+4. **Stack-with-types** (deeper Dyck variants). Tests whether
+   rotation can encode per-depth type memory or whether DeltaNet's
+   recall is essential for matched-bracket type tracking.
+5. **Long-context MQAR (T=4096+)**. Push recall ability past
+   DeltaNet's known limit. If both fail, we need stronger memory.
+
+### The likely missing primitive: selective rotation
+
+Mamba2-style `Δ_t = f(x_t)` gating of the rotation magnitude:
+
+```
+λ_t = σ(W_λ · x_t) ∈ (0, 1)
+R_t = exp(λ_t · skew(W_skew · x_t)) · R_{t-1}
+```
+
+`λ_t = 0` ⇒ identity rotation (skip token); preserves the rotation
+primitive (still Grazzi-clean), parallel-scannability (cumulative
+product unchanged), and the Lean associativity proof (semidirect
+product structure). ~30-line extension to `OrthogonalScanAttention`;
+no Triton kernel change.
+
+Should fix selective-copy failure and improve LM PPL by allowing the
+ortho layers to ignore irrelevant tokens.
+
+### Recommended sequence (after current overnight runs land)
+
+| Step | Task | Compute |
+|---|---|---|
+| 6.1 | S₅ T=512 sweep (deltanet vs hybrid v2) | ~30 min |
+| 6.2 | Selective copy sweep | ~30 min |
+| 6.3 | Implement `use_selective_lambda` in OrthogonalScanAttention | ~1 hour Python |
+| 6.4 | Re-run mod-p / parity / induction with selective ortho (preserve wins) | ~1 hour |
+| 6.5 | Re-run TinyStories + Python LM PPL with selective ortho | ~1 hour |
+| 6.6 | Triton backward kernel for matmul-scan | ~2-3 hours |
+| 6.7 | Distill from coding teacher (DeepSeek-Coder / StarCoder); HumanEval / MBPP | multi-day |
+
+Total compute for 6.1-6.5 (the architectural iteration): ~4-5 hours
+on 2× RTX 5090. 6.6 is engineering. 6.7 is the "demonstrate at LLM
+scale on coding tasks" final push.
+
+### Why this sequence
+
+6.1-6.2 surface the next failure mode; 6.3 builds the fix; 6.4-6.5
+prove the fix doesn't regress; 6.6 unlocks 6.7 by closing the
+remaining wall-clock gap. The user's stated goal is "assess if this
+works on LLM coding tasks", which 6.7 directly addresses.

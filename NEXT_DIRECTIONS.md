@@ -363,3 +363,99 @@ recall simultaneously**, addressing the central tradeoff in the field.
 
 These can revisit later if `(R, c)` succeeds and we want complementary
 boosts.
+
+## Next iteration: hunting hybrid's failure modes
+
+After Phases 1-12 produced a hybrid that wins on continuous-angle
+state-tracking and is competitive on real-text LM, the honest next
+move is **systematically finding where hybrid v2 fails** and
+identifying the missing primitive.
+
+### Where to look for failures (ordered by expected information value)
+
+1. **Long-T S₅ word problem (T=512)**. At T=128, deltanet_negeig wins
+   (98 % pos_recall) and hybrid lags (71 %). At T=512, three possible
+   outcomes:
+   - (a) deltanet_negeig catastrophically fails like with mod-5 → SGD
+     limits expose, hybrid wins by default.
+   - (b) hybrid catastrophically fails → confirms SO(n)-rotation
+     doesn't scale to long-T non-solvable group state-tracking.
+   - (c) both fail → need a new primitive entirely.
+   Whichever way it goes, this is the cheapest test to run and
+   directly tells us whether SO(n) rotations generalise to long-T
+   non-abelian state.
+
+2. **Selective copy** (Mamba paper). Sequence with mostly noise tokens
+   and a few signal tokens (marked by a prefix). Output the signal
+   tokens in order. **Hybrid likely fails** on this:
+   - Ortho rotation is *always-on* — there's no input-dependent
+     "skip this token" mechanism. SGD has to learn to make the
+     rotation near-identity on noise tokens, which is an
+     optimisation problem, not an architectural one.
+   - DeltaNet has implicit selectivity via β_t.
+   - This task identifies the **selectivity wall** for ortho, which
+     points at the missing primitive (Mamba2-style `Δ_t = f(x_t)`
+     gating the rotation).
+
+3. **Multi-class mod-p with very large p** (p ∈ {11, 13, 17}). At
+   small p the rotation angle 2π/p is easy for SGD; at p=17 it's
+   ~21° — much harder to find precisely. Tests the *optimisation
+   regime* of SO(n) rather than its expressivity.
+
+4. **Stack-with-types tasks** (deeper Dyck variants). Pure depth
+   tracking (current Dyck task) is one thing; matching `}` to a
+   specific `{` from N tokens ago is harder — it requires per-depth
+   *type memory*. Hybrid's rotation accumulator doesn't natively
+   encode "type of thing at depth k". This may be where DeltaNet's
+   recall is essential and hybrid's rotation alone insufficient.
+
+5. **Long-context recall (MQAR variants at T=4096+)**. Push
+   DeltaNet's recall ability past where it works at scale. If both
+   pure DeltaNet and hybrid fail, "selectivity + erase" isn't
+   sufficient and we need stronger memory primitives.
+
+### The likely missing primitive: selective rotation
+
+The diagnosis from (2) and (4) above points at **input-dependent
+gating of the rotation magnitude**. Mamba2 has this for its scalar
+state via `Δ_t = f(x_t)`; ortho currently doesn't. State update
+becomes:
+
+```
+λ_t = σ(W_λ · x_t)                      ∈ (0, 1)
+R_t = exp(λ_t · skew(W_skew · x_t)) · R_{t-1}
+```
+
+`λ_t = 0` ⇒ identity rotation (skip token), `λ_t = 1` ⇒ full
+rotation. Adds the "selectivity" that ortho currently lacks while
+preserving:
+
+- the rotation primitive (Grazzi-clean — eigenvalues still on unit
+  circle).
+- parallel-scannability (cumulative product, same Triton kernel).
+- the Lean associativity proof (semidirect product structure).
+
+This addresses (2) selective copy and probably (4) deep nesting —
+both need "skip this token" capability.
+
+Implementation: ~30 lines of `OrthogonalScanAttention` extension. No
+kernel change required — `O_t = exp(λ_t · skew_t)` is computed before
+the scan; the scan kernel handles whatever per-token rotations it's
+given.
+
+### Recommended sequence (after current overnight results land)
+
+1. **S₅ T=512** sweep (fastest test; ~30 min).
+2. **Selective copy** sweep (predict failure of ortho, confirm with
+   data; ~30 min).
+3. **Implement selective rotation** as
+   `OrthogonalScanAttention(use_selective_lambda=True)`.
+4. **Re-run** the empirical scorecard with the new selective ortho:
+   - Mod-p sweep (should preserve win)
+   - Selective copy (should now solve)
+   - LM PPL on TinyStories (likely improves)
+   - LM PPL on Python (the user's stated goal)
+5. **Triton backward kernel** for matmul-scan to close the remaining
+   ~2× wall-clock gap to DeltaNet.
+6. **Distill from a coding teacher** (DeepSeek-Coder, StarCoder) into
+   the upgraded hybrid; evaluate on HumanEval / MBPP.

@@ -97,24 +97,49 @@ commutative and non-commutative cases).
 
 ## First-pass empirical results (2026-04-25, 2× RTX 5090)
 
-Full writeup in [`RESULTS.md`](RESULTS.md). Headline:
+Full writeup in [`RESULTS.md`](RESULTS.md); strategy doc in
+[`NEXT_DIRECTIONS.md`](NEXT_DIRECTIONS.md). Headline:
 
 - **Triton kernels run on sm_120 / Blackwell consumer** — no
   pytorch#176426 segfault; BF16-input + FP32-accum numerics within
   `EVAL_PLAN.md` §2.3 tolerances after fixing three real kernel bugs.
-- **Fused-readout `heisenberg_d` runs at 1.8-4.5× `linear_attn`** across
-  realistic shapes. Apples-to-apples kernel comparison.
+- **Fused-readout `heisenberg_d` runs at 1.8-4.5× `linear_attn`**.
 - **Parity kill-gate cleared at T=64** with a +32.6 pp end-token margin
-  (HeisenbergAttention 98 % vs LinearAttention 50 %, both 1.05 M params,
-  4 layers, d_head=32, 5 000 AdamW steps). The bilinear cross-pair is a
-  *useful* state-tracking primitive on real hardware.
-- **SOTA bake-off result is honest, not flattering.** At T=64 our cell
-  matches DeltaNet, Gated DeltaNet, and Mamba2 (all using
-  `use_short_conv=True` from fla); plain linear-attn and no-posenc softmax
-  fail. **At T=128 our cell joins linear-attn and softmax in failing**
-  while DeltaNet/GDN/Mamba2 still pass. The bilinear cross-pair extends
-  the parity-solvable horizon (T=32 → T=64) but does not by itself match
-  the fla-engineered 1D-conv-plus-scan story at T=128.
+  for our bilinear Heisenberg cell vs plain linear-attn (98 % vs 50 %).
+- **At T=128 our Heisenberg cell hits the wall predicted by Grazzi et al.
+  ICLR'25** ([2411.12537](https://arxiv.org/abs/2411.12537)) — its
+  transition spectrum ⊂ {1}, so it is TC⁰-stuck and cannot solve parity
+  at unbounded T. Same wall hits plain linear-attn and no-posenc softmax.
+  DeltaNet/GDN/Mamba2 pass T=128 via engineered tricks
+  (`use_short_conv=True`).
+- 🎯 **The Grazzi-clean fix: SO(n) orthogonal scan.** Per-channel state
+  is an `n×n` orthogonal matrix with input-dependent transitions
+  `O_t = exp(X_t)` (skew-symmetric `X_t`). Spectrum lives on the unit
+  circle, including `−1`. NC¹-complete via Barrington. **Solves parity
+  at T=64, T=128, AND T=256 to 100 % accuracy by training step 1 000**
+  — faster than every fla baseline, and beats DeltaNet at T=256 where
+  DeltaNet stalls at 56 % q4 within our 5 000-step budget. **Also solves
+  T=512** (converges by step 2 000); T=1024 testing in progress.
+  PyTorch impl in `experiments/layers.py`; Triton kernel + tests in
+  `kernels/ortho_son/`.
+- ⚠️ **Concurrent prior art**: [AUSSM (Karuvally et al., July 2025,
+  arXiv:2507.05238)](https://arxiv.org/abs/2507.05238) independently
+  proposed the same core skew-symmetric input-dependent matrix-exp
+  transition. Our differentiation: cumulative matrix state (vs acting on
+  vectors), multi-layer convergence-speed comparison, sm_120 Triton
+  kernel.
+- ❌ **Tested follow-up `RotConjAttention` (semidirect `SO(n) ⋉ ℝ^{n×n}`):**
+  the conjugated KV memory `c_t = O_t c_{t-1} O_tᵀ + k⊗v` solves parity
+  (matches ortho, slower) but **fails induction-heads recall (3.3 % acc,
+  chance is 3.1 %)** at our 1M-param scale, alongside pure ortho (2.6 %)
+  and linear-attention (8.2 %). Only DeltaNet (100 %) solves recall.
+  **Diagnosis:** recall is enabled by the **delta-rule erase
+  `(I − β k kᵀ)`**, not by state structure or unbounded memory. Adding an
+  unbounded `c` slot without an erase mechanism doesn't grant recall
+  power — distractor positions saturate the memory with noise. The clean
+  empirical separator between recall-capable and recall-incapable
+  architectures is *whether the architecture has a rank-1 erase
+  operation applied per token*. Full diagnostic in `RESULTS.md` Phase 6.
 
 ## Novelty table (after `LITERATURE.md` follow-up search)
 

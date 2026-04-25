@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from experiments.layers import (
     LinearAttention, HeisenbergAttention, SoftmaxAttention,
     DeltaNetAttention, GatedDeltaNetAttention, Mamba2Attention,
+    OrthogonalScanAttention, RotConjAttention,
 )
 from experiments.model import TinyLM
 from experiments.tasks.parity import make_batch
@@ -42,6 +43,8 @@ ARCHES = {
     "deltanet":    DeltaNetAttention,
     "gateddelta":  GatedDeltaNetAttention,
     "mamba2":      Mamba2Attention,
+    "ortho":       OrthogonalScanAttention,        # SO(n) scan — Grazzi-clean
+    "rotconj":     RotConjAttention,               # SO(n) ⋉ ℝ^{n×n} — semidirect, novel
 }
 
 
@@ -127,8 +130,10 @@ def train_one(arch: str, T: int, steps: int, batch_size: int,
             print(f"{step:>6d}  {last_train_loss:>11.4f}  "
                   f"{v_loss:>9.4f}  {v_acc:>8.3f}  {e_acc:>8.3f}  {qs}")
 
-    # Final eval, larger batch.
-    v_loss, v_acc, e_acc, _ = _val(model, T=T, batch_size=2048, device=device)
+    # Final eval, larger batch — capped to avoid Mamba2's per-step
+    # O(T·B·d_state·d_head) memory blow-up at T=128.
+    final_bs = 2048 if T <= 64 else 512
+    v_loss, v_acc, e_acc, _ = _val(model, T=T, batch_size=final_bs, device=device)
     secs = time.perf_counter() - t0
     return RunResult(
         arch=arch, T=T, steps=steps,

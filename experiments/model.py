@@ -68,6 +68,7 @@ class TinyLM(nn.Module):
         d_head: int = 32,
         d_ff: int | None = None,
         attention_cls: Callable[..., nn.Module] | None = None,
+        max_T: int = 0,                       # 0 = no positional encoding
     ):
         super().__init__()
         if attention_cls is None:
@@ -75,6 +76,13 @@ class TinyLM(nn.Module):
         if d_ff is None:
             d_ff = 4 * d_model
         self.embed = nn.Embedding(vocab_size, d_model)
+        # Optional learnable absolute positional embedding (max_T > 0).
+        # Off by default; needed for MQAR-style recall where the
+        # architecture must distinguish lookup-phase vs query-phase
+        # positions.
+        self.max_T = max_T
+        if max_T > 0:
+            self.pos_embed = nn.Embedding(max_T, d_model)
         self.blocks = nn.ModuleList([
             Block(d_model=d_model, n_heads=n_heads, d_head=d_head,
                   d_ff=d_ff, attention_cls=attention_cls)
@@ -85,6 +93,10 @@ class TinyLM(nn.Module):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed(input_ids)
+        if self.max_T > 0:
+            T = input_ids.shape[1]
+            pos = torch.arange(T, device=input_ids.device)
+            x = x + self.pos_embed(pos)
         for blk in self.blocks:
             x = blk(x)
         return self.lm_head(self.out_norm(x))

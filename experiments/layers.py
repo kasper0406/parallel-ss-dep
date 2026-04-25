@@ -219,6 +219,151 @@ class GatedDeltaNetAttention(_FlaWrapper):
         ))
 
 
+class OrthogonalScanAttention(nn.Module):
+    """SO(n) scan — Grazzi-clean NC¹-accessible parallel-scan primitive.
+
+    Per-channel state is an n×n orthogonal matrix (SO(n)). Transition is
+    `O_t = exp(X_t)` for X_t skew-symmetric (n(n-1)/2 floats from the
+    input). Composition is matrix multiplication; exp is differentiable
+    via `torch.linalg.matrix_exp`.
+
+    Why this escapes Grazzi's TC⁰ wall:
+      - X_t skew-symmetric ⇒ O_t = exp(X_t) ∈ SO(n) ⇒ eigenvalues are
+        on the unit circle: {e^{iθ_k}} including −1 at θ=π.
+      - SO(n) for n≥3 contains the icosahedral group A₅, which is
+        non-solvable. Per Barrington's theorem, scans over non-solvable
+        groups are NC¹-complete.
+      - Compare to plain Heisenberg whose transition spec ⊂ {1}: stuck TC⁰.
+
+    State per channel: n² floats. Composition: n×n matmul (fast for small n).
+    For n=4: 16-float state per channel; small enough to fit alongside
+    Heisenberg's d²-state at matched parameter count.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_head: int,
+                 ortho_dim: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.n = ortho_dim
+        self.n_skew = ortho_dim * (ortho_dim - 1) // 2
+
+        # Skew-symmetric generator params per head per token.
+        self.W_skew = nn.Linear(d_model, n_heads * self.n_skew, bias=False)
+        # "Input" vector that gets rotated by accumulated state.
+        self.W_v = nn.Linear(d_model, n_heads * ortho_dim, bias=False)
+        # Output projection (n_heads · ortho_dim → d_model).
+        self.W_o = nn.Linear(n_heads * ortho_dim, d_model, bias=False)
+
+        # Cached upper-triangular index pattern for skew-symmetric build.
+        idx_i, idx_j = torch.triu_indices(ortho_dim, ortho_dim, offset=1)
+        self.register_buffer("_idx_i", idx_i, persistent=False)
+        self.register_buffer("_idx_j", idx_j, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        H, n = self.n_heads, self.n
+
+        # Build skew-symmetric matrix per (B, T, H).
+        skew_flat = self.W_skew(x).view(B, T, H, self.n_skew)
+        skew = torch.zeros(B, T, H, n, n, device=x.device, dtype=x.dtype)
+        skew[..., self._idx_i, self._idx_j] = skew_flat
+        skew[..., self._idx_j, self._idx_i] = -skew_flat
+
+        # Per-step orthogonal transition: O_t = exp(X_t) ∈ SO(n).
+        # matrix_exp handles arbitrary batch dims.
+        O_t = torch.linalg.matrix_exp(skew)            # (B, T, H, n, n)
+
+        # Cumulative left-multiplication along T: state_t = O_t · O_{t-1} · ... · O_0.
+        # Sequential scan — replace with Blelloch on GPU later if hot.
+        states = torch.empty_like(O_t)
+        states[:, 0] = O_t[:, 0]
+        for t in range(1, T):
+            states[:, t] = O_t[:, t] @ states[:, t - 1]
+
+        # Apply accumulated rotation to learned per-token input vector.
+        v = self.W_v(x).view(B, T, H, n)
+        rotated = (states @ v.unsqueeze(-1)).squeeze(-1)       # (B, T, H, n)
+
+        return self.W_o(rotated.reshape(B, T, H * n))
+
+
+class RotConjAttention(nn.Module):
+    """Semidirect-product scan `SO(n) ⋉ ℝ^{n×n}`.
+
+    Per channel, state is `(R_t, c_t)` with R ∈ SO(n) and c ∈ ℝ^{n×n}.
+    Per-token transition:
+        R_t = O_t · R_{t-1}                          (rotation, like ortho)
+        c_t = O_t · c_{t-1} · O_tᵀ + k_t ⊗ v_t       (conjugated KV memory)
+    where O_t = exp(skew(W_skew · x_t)).
+
+    Composition (provably associative):
+        (R_a, c_a) · (R_b, c_b) = (R_b R_a,  R_b c_a R_bᵀ + c_b)
+
+    This bypasses Grazzi's TC⁰ wall *on the memory slot itself*: the
+    transition `c → R c Rᵀ` has spectrum `{e^{i(θ_a + θ_b)}}` which
+    includes −1 (when θ_a + θ_b = π). The c slot is unbounded, giving
+    KV-style memory growth that AUSSM-style pure-unitary architectures lack.
+
+    Readout: `o_t = q_t · c_t` (linear-attention style).
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_head: int,
+                 ortho_dim: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.n = ortho_dim
+        self.n_skew = ortho_dim * (ortho_dim - 1) // 2
+
+        # Skew-symmetric generator (gives R via matrix_exp).
+        self.W_skew = nn.Linear(d_model, n_heads * self.n_skew, bias=False)
+        # K, V for the c memory (per-token outer product k_t ⊗ v_t).
+        self.W_k = nn.Linear(d_model, n_heads * ortho_dim, bias=False)
+        self.W_v = nn.Linear(d_model, n_heads * ortho_dim, bias=False)
+        # Q for the readout (q_t · c_t).
+        self.W_q = nn.Linear(d_model, n_heads * ortho_dim, bias=False)
+        # Output projection.
+        self.W_o = nn.Linear(n_heads * ortho_dim, d_model, bias=False)
+
+        idx_i, idx_j = torch.triu_indices(ortho_dim, ortho_dim, offset=1)
+        self.register_buffer("_idx_i", idx_i, persistent=False)
+        self.register_buffer("_idx_j", idx_j, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        H, n = self.n_heads, self.n
+
+        # Build skew-symmetric and orthogonal matrices per token.
+        skew_flat = self.W_skew(x).view(B, T, H, self.n_skew)
+        skew = torch.zeros(B, T, H, n, n, device=x.device, dtype=x.dtype)
+        skew[..., self._idx_i, self._idx_j] = skew_flat
+        skew[..., self._idx_j, self._idx_i] = -skew_flat
+        O_t = torch.linalg.matrix_exp(skew)            # (B, T, H, n, n)
+
+        # K, V — per-token outer products kv_t = k_t ⊗ v_t : (B, T, H, n, n).
+        k = self.W_k(x).view(B, T, H, n)
+        v = self.W_v(x).view(B, T, H, n)
+        kv = k.unsqueeze(-1) * v.unsqueeze(-2)         # (B, T, H, n, n)
+
+        # Sequential scan: c_t = O_t @ c_{t-1} @ O_tᵀ + kv_t.
+        c = torch.zeros(B, H, n, n, device=x.device, dtype=x.dtype)
+        c_states = torch.empty(B, T, H, n, n, device=x.device, dtype=x.dtype)
+        for t in range(T):
+            O = O_t[:, t]                              # (B, H, n, n)
+            c = O @ c @ O.transpose(-1, -2) + kv[:, t]
+            c_states[:, t] = c
+
+        # Readout: o_t = q_t · c_t (linear-attn style; q is row vector).
+        q = self.W_q(x).view(B, T, H, n)               # (B, T, H, n)
+        # q (..., n) treated as (..., 1, n); c (..., n, n); result (..., 1, n) → (..., n).
+        o = (q.unsqueeze(-2) @ c_states).squeeze(-2)   # (B, T, H, n)
+
+        return self.W_o(o.reshape(B, T, H * n))
+
+
 class Mamba2Attention(_FlaWrapper):
     """fla Mamba2 — modern SSM, state-of-the-art for many state-tracking tasks."""
 

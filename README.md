@@ -39,6 +39,18 @@ clean diagnostic decomposition of why the dominant architectures
    - Parity at T=512: **100 %** (converges step 1500)
    - Induction-heads recall: **100 %** (converges step 1200)
    - All at 0.94 M params, 4 layers total, 3000 AdamW steps.
+3a. **Hybrid empirically dominates `DeltaNet+allow_neg_eigval=True`
+    (the strongest published single-cell baseline) on modular addition
+    mod-p**, especially at long T:
+    - T=128 mod-3 / mod-5: hybrid solves at step 1500-2000, deltanet_negeig
+      at step 4000 (2-3× faster).
+    - T=512 mod-3: hybrid 100 %, deltanet_negeig 93 %.
+    - **T=512 mod-5: hybrid 100 %, deltanet_negeig catastrophically
+      diverges to 9.1 % (below random 20 %).**
+    The Householder reflector with `β > 1` is numerically fragile at
+    long T and collapses below random; SO(n)-scan handles Z_p
+    natively. This is the cleanest single-task empirical win for the
+    hybrid framing.
 4. The hybrid finding gives the empirical rank-ordering on parity:
    linear / heisenberg (✗ TC⁰) → DeltaNet default (T=128 only) → ortho
    / hybrid (T=512). And on recall: linear / ortho / rotconj / rotdelta

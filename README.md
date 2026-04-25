@@ -13,8 +13,10 @@ We identify the pattern and search the unexplored corners.
 - Brainstorm of 25 candidate monoids: [`IDEAS.md`](IDEAS.md)
 - Follow-up literature search: [`LITERATURE.md`](LITERATURE.md)
 - GPU / evaluation strategy: [`EVAL_PLAN.md`](EVAL_PLAN.md)
+- **Empirical results (2026-04-25): [`RESULTS.md`](RESULTS.md)**
 - Lean project: [`StateDep/`](StateDep/)
 - Kernel prototypes (PyTorch reference + Triton source + Mac tests): [`kernels/`](kernels/)
+- Layer modules + training loop: [`experiments/`](experiments/)
 
 ## Reframing
 
@@ -93,6 +95,27 @@ combined `shared/test_scan.py` (the Blelloch down-sweep's operand order
 is load-bearing for non-commutative monoids; the test exercises both
 commutative and non-commutative cases).
 
+## First-pass empirical results (2026-04-25, 2× RTX 5090)
+
+Full writeup in [`RESULTS.md`](RESULTS.md). Headline:
+
+- **Triton kernels run on sm_120 / Blackwell consumer** — no
+  pytorch#176426 segfault; BF16-input + FP32-accum numerics within
+  `EVAL_PLAN.md` §2.3 tolerances after fixing three real kernel bugs.
+- **Fused-readout `heisenberg_d` runs at 1.8-4.5× `linear_attn`** across
+  realistic shapes. Apples-to-apples kernel comparison.
+- **Parity kill-gate cleared at T=64** with a +32.6 pp end-token margin
+  (HeisenbergAttention 98 % vs LinearAttention 50 %, both 1.05 M params,
+  4 layers, d_head=32, 5 000 AdamW steps). The bilinear cross-pair is a
+  *useful* state-tracking primitive on real hardware.
+- **SOTA bake-off result is honest, not flattering.** At T=64 our cell
+  matches DeltaNet, Gated DeltaNet, and Mamba2 (all using
+  `use_short_conv=True` from fla); plain linear-attn and no-posenc softmax
+  fail. **At T=128 our cell joins linear-attn and softmax in failing**
+  while DeltaNet/GDN/Mamba2 still pass. The bilinear cross-pair extends
+  the parity-solvable horizon (T=32 → T=64) but does not by itself match
+  the fla-engineered 1D-conv-plus-scan story at T=128.
+
 ## Novelty table (after `LITERATURE.md` follow-up search)
 
 Verdict: 🟢 open / 🟡 adjacent / 🔴 covered. Full per-candidate
@@ -150,22 +173,43 @@ is not obvious) but target different algebras:
 - [**DeltaProduct** (NeurIPS 2025)](https://arxiv.org/abs/2502.10297), [**PD-SSM** (NeurIPS 2025 spotlight)](https://arxiv.org/abs/2509.22284) — recent entrants to the "state-tracking via richer monoids" area; both solve single-index parity via scan.
 - [**Matrix Is All You Need** (2506.01966)](https://arxiv.org/abs/2506.01966) — unifies convolution/recurrence/attention under sparse-matrix factorisations.
 
-## Planned next steps
+## Status of planned next steps
 
-The plan has sharpened considerably after the kernel + literature passes.
-In rough priority order:
+The plan from [`EVAL_PLAN.md`](EVAL_PLAN.md), revised in light of the
+2026-04-25 results in [`RESULTS.md`](RESULTS.md):
 
-1. **Port `heisenberg_d` and `unipotent_u4` kernels to the 2× RTX 5090 dev rig.** Verify BF16-input + FP32-accum numerics match the fp64 PyTorch reference at the tolerances in [`EVAL_PLAN.md` §2.3](EVAL_PLAN.md). Smoke-check that we don't hit [pytorch#176426](https://github.com/pytorch/pytorch/issues/176426) (the sm_120-specific multi-`tl.load` segfault).
-2. **Run the 30M-parameter kill-gate synthetic suite** (MQAR + parity + mod-p + Dyck-2) from [`EVAL_PLAN.md` §3.6](EVAL_PLAN.md). If `heisenberg_d` or `unipotent_u4` don't beat `linear_attn` by ≥10 pp on the state-tracking tasks, freeze here and write up the Lean library as a negative result. If they do: proceed.
-3. **Add scalar RetNet-style decay to `HeisenbergD.lean`** — ~30-line Lean extension preserving the monoid, corresponds to `(a, b, c, λ) · (a', b', c', λ') = (λ'a + a', λ'b + b', λ'c + c' + a⊗b'ᵀ, λλ')`. Needed so the state stays bounded in training.
-4. **SmolLM2-135M distillation** with 75 % `heisenberg_d`-hybrid + 25 % softmax, LoLCATs-style two-stage recipe.
-5. **`Signature.lean` bench kernel**. Now that we have the Lean proof, the grade-3 scan has a clear combine rule; budget permitting, compare against `heisenberg_d` to see whether the extra grade earns its cost.
-6. **Chunkwise-scan correctness theorem for `Delta`** and **general `U_n`** — Lean side, lower priority than finishing the measurement loop.
+1. ✅ **Port kernels to 2× RTX 5090 dev rig.** Done. No sm_120 segfault.
+   Three real bugs fixed (BF16 dtype, state-output dtype, multi-head grid
+   indexing). Numerics within `EVAL_PLAN.md` §2.3 tolerances. Fused-readout
+   `heisenberg_d` variant added — 1.8-4.5× cost vs `linear_attn`.
+2. ✅ **Parity kill-gate at small scale.** Cleared at T=64 with +32.6 pp
+   end-token margin vs `linear_attn`. Failed at T=128 (so did
+   `linear_attn` and softmax-no-posenc); DeltaNet, Gated DeltaNet, and
+   Mamba2 all pass T=128 thanks to their `use_short_conv=True` default.
+3. **`use_short_conv=False` ablation on DeltaNet/GDN at T=128.** Open.
+   Tells us whether the conv or the delta rule is doing the parity work
+   in fla. The most informative single experiment we still owe.
+4. **Stack a kernel-4 1D causal conv onto Heisenberg.** Open. If the
+   conv does the heavy lifting in fla, the same trick should put us back
+   in the SOTA conversation at T=128.
+5. **MQAR (Zoology) at small scale.** Open — different separator from
+   parity (retrieval, not state-tracking). Per `EVAL_PLAN.md` §3.6, this
+   completes the kill-gate suite.
+6. **`unipotent_u4` (trilinear cell) at T=128.** Open. Tests whether
+   higher-grade tensor monoids extend the horizon past Heisenberg's bilinear.
+7. **Add scalar RetNet-style decay to `HeisenbergD.lean`.** Open.
+   ~30-line Lean extension preserving the monoid, needed for bounded state
+   norm in long training.
+8. **SmolLM2-135M distillation** (`EVAL_PLAN.md` §3.3). Blocked on
+   (a) deciding whether to first stack short_conv onto Heisenberg
+   per (4) and (b) writing a custom autograd Function around the Triton
+   kernel (current PyTorch-cumsum reference materialises the d²-state,
+   which won't fit at 135M).
+9. **`Signature.lean` bench kernel** and **chunkwise-scan correctness for
+   `Delta` / general `U_n`**. Lower priority than the measurement loop.
 
-The full hardware-aware evaluation plan (including sm_120 Triton gotchas,
-NVFP4 / MXFP8 / 2:4 sparsity tuning levers for later, precision targets,
-and compute budget) is in [`EVAL_PLAN.md`](EVAL_PLAN.md). The 25-entry
-brainstorm of further candidate monoids is in [`IDEAS.md`](IDEAS.md).
+The 25-entry brainstorm of further candidate monoids is in
+[`IDEAS.md`](IDEAS.md).
 
 ## Build
 

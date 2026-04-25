@@ -163,3 +163,22 @@ def chunked(
         prev_B = prev_B + chunk_b_sum
 
     return out_a, out_b, out_c
+
+
+def naive_loop_with_readout(q: Tensor, a: Tensor, b: Tensor) -> Tensor:
+    """Reference for the fused-readout kernel.
+
+    q, a, b: (T, d). Returns o: (T, d) with o[t] = q[t] @ c[t] where
+    c[t] = Σ_{i<j≤t} a[i] ⊗ b[j].
+
+    Computed by materializing c at every step (fp64 reference, slow).
+    """
+    T, d = a.shape
+    c = torch.zeros(d, d, dtype=a.dtype, device=a.device)
+    running_a = torch.zeros(d, dtype=a.dtype, device=a.device)
+    out = torch.empty(T, d, dtype=q.dtype, device=q.device)
+    for t in range(T):
+        c = c + torch.outer(running_a, b[t])
+        running_a = running_a + a[t]
+        out[t] = q[t] @ c
+    return out

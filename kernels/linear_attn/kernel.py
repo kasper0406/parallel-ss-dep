@@ -37,14 +37,15 @@ if _HAS_TRITON:
         stride_kb, stride_kh, stride_kt, stride_kd,
         stride_vb, stride_vh, stride_vt, stride_vd,
         stride_ob, stride_oh, stride_ot, stride_od,
+        NUM_HEADS: tl.constexpr,
         D_K: tl.constexpr,
         D_V: tl.constexpr,
         BLOCK_T: tl.constexpr,
     ):
         """One program = one (batch, head) pair; walks T in BLOCK_T chunks."""
         pid_bh = tl.program_id(0)
-        pid_b = pid_bh // tl.num_programs(1)
-        pid_h = pid_bh %  tl.num_programs(1)
+        pid_b = pid_bh // NUM_HEADS
+        pid_h = pid_bh %  NUM_HEADS
 
         # Compute per-head base pointers.
         q_base = Q_ptr + pid_b * stride_qb + pid_h * stride_qh
@@ -78,8 +79,8 @@ if _HAS_TRITON:
                 mask=mask_t[:, None], other=0.0,
             )
 
-            # Inter-chunk: q @ S.
-            inter = tl.dot(q, S)                          # (BLOCK_T, D_V)
+            # Inter-chunk: q @ S. S is fp32 accumulator, so promote q to match.
+            inter = tl.dot(q.to(tl.float32), S)           # (BLOCK_T, D_V)
 
             # Intra-chunk: causal dense attention over the BLOCK_T window.
             attn = tl.dot(q, tl.trans(k))                 # (BLOCK_T, BLOCK_T)
@@ -110,7 +111,7 @@ if _HAS_TRITON:
         linear_attn_fwd[grid](
             q, k, v, o, T,
             *q.stride(), *k.stride(), *v.stride(), *o.stride(),
-            D_K=D_K, D_V=D_V, BLOCK_T=block_t,
+            NUM_HEADS=H, D_K=D_K, D_V=D_V, BLOCK_T=block_t,
             num_warps=4,
         )
         return o

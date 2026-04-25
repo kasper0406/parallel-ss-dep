@@ -74,6 +74,7 @@ if _HAS_TRITON:
         T_seq,
         stride_xb, stride_xh, stride_xt, stride_xk, stride_xd,
         stride_yb, stride_yh, stride_yt, stride_yk, stride_yd,
+        NUM_HEADS: tl.constexpr,
         D: tl.constexpr,
         BLOCK_T: tl.constexpr,
         BLOCK_D: tl.constexpr,
@@ -84,8 +85,8 @@ if _HAS_TRITON:
         # Decode (b, h, d_block) from the flat program id.
         pid_bh = pid // num_d
         pid_d  = pid %  num_d
-        pid_b = pid_bh // tl.num_programs(1)
-        pid_h = pid_bh %  tl.num_programs(1)
+        pid_b = pid_bh // NUM_HEADS
+        pid_h = pid_bh %  NUM_HEADS
 
         x_base = X_ptr + pid_b * stride_xb + pid_h * stride_xh
         y_base = Y_ptr + pid_b * stride_yb + pid_h * stride_yh
@@ -165,14 +166,16 @@ if _HAS_TRITON:
         assert x.is_cuda, "u4 scan kernel needs CUDA"
         B, H, T, six, D = x.shape
         assert six == 6, f"expected 6 channels in axis -2, got {six}"
-        y = torch.empty_like(x)
+        # The trilinear x14 channel grows as O(T³) worst-case; BF16's 7-bit
+        # mantissa overflows by T~1024. Output stays fp32 regardless of input.
+        y = torch.empty(B, H, T, six, D, dtype=torch.float32, device=x.device)
 
         num_d = (D + block_d - 1) // block_d
         grid = (B * H * num_d,)
         u4_scan_fwd[grid](
             x, y, T,
             *x.stride(), *y.stride(),
-            D=D, BLOCK_T=block_t, BLOCK_D=block_d,
+            NUM_HEADS=H, D=D, BLOCK_T=block_t, BLOCK_D=block_d,
             num_warps=4,
         )
         return y

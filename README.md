@@ -1,24 +1,56 @@
 # state-dep-parallel
 
-Formalising associativity for **state-dependent, parallelizable RNN cells**
-in Lean, then building Triton kernels for the most promising candidates.
+Mapping the design space of **state-dependent, parallelizable RNN cells**
+— Lean formalisation, Triton kernels for Blackwell sm_120, and a
+clean diagnostic decomposition of why the dominant architectures
+(DeltaNet, Mamba2, AUSSM, …) succeed where they do.
 
-The guiding question: *which algebraic structures let a step operator
-depend on input / prior state while still collapsing into an associative
-prefix-sum scan?* Everything in modern linear-attention land is an
-instance of this pattern (Mamba, GLA, DeltaNet, Gated DeltaNet, RWKV, …).
-We identify the pattern and search the unexplored corners.
+- [`RESULTS.md`](RESULTS.md) — full empirical writeup
+- [`NEXT_DIRECTIONS.md`](NEXT_DIRECTIONS.md) — strategy doc with literature search
+- [`EVAL_PLAN.md`](EVAL_PLAN.md) — GPU + evaluation plan
+- [`PLAN.md`](PLAN.md) — original research plan
+- [`IDEAS.md`](IDEAS.md), [`LITERATURE.md`](LITERATURE.md) — earlier brainstorm + lit search
+- [`StateDep/`](StateDep/) — Lean project
+- [`kernels/`](kernels/) — Triton kernels
+- [`experiments/`](experiments/) — training drivers and architecture modules
 
-- Research plan: [`PLAN.md`](PLAN.md)
-- Brainstorm of 25 candidate monoids: [`IDEAS.md`](IDEAS.md)
-- Follow-up literature search: [`LITERATURE.md`](LITERATURE.md)
-- GPU / evaluation strategy: [`EVAL_PLAN.md`](EVAL_PLAN.md)
-- **Empirical results (2026-04-25): [`RESULTS.md`](RESULTS.md)**
-- Lean project: [`StateDep/`](StateDep/)
-- Kernel prototypes (PyTorch reference + Triton source + Mac tests): [`kernels/`](kernels/)
-- Layer modules + training loop: [`experiments/`](experiments/)
+## Headline findings
 
-## Reframing
+1. **Two architecturally distinct walls** in the parallel-scan-friendly
+   design space, each with a published characterisation:
+   - **Grazzi's TC⁰ wall** ([Grazzi et al. ICLR'25][grazzi]) — a linear
+     RNN with transition spectrum in `[0, 1]^d` cannot express parity
+     at unbounded T. Escape requires negative or unit-circle eigenvalues.
+   - **The recall wall** ([Zoology / MQAR][zoology]) — recall requires
+     a **rank-1 erase `(I − β k kᵀ)` applied per token in a fixed
+     frame**. Architectures without it fail induction-heads and MQAR
+     even at small scale.
+2. **The two walls are mechanically incompatible inside a single state.**
+   The rotation that escapes wall 1 (input-dependent two-sided action
+   `c → O c Oᵀ`) is the same conjugation that destroys the fixed-frame
+   structure recall depends on. We tested four single-cell architectures
+   that try to escape both — all fail recall (chance) regardless of
+   parameterisation, including a tanh-bounded variant that should
+   minimise frame disruption.
+3. **The minimum architectural escape is a heterogeneous layer stack.**
+   `[ortho, deltanet, ortho, deltanet]` — alternating SO(n) scan layers
+   (Grazzi-clean parity) and DeltaNet layers (fixed-frame recall) —
+   solves both walls cleanly:
+   - Parity at T=512: **100 %** (converges step 1500)
+   - Induction-heads recall: **100 %** (converges step 1200)
+   - All at 0.94 M params, 4 layers total, 3000 AdamW steps.
+4. The hybrid finding gives the empirical rank-ordering on parity:
+   linear / heisenberg (✗ TC⁰) → DeltaNet default (T=128 only) → ortho
+   / hybrid (T=512). And on recall: linear / ortho / rotconj / rotdelta
+   (✗ chance) → DeltaNet / hybrid (✓ 100 %).
+5. **Triton kernels for sm_120 (Blackwell consumer / RTX 5090) ship
+   for** `linear_attn`, `heisenberg_d` (with fused-readout variant),
+   `unipotent_u4`, and `ortho_son` (matrix-multiplication scan).
+   Three kernel bugs found and fixed; no pytorch#176426 segfault.
+
+## Approach
+
+### The reframing
 
 Every known state-dependent parallelizable RNN cell corresponds to a
 **finite-dimensional associative algebra** `A` over ℝ (or an ordered
@@ -28,20 +60,93 @@ semiring), where:
 - each step is left-multiplication by an input-dependent element of A,
 - composition across steps is A's multiplication table.
 
-The abstract parallel-scan correctness theorem (`StateDep/Scan.lean`)
+The abstract parallel-scan correctness theorem ([`StateDep/Scan.lean`](StateDep/Scan.lean))
 says: for any monoid, any binary-tree re-association of a fold equals
-the sequential fold. So *the only* algebraic content a kernel needs is a
-`Monoid` instance on the parameter type. The design problem reduces to
-finding an `A` that is:
+the sequential fold. So *the only* algebraic content a kernel needs is
+a `Monoid` instance on the parameter type. The design problem reduces
+to finding an `A` that is:
 
 1. low-dimensional (memory bandwidth),
 2. cheap to multiply (compute),
 3. expressively nonlinear in a useful way.
 
-## What's formalised
+### The wall framing
 
-Thirteen monoids / groups proved in Lean 4 + mathlib, 1845 lines, no
-`sorry`s, builds clean from a warm mathlib cache in ~2 seconds.
+After eight rounds of architecture iteration, the empirical surface of
+this design space looks like:
+
+```
+                                       ┌─ recall wall ──┐
+                                       │  (Zoology /    │
+                                       │   MQAR — needs │
+                                       │   fixed-frame  │
+                                       │   rank-1       │
+                                       │   erase)       │
+                                       └────────────────┘
+                                              │
+                            ┌─────────────────┴─────────────────┐
+                            │                                   │
+                ┌─ Grazzi   │                                   │ ─┐
+                │  TC⁰ wall │       SINGLE CELL                  │  │ HYBRID
+                │  (parity  │       cannot escape both          │  │ STACK
+                │  needs    │       (rotation breaks frame)     │  │ escapes
+                │  spectrum │                                   │  │ both
+                │  outside  │                                   │  │
+                │  [0, 1])  │                                   │  │
+                └───────────┘                                   └──┘
+```
+
+Each axis has a clean published characterisation; the *incompatibility*
+across them in a single state is the new observation. The minimum
+escape is alternating specialist layers.
+
+## Solutions tested, with results and literature placement
+
+Eight architectures tested at matched ~1 M params, 4 layers, 3-5 k AdamW
+steps, on parity (state-tracking) and induction-heads (recall).
+
+### 1. **Heisenberg cross-pair** `c_t = Σ_{i<j} aᵢ ⊗ bⱼ`  *(our original novelty)*
+
+- Lean: [`StateDep/HeisenbergD.lean`](StateDep/HeisenbergD.lean), bilinear ordered-pair sum, proved associative.
+- Triton: [`kernels/heisenberg_d/`](kernels/heisenberg_d/) with fused readout — 1.8-4.5× `linear_attn` cost.
+- Result: solves T=64 parity (+32.6 pp end-tok over linear-attn), **fails T=128 (TC⁰ stuck)**.
+- Literature: HLA (Zhang 2025, [arXiv:2510.27258](https://arxiv.org/abs/2510.27258)) uses *symmetric* `(Σ kᵢkᵢᵀ)(Σ qⱼvⱼᵀ)`; DeltaNet uses single-index `Σ kᵢvᵢᵀ`. The strictly-triangular ordered-pair sum as scan state is novel; the cell as defined is TC⁰-stuck, so it doesn't compete with Grazzi-clean architectures.
+
+### 2. **SO(n) scan (`ortho`)** `O_t = exp(skew(W_skew · x_t))`, `R_t = O_t R_{t-1}`
+
+- PyTorch impl: [`experiments/layers.py:OrthogonalScanAttention`](experiments/layers.py).
+- Triton: [`kernels/ortho_son/`](kernels/ortho_son/) — matrix-multiplication parallel scan.
+- Result: solves parity at **T=64, 128, 256, 512 all 100 %** (convergence 1000-2000 steps); **fails induction (chance)**.
+- Literature: **AUSSM** ([Karuvally et al., July 2025, arXiv:2507.05238][aussm]) independently proposed the same skew-symmetric input-dependent matrix-exp construction; their state is per-channel diagonal, ours is matrix; otherwise concurrent. **DeltaProduct** ([Yang et al. NeurIPS 2025, arXiv:2502.10297][deltaproduct]) achieves O(n) via products of K Householders — equivalent image at K=n. Our distinct angle: matrix-state rather than acting-on-vector, sm_120 Triton kernel.
+
+### 3. **Semidirect `SO(n) ⋉ ℝ^{n×n}` (`rotconj`)** state `(R_t, c_t)`, `c_t = O_t c_{t-1} O_tᵀ + k ⊗ v`
+
+- PyTorch impl: [`experiments/layers.py:RotConjAttention`](experiments/layers.py).
+- Result: solves parity at T=64-256 (slower than ortho); **fails induction (chance)**.
+- Literature: novel — no published architecture uses semidirect product `G ⋉ V` with `G` a Lie group acting on matrix-valued `V` by conjugation as the parallel-scan monoid. **Diagnosis after running**: additive c-update saturates with noise from distractor positions; rotation conjugation alone does not enable recall.
+
+### 4. **Rotation + delta-rule (`rotdelta`)** `c_t = (I − β k kᵀ)(O_t c_{t-1} O_tᵀ) + β k vᵀ`
+
+- PyTorch impl: [`experiments/layers.py:RotDeltaAttention`](experiments/layers.py).
+- Result: solves parity (slower); **fails induction at chance** in two variants (unbounded skew + tanh-bounded skew ≤ 0.5 rad).
+- Literature: novel by combination — an agent verified the two-sided action `c → A c B` is distinct from DeltaProduct's left-only `c → A c`. Triple-monoid `(A, B, d) · (A', B', d') = (A'A, BB', A'dB' + d')` is associative, chunkwise-WY-able. **The empirical result IS the contribution**: this combination *cannot work* mechanistically because rotation conjugation rotates stored keys away from their original frame; the inner-product alignment delta-rule recall depends on is broken regardless of rotation magnitude. **Mechanistic incompatibility**.
+
+### 5. **Hybrid layer stack `[ortho, deltanet, ortho, deltanet]`** *(the answer)*
+
+- PyTorch impl: [`experiments/train_hybrid.py`](experiments/train_hybrid.py) + `attention_cls_per_layer` arg in [`experiments/model.py`](experiments/model.py).
+- Result: parity at T=128 → **100 %** (step 1200), parity at T=512 → **100 %** (step 1500), induction → **100 %** (step 1200). Both walls escaped.
+- Literature: the closest published precedent is **Olmo-Hybrid** ([Merrill, Li et al. 2026, arXiv:2604.03444](https://arxiv.org/abs/2604.03444)) which combines transformer + Gated DeltaNet and ties it to a TC⁰ → NC¹ argument — but their state-tracking layer is *DeltaNet's internal Householder*; nobody else uses an explicit SO(n) / orthogonal / unitary layer alongside DeltaNet. Other hybrid-layer-stack papers (**Qwen3-Next** 75/25 GDN+softmax, **Hymba**, **Samba**, **Jamba**, **Zamba**, **MAD**) frame the layer split via empirical capability decomposition (recall vs context summarisation), not via the two specific walls we identify.
+
+### Where this places us
+
+- The cell-level novelty (`heisenberg_d`, `rotconj`, `rotdelta`) is real — those scan structures are not in the published literature — but the cells we tested don't out-perform DeltaProduct or DeltaNet+`allow_neg_eigval=True` at single-cell expressivity. **Single-cell unification of parity + recall is essentially solved by DeltaProduct** ([Yang et al. 2025][deltaproduct]); we add nothing to that picture beyond extra cells in the same equivalence class.
+- The cleanest novel contribution is the **two-walls + incompatibility framing** and the corresponding **minimum hybrid stack**. Olmo-Hybrid argues "transformer + DeltaNet ⇒ TC⁰ ∪ NC¹" but doesn't decompose into rotation + erase as separate primitives, and doesn't state the impossibility direction. Our `[ortho, deltanet]` alternating stack is the smallest concrete witness we know of.
+
+## What's formalised in Lean
+
+Thirteen monoids / groups proved associative in Lean 4 + mathlib, ~1845
+lines, no `sorry`s, builds clean from a warm cache in ~2 seconds. Full
+table:
 
 | # | Module | Structure | Combine | State | Cross-term |
 |---|---|---|---|---|---|
@@ -53,230 +158,83 @@ Thirteen monoids / groups proved in Lean 4 + mathlib, 1845 lines, no
 | 6 | `GF2Heisenberg.lean` | Heisenberg over `ZMod 2`; parity via popcount-choose-2 | O(1) | 3 bits | bilinear over GF(2) |
 | 7 | `Rotor.lean` | quaternion rotor cell (non-commutative) | O(1) | 4 | non-commutative group |
 | 8 | `Dyck.lean` | parenthesis-balance `(c, d) ∈ ℕ²`, `min`-cancel | O(1) | 2 | nested `min` |
-| 9 | `Unipotent.lean` | `U_4` as a 6-parameter group | O(1) | 6 | **trilinear ordered triple** |
+| 9 | `Unipotent.lean` | `U_4` as a 6-parameter group | O(1) | 6 | trilinear ordered triple |
 | 10 | `HeisenbergD.lean` | multi-dim Heisenberg, vector `a, b`, matrix `c` | O(d²) | 2d + d² | bilinear outer product |
 | 11 | `Delta.lean` | Sherman-Morrison composition of rank-1 perts | O(d²) | — | rank-1 → rank-2 |
 | 12 | `Magnus.lean` | BCH-truncated-at-2 over matrix pairs `(A, B)` | O(d³) | 2d² | commutator `[A, A']` |
 | 13 | `Signature.lean` | level-3 truncated tensor-algebra signature `(s, v, M, T)` | O(d³) | 1 + d + d² + d³ | graded tensor product |
 
-Several deserve special note:
-
-- `Scan.lean` is the one piece of infrastructure everyone else rides on: any `Monoid` instance inherits parallel-scan correctness for free.
-- `Delta.lean`'s Sherman-Morrison identity `(I − β₁k₁k₁ᵀ)(I − β₂k₂k₂ᵀ) = I − β₁k₁k₁ᵀ − β₂k₂k₂ᵀ + β₁β₂(k₁·k₂)·k₁k₂ᵀ` is the only substantive matrix proof; everything else reduces to `ext` + `ring` / `abel`.
-- `GF2Heisenberg.lean` proves `((parity_inputs xs).prod).c = (popcount xs).choose 2 (mod 2)` by induction + Pascal — a direct demonstration that a 3-bit monoid state solves a problem linear RNNs provably cannot at constant width.
-- `Dyck.lean` is the only strict-monoid-only cell (no inverses); associativity is a four-way `split_ifs <;> omega`.
-- `Signature.lean` formalises the grade-3 tensor algebra and is the universal parent of the bilinear and trilinear cells — multi-d Heisenberg is its grade-2 sliver, `U_n`'s trilinear term is a triangular projection of its grade-3 slot.
-
-## The interesting observation from the proofs
-
-The hard line in each associativity proof is *always* the single bilinear
-cross-term between consecutive steps. Every other coordinate is closed by
-`simp` or `rfl`. So "expressivity" in this whole family of architectures
-lives in one bilinear form per step, wrapped in an associative envelope —
-and the wrapper is the multiplication table of the chosen finite-dim
-algebra.
-
 ## Triton kernels
 
-Three PyTorch reference implementations + Triton kernel sources +
-Mac-runnable correctness tests (full details in [`kernels/README.md`](kernels/README.md)):
+Four cells with PyTorch reference + Triton source + Mac-runnable
+correctness tests:
 
-| Kernel | Reference passes at | Source | Purpose |
-|---|---|---|---|
-| `kernels/linear_attn` | max \|Δ\| ~1e-13 (fp64) | `Affine.lean` + fast-weight | baseline for all benchmarks |
-| `kernels/heisenberg_d` | max \|Δ\| ~1e-12 (fp64) | `HeisenbergD.lean` | novel: causal-pair outer product `Σ_{i<j} aᵢbⱼᵀ` |
-| `kernels/unipotent_u4` | max \|Δ\| ~1e-11 (fp64), explicit trilinear check passes | `Unipotent.lean` | novel: trilinear ordered triple `Σ_{i<j<k}` |
+| Kernel | Purpose | Status on sm_120 (RTX 5090) |
+|---|---|---|
+| [`kernels/linear_attn/`](kernels/linear_attn/) | baseline linear attention | ✓ correctness, ~893 Mtok/s peak |
+| [`kernels/heisenberg_d/`](kernels/heisenberg_d/) | bilinear cross-pair, with fused-readout variant | ✓ correctness, 1.8-4.5× linear_attn |
+| [`kernels/unipotent_u4/`](kernels/unipotent_u4/) | trilinear ordered triple | ✓ correctness, 5-11× linear_attn |
+| [`kernels/ortho_son/`](kernels/ortho_son/) | matrix-multiplication scan (SO(n)) | ✓ correctness on FP32 |
 
-Each kernel ships as `reference.py` (PyTorch, runs on Mac) +
-`kernel.py` (Triton, GPU-only, import-guarded) + `test.py`
-(naive-vs-chunked numerical check, runs on Mac). `kernels/shared/scan.py`
-has a sequential / Blelloch / Hillis-Steele scan reference used by the
-combined `shared/test_scan.py` (the Blelloch down-sweep's operand order
-is load-bearing for non-commutative monoids; the test exercises both
-commutative and non-commutative cases).
+No pytorch#176426 (sm_120 multi-`tl.load`) segfault on any kernel. BF16
+in / FP32 accum within `EVAL_PLAN.md` §2.3 tolerances.
 
-## First-pass empirical results (2026-04-25, 2× RTX 5090)
-
-Full writeup in [`RESULTS.md`](RESULTS.md); strategy doc in
-[`NEXT_DIRECTIONS.md`](NEXT_DIRECTIONS.md). Headline:
-
-- **Triton kernels run on sm_120 / Blackwell consumer** — no
-  pytorch#176426 segfault; BF16-input + FP32-accum numerics within
-  `EVAL_PLAN.md` §2.3 tolerances after fixing three real kernel bugs.
-- **Fused-readout `heisenberg_d` runs at 1.8-4.5× `linear_attn`**.
-- **Parity kill-gate cleared at T=64** with a +32.6 pp end-token margin
-  for our bilinear Heisenberg cell vs plain linear-attn (98 % vs 50 %).
-- **At T=128 our Heisenberg cell hits the wall predicted by Grazzi et al.
-  ICLR'25** ([2411.12537](https://arxiv.org/abs/2411.12537)) — its
-  transition spectrum ⊂ {1}, so it is TC⁰-stuck and cannot solve parity
-  at unbounded T. Same wall hits plain linear-attn and no-posenc softmax.
-  DeltaNet/GDN/Mamba2 pass T=128 via engineered tricks
-  (`use_short_conv=True`).
-- 🎯 **The Grazzi-clean fix: SO(n) orthogonal scan.** Per-channel state
-  is an `n×n` orthogonal matrix with input-dependent transitions
-  `O_t = exp(X_t)` (skew-symmetric `X_t`). Spectrum lives on the unit
-  circle, including `−1`. NC¹-complete via Barrington. **Solves parity
-  at T=64, T=128, AND T=256 to 100 % accuracy by training step 1 000**
-  — faster than every fla baseline, and beats DeltaNet at T=256 where
-  DeltaNet stalls at 56 % q4 within our 5 000-step budget. **Also solves
-  T=512** (converges by step 2 000); T=1024 testing in progress.
-  PyTorch impl in `experiments/layers.py`; Triton kernel + tests in
-  `kernels/ortho_son/`.
-- ⚠️ **Concurrent prior art**: [AUSSM (Karuvally et al., July 2025,
-  arXiv:2507.05238)](https://arxiv.org/abs/2507.05238) independently
-  proposed the same core skew-symmetric input-dependent matrix-exp
-  transition. Our differentiation: cumulative matrix state (vs acting on
-  vectors), multi-layer convergence-speed comparison, sm_120 Triton
-  kernel.
-- ❌ **Tested follow-up `RotConjAttention` (semidirect `SO(n) ⋉ ℝ^{n×n}`):**
-  the conjugated KV memory `c_t = O_t c_{t-1} O_tᵀ + k⊗v` solves parity
-  (matches ortho, slower) but **fails induction-heads recall (3.3 % acc,
-  chance is 3.1 %)** alongside pure ortho (2.6 %) and linear-attention
-  (8.2 %). Only DeltaNet (100 %) solves recall. **Diagnosis:** recall is
-  enabled by the **delta-rule erase `(I − β k kᵀ)`**, not by state
-  structure or unbounded memory.
-- ❌ **Tested second follow-up `RotDeltaAttention` (rotation + delta-rule
-  erase, two-sided action `(I − β k kᵀ)(O c Oᵀ) + β k vᵀ`):** verified
-  novel by literature search (two-sided action distinct from
-  DeltaProduct's left-only). Implemented; **fails induction (3.9 %),
-  including with tanh-bounded skew (5.7 %)**. Mechanistic diagnosis: the
-  rotation conjugation `O c Oᵀ` rotates stored keys away from their
-  original frame, breaking delta-rule recall. **The two mechanisms —
-  rotation (Grazzi-clean) and delta-rule recall — are fundamentally
-  incompatible in a single state.** Full diagnostic in `RESULTS.md`
-  Phase 7.
-- ✅ **Hybrid layer stack `[ortho, deltanet, ortho, deltanet]` solves
-  both walls.** Induction recall: 100 % by step 1200. Parity at T=128:
-  100 % by step 1200 (stable through step 3000 after one training
-  transient). The architectural answer to the "both walls in one model"
-  question is **specialist layers, not specialist cells** — each layer
-  type handles the wall it can, the residual stream carries information
-  between them. Mechanistically distinct from existing fla hybrids
-  (which are engineering choices); our framing makes the *reason*
-  explicit (the two walls are mechanically distinct and can't share a
-  state). Full writeup in `RESULTS.md` Phase 8.
-
-## Novelty table (after `LITERATURE.md` follow-up search)
-
-Verdict: 🟢 open / 🟡 adjacent / 🔴 covered. Full per-candidate
-adjacent-work write-ups in [`LITERATURE.md`](LITERATURE.md).
-
-| Structure | Combine | State | Verdict | Note |
-|---|---|---|---|---|
-| **Truncated signature `T^≤3`** (`Signature.lean`) | O(d³) | 1+d+d²+d³ | 🟢 | verified via Log-NCDE, SLiCEs, SigGate — all use signatures as *input features* or *ODE forcing*, never as **scan state**. Chen product as scan monoid remains open. |
-| **Multi-d Heisenberg** `Σ_{i<j} aᵢ⊗bⱼ` (`HeisenbergD.lean`) | O(d²) | 2d+d² | 🟢 | [HLA (Zhang 2025)](https://arxiv.org/abs/2510.27258) uses *symmetric* `(Σ kᵢkᵢᵀ)(Σ qⱼvⱼᵀ)`; DeltaNet / fast-weights use same-index `Σ kᵢvᵢᵀ`. The strictly-triangular ordered-pair sum is unused. |
-| **Unipotent U_n** `Σ_{i<j<k}` (`Unipotent.lean`) | O(n²) | n(n−1)/2 | 🟢 | closest: [Bilinear RNN (Csordas 2025)](https://arxiv.org/abs/2505.21749), but that's a bilinear transition matrix, different object. |
-| **BCH / Magnus K=2** (`Magnus.lean`) | O(d³) | 2d² | 🟢 | closest: [Log-NCDE (Walker 2024)](https://arxiv.org/abs/2402.18512) uses Magnus-style log-signatures as ODE inputs, not as scan state. Truncated BCH as a monoid in ML is unused. |
-| **Dyck / balance** (`Dyck.lean`) | O(1) | 2 | 🟢 | Merrill-Sabharwal [*Illusion of State*](https://arxiv.org/abs/2404.08819) (ICML'24), Strobl et al. TACL'24, Hewitt et al. EMNLP'20 all document Dyck as a named linear-RNN / Transformer failure mode; no one proposes this monoid as the fix. |
-| **GF(2)-Heisenberg / parity** (`GF2Heisenberg.lean`) | O(1) | 3 bits | 🟡 | softened. Single-index parity *is* now solved in parallel scans by [Grazzi et al. ICLR'25](https://arxiv.org/abs/2411.12537), [DeltaProduct NeurIPS'25](https://arxiv.org/abs/2502.10297), [PD-SSM NeurIPS'25](https://arxiv.org/abs/2509.22284). Our interest narrows to the **ordered bit-pair** `Σ_{i<j} xᵢxⱼ` form (vs single-index parity). |
-| Scalar Heisenberg `H_3` | O(1) | 3 | 🟢 | gateway to multi-d; too small alone |
-| Quaternion rotor | O(1) | 4 | 🔴 | [QRNN (Parcollet 2018)](https://arxiv.org/abs/1806.04418), [GATr (Brehmer 2023)](https://arxiv.org/abs/2305.18415) — well-covered |
-| Clifford / geometric algebra | O(2^d) | 2^d | 🟡 | as a *scan primitive* specifically, less explored |
-| Jet / dual number | O(1) | 2 | 🟡 | likely uninteresting — too little expressivity |
-| Tropical / Viterbi | O(1) / O(d²) | d to d² | 🟡 | [Tropical Attention NeurIPS'25](https://arxiv.org/abs/2505.17190) crowds the tropical-scan niche |
-| Affine / SSM | O(d²) | d+d² | 🔴 | Mamba / S4 / RWKV / GLA |
-| Delta / Sherman-Morrison | O(d²) w/ WY | d² chunk-bounded | 🔴 | DeltaNet, Gated DeltaNet, Kimi Linear |
-
-### The novelty claim, pinned down
-
-HLA's masked second-order state (verified against the arXiv HTML) is
-
-```
-S_tᴷ   = Σ_{i≤t} kᵢ kᵢᵀ        (single-index key Gram)
-C_t^QV = Σ_{i≤t} qᵢ vᵢᵀ         (single-index query-value outer)
-o_t    = q_tᵀ · S_tᴷ · C_t^QV
-```
-
-— single-index sums multiplied together. The "higher-orderness" is the
-matrix product of two same-step statistics, not an ordered-pair sum.
-
-Our multi-d Heisenberg state is explicitly
-
-```
-c_t = Σ_{i<j≤t} aᵢ bⱼᵀ          (ordered-pair sum, i strictly before j)
-```
-
-These are *different tensors*. Expanding HLA's product and comparing
-indices, HLA's statistic is
-`Σ_{i,j}(kᵢ · qⱼ) kᵢ vⱼᵀ` — symmetric over `(i,j)` pairs,
-whereas Heisenberg's is strictly triangular `i<j`. Unipotent `U_n` gives
-the analogous triangular triple/higher-order sums, and `Signature.lean`
-generalises to the universal graded object of which both are projections.
-
-## Adjacent "find a non-obvious associative structure" work
-
-Papers that share the methodology (find a monoid where the combine law
-is not obvious) but target different algebras:
-
-- [**Log-Linear Attention** (Guo 2025, ICLR'26)](https://arxiv.org/abs/2506.04761) — logarithmically growing state via hierarchical scans. Orthogonal: we could stack a log-linear variant on top of any of our cells.
-- [**Kalman Linear Attention** (KLA 2026)](https://arxiv.org/abs/2602.10743) — Kalman precision recursion is a Möbius / fractional-linear map, composes via 2×2 matrix multiplication. Different monoid (PGL₂) but exact same discovery pattern as ours.
-- [**DeltaProduct** (NeurIPS 2025)](https://arxiv.org/abs/2502.10297), [**PD-SSM** (NeurIPS 2025 spotlight)](https://arxiv.org/abs/2509.22284) — recent entrants to the "state-tracking via richer monoids" area; both solve single-index parity via scan.
-- [**Matrix Is All You Need** (2506.01966)](https://arxiv.org/abs/2506.01966) — unifies convolution/recurrence/attention under sparse-matrix factorisations.
-
-## Status of planned next steps
-
-The plan from [`EVAL_PLAN.md`](EVAL_PLAN.md), revised in light of the
-2026-04-25 results in [`RESULTS.md`](RESULTS.md):
-
-1. ✅ **Port kernels to 2× RTX 5090 dev rig.** Done. No sm_120 segfault.
-   Three real bugs fixed (BF16 dtype, state-output dtype, multi-head grid
-   indexing). Numerics within `EVAL_PLAN.md` §2.3 tolerances. Fused-readout
-   `heisenberg_d` variant added — 1.8-4.5× cost vs `linear_attn`.
-2. ✅ **Parity kill-gate at small scale.** Cleared at T=64 with +32.6 pp
-   end-token margin vs `linear_attn`. Failed at T=128 (so did
-   `linear_attn` and softmax-no-posenc); DeltaNet, Gated DeltaNet, and
-   Mamba2 all pass T=128 thanks to their `use_short_conv=True` default.
-3. **`use_short_conv=False` ablation on DeltaNet/GDN at T=128.** Open.
-   Tells us whether the conv or the delta rule is doing the parity work
-   in fla. The most informative single experiment we still owe.
-4. **Stack a kernel-4 1D causal conv onto Heisenberg.** Open. If the
-   conv does the heavy lifting in fla, the same trick should put us back
-   in the SOTA conversation at T=128.
-5. **MQAR (Zoology) at small scale.** Open — different separator from
-   parity (retrieval, not state-tracking). Per `EVAL_PLAN.md` §3.6, this
-   completes the kill-gate suite.
-6. **`unipotent_u4` (trilinear cell) at T=128.** Open. Tests whether
-   higher-grade tensor monoids extend the horizon past Heisenberg's bilinear.
-7. **Add scalar RetNet-style decay to `HeisenbergD.lean`.** Open.
-   ~30-line Lean extension preserving the monoid, needed for bounded state
-   norm in long training.
-8. **SmolLM2-135M distillation** (`EVAL_PLAN.md` §3.3). Blocked on
-   (a) deciding whether to first stack short_conv onto Heisenberg
-   per (4) and (b) writing a custom autograd Function around the Triton
-   kernel (current PyTorch-cumsum reference materialises the d²-state,
-   which won't fit at 135M).
-9. **`Signature.lean` bench kernel** and **chunkwise-scan correctness for
-   `Delta` / general `U_n`**. Lower priority than the measurement loop.
-
-The 25-entry brainstorm of further candidate monoids is in
-[`IDEAS.md`](IDEAS.md).
+Three kernel bugs found and fixed during the port:
+1. `linear_attn` BF16-input dtype mismatch in `tl.dot(q, S)`;
+2. `heisenberg_d` / `unipotent_u4` writing state outputs in BF16 (overflow at T=2048);
+3. `linear_attn` / `unipotent_u4` deriving head-index from `tl.num_programs(1)` on a 1-D grid (heads aliased onto head 0; out-of-bounds writes for `B*H > B`).
 
 ## Build
 
-Lean library — requires `elan`, `lake`, and network access for the first
-`lake exe cache get`:
-
+Lean library — requires `elan`, `lake`, network access:
 ```bash
 cd StateDep
 source $HOME/.elan/env
-lake exe cache get   # pulls prebuilt mathlib oleans
-lake build           # ~2s on a warm cache
+lake exe cache get
+lake build
 ```
 
-Each module ends with a `Tree.eval_eq_prod` corollary that type-checks
-the specific monoid against the abstract scan theorem — the build
-succeeding *is* the correctness check.
-
-Kernel tests — from the repo root:
-
+Python environment (uv + cu132 nightly torch + triton + flash-linear-attention):
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install torch
-python kernels/linear_attn/test.py
-python kernels/heisenberg_d/test.py
-python kernels/unipotent_u4/test.py
-python kernels/shared/test_scan.py
+uv venv .venv && source .venv/bin/activate
+uv pip install torch --index-url https://download.pytorch.org/whl/nightly/cu132
+uv pip install numpy flash-linear-attention
 ```
 
-All four print `OK`. No GPU required.
+Smoke + bench + experiments:
+```bash
+python kernels/smoke_gpu.py                 # all kernels correctness
+python kernels/bench_gpu.py                 # throughput grid
+python experiments/train.py --T 64 128 256 --steps 5000 --batch 256 \
+    --arches linear,heisenberg,deltanet,mamba2,ortho,rotconj,rotdelta
+python experiments/train_induction.py --arches linear,ortho,rotconj,rotdelta,deltanet
+python experiments/train_hybrid.py --task induction --layers ortho,deltanet,ortho,deltanet
+python experiments/train_hybrid.py --task parity    --layers ortho,deltanet,ortho,deltanet --T 512
+```
+
+## What's next
+
+The mechanistic-decomposition story leaves four concrete tasks:
+
+1. **Modular counting (mod 3, 5, 7) experiment.** The single sharpest
+   prediction of our framing: `Z_p ⊂ SO(2)` for any p (rotation by 2π/p),
+   so SO(n)-scan and our hybrid solve any modular counting; DeltaNet
+   even with `allow_neg_eigval=True` only reaches `Z_2`. Likely the
+   cleanest separator from DeltaProduct as well (its Householder
+   eigenvalues are `±1` only).
+2. **S₅ word problem.** Tests *non-solvable* state-tracking. SO(n) for
+   n≥3 contains A₅ in principle; the question is whether SGD finds the
+   non-abelian rotations. DeltaProduct has the cleanest published
+   numbers here (NeurIPS 2025); we'd compare directly.
+3. **Lean: incompatibility theorem.** Formalise *"two-sided rotation
+   conjugation cannot host both Grazzi-clean spectrum and a fixed-frame
+   recall basis simultaneously"* in Lean. New module
+   `IncompatibilityTheorem.lean`.
+4. **SmolLM2-135M distillation** with hybrid layer stack (per
+   [`EVAL_PLAN.md`](EVAL_PLAN.md) §3.3). Stretches the result beyond
+   synthetics.
+
+[grazzi]: https://arxiv.org/abs/2411.12537
+[zoology]: https://arxiv.org/abs/2312.04927
+[aussm]: https://arxiv.org/abs/2507.05238
+[deltaproduct]: https://arxiv.org/abs/2502.10297

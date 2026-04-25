@@ -588,3 +588,122 @@ If we only have a single 8×B200 node for a *single* week and the goal is
 Written to `/Volumes/git/state-dep-parallel/EVAL_PLAN.md`. Recommended initial
 student model size: **135M parameters** (SmolLM2-135M). First end-to-end eval
 GPU budget: **~40 B200-hours**.
+
+---
+
+## 5. Refined plan after Phase 1-8 architectural exploration
+
+After the 2× RTX 5090 dev session in April 2026 (full writeup in
+[`RESULTS.md`](RESULTS.md)), the plan has sharpened considerably. The
+findings:
+
+- **Two architecturally distinct walls** identified mechanistically
+  (Grazzi TC⁰ wall + Zoology recall wall).
+- **Single-cell unification fails** (rotation conjugation breaks the
+  fixed-frame structure delta-rule recall depends on; tested 4 cells).
+- **Hybrid layer stack `[ortho, deltanet, ortho, deltanet]`** solves
+  both (parity at T=512 = 100 %, induction = 100 %, 0.94 M params).
+
+### Status of original §4.3 sequencing
+
+| Original step | Status |
+|---|---|
+| Day 1 morning: kernel port + smoke tests on sm_120 | ✓ done |
+| Day 1 afternoon: autotune sweep (skipped — used PyTorch refs to ship faster) | partial |
+| Day 2: 30M synthetic suite (parity, MQAR, mod-p, Dyck) | ✓ parity done at 1M params; MQAR partially done; mod-p, Dyck not run |
+| Day 3-4: SmolLM2-135M distillation | not started |
+| Day 5-6: Qwen3-1.7B distillation | not started |
+| Day 7: Qwen3-4B / negative-result writeup decision | superseded — the empirical findings reframe the project |
+
+### Refined priority list (replaces §4.3 day 3-7)
+
+The architectural exploration produced a sharper research story than
+"distill SmolLM2 with `heisenberg_d` hybrid". The four work items below
+cover both *empirical validation of the wall framing* (high priority,
+new) and *the original distillation arc* (still relevant for scale).
+
+#### 5.1 Modular counting mod p > 2 *(highest priority)*
+
+The cleanest theoretical prediction of the wall framing: `Z_p ⊂ SO(2)`
+for any p, so SO(n)-scan and our hybrid solve any modular counting,
+while DeltaNet (even with `allow_neg_eigval=True`) only reaches `Z_2`
+because Householder reflectors have eigenvalue ±1 along k.
+**DeltaProduct's Householder-product eigenvalues are also ±1**, so it
+should also fail mod-p for p > 2.
+
+If this prediction holds at our 1M-param scale, it's the cleanest
+single-task separator we have between hybrid and DeltaProduct.
+
+- **Task**: predict `(x₁ + x₂ + … + x_t) mod p` at every position, for
+  `p ∈ {3, 5, 7}`.
+- **Architectures**: linear, heisenberg, ortho, rotconj, deltanet,
+  deltaproduct (need to install / wrap), mamba2, hybrid.
+- **Setup**: T=128, vocab=p, n_layers=4, d_head=32, 5000 steps.
+- **Pass criterion**: hybrid solves all p ∈ {3, 5, 7}; DeltaNet /
+  DeltaProduct fail for p > 2 (at chance = 1/p).
+- **Compute**: ~2 GPU-hours per (arch × p) on a single 5090. Total
+  ~50 GPU-hours.
+
+#### 5.2 S₅ word problem *(high priority)*
+
+The canonical NC¹-complete benchmark. SO(n) for n≥3 contains A₅, so
+in-principle solvable by ortho / hybrid. The empirical question is
+whether SGD finds non-abelian rotations or stays in the abelian
+subgroup.
+
+- **Task**: from [Grazzi et al. ICLR'25](https://arxiv.org/abs/2411.12537)
+  + [DeltaProduct (Yang et al. NeurIPS'25)](https://arxiv.org/abs/2502.10297)
+  benchmark suite — sequence of S₅ generators, predict whether
+  composition is identity.
+- **Architectures**: same set as 5.1.
+- **Pass criterion**: any architecture solves > 95 % at T=512. Per
+  Grazzi et al., DeltaNet+`allow_neg_eigval` partially solves; we
+  expect hybrid to match or beat.
+- **Compute**: ~30 GPU-hours.
+
+#### 5.3 Lean: incompatibility theorem *(parallel work, no GPU)*
+
+Formalise the empirical observation that single-cell rotation × delta
+is impossible:
+
+- **Theorem (sketch)**: let `M = (M_t)_{t=1}^T` be a sequence of
+  transitions. If each `M_t = (I − β_t k_t k_tᵀ) O_t (I − β_t k_t k_tᵀ)ᵀ`
+  with `O_t ∈ SO(n)` and `k_t` data-dependent, then there is no
+  fixed-basis decoding `q · c_t` that recovers `(q · k_p)·v_p` for an
+  arbitrary "stored" pair (k_p, v_p) at p < t.
+- **Module**: new `StateDep/IncompatibilityTheorem.lean`.
+- **Effort**: ~50-100 lines of Lean. Group-theoretic argument plus a
+  standard inner-product calculation.
+
+#### 5.4 SmolLM2-135M distillation with hybrid stack
+
+The original §3.3 plan, but using the refined hybrid architecture
+instead of pure heisenberg_d:
+
+- **Hybrid spec**: replace 3 of every 4 attention layers in SmolLM2 with
+  alternating ortho + DeltaNet, keeping every 4th as softmax. Mirrors
+  Qwen3-Next's 75 % linear / 25 % softmax with finer-grained
+  specialisation.
+- **Recipe**: LoLCATs-style two-stage (attention transfer + LoRA SFT),
+  per §3.3.
+- **Compute**: per §4.2 estimate, ~12 B200-h ≈ 60 wall-clock-h on 2×
+  5090. Doable but depends on whether 5.1 + 5.2 give signal.
+- **Gating**: only proceed if (a) modular counting (5.1) shows clean
+  separation hybrid ≫ DeltaProduct, *or* (b) S₅ (5.2) shows hybrid ≥
+  DeltaProduct. If neither, the project is the formal+kernel+
+  diagnostic contribution and distillation is overkill.
+
+### Compute budget on 2× RTX 5090
+
+Total budget for 5.1 + 5.2 + 5.3 ≈ ~80 GPU-hours of synthetic
+experiments + Lean work. 5.4 distillation is another ~60 wall-clock
+hours if pursued.
+
+### Why this sequence
+
+The wall-framing result is publishable on its own (formal Lean +
+incompatibility theorem + minimal hybrid). 5.1 and 5.2 are the cleanest
+empirical separators that distinguish *our* hybrid framing from the
+existing fla / DeltaProduct line. 5.4 is the scale-up that proves the
+finding generalises to LLMs; only worth pursuing once 5.1 / 5.2 give
+signal.

@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from experiments.layers import (
     LinearAttention, HeisenbergAttention, SoftmaxAttention,
     DeltaNetAttention, GatedDeltaNetAttention, Mamba2Attention,
-    OrthogonalScanAttention, RotConjAttention,
+    OrthogonalScanAttention, RotConjAttention, RotDeltaAttention,
 )
 from experiments.model import TinyLM
 from experiments.tasks.parity import make_batch
@@ -45,6 +45,7 @@ ARCHES = {
     "mamba2":      Mamba2Attention,
     "ortho":       OrthogonalScanAttention,        # SO(n) scan — Grazzi-clean
     "rotconj":     RotConjAttention,               # SO(n) ⋉ ℝ^{n×n} — semidirect, novel
+    "rotdelta":    RotDeltaAttention,              # rotation + delta-rule erase (variant α)
 }
 
 

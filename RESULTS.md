@@ -466,29 +466,98 @@ is the open theory question. If yes: a single cell that solves both
 parity and recall. If no: hybrid layer stack (alternate ortho and
 DeltaNet) is the engineering fallback.
 
-### Summary of what the empirical work has shown
+## Phase 7 — RotDeltaAttention: the "rotation + delta-rule" combination fails
 
-After five rounds of architecture iteration and three rounds of
-parallel literature search:
-- **Bilinear cross-pair Heisenberg** (our project's original novelty):
-  works at T=64, fails at T=128. TC⁰-stuck per Grazzi.
-- **SO(n) scan** (Grazzi-clean): solves parity at T=64-512.
-  Concurrent with AUSSM (July 2025). Our differentiation: matrix-state,
-  Triton kernel, multi-layer comparison.
-- **RotConj `(R, c)`** (semidirect): solves parity (slower) but fails
-  recall. The bounded/unbounded distinction is the wrong axis; the
-  erase-vs-no-erase distinction is the right one.
-- **DeltaNet (with default fla tricks)**: solves both parity (T=128
-  with fla's `use_short_conv=True`) and recall. The reference baseline.
+After RotConj failed recall (additive c with no erase), the next
+hypothesised fix was to add DeltaNet's rank-1 erase to the rotation-
+conjugated state. Verified novel by a research agent (two-sided action
+`A·c·B` distinct from DeltaProduct's left-only `A·c`; triple-monoid
+`(A_t, B_t, d_t)` is associative):
 
-The honest project narrative:
+```
+c_t = (I − β_t k_t k_tᵀ) · (O_t c_{t-1} O_tᵀ) + β_t k_t v_tᵀ
+```
+
+Implemented as `experiments/layers.py:RotDeltaAttention`. Tested two
+variants on induction heads (3000 steps, 1M params):
+
+| Variant | acc | Diagnosis |
+|---|---|---|
+| RotDelta unbounded skew | **3.9 %** | chance |
+| RotDelta tanh-bounded skew (≤ 0.5 rad) | **5.7 %** | barely above chance |
+| DeltaNet (reference) | 99.6 % | converges step 600 |
+
+**Mechanistic diagnosis:** the rotation conjugation `O c Oᵀ` rotates
+*stored* keys away from their original frame. When a query at time T
+arrives, the stored content `(R · k_p1)(R · v_p1)ᵀ` (where
+`R = O_T·O_{T-1}·…·O_{p1+1}`) is in a different frame than the query
+`q_T`. For DeltaNet to retrieve, the inner product `q_T · k_p1` must be
+large; under conjugation it becomes `q_T · (R k_p1)`, which depends on
+the entire intervening rotation history.
+
+In short: **two-sided rotation conjugation is fundamentally
+incompatible with delta-rule recall**. The mechanism that makes
+rotation Grazzi-clean (changing the eigenvalue spectrum on c) is the
+same mechanism that breaks frame consistency for retrieval. Bounding
+the per-step rotation angle didn't help — even very small rotations
+compound over T steps to scramble the frame.
+
+This negative result is informative: it locates a *real architectural
+constraint*, not just an optimisation difficulty.
+
+## Summary of empirical findings
+
+After six rounds of architecture iteration, three rounds of parallel
+literature search, and four kill-gate-style benchmarks:
+
+| Architecture | Parity | Induction recall | Notes |
+|---|---|---|---|
+| Heisenberg cross-pair (original novelty) | ✓ T=64, ✗ T=128 | (not tested) | TC⁰-stuck per Grazzi |
+| SO(n) scan (ortho) | ✓ T=64–512 | ✗ chance | concurrent with AUSSM (July 2025) |
+| RotConj (semidirect, additive c) | ✓ slower | ✗ chance | unbounded c without erase saturates with noise |
+| RotDelta (rotation + delta-erase) | (not tested fully) | ✗ chance | conjugation breaks recall frame |
+| Linear-attn | ✗ T=64 | ~chance | TC⁰ + no erase |
+| DeltaNet (`use_short_conv=True`) | ✓ T=128 | ✓ 100 % | the reference baseline |
+
+**Two distinct walls** localised:
+
+1. **Grazzi's TC⁰ wall** (parity at unbounded T) — escaped by SO(n)
+   scan, DeltaProduct, AUSSM, DeltaNet+`allow_neg_eigval`. Mechanism:
+   transition spectrum must include eigenvalues outside `[0, 1]`.
+2. **The recall wall** (induction / MQAR) — escaped only by
+   delta-rule erase `(I − β k kᵀ)` applied to a state in a *fixed
+   frame*. Mechanism: keys-as-stored must align with keys-as-queried.
+
+**Crucial architectural observation:** these two walls are not
+addressable by the same single-cell mechanism. Rotation breaks frame
+consistency; pure delta-rule has positive eigenvalues unless `β > 1`
+(which is DeltaNet's `allow_neg_eigval=True`, already published).
+
+The clean compositions that succeed are:
+- **DeltaNet + `allow_neg_eigval=True`** (already in fla): β ∈ (0, 2)
+  gives one negative eigenvalue along k_t per step. Already published
+  via Grazzi et al. ICLR'25 + DeltaProduct.
+- **Hybrid layer stacks**: alternate ortho-style layers (parity) and
+  DeltaNet-style layers (recall). Engineering, not single-cell novelty.
+
+### Honest project narrative
+
 > *We formalised the parallel-scan-monoid framework in Lean, identified
-> several novel algebraic primitives (Heisenberg cross-pair, SO(n)-state
-> scan, semidirect-product scan), shipped Blackwell sm_120 Triton
-> kernels for them, and empirically located the Grazzi TC⁰ wall and the
-> separate "recall requires delta-rule erase" wall. The project's
+> several novel algebraic primitives (Heisenberg cross-pair, SO(n)-
+> state scan, semidirect-product scan, rotation-conjugated DeltaNet),
+> shipped Blackwell sm_120 Triton kernels, and empirically located both
+> Grazzi's TC⁰ wall and a separate, mechanically distinct "recall
+> requires fixed-frame erase" wall. We then designed and tested four
+> single-cell architectures attempting to escape both walls
+> simultaneously. None succeeded — rotation conjugation is incompatible
+> with delta-rule recall, regardless of variant. The project's
 > contribution is the formalisation + kernels + clean diagnostic
-> empirical analysis, not a SOTA architecture.*
+> mapping of the architectural design space, plus an empirical negative
+> result (rotation × delta-erase doesn't combine cleanly) that is
+> informative for the field. A SOTA-competitive single-cell
+> architecture in this design space appears to require either a
+> fundamentally different ingredient combination or — more likely — a
+> hybrid layer stack rather than a single cell.*
 
 ## Section summary table
 

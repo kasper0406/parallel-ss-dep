@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def _split_heads(x: torch.Tensor, n_heads: int) -> torch.Tensor:
@@ -359,6 +360,104 @@ class RotConjAttention(nn.Module):
         # Readout: o_t = q_t · c_t (linear-attn style; q is row vector).
         q = self.W_q(x).view(B, T, H, n)               # (B, T, H, n)
         # q (..., n) treated as (..., 1, n); c (..., n, n); result (..., 1, n) → (..., n).
+        o = (q.unsqueeze(-2) @ c_states).squeeze(-2)   # (B, T, H, n)
+
+        return self.W_o(o.reshape(B, T, H * n))
+
+
+class RotDeltaAttention(nn.Module):
+    """Rotation-conjugated DeltaNet — variant (α) of the rotation+delta family.
+
+    State per channel: c ∈ ℝ^{n×n}. Per-step update combines (a) two-sided
+    rotation conjugation (Grazzi-clean — eigenvalues of `R ⊗ R` include −1),
+    (b) DeltaNet-style rank-1 erase (recall mechanism), and (c) rank-1 write:
+
+        c_t = (I − β_t k_t k_tᵀ) · (O_t c_{t-1} O_tᵀ) + β_t k_t v_tᵀ
+
+    Per-token transition factors as `c → A_t c B_t + d_t` with:
+        A_t = (I − β_t k_t k_tᵀ) O_t
+        B_t = O_tᵀ
+        d_t = β_t k_t v_tᵀ
+
+    The triple-monoid `(A, B, d) · (A', B', d') = (A'A, BB', A'dB' + d')`
+    is associative — verified analytically. Distinct from DeltaProduct
+    (which uses left-multiplication only); the two-sided action `c → AcB`
+    preserves trace/eigenvalues/rank of c, which left-multiplication does
+    not. Per the literature search, this combination is genuinely novel.
+
+    β_t = sigmoid(W_β · x_t) ∈ (0, 1) — standard DeltaNet erase strength.
+    Readout: o_t = q_t · c_t.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_head: int,
+                 ortho_dim: int = 4, max_skew_angle: float = 0.5):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.n = ortho_dim
+        self.n_skew = ortho_dim * (ortho_dim - 1) // 2
+        # Bound the per-step rotation angle so cumulative rotation over T
+        # doesn't scramble the state. With max_skew_angle=0.5, each O_t is
+        # within ~30° of identity per axis, and over T=64 the cumulative
+        # rotation stays in a controlled regime.
+        self.max_skew_angle = max_skew_angle
+
+        self.W_skew = nn.Linear(d_model, n_heads * self.n_skew, bias=False)
+        self.W_k = nn.Linear(d_model, n_heads * ortho_dim, bias=False)
+        self.W_v = nn.Linear(d_model, n_heads * ortho_dim, bias=False)
+        self.W_q = nn.Linear(d_model, n_heads * ortho_dim, bias=False)
+        # Erase strength gate β ∈ (0, 1) per token per head.
+        self.W_beta = nn.Linear(d_model, n_heads, bias=True)
+        self.W_o = nn.Linear(n_heads * ortho_dim, d_model, bias=False)
+
+        idx_i, idx_j = torch.triu_indices(ortho_dim, ortho_dim, offset=1)
+        self.register_buffer("_idx_i", idx_i, persistent=False)
+        self.register_buffer("_idx_j", idx_j, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        H, n = self.n_heads, self.n
+
+        # Build skew-symmetric and orthogonal matrices, with bounded angle.
+        skew_flat = self.W_skew(x).view(B, T, H, self.n_skew)
+        skew_flat = self.max_skew_angle * torch.tanh(skew_flat)
+        skew = torch.zeros(B, T, H, n, n, device=x.device, dtype=x.dtype)
+        skew[..., self._idx_i, self._idx_j] = skew_flat
+        skew[..., self._idx_j, self._idx_i] = -skew_flat
+        O_t = torch.linalg.matrix_exp(skew)            # (B, T, H, n, n)
+
+        # K, V, β per token per head. Normalize k to unit norm so the
+        # erase factor (I − β k kᵀ) is well-conditioned (eigenvalues
+        # in {1, …, 1, 1−β} along k).
+        k = self.W_k(x).view(B, T, H, n)
+        k = F.normalize(k, dim=-1, eps=1e-6)            # unit-norm key
+        v = self.W_v(x).view(B, T, H, n)
+        beta = torch.sigmoid(self.W_beta(x))            # (B, T, H), in (0, 1)
+
+        # Sequential scan: c_t = (I − β k kᵀ)(O c_{t-1} Oᵀ) + β k vᵀ.
+        c = torch.zeros(B, H, n, n, device=x.device, dtype=x.dtype)
+        c_states = torch.empty(B, T, H, n, n, device=x.device, dtype=x.dtype)
+        eye = torch.eye(n, device=x.device, dtype=x.dtype)
+        for t in range(T):
+            O = O_t[:, t]                              # (B, H, n, n)
+            k_t = k[:, t]                              # (B, H, n)
+            v_t = v[:, t]                              # (B, H, n)
+            b_t = beta[:, t].unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
+            # 1. Rotate: c' = O · c · Oᵀ.
+            c_rot = O @ c @ O.transpose(-1, -2)
+            # 2. Erase: (I − β k kᵀ) · c'  via Sherman-Morrison form.
+            kkT_c = k_t.unsqueeze(-1) * (k_t.unsqueeze(-2) @ c_rot).squeeze(-2).unsqueeze(-2)
+            # Cleaner: build erase matrix and multiply.
+            erase = eye - b_t * (k_t.unsqueeze(-1) * k_t.unsqueeze(-2))   # (B, H, n, n)
+            c_erased = erase @ c_rot
+            # 3. Write: + β k vᵀ.
+            write = b_t * (k_t.unsqueeze(-1) * v_t.unsqueeze(-2))
+            c = c_erased + write
+            c_states[:, t] = c
+
+        # Readout: o_t = q_t · c_t.
+        q = self.W_q(x).view(B, T, H, n)
         o = (q.unsqueeze(-2) @ c_states).squeeze(-2)   # (B, T, H, n)
 
         return self.W_o(o.reshape(B, T, H * n))

@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from experiments.layers import (
     LinearAttention, HeisenbergAttention, SoftmaxAttention,
     DeltaNetAttention, GatedDeltaNetAttention, Mamba2Attention,
-    OrthogonalScanAttention, RotConjAttention,
+    OrthogonalScanAttention, RotConjAttention, RotDeltaAttention,
 )
 from experiments.model import TinyLM
 from experiments.tasks.induction import make_batch as induction_batch
@@ -37,6 +37,7 @@ ARCHES = {
     "mamba2":     Mamba2Attention,
     "ortho":      OrthogonalScanAttention,
     "rotconj":    RotConjAttention,
+    "rotdelta":   RotDeltaAttention,
 }
 
 

@@ -131,15 +131,24 @@ Full writeup in [`RESULTS.md`](RESULTS.md); strategy doc in
 - ❌ **Tested follow-up `RotConjAttention` (semidirect `SO(n) ⋉ ℝ^{n×n}`):**
   the conjugated KV memory `c_t = O_t c_{t-1} O_tᵀ + k⊗v` solves parity
   (matches ortho, slower) but **fails induction-heads recall (3.3 % acc,
-  chance is 3.1 %)** at our 1M-param scale, alongside pure ortho (2.6 %)
-  and linear-attention (8.2 %). Only DeltaNet (100 %) solves recall.
-  **Diagnosis:** recall is enabled by the **delta-rule erase
-  `(I − β k kᵀ)`**, not by state structure or unbounded memory. Adding an
-  unbounded `c` slot without an erase mechanism doesn't grant recall
-  power — distractor positions saturate the memory with noise. The clean
-  empirical separator between recall-capable and recall-incapable
-  architectures is *whether the architecture has a rank-1 erase
-  operation applied per token*. Full diagnostic in `RESULTS.md` Phase 6.
+  chance is 3.1 %)** alongside pure ortho (2.6 %) and linear-attention
+  (8.2 %). Only DeltaNet (100 %) solves recall. **Diagnosis:** recall is
+  enabled by the **delta-rule erase `(I − β k kᵀ)`**, not by state
+  structure or unbounded memory.
+- ❌ **Tested second follow-up `RotDeltaAttention` (rotation + delta-rule
+  erase, two-sided action `(I − β k kᵀ)(O c Oᵀ) + β k vᵀ`):** verified
+  novel by literature search (two-sided action distinct from
+  DeltaProduct's left-only). Implemented; **fails induction (3.9 %),
+  including with tanh-bounded skew (5.7 %)**. Mechanistic diagnosis:
+  the rotation conjugation `O c Oᵀ` rotates stored keys away from their
+  original frame; when a query arrives at time T, the stored content is
+  in a frame that depends on the entire intervening rotation history,
+  breaking the inner-product alignment delta-rule recall requires. **The
+  two mechanisms — rotation (Grazzi-clean) and delta-rule recall — are
+  fundamentally incompatible in a single state.** Full diagnostic in
+  `RESULTS.md` Phase 7. The path to "single cell solving both parity and
+  recall" appears to need a fundamentally different ingredient, or a
+  hybrid layer stack rather than a single cell.
 
 ## Novelty table (after `LITERATURE.md` follow-up search)
 

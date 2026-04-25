@@ -23,6 +23,7 @@ from __future__ import annotations
 try:
     import triton
     import triton.language as tl
+    import torch
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
@@ -114,6 +115,63 @@ if _HAS_TRITON:
             num_warps=1,                                # tiny per-program work
         )
         return Y
+
+
+    class MatmulScanFn(torch.autograd.Function):  # type: ignore[misc]
+        """Autograd wrapper around the Triton matmul-scan kernel.
+
+        Forward: y_t = O_t · y_{t-1} · ... · O_0, y_{-1} = I.
+        Backward: derived analytically, see kernel.py docstring.
+
+        Forward uses Triton kernel; backward uses vectorised PyTorch
+        sequential reverse pass (B, H, n, n) — fast because n is small.
+        """
+        # NB: we import torch inside the if-branch to keep the file
+        # importable on Mac. Reference torch globally below since we're
+        # inside the `if _HAS_TRITON:` block.
+
+        @staticmethod
+        def forward(ctx, O, block_t):
+            import torch
+            Y = launch(O, block_t=block_t)
+            ctx.save_for_backward(O, Y)
+            ctx.block_t = block_t
+            return Y
+
+        @staticmethod
+        def backward(ctx, grad_Y):
+            import torch
+            O, Y = ctx.saved_tensors
+            B, H, T, N, _ = O.shape
+
+            # Reverse recurrence:
+            #   Q_k = grad_Y[k] + O_{k+1}^T @ Q_{k+1},   Q_{T-1} = grad_Y[T-1]
+            # Then grad_O[k] = Q_k @ y_{k-1}^T,  with y_{-1} = I.
+            Q = torch.empty_like(O)
+            Q[..., T - 1, :, :] = grad_Y[..., T - 1, :, :]
+            for t in range(T - 2, -1, -1):
+                Q[..., t, :, :] = (
+                    grad_Y[..., t, :, :]
+                    + O[..., t + 1, :, :].transpose(-1, -2) @ Q[..., t + 1, :, :]
+                )
+
+            grad_O = torch.empty_like(O)
+            # k = 0 case: y_{-1} = I, so grad_O[0] = Q[0].
+            grad_O[..., 0, :, :] = Q[..., 0, :, :]
+            # k ≥ 1: grad_O[k] = Q[k] @ Y[k-1]^T (row-major matmul).
+            grad_O[..., 1:, :, :] = Q[..., 1:, :, :] @ Y[..., :-1, :, :].transpose(-1, -2)
+
+            return grad_O, None
+
+
+    def matmul_scan(O, block_t: int = 64):
+        """Differentiable cumulative matrix-multiplication scan.
+
+        Forward via Triton kernel; backward via vectorised PyTorch
+        reverse pass. Apples-to-apples replacement for sequential
+        ``state[t] = O[t] @ state[t-1]`` Python loops.
+        """
+        return MatmulScanFn.apply(O, block_t)
 
 else:
 

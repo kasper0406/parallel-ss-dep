@@ -302,11 +302,20 @@ class OrthogonalScanAttention(nn.Module):
         O_t = torch.linalg.matrix_exp(skew)            # (B, T, H, n, n)
 
         # Cumulative left-multiplication along T: state_t = O_t · O_{t-1} · ... · O_0.
-        # Sequential scan — replace with Blelloch on GPU later if hot.
-        states = torch.empty_like(O_t)
-        states[:, 0] = O_t[:, 0]
-        for t in range(1, T):
-            states[:, t] = O_t[:, t] @ states[:, t - 1]
+        # Use the Triton-backed differentiable scan kernel — eliminates the
+        # Python for-loop overhead that dominated wall-clock at scale.
+        # Layout: (B, T, H, n, n) → (B, H, T, n, n) for the kernel, then back.
+        if x.is_cuda:
+            from kernels.ortho_son import kernel as _ortho_kernel
+            O_perm = O_t.permute(0, 2, 1, 3, 4).contiguous()       # (B, H, T, n, n)
+            states_perm = _ortho_kernel.matmul_scan(O_perm, block_t=64)
+            states = states_perm.permute(0, 2, 1, 3, 4).contiguous()
+        else:
+            # CPU fallback (Mac / debugging).
+            states = torch.empty_like(O_t)
+            states[:, 0] = O_t[:, 0]
+            for t in range(1, T):
+                states[:, t] = O_t[:, t] @ states[:, t - 1]
 
         # Apply accumulated rotation to learned per-token input vector.
         v = self.W_v(x).view(B, T, H, n)

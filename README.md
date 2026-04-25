@@ -47,10 +47,19 @@ clean diagnostic decomposition of why the dominant architectures
     - T=512 mod-3: hybrid 100 %, deltanet_negeig 93 %.
     - **T=512 mod-5: hybrid 100 %, deltanet_negeig catastrophically
       diverges to 9.1 % (below random 20 %).**
-    The Householder reflector with `β > 1` is numerically fragile at
-    long T and collapses below random; SO(n)-scan handles Z_p
-    natively. This is the cleanest single-task empirical win for the
-    hybrid framing.
+4. **Honest task-dependent picture** (`RESULTS.md` Phases 10-11):
+   - Hybrid wins **continuous-angle modular arithmetic** (Z_p ⊂ SO(2)).
+   - DeltaNet+`allow_neg_eigval=True` wins **discrete-reflection
+     non-solvable group state-tracking** (S₅ word problem at T=128:
+     0.98 pos_recall vs hybrid's 0.71). Householder reflectors are a
+     more direct fit for transpositions than rotations.
+   - Pure DeltaNet (with `use_short_conv=True`) wins **real-text LM**
+     (TinyStories, 135M, 5000 steps: PPL 5.65 vs hybrid's 9.79). The
+     engineering tricks on DeltaNet layers (short conv, qk-l2-norm,
+     silu) matter more than algebraic novelty for LM-style tasks.
+   - Hybrid Triton kernel + custom autograd brings hybrid to 3.5×
+     DeltaNet wall-clock (was 14.5× before). 135M-scale distillation
+     is now feasible.
 4. The hybrid finding gives the empirical rank-ordering on parity:
    linear / heisenberg (✗ TC⁰) → DeltaNet default (T=128 only) → ortho
    / hybrid (T=512). And on recall: linear / ortho / rotconj / rotdelta

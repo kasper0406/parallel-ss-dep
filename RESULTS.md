@@ -540,6 +540,79 @@ The clean compositions that succeed are:
 - **Hybrid layer stacks**: alternate ortho-style layers (parity) and
   DeltaNet-style layers (recall). Engineering, not single-cell novelty.
 
+## Phase 11 — Practical demonstration: 135M LM training on TinyStories
+
+The first practical-scale test: train hybrid and pure DeltaNet at 135M
+parameters from scratch on TinyStories ([HuggingFaceTB/SmolLM2-135M
+tokenizer, ~500 MB children's stories, vocab 49152). Architecture
+matches SmolLM2-135M dimensions (d_model=576, n_heads=9, d_head=64,
+n_layers=30). 5000 AdamW steps, batch=8, T=512, lr=3e-4 cosine.
+
+| Arch | Final train loss | Final val PPL | Wall time |
+|---|---|---|---|
+| **DeltaNet** | 2.04 | **5.65** | 718 s |
+| Hybrid `[ortho, deltanet]×15` | 2.60 | 9.79 | 1251 s (1.74× slower) |
+
+Per-step at this scale:
+- DeltaNet: 144 ms/step, ~29k tok/s
+- Hybrid: 250 ms/step, ~16k tok/s
+
+**Honest finding**: hybrid is ~73 % worse on PPL at matched compute on
+real text. The lack of feature-engineering tricks on the ortho layers
+(no `use_short_conv`, no `qk_norm="l2"`, no silu activation) hurts on
+LM-style tasks where local n-gram context matters more than long-range
+state-tracking algebra. The empirical scorecard shows task-dependent
+advantages:
+
+| Task | Hybrid | DeltaNet (default) | DeltaNet+negeig |
+|---|---|---|---|
+| Mod-3 T=512 | **100 %** | 86 % | 93 % |
+| **Mod-5 T=512** | **100 %** | (untested) | **9 % (catastrophic)** |
+| Parity T=512 | 100 % | fails | 100 % |
+| Induction recall T=64 | 100 % | 100 % | 100 % |
+| **LM PPL TinyStories (135M, 5k steps)** | 9.79 | **5.65** | (untested) |
+| S₅ word problem T=128 | 71 % pos_rec | 68 % | **98 %** |
+
+The clean conclusion of this exploration:
+
+> *Hybrid layer stacks with SO(n)-rotation primitives are a real
+> architectural escape from the two-walls structure (Grazzi TC⁰ +
+> Zoology recall) AND have a sharp empirical edge on **continuous-angle
+> state-tracking** (modular arithmetic mod-p for any p, where Z_p ⊂
+> SO(2)). They are **NOT** a universal win:*
+>
+> *(a) On **real-text LM tasks**, the engineering tricks on DeltaNet
+> layers (kernel-4 short conv, l2-normalised qk, silu) matter more than
+> the algebraic novelty in the ortho layers. To make hybrid competitive
+> on LM, those tricks would need to be transplanted onto ortho.*
+>
+> *(b) On **non-solvable discrete-group state-tracking** (S₅ word
+> problem via transpositions), Householder reflectors with
+> `allow_neg_eigval=True` fit the task better than rotations. SO(n)
+> contains S_n in principle but SGD prefers continuous solutions.*
+>
+> *The architectural advantage of any single primitive is
+> task-dependent on the underlying group structure. The hybrid stack
+> is the cleanest mechanistic decomposition we have, but proving its
+> practical superiority requires either (i) tasks where Z_p arithmetic
+> matters at scale, or (ii) engineering improvements that close the
+> LM gap.*
+
+The next-iteration engineering items, if pursued:
+
+1. **Bring DeltaNet-style tricks to the ortho layer**: add a kernel-4
+   short conv on the input projection, l2-normalise the rotation
+   parameters, swap the readout projection's nonlinearity to silu.
+   This should close most of the LM PPL gap while preserving the
+   mod-p advantage.
+2. **Triton backward kernel** for the matmul-scan: currently backward
+   uses a vectorised PyTorch reverse pass (O(T) sequential matmul on
+   GPU). A Triton backward could remove the remaining ~2× wall-clock
+   gap vs DeltaNet.
+3. **SmolLM2-135M distillation** rather than from-scratch: if hybrid
+   is initialised from the teacher's projections, the LM gap may close
+   much faster than 5k steps from scratch.
+
 ## Phase 10 — Triton autograd kernel + S₅ word problem
 
 ### Triton autograd wiring (engineering)

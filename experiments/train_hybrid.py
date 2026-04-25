@@ -24,7 +24,8 @@ import torch.nn.functional as F
 
 from experiments.layers import (
     LinearAttention, HeisenbergAttention, SoftmaxAttention,
-    DeltaNetAttention, GatedDeltaNetAttention, Mamba2Attention,
+    DeltaNetAttention, DeltaNetNegEigAttention,
+    GatedDeltaNetAttention, Mamba2Attention,
     OrthogonalScanAttention, RotConjAttention, RotDeltaAttention,
 )
 from experiments.model import TinyLM
@@ -37,6 +38,7 @@ ARCHES = {
     "heisenberg": HeisenbergAttention,
     "softmax":    SoftmaxAttention,
     "deltanet":   DeltaNetAttention,
+    "deltanet_negeig": DeltaNetNegEigAttention,
     "gateddelta": GatedDeltaNetAttention,
     "mamba2":     Mamba2Attention,
     "ortho":      OrthogonalScanAttention,

@@ -179,11 +179,6 @@ class DeltaNetAttention(_FlaWrapper):
 
     def __init__(self, d_model: int, n_heads: int, d_head: int):
         from fla.layers import DeltaNet
-        # `expand_k=expand_v=1.0` keeps head_dim aligned to our d_head when
-        # `hidden_size = n_heads * d_head` — but DeltaNet derives head_dim from
-        # hidden_size / num_heads, so we set hidden_size = n_heads * d_head and
-        # let the model project from/to d_model itself if the dims differ.
-        # In our setup d_model == n_heads * d_head (matched arch), so this works.
         assert d_model == n_heads * d_head, \
             f"DeltaNet expects d_model == n_heads*d_head; got {d_model} vs {n_heads*d_head}"
         super().__init__(DeltaNet(
@@ -198,6 +193,36 @@ class DeltaNetAttention(_FlaWrapper):
             use_short_conv=True,
             qk_activation="silu",
             qk_norm="l2",
+            allow_neg_eigval=False,
+        ))
+
+
+class DeltaNetNegEigAttention(_FlaWrapper):
+    """fla DeltaNet with `allow_neg_eigval=True` — Grazzi-clean variant.
+
+    Rescales β so the Householder reflector `(I − β k kᵀ)` can have eigenvalue
+    in (−1, 1) along k. Per Grazzi et al. ICLR'25, this lifts DeltaNet from
+    chance to 100% on parity at T ≤ 256. The strongest published single-cell
+    baseline against our hybrid.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_head: int):
+        from fla.layers import DeltaNet
+        assert d_model == n_heads * d_head, \
+            f"DeltaNet expects d_model == n_heads*d_head; got {d_model} vs {n_heads*d_head}"
+        super().__init__(DeltaNet(
+            mode="chunk",
+            d_model=d_model,
+            hidden_size=d_model,
+            num_heads=n_heads,
+            expand_k=1.0,
+            expand_v=1.0,
+            use_beta=True,
+            use_gate=False,
+            use_short_conv=True,
+            qk_activation="silu",
+            qk_norm="l2",
+            allow_neg_eigval=True,
         ))
 
 

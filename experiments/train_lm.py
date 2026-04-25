@@ -33,34 +33,60 @@ from experiments.layers import (
 from experiments.model import TinyLM
 
 
+_NAME_TO_CLS = {
+    "deltanet":   DeltaNetAttention,
+    "deltanet_negeig": DeltaNetNegEigAttention,
+    "ortho":      OrthogonalScanAttention,
+}
+
+
 def build_arch(name: str, n_layers: int):
-    """Map an arch name to either a single attention class or a per-layer list."""
-    if name == "deltanet":
-        return dict(attention_cls=DeltaNetAttention)
-    if name == "deltanet_negeig":
-        return dict(attention_cls=DeltaNetNegEigAttention)
-    if name == "ortho":
-        return dict(attention_cls=OrthogonalScanAttention)
+    """Map an arch name to either a single attention class or a per-layer list.
+
+    For shorthand patterns:
+      hybrid        — alternating ortho/deltanet (50/50, ortho first).
+      hybrid_25_75  — 1 ortho + 3 deltanet, repeating.
+      hybrid_75_25  — 3 ortho + 1 deltanet, repeating.
+    Or use --layers for an explicit comma-separated list.
+    """
+    if name in _NAME_TO_CLS:
+        return dict(attention_cls=_NAME_TO_CLS[name])
     if name == "hybrid":
-        cls = []
-        for i in range(n_layers):
-            cls.append(OrthogonalScanAttention if i % 2 == 0 else DeltaNetAttention)
+        cls = [OrthogonalScanAttention if i % 2 == 0 else DeltaNetAttention
+               for i in range(n_layers)]
+        return dict(attention_cls_per_layer=cls)
+    if name == "hybrid_25_75":
+        # 1 ortho + 3 deltanet pattern, ortho at every 4th position.
+        cls = [OrthogonalScanAttention if i % 4 == 0 else DeltaNetAttention
+               for i in range(n_layers)]
+        return dict(attention_cls_per_layer=cls)
+    if name == "hybrid_75_25":
+        # 3 ortho + 1 deltanet pattern.
+        cls = [DeltaNetAttention if i % 4 == 0 else OrthogonalScanAttention
+               for i in range(n_layers)]
         return dict(attention_cls_per_layer=cls)
     if name == "hybrid_negeig":
-        cls = []
-        for i in range(n_layers):
-            cls.append(OrthogonalScanAttention if i % 2 == 0 else DeltaNetNegEigAttention)
+        cls = [OrthogonalScanAttention if i % 2 == 0 else DeltaNetNegEigAttention
+               for i in range(n_layers)]
         return dict(attention_cls_per_layer=cls)
     raise ValueError(f"unknown arch: {name}")
+
+
+def parse_layers_arg(spec: str) -> list:
+    """Parse comma-separated --layers spec into a class list."""
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    return [_NAME_TO_CLS[p] for p in parts]
 
 
 class TokenisedStream(IterableDataset):
     """Streaming IterableDataset of fixed-length tokenised chunks."""
 
-    def __init__(self, dataset, tokenizer, block_size, shuffle_buffer=1024):
+    def __init__(self, dataset, tokenizer, block_size, text_field="text",
+                 shuffle_buffer=1024):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.block_size = block_size
+        self.text_field = text_field
         self.shuffle_buffer = shuffle_buffer
 
     def __iter__(self):
@@ -71,7 +97,7 @@ class TokenisedStream(IterableDataset):
         if eos is None:
             eos = 0
         for example in self.dataset:
-            text = example["text"]
+            text = example[self.text_field]
             ids = self.tokenizer.encode(text, add_special_tokens=False)
             buf.extend(ids)
             buf.append(eos)
@@ -85,9 +111,14 @@ class TokenisedStream(IterableDataset):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--arch", type=str, required=True,
+    p.add_argument("--arch", type=str, default=None,
                    choices=["deltanet", "deltanet_negeig", "ortho",
-                            "hybrid", "hybrid_negeig"])
+                            "hybrid", "hybrid_25_75", "hybrid_75_25",
+                            "hybrid_negeig"])
+    p.add_argument("--layers", type=str, default=None,
+                   help="explicit comma-separated layer arch list, "
+                        "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
+                        "Overrides --arch.")
     p.add_argument("--T", type=int, default=512)
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--steps", type=int, default=5000)
@@ -100,12 +131,20 @@ def main():
     p.add_argument("--val_every", type=int, default=500)
     p.add_argument("--tokenizer", type=str,
                    default="HuggingFaceTB/SmolLM2-135M")
-    p.add_argument("--dataset", type=str, default="roneneldan/TinyStories")
+    p.add_argument("--dataset", type=str, default="roneneldan/TinyStories",
+                   help="HF dataset id; supports also 'codeparrot/codeparrot-clean' "
+                        "and bigcode/the-stack-smol/data/python")
+    p.add_argument("--dataset_config", type=str, default=None,
+                   help="Optional config name (e.g. 'python' for the-stack-smol)")
+    p.add_argument("--text_field", type=str, default="text",
+                   help="Field in the dataset that contains the text "
+                        "('text' for TinyStories, 'content' for codeparrot/the-stack)")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
-    print(f"GPU: {torch.cuda.get_device_name(0)}  arch={args.arch}")
+    arch_label = args.arch if args.arch else f"layers={args.layers}"
+    print(f"GPU: {torch.cuda.get_device_name(0)}  arch={arch_label}")
 
     # 1. Tokeniser + dataset.
     from transformers import AutoTokenizer
@@ -115,18 +154,45 @@ def main():
     print(f"  vocab size: {tok.vocab_size}")
 
     print(f"Loading dataset {args.dataset} (streaming) ...")
-    train_stream = load_dataset(args.dataset, split="train", streaming=True)
-    val_stream = load_dataset(args.dataset, split="validation", streaming=True)
+    ds_kwargs = dict(streaming=True)
+    if args.dataset_config:
+        ds_kwargs["name"] = args.dataset_config
+    try:
+        train_stream = load_dataset(args.dataset, split="train", **ds_kwargs)
+    except ValueError:
+        # Some datasets only have "train".
+        train_stream = load_dataset(args.dataset, **ds_kwargs)["train"]
+    try:
+        val_stream = load_dataset(args.dataset, split="validation", **ds_kwargs)
+    except (ValueError, KeyError):
+        # No validation split — split off a slice of train as held-out.
+        # We just take a separate streaming pass with a different seed-shuffle.
+        try:
+            val_stream = load_dataset(args.dataset, split="test", **ds_kwargs)
+        except (ValueError, KeyError):
+            print("  no val/test split — using shuffled train tail as validation")
+            val_stream = load_dataset(args.dataset, split="train",
+                                      **ds_kwargs).shuffle(seed=42).skip(10_000)
 
-    train_ds = TokenisedStream(train_stream, tok, args.T)
-    val_ds = TokenisedStream(val_stream, tok, args.T)
+    train_ds = TokenisedStream(train_stream, tok, args.T,
+                               text_field=args.text_field)
+    val_ds = TokenisedStream(val_stream, tok, args.T,
+                             text_field=args.text_field)
     train_loader = DataLoader(train_ds, batch_size=args.batch, num_workers=2)
     val_loader = DataLoader(val_ds, batch_size=args.batch, num_workers=1)
 
     # 2. Model.
-    attn_kw = build_arch(args.arch, args.n_layers)
+    if args.layers:
+        cls_list = parse_layers_arg(args.layers)
+        n_layers_actual = len(cls_list)
+        attn_kw = dict(attention_cls_per_layer=cls_list)
+    else:
+        if args.arch is None:
+            raise SystemExit("specify --arch or --layers")
+        attn_kw = build_arch(args.arch, args.n_layers)
+        n_layers_actual = args.n_layers
     model = TinyLM(
-        vocab_size=tok.vocab_size, d_model=args.d_model, n_layers=args.n_layers,
+        vocab_size=tok.vocab_size, d_model=args.d_model, n_layers=n_layers_actual,
         n_heads=args.n_heads, d_head=args.d_head, **attn_kw,
     ).to("cuda")
     print(f"  params: {model.num_params() / 1e6:.1f}M")

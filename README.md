@@ -62,14 +62,28 @@ clean diagnostic decomposition of why the dominant architectures
    brought hybrid PPL from 9.79 → **6.73** (DeltaNet 5.65), shrinking
    the gap from 73 % worse to 19 % worse. Critically: the mod-p
    advantage is *preserved and strengthened* (mod-3 T=128 converges
-   at step 1500 with v2 vs step 2000 with v1). This is the practical
-   demonstration: hybrid v2 is competitive on real-text LM AND wins
-   long-T modular arithmetic where DeltaNet+negeig catastrophically
-   fails (mod-5 T=512: hybrid 100 % vs DeltaNet+negeig 9 %).
-6. Hybrid Triton kernel + custom autograd brings hybrid to 1.74×
-   DeltaNet wall-clock at 135M scale (was 14.5× before). 135M
-   distillation is feasible; further Triton backward optimisation
-   could close the rest.
+   at step 1500 with v2 vs step 2000 with v1).
+6. **Hybrid 25/75 ratio (deltanet-heavy) is the right recipe for
+   code-LM** (`RESULTS.md` Phase 13). On Python code at 135M for
+   5000 steps, the ratio ablation gives:
+   - 0 % ortho (pure DeltaNet): PPL 51.00
+   - **25 % ortho (1 per 4 layers): PPL 54.73 (1.07×)** ⭐
+   - 50 % ortho (alternating): PPL 62.13 (1.22×)
+   - 75 % ortho: PPL 78.74 (1.54×)
+
+   At 25/75 the LM gap is 7 %, the wall-clock penalty 1.27×, and the
+   architecture preserves the long-T mod-p win.
+
+7. **Dyck-2 bracket depth-tracking does *not* separate the architectures**
+   — both deltanet+conv and hybrid solve to 100 % even at T=512. So
+   the synthetic proxy for "scope tracking in code" doesn't show
+   hybrid's algebraic structure; deltanet+conv is sufficient.
+   Hybrid's empirical home is in continuous-angle modular state-
+   tracking (mod-3, mod-5 at long T), not in plain depth-counting.
+8. Hybrid Triton kernel + custom autograd brings hybrid to 1.27×
+   DeltaNet wall-clock at the 25/75 ratio (was 14.5× before fixes
+   and 1.74× at 50/50). 135M distillation from a coding teacher is
+   now genuinely feasible.
 4. The hybrid finding gives the empirical rank-ordering on parity:
    linear / heisenberg (✗ TC⁰) → DeltaNet default (T=128 only) → ortho
    / hybrid (T=512). And on recall: linear / ortho / rotconj / rotdelta

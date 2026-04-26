@@ -172,6 +172,60 @@ away from architecture research toward eval/inference innovations
 **Option 5: Test directions C (event-driven) or D (tree-scan over AST).**
 But the pattern strongly suggests they'd be more null results.
 
+---
+
+## Update 2026-04-26 evening: Scale-up of multipass_dd flips the verdict
+
+Followed Option 1 (scale up multipass_dd). Ran on Python code at intermediate
+scale: T=256, 3000 steps, ~30M params.
+
+### Compute-fair comparison (both ~16 attention-block-equivalents)
+
+| Arch | n_layers | Params | Val PPL @ 3000 | Δ vs DN |
+|------|----------|--------|----------------|---------|
+| DeltaNet @16L | 16 | 42.0M | 69.57 | baseline |
+| **multipass_dd @8L** | 8 (×2 cells/layer) | **35.7M** | **67.79** | **−2.6%** |
+
+multipass_dd wins with **15% fewer parameters** AND ran 10-15% faster
+wall-clock (fewer FFN blocks).
+
+### Convergence trajectory tells the real story
+
+| Step | DN @16L val PPL | multipass_dd @8L val PPL | Δ |
+|------|-----------------|---------------------------|---|
+| 1000 | 125.05 | 128.16 | DN ahead +2.5% |
+| 2000 | 86.41 | 82.29 | multipass ahead **−4.8%** |
+| 3000 | 69.57 | 67.79 | multipass ahead **−2.6%** |
+
+multipass starts behind, catches up, then pulls ahead. Best gap mid-training, narrows slightly by end.
+
+### What changed vs the 14M comparison?
+
+At 14M (1500 steps, T=128):
+- DN @8L code: 108.36
+- multipass_dd @4L code: 108.50 → tied
+
+At 30M (3000 steps, T=256):
+- DN @16L code: 69.57
+- multipass_dd @8L code: 67.79 → multipass wins
+
+**The architectural advantage emerges with scale.** Possibilities:
+1. The two-cell ensemble effect provides regularization that helps with longer training.
+2. Each cell has more capacity (d_model=256 vs 128), so individual specialists can learn more diverse features.
+3. T=256 gives more long-range dependencies where the ensemble of state-tracking cells helps.
+
+### Promotion: Direction B is no longer "dead"
+
+The earlier 14M-scale verdict ("loses to deeper DeltaNet at compute parity") only held at small scale. At 30M with longer training, multipass_dd wins clean. This is the first novel-direction positive result this session.
+
+**Next test:** scale further. multipass_dd @ 100-135M params, 5000+ steps, T=512 on code. Cost: 4-8 hours per run. If the gap holds or widens, this is a real architectural finding.
+
+### Caveats
+- 30M is still small; need to confirm at 135M
+- Tested only on Python code; need TinyStories at 30M to confirm gap is consistent
+- Single seed; need 2-3 seeds for confidence
+- The multipass_dd architecture uses `delta + delta_negeig` — two flavors of the same cell. Whether the win generalizes to other cell pairings (delta + ortho, delta + heisenberg with proper init) is unknown.
+
 ## What to do next
 
 Two options, in order of expected info-per-effort:

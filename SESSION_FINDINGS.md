@@ -226,6 +226,93 @@ The earlier 14M-scale verdict ("loses to deeper DeltaNet at compute parity") onl
 - Single seed; need 2-3 seeds for confidence
 - The multipass_dd architecture uses `delta + delta_negeig` — two flavors of the same cell. Whether the win generalizes to other cell pairings (delta + ortho, delta + heisenberg with proper init) is unknown.
 
+---
+
+## Update 2026-04-26 late evening: 135M scale-up does NOT replicate
+
+Ran the queued 135M / 5K-step experiment.
+
+| Arch | Params | FFN blocks | Val PPL @ 5K | Wallclock |
+|------|--------|------------|--------------|-----------|
+| **DeltaNet @30L** | 216.3M | 30 | **51.00** | baseline |
+| multipass_dd @15L | 156.5M | 15 | 52.97 (+3.9%) | 1.5× faster |
+
+### Convergence trajectory
+
+| Step | multipass | DeltaNet | Δ |
+|------|-----------|----------|---|
+| 1000 | 115.29 | 119.88 | mp −3.8% |
+| 2000 | 86.93 | 86.69 | DN +0.3% |
+| 3000 | 66.45 | 65.21 | DN +1.9% |
+| 4000 | 57.70 | 55.94 | DN +3.1% |
+| 5000 | 52.97 | 51.00 | **DN +3.9%** |
+
+multipass starts ahead but DN's depth advantage compounds steadily. By
+step 5000, DN wins by 3.9%.
+
+### Honest re-reading of direction B
+
+The 30M-scale "win" was an artifact of the specific compute regime:
+short training (3000 steps), shorter T (256), and the "warmup phase"
+dominating the comparison. At frontier scale (5000 steps, T=512), DN's
+depth wins.
+
+multipass_dd is genuinely more **parameter-efficient** (28% fewer params
+for 3.9% PPL loss) and **wallclock-efficient** (1.5× faster). For
+deployment scenarios where PARAM count matters more than PPL, this is a
+valid trade-off. But it's not a "novel architecture beats DeltaNet on
+LM" win — DN @30L wins on PPL at compute parity.
+
+### The full session in one table
+
+| Direction | Best variant | Best result | Verdict |
+|-----------|--------------|-------------|---------|
+| A | hybrid_sg_25_75 | tied within ±2% | not the win |
+| B | multipass_dd @30M | -2.6% PPL vs DN | seemed like win... |
+| B | multipass_dd @135M | +3.9% PPL vs DN | ...didn't replicate at scale |
+| E | bracket aux | tied at w=0.1, hurts at w=0.5 | not the win |
+| (compute baseline) | deeper DeltaNet | always wins on PPL | local optimum |
+
+### Final session conclusion
+
+After 7+ hours of compute across 2× RTX 5090 testing 4 novel directions
+at multiple scales (14M, 30M, 135M):
+
+**Zero clean architectural wins for "novel" cells over depth-scaled
+DeltaNet at our compute budget.**
+
+Pattern is robust:
+- At small scale, novel cells tie within noise
+- At medium scale, some novel cells appear to win (regression-to-mean
+  effect of "warmup phase")
+- At frontier scale, depth-scaled DeltaNet pulls ahead
+
+This is consistent with the 10-agent brainstorm's frontier-convergence
+finding: industry settled on softmax+linear hybrids and depth scaling
+for good reasons. Novel cell engineering at small lab scale doesn't
+easily produce wins.
+
+**Recommended next steps (if user wants to continue):**
+
+1. **Frontier-with-twist** (option C from earlier strategic options).
+   Take Gated DeltaProduct (Siems Feb '25, 1-2 PPL gain documented at
+   805M scale) + identity-init + structural aux. Novel as combination,
+   not as components. Highest expected PPL win.
+
+2. **Generation eval pivot**. Set up HumanEval pass@k evaluation. Tests
+   whether architectural differences hide behind PPL parity. Direction
+   E (verifier-coupled training) and Direction B (multipass) might both
+   show generation-side wins even when PPL ties.
+
+3. **Distillation from frontier coder** (literature recipe). LoLCATs from
+   Qwen2.5-Coder-1.5B → ~3 GPU-weeks budget on 2× 5090. Highest-confidence
+   path to a useful coder model. Not novel but functional.
+
+4. **Accept depth-scaled DeltaNet as the local optimum**. Write up the
+   negative results as a paper ("when novel cells don't beat well-tuned
+   baselines: a small-lab perspective"). Pivot research focus to evals,
+   inference-side innovations, or different problem entirely.
+
 ## What to do next
 
 Two options, in order of expected info-per-effort:

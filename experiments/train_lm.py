@@ -32,6 +32,7 @@ from experiments.layers import (
     HeisenbergAttention, MultiPassAttention,
 )
 from experiments.model import TinyLM
+from experiments.aux_brackets import compute_bracket_deltas, bracket_depth
 
 
 _NAME_TO_CLS = {
@@ -165,6 +166,12 @@ def main():
                             "multipass_dh", "multipass_dho", "multipass_dd"])
     p.add_argument("--n_symbols", type=int, default=512,
                    help="Hash bucket size for SymbolGrounded layer.")
+    p.add_argument("--aux_brackets", action="store_true",
+                   help="Add bracket-depth auxiliary loss (direction E).")
+    p.add_argument("--aux_weight", type=float, default=0.1,
+                   help="Weight on the aux loss term.")
+    p.add_argument("--aux_max_depth", type=int, default=24,
+                   help="Cap bracket depth at this value for the aux head.")
     p.add_argument("--layers", type=str, default=None,
                    help="explicit comma-separated layer arch list, "
                         "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
@@ -242,11 +249,20 @@ def main():
         attn_kw = build_arch(args.arch, args.n_layers,
                              vocab_size=tok.vocab_size, n_symbols=args.n_symbols)
         n_layers_actual = args.n_layers
+    aux_dim = (args.aux_max_depth + 1) if args.aux_brackets else 0
     model = TinyLM(
         vocab_size=tok.vocab_size, d_model=args.d_model, n_layers=n_layers_actual,
-        n_heads=args.n_heads, d_head=args.d_head, **attn_kw,
+        n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim, **attn_kw,
     ).to("cuda")
-    print(f"  params: {model.num_params() / 1e6:.1f}M")
+    print(f"  params: {model.num_params() / 1e6:.1f}M  aux_dim={aux_dim}")
+
+    if args.aux_brackets:
+        print("Computing bracket-deltas table for tokenizer ...")
+        bracket_deltas = compute_bracket_deltas(tok)
+        print(f"  table shape: {bracket_deltas.shape}, "
+              f"non-zero count: {(bracket_deltas != 0).sum().item()}")
+    else:
+        bracket_deltas = None
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                             weight_decay=0.1)
@@ -268,16 +284,26 @@ def main():
             train_iter = iter(train_loader)
             x, y = next(train_iter)
         x, y = x.to("cuda"), y.to("cuda")
-        logits = model(x)
-        loss = F.cross_entropy(
+        if args.aux_brackets:
+            logits, aux_logits = model(x, return_aux=True)
+            depth = bracket_depth(x, bracket_deltas).clamp(0, args.aux_max_depth)
+            aux_loss = F.cross_entropy(
+                aux_logits.reshape(-1, args.aux_max_depth + 1),
+                depth.reshape(-1),
+            )
+        else:
+            logits = model(x)
+            aux_loss = torch.zeros((), device="cuda")
+        lm_loss = F.cross_entropy(
             logits.reshape(-1, tok.vocab_size), y.reshape(-1),
         )
+        loss = lm_loss + args.aux_weight * aux_loss
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         scheduler.step()
-        losses.append(loss.item())
+        losses.append(lm_loss.item())  # track LM loss alone for comparison
 
         if step % args.log_every == 0 or step == args.steps:
             now = time.perf_counter()

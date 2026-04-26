@@ -105,6 +105,73 @@ Direction E is the biggest "different from frontier" bet because no published au
 3. Direction E directly addresses the PPL-vs-HumanEval gap that Agent 07 flagged. Even if it doesn't improve PPL, it might improve actual code generation quality.
 4. Distillation (literature) is the highest-confidence improvement, but the user wants novel.
 
+---
+
+## Direction E (verifier-coupled aux) — first variant tested
+
+**Setup:** Bracket-depth auxiliary loss. Per-token aux head predicts current bracket depth (0..24 classification). Loss: cross-entropy with weight 0.1, added to LM loss.
+
+Implementation: `experiments/aux_brackets.py` precomputes a (vocab_size,)
+table of `#open_brackets - #close_brackets` per token text; per-token depth = cumsum along the sequence. Aux head is `nn.Linear(d_model -> 25)` on the final layer's hidden state.
+
+### Results (codeparrot-clean, 1500 steps, T=128, ~14M params, seed 0)
+
+| Arch | Val PPL @ 1500 | Δ vs baseline |
+|------|----------------|---------------|
+| DeltaNet baseline | 113.68 | — |
+| DeltaNet + bracket aux (w=0.1) | **113.48** | **−0.18%** (noise) |
+
+Train losses tracked nearly identically step-for-step. The aux head consumed gradient bandwidth without measurably reshaping the residual stream.
+
+**Why it didn't bite:** the aux head at the final layer can learn to read off bracket depth without forcing earlier layers to encode it. With weight=0.1 the gradient pressure is small. The bracket signal at T=128 affects relatively few token transitions — most of the LM loss comes from per-token vocabulary distributions where bracket depth is a weak predictor.
+
+Plans for follow-up (running now): aux_weight=0.5 to see if stronger pressure produces a visible LM effect. If still null, definitive negative on this aux signal at this scale.
+
+**aux_weight=0.5 result:** PPL **116.14** = +2.2% worse than baseline. The stronger aux signal *actively hurts* LM performance. Combined with the weight=0.1 null result, this is a definitive negative: bracket-depth aux either does nothing (low weight) or steals capacity from the LM (high weight). The signal is wrong-shaped.
+
+---
+
+## Pattern across all four novel-direction experiments
+
+| Direction | Variant | TinyStories | Code | Verdict |
+|-----------|---------|-------------|------|---------|
+| A | symgrounded standalone | 30+ (plateau) | — | catastrophic loss |
+| A | hybrid_sg_25_75 | 13.25 (-0.8%) | 116.08 (+2.1%) | tied |
+| A | hybrid_sg (50/50) | 13.62 (+1.9%) | — | small loss |
+| B | multipass_dh | 30.21 (+126%) | 237.69 (+109%) | catastrophic |
+| B | multipass_dd | 12.96 (-3.0%) | 108.50 (-4.6%) | wins vs same-depth, loses to deeper |
+| B | DeltaNet @8L (compute-parity) | **12.25** | **108.36** | **best on text, ties on code** |
+| E | DeltaNet + bracket aux | 113.48 (-0.18%) | — | tied (running w=0.5) |
+
+**The pattern:** at our scale (~14M params, 1500 steps), the LM optimization landscape is well-explored by depth-scaled DeltaNet. Novel cells either:
+- Catastrophically fail when paired with weak baselines (multipass_dh, symgrounded)
+- Match depth-scaled DeltaNet within noise (hybrid_sg_25_75, multipass_dd, aux_brackets)
+- Lose to depth-scaled DeltaNet on text while tying on code (multipass_dd)
+
+No clear architectural wins from cell engineering, parallel composition, or aux losses *at this scale*.
+
+## Strategic options going forward
+
+Given 4 novel-direction experiments yielded zero clean wins:
+
+**Option 1: Scale up.** Run experiments at 135M params / 5K-10K steps where
+architectural differences may show. Cost: 4-8 hours per run.
+
+**Option 2: Generation-side eval.** Maybe novel architectures help on
+HumanEval-pass@1 even when PPL is tied. Need a generation eval pipeline.
+Most novel directions (E especially) are about quality not PPL.
+
+**Option 3: Frontier-with-a-twist.** Combine literature recipes (Gated
+DeltaProduct, identity-init, distillation) in a way nobody else has.
+Less novel per component, more novel as a system.
+
+**Option 4: Accept depth-scaled DeltaNet as the local optimum.** Pivot
+away from architecture research toward eval/inference innovations
+(direction 10 from the original brainstorm: S* state-forking, MoR).
+
+**Option 5: Test directions C (event-driven) or D (tree-scan over AST).**
+But the pattern strongly suggests they'd be more null results.
+
 ## What to do next
 
 Two options, in order of expected info-per-effort:

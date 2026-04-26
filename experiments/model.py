@@ -76,6 +76,7 @@ class TinyLM(nn.Module):
         attention_cls: Callable[..., nn.Module] | None = None,
         max_T: int = 0,                       # 0 = no positional encoding
         attention_cls_per_layer: list[Callable[..., nn.Module]] | None = None,
+        aux_dim: int = 0,                     # 0 = no aux head
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -106,8 +107,14 @@ class TinyLM(nn.Module):
         ])
         self.out_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        # Optional aux head — e.g. for bracket-depth supervision (direction E).
+        self.aux_dim = aux_dim
+        if aux_dim > 0:
+            self.aux_head = nn.Linear(d_model, aux_dim, bias=True)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor,
+                return_aux: bool = False
+                ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         x = self.embed(input_ids)
         if self.max_T > 0:
             T = input_ids.shape[1]
@@ -115,7 +122,12 @@ class TinyLM(nn.Module):
             x = x + self.pos_embed(pos)
         for blk in self.blocks:
             x = blk(x, input_ids=input_ids)
-        return self.lm_head(self.out_norm(x))
+        h = self.out_norm(x)
+        lm_logits = self.lm_head(h)
+        if return_aux and self.aux_dim > 0:
+            aux_logits = self.aux_head(h)
+            return lm_logits, aux_logits
+        return lm_logits
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

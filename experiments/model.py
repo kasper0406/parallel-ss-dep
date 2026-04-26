@@ -268,3 +268,13 @@ class TinyLM(nn.Module):
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def feedback_alphas(self) -> list[float]:
+        """Return current per-layer α values (FiLM/additive feedback strength).
+
+        Empty list if feedback is disabled. Useful for diagnosing whether
+        the model has actually learned to use top-down feedback.
+        """
+        if self.feedback_mode == "none":
+            return []
+        return [float(fb.alpha.detach().item()) for fb in self.feedback]

@@ -327,9 +327,13 @@ def main():
         if step % args.log_every == 0 or step == args.steps:
             now = time.perf_counter()
             tok_per_sec = (step - last_log_step) * args.batch * args.T / (now - last_log)
-            print(f"{step:>6d}  {tok_per_sec:>8.0f}  "
-                  f"{sum(losses[-args.log_every:]) / max(1, len(losses[-args.log_every:])):>8.4f}  "
-                  f"{scheduler.get_last_lr()[0]:>9.2e}")
+            line = (f"{step:>6d}  {tok_per_sec:>8.0f}  "
+                    f"{sum(losses[-args.log_every:]) / max(1, len(losses[-args.log_every:])):>8.4f}  "
+                    f"{scheduler.get_last_lr()[0]:>9.2e}")
+            if args.feedback != "none":
+                alphas = model.feedback_alphas()
+                line += f"  α=[{','.join(f'{a:+.3f}' for a in alphas)}]"
+            print(line)
             last_log = now
             last_log_step = step
 

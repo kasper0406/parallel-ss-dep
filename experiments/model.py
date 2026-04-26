@@ -128,17 +128,25 @@ class FeedbackProjection(nn.Module):
         # but the gradient on α is non-zero (because W_* are non-zero) so
         # the optimizer can move it.
         self.alpha = nn.Parameter(torch.zeros(1))
+        # Diagnostic: freeze α at 0 (ablation — film with feedback machinery
+        # but no actual feedback application). Tests whether "dead weights"
+        # alone hurt PPL.
+        self.freeze_alpha = False
+
+    def get_alpha(self) -> torch.Tensor:
+        return torch.zeros_like(self.alpha) if self.freeze_alpha else self.alpha
 
     def forward(self, x: torch.Tensor, state_above_lagged: torch.Tensor) -> torch.Tensor:
         if self.mode == "none" or state_above_lagged is None:
             return x
+        a = self.get_alpha()
         if self.mode in ("additive", "predictive"):
             fb = self.W_fb(state_above_lagged)
-            return x + self.alpha * fb
+            return x + a * fb
         if self.mode == "film":
             scale = self.W_scale(state_above_lagged)
             shift = self.W_shift(state_above_lagged)
-            return x * (1.0 + self.alpha * scale) + self.alpha * shift
+            return x * (1.0 + a * scale) + a * shift
         return x
 
 
@@ -248,7 +256,7 @@ class TinyLM(nn.Module):
                 # representations).
                 proj = self.feedback[L]
                 pred = proj.W_fb(state_above_lagged)
-                h_input = h + proj.alpha * pred
+                h_input = h + proj.get_alpha() * pred
                 err = pass1_outs[L].detach() - pred        # detach target only
                 surprise_loss = surprise_loss + (err ** 2).mean()
                 h = blk(h_input, input_ids=input_ids)
@@ -278,3 +286,9 @@ class TinyLM(nn.Module):
         if self.feedback_mode == "none":
             return []
         return [float(fb.alpha.detach().item()) for fb in self.feedback]
+
+    def freeze_alpha(self) -> None:
+        """Diagnostic: lock α at 0 across all layers (no active feedback)."""
+        if self.feedback_mode != "none":
+            for fb in self.feedback:
+                fb.freeze_alpha = True

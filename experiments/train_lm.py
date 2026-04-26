@@ -178,6 +178,13 @@ def main():
     p.add_argument("--surprise_weight", type=float, default=0.0,
                    help="Weight on the surprise (prediction-error) aux "
                         "loss for predictive feedback mode.")
+    p.add_argument("--freeze_alpha", action="store_true",
+                   help="Diagnostic: build film/additive arch with all α=0 "
+                        "frozen. Tests dead-weight effect of feedback "
+                        "machinery without active feedback.")
+    p.add_argument("--save_ckpt", type=str, default=None,
+                   help="Path to save final model checkpoint (for downstream "
+                        "evals like HumanEval, bracket-structure, long-T PPL).")
     p.add_argument("--layers", type=str, default=None,
                    help="explicit comma-separated layer arch list, "
                         "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
@@ -261,8 +268,10 @@ def main():
         n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim,
         feedback_mode=args.feedback, **attn_kw,
     ).to("cuda")
+    if args.freeze_alpha and args.feedback != "none":
+        model.freeze_alpha()
     print(f"  params: {model.num_params() / 1e6:.1f}M  aux_dim={aux_dim}  "
-          f"feedback={args.feedback}")
+          f"feedback={args.feedback}{' (α frozen=0)' if args.freeze_alpha else ''}")
 
     if args.aux_brackets:
         print("Computing bracket-deltas table for tokenizer ...")
@@ -359,6 +368,23 @@ def main():
 
     secs = time.perf_counter() - t0
     print(f"\nDone in {secs:.0f}s ({secs/args.steps*1000:.0f} ms/step avg).")
+
+    if args.save_ckpt:
+        ckpt = {
+            "state_dict": model.state_dict(),
+            "config": {
+                "vocab_size": tok.vocab_size,
+                "d_model": args.d_model, "n_heads": args.n_heads,
+                "d_head": args.d_head, "n_layers": n_layers_actual,
+                "max_T": args.T, "feedback_mode": args.feedback,
+                "arch": args.arch, "layers_spec": args.layers,
+                "n_symbols": args.n_symbols,
+                "tokenizer": args.tokenizer,
+            },
+        }
+        pathlib.Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(ckpt, args.save_ckpt)
+        print(f"Checkpoint saved to {args.save_ckpt}")
 
 
 if __name__ == "__main__":

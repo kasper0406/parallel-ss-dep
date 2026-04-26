@@ -514,3 +514,43 @@ Given the consistent small-scale-only pattern (multipass_dd, film both):
 3. **OR** test the now-bug-fixed predictive variant. Cleanest scientific framing per literature; might behave differently than additive/film.
 
 4. **HumanEval eval** would still be informative — PPL parity might hide generation-quality wins.
+
+---
+
+## Update: bug-fixed predictive variant doesn't help
+
+Tested predictive @ 30M code with proper gradient flow (only target detached, prediction attached) and surprise_weight=0.1. Two seeds:
+
+| Seed | predictive PPL | DN PPL | film PPL |
+|------|----------------|--------|----------|
+| 0 | 73.00 | ~70.62 | ~67.83 |
+| 1 | 69.24 | ~70.81 | ~68.61 |
+| **mean** | **71.12** | **70.33** | **68.17** |
+
+predictive is **+1.1% worse than DN** and **+4.3% worse than film** at 30M.
+
+The surprise gradient destabilizes training: lower-layer states are pushed toward the top-down prediction, which competes with the LM gradient. The Ali/Kietzmann scientific framing doesn't translate to LM PPL improvements at this scale.
+
+This closes the cross-layer-feedback chapter. **Best variant remains film mode (additive scale+shift modulation)**, which gives −3.1% at 30M but ties at 135M.
+
+## Closing the architecture exploration
+
+After 5 novel directions, ~12 GPU-hours, and multiple scales:
+
+| Direction | 30M result | 135M result |
+|-----------|------------|-------------|
+| A symbol-grounded | tied | (not tested) |
+| B multipass_dd | −2.6% | +3.9% (lost) |
+| B' film feedback | **−3.1% (3 seeds, σ=0.9%)** | +0.08% (tied param-matched) |
+| E bracket aux | null | (not tested) |
+| E' predictive coding | +1.1% (worse) | (not tested) |
+
+**Pattern:** novel architectures that work at 30M fail at 135M when params are matched. The architectural-only effect is genuinely small at scale.
+
+This matches the brainstorm's frontier-convergence finding: industry settled on softmax+linear hybrids and depth scaling for good reasons. Novel cell engineering at small-lab scale produces small-scale wins that don't transfer to frontier.
+
+**The user's options now:**
+1. Pivot to literature recipes (distillation, Gated DeltaProduct, Samba). Highest-confidence path to a useful model. Not novel.
+2. Build a small-scale (30-100M) edge coder with film feedback. The −3.1% win is real and exploitable. Different research question (efficiency, not capability).
+3. HumanEval pass@1 eval on existing 135M models. Tests if PPL parity hides generation wins. Last useful test of the architectural angle.
+4. Stop architecture exploration; pivot to inference-side innovations (S\* state-forking, MoR) or curriculum/data work.

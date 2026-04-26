@@ -383,3 +383,62 @@ If the 135M run shows further shrinkage to 0% or negative, this is
 the same "small-scale artifact" pattern as multipass_dd. If it holds
 at ~2% positive on code, it's a genuine code-specific architectural
 finding worth deeper investigation.
+
+---
+
+## 135M code result — film holds positive but small
+
+**film @30L+30FFN (236M, with film cross-layer feedback) vs DeltaNet @30L (216M):**
+
+Trajectory (T=512, 5000 steps):
+
+| Step | film val PPL | DN val PPL | Δ |
+|------|--------------|------------|---|
+| 1000 | 117.79 | 119.88 | film −1.7% |
+| 2000 | 86.31 | 86.69 | film −0.4% |
+| 3000 | 63.93 | 65.21 | film −2.0% |
+| 4000 | 55.30 | 55.94 | film −1.1% |
+| **5000** | **50.75** | **51.00** | **film −0.5%** ⭐ |
+
+film is ahead at every val checkpoint at 135M. Different from
+multipass_dd which started ahead and ended +3.9% behind by step 5000.
+
+### Final summary table across all scales
+
+| Config | DN | film | Δ | Comment |
+|--------|------|-------|---|---------|
+| 14M / T=128 TinyStories | 13.36 | 12.93 | film −3.2% | win |
+| 14M / T=128 code | 113.68 | 107.28 | film −5.6% | win |
+| 14M / T=256 code | 134.01 | 130.07 | film −2.9% | win, smaller |
+| 30M / T=256 TinyStories | 6.96 | 7.03 | film +1.0% | **loses on text** |
+| 30M / T=256 code | 69.57 | 68.06 | film −2.2% | win |
+| 135M / T=512 code | 51.00 | 50.75 | film **−0.5%** | **wins at frontier** |
+
+### Honest verdict
+
+**Cross-layer top-down feedback (film mode) is the first novel direction
+this session that maintains a positive PPL improvement on code from
+14M up to 135M scale.** The win shrinks with scale (5.6% → 2.2% → 0.5%),
+suggesting it's not a transformative architectural finding — but it's
+genuinely positive and consistent.
+
+**Caveats (must call out):**
+1. **Param count not perfectly matched.** film has 9% more params at 135M
+   (236M vs 216M). Some of the 0.5% gain might come from extra params.
+   Need film with reduced layers to match params for a clean claim.
+2. **Wallclock cost.** film is ~30% slower (2-pass forward).
+3. **Single seed.** Should run 2-3 seeds for confidence.
+4. **Code-specific.** Film LOSES on natural text (TinyStories @30M = +1.0%).
+   Whatever feedback is doing helps code structure but hurts text PPL.
+5. **Win shrinks with scale.** At 14M → 5.6%, at 135M → 0.5%. If the
+   shrinkage continues, at 1B+ scale the win could be ~0% or negative.
+
+**This is real but modest evidence for direction. Not a knockout. Worth:**
+- Confirming with seed sweep (2-3 seeds)
+- Param-matched comparison (film with fewer layers)
+- HumanEval-style generation eval (does the small PPL win matter for code generation?)
+- Scale to 350M-1B to check if shrinkage continues
+
+Net assessment: **first novel direction this session that survives
+135M-scale validation on code**, even if marginally. Cross-layer
+feedback as a code-specific architectural prior is a real finding.

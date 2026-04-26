@@ -322,3 +322,64 @@ Two options, in order of expected info-per-effort:
 2. **Direction E — verifier-coupled PT.** Aux loss: predict "will the next K tokens parse?" as binary head, applied during code-LM training. Cheap signal (microseconds per check). Code-specific. Tests whether the gap between PPL and HumanEval is closeable from the training side. ~1 week eng (parser pipeline + aux head + ablation).
 
 Both are genuinely novel relative to the 2025 frontier. Both could yield real wins if they work. They're orthogonal — could ship both.
+
+---
+
+## Update 2026-04-26 night: Cross-layer top-down feedback (Day 1+2)
+
+User proposed a fundamentally different direction: cross-layer top-down
+feedback with t-1 lag (parallel-scan-friendly). 4 modes implemented:
+none / additive / film / predictive. 2-pass forward — pass 1 collects
+each layer's outputs, pass 2 modulates each layer's input by the
+*next-deeper layer*'s pass-1 output, shifted right by 1.
+
+α_L per-layer learnable strength, init=0 so model starts as feedforward.
+Critical bug fix: also init W_fb (and W_scale/W_shift) non-zero —
+otherwise gradient on α is zero forever.
+
+### 14M / 1500 steps / T=128 (TinyStories + code)
+
+| Mode | TinyStories PPL | Code PPL |
+|------|-----------------|----------|
+| none (baseline) | 13.36 | 113.68 |
+| additive | 13.00 (−2.7%) | 110.01 (−3.2%) |
+| predictive | 13.00 (−2.7%) | (not run) |
+| **film** | **12.93 (−3.2%)** | **107.28 (−5.6%)** |
+
+film wins on both, bigger on code than text. **First clean
+positive-direction result of this session.**
+
+### 30M / 3000 steps / T=256
+
+| Eval | DN @16L | film @16L | Δ |
+|------|---------|-----------|---|
+| TinyStories | 6.96 | 7.03 | film **+1.0% worse** |
+| Code | 69.57 | 68.06 | film **−2.2% better** |
+
+The TinyStories win disappeared at 30M; the code win shrank from
+−5.6% to −2.2%. Pattern: the win is **code-specific** and **shrinks
+with scale**.
+
+### 135M / 5000 steps / T=512 (running) — the critical test
+
+multipass_dd's 30M code win disappeared completely at 135M (DN was
++3.9% better). Will film's 30M code win survive? Currently at step
+400 of 5000 (~5 hours). film 0.02 nats ahead in train; need val
+trajectory to know.
+
+### Honest read
+
+Cross-layer feedback **is** the first novel direction this session
+that gives real LM PPL improvement at small scale. The fact that the
+win is bigger on code than text matches the mechanistic story — code
+has explicit hierarchy (function/class/scope) that benefits from
+top-down modulation more than natural text does.
+
+But: the win shrinks with scale. By 30M:
+- TinyStories: gone
+- Code: half its 14M magnitude
+
+If the 135M run shows further shrinkage to 0% or negative, this is
+the same "small-scale artifact" pattern as multipass_dd. If it holds
+at ~2% positive on code, it's a genuine code-specific architectural
+finding worth deeper investigation.

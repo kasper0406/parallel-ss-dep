@@ -52,8 +52,14 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm(d_model)
         self.mlp = GLU(d_model, d_ff)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x))
+    def forward(self, x: torch.Tensor,
+                input_ids: torch.Tensor | None = None) -> torch.Tensor:
+        # Symbol-grounded attention needs the raw token IDs to key its
+        # sparse table. Other attentions ignore input_ids.
+        if getattr(self.attn, "needs_input_ids", False):
+            x = x + self.attn(self.attn_norm(x), input_ids=input_ids)
+        else:
+            x = x + self.attn(self.attn_norm(x))
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
@@ -108,7 +114,7 @@ class TinyLM(nn.Module):
             pos = torch.arange(T, device=input_ids.device)
             x = x + self.pos_embed(pos)
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x, input_ids=input_ids)
         return self.lm_head(self.out_norm(x))
 
     def num_params(self) -> int:

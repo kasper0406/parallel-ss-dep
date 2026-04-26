@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, IterableDataset
 
 from experiments.layers import (
     DeltaNetAttention, DeltaNetNegEigAttention,
-    OrthogonalScanAttention,
+    OrthogonalScanAttention, SymbolGroundedAttention,
 )
 from experiments.model import TinyLM
 
@@ -40,7 +40,14 @@ _NAME_TO_CLS = {
 }
 
 
-def build_arch(name: str, n_layers: int):
+def _make_sg_factory(vocab_size: int, n_symbols: int):
+    """Factory closure for SymbolGroundedAttention with vocab params bound."""
+    def _f(**kw):
+        return SymbolGroundedAttention(vocab_size=vocab_size, n_symbols=n_symbols, **kw)
+    return _f
+
+
+def build_arch(name: str, n_layers: int, vocab_size: int = 0, n_symbols: int = 512):
     """Map an arch name to either a single attention class or a per-layer list.
 
     For shorthand patterns:
@@ -68,6 +75,20 @@ def build_arch(name: str, n_layers: int):
     if name == "hybrid_negeig":
         cls = [OrthogonalScanAttention if i % 2 == 0 else DeltaNetNegEigAttention
                for i in range(n_layers)]
+        return dict(attention_cls_per_layer=cls)
+    # SymbolGrounded variants: need vocab_size + n_symbols bound at build time.
+    if name == "symgrounded":
+        sg = _make_sg_factory(vocab_size, n_symbols)
+        return dict(attention_cls=sg)
+    if name == "hybrid_sg":
+        # 50/50 alternating SymGrounded + DeltaNet (sg first).
+        sg = _make_sg_factory(vocab_size, n_symbols)
+        cls = [sg if i % 2 == 0 else DeltaNetAttention for i in range(n_layers)]
+        return dict(attention_cls_per_layer=cls)
+    if name == "hybrid_sg_25_75":
+        # 1 sg + 3 delta pattern (sparse symbolic).
+        sg = _make_sg_factory(vocab_size, n_symbols)
+        cls = [sg if i % 4 == 0 else DeltaNetAttention for i in range(n_layers)]
         return dict(attention_cls_per_layer=cls)
     raise ValueError(f"unknown arch: {name}")
 
@@ -114,7 +135,10 @@ def main():
     p.add_argument("--arch", type=str, default=None,
                    choices=["deltanet", "deltanet_negeig", "ortho",
                             "hybrid", "hybrid_25_75", "hybrid_75_25",
-                            "hybrid_negeig"])
+                            "hybrid_negeig",
+                            "symgrounded", "hybrid_sg", "hybrid_sg_25_75"])
+    p.add_argument("--n_symbols", type=int, default=512,
+                   help="Hash bucket size for SymbolGrounded layer.")
     p.add_argument("--layers", type=str, default=None,
                    help="explicit comma-separated layer arch list, "
                         "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
@@ -189,7 +213,8 @@ def main():
     else:
         if args.arch is None:
             raise SystemExit("specify --arch or --layers")
-        attn_kw = build_arch(args.arch, args.n_layers)
+        attn_kw = build_arch(args.arch, args.n_layers,
+                             vocab_size=tok.vocab_size, n_symbols=args.n_symbols)
         n_layers_actual = args.n_layers
     model = TinyLM(
         vocab_size=tok.vocab_size, d_model=args.d_model, n_layers=n_layers_actual,

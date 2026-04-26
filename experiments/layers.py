@@ -549,3 +549,108 @@ class Mamba2Attention(_FlaWrapper):
             n_groups=1,
             chunk_size=64,
         ))
+
+
+# ---------------------------------------------------------------------------
+# Symbol-Grounded scan — novel direction A.
+#
+# Per-head state S ∈ ℝ^{V × D}, keyed by INPUT TOKEN ID. On binding events
+# (gated), the cell writes the current value to S[id]. On every token, the
+# cell reads S[id] (last-write-wins). Different from kNN-cache and PKM:
+# keys are token *identities*, not opaque content vectors.
+#
+# Refresher on associativity:
+#   For a sequence of (id_i, gate_i, value_i), the prefix-state is the
+#   "last-write-wins" semilattice — for each id, take the latest write
+#   whose gate fired hardest (we use a soft mix). Composing two prefix
+#   tables (A, B) where B is later: result[id] = B[id] if id ∈ B else A[id].
+#   This is associative ⇒ parallel-scan compatible.
+#
+# This reference impl is sequential in T (Python loop) for clarity. Speed
+# is fine at synthetic-task scale (T ≤ 256). A Triton scan kernel comes
+# later if the cell wins on var_binding.
+# ---------------------------------------------------------------------------
+
+
+class SymbolGroundedAttention(nn.Module):
+    """Sequence-aware sparse symbol table keyed by token-id.
+
+    Forward signature requires `input_ids` (the token IDs, B×T int64).
+    Block.forward must thread these through.
+
+    State (per head, per example): S ∈ ℝ^{V × D}.
+        Initialized to zeros at t=0.
+        On token t with id_t, writes S[id_t] ← gate · v_t + (1-gate) · S[id_t].
+        Reads happen *before* the write (causal).
+
+    Output at token t:  o_t = q_t · read_t + b_t
+        where read_t = S_{t-1}[id_t], q_t/b_t are per-token projections.
+        b_t (bypass) keeps the layer useful when id_t hasn't been bound.
+    """
+
+    needs_input_ids = True       # signal to Block
+
+    def __init__(self, d_model: int, n_heads: int, d_head: int,
+                 vocab_size: int, n_symbols: int | None = None):
+        """
+        Args:
+            vocab_size: tokenizer vocab size (for the embed dim story).
+            n_symbols: size of the hashed symbol table. If None, uses
+                vocab_size directly (state is (B,H,V,D)). For real LM use
+                with V=50K, set n_symbols ~ 256-2048 to keep state small;
+                IDs are hashed via `id % n_symbols`.
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.vocab_size = vocab_size
+        self.n_symbols = n_symbols if n_symbols is not None else vocab_size
+        self.qkv_dim = n_heads * d_head
+        self.W_v = nn.Linear(d_model, self.qkv_dim, bias=False)
+        self.W_w = nn.Linear(d_model, self.qkv_dim, bias=False)
+        self.W_q = nn.Linear(d_model, self.qkv_dim, bias=False)
+        self.W_b = nn.Linear(d_model, self.qkv_dim, bias=False)
+        self.W_o = nn.Linear(self.qkv_dim, d_model, bias=False)
+        # Bias the write-gate toward "don't write" so the cell starts as a
+        # near-pure bypass and learns to turn on writes as needed.
+        nn.init.zeros_(self.W_w.weight)
+        self.write_bias = nn.Parameter(torch.full((self.qkv_dim,), -2.0))
+
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        H, D, V = self.n_heads, self.d_head, self.n_symbols
+
+        v = _split_heads(self.W_v(x), H)                          # (B, H, T, D)
+        w_logit = _split_heads(self.W_w(x) + self.write_bias, H)  # (B, H, T, D)
+        q = _split_heads(self.W_q(x), H)                          # (B, H, T, D)
+        b = _split_heads(self.W_b(x), H)                          # (B, H, T, D)
+
+        S = torch.zeros(B, H, V, D, device=x.device, dtype=x.dtype)
+        outs = []
+
+        # Hash token ids into the (smaller) symbol-table dimension.
+        if self.n_symbols != self.vocab_size:
+            hashed_ids = input_ids % self.n_symbols
+        else:
+            hashed_ids = input_ids
+
+        for t in range(T):
+            id_t = hashed_ids[:, t]                               # (B,)
+            # Index for gather/scatter along V dim.
+            id_idx = id_t.view(B, 1, 1, 1).expand(B, H, 1, D)     # (B, H, 1, D)
+
+            # Read S[id_t] before write.
+            read_t = S.gather(2, id_idx).squeeze(2)               # (B, H, D)
+
+            # Output mixes lookup with bypass.
+            o_t = q[:, :, t] * read_t + b[:, :, t]                # (B, H, D)
+            outs.append(o_t)
+
+            # Gated write.
+            gate = torch.sigmoid(w_logit[:, :, t])                # (B, H, D)
+            new_val = gate * v[:, :, t] + (1.0 - gate) * read_t   # (B, H, D)
+            S = S.scatter(2, id_idx, new_val.unsqueeze(2))
+
+        out = torch.stack(outs, dim=2)                            # (B, H, T, D)
+        return self.W_o(_merge_heads(out))

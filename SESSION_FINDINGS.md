@@ -442,3 +442,75 @@ genuinely positive and consistent.
 Net assessment: **first novel direction this session that survives
 135M-scale validation on code**, even if marginally. Cross-layer
 feedback as a code-specific architectural prior is a real finding.
+
+---
+
+## 2026-04-26 follow-up: param-matched 135M + 30M seed sweep
+
+To validate the 135M result, ran two follow-up tests.
+
+### 30M seed sweep (3 seeds, code)
+
+| Seed | DN PPL | film PPL | Δ |
+|------|--------|----------|---|
+| 0 | 69.57 | 68.06 | −2.2% |
+| 1 | 70.81 | 68.61 | −3.1% |
+| 2 | 70.62 | 67.83 | −3.9% |
+| **mean** | **70.33** | **68.17** | **−3.1% (±0.9%)** |
+
+Win at 30M is **real and reproducible**: ~3% PPL improvement, σ < 1%. Clearly architectural at this scale.
+
+### Param-matched 135M (film @27L vs DN @30L)
+
+The film @30L 135M result had 9% more params (236M vs 216M). film @27L matches params at 218M (within 1%).
+
+| Arch | Params | Val PPL @ 5000 | Δ vs DN |
+|------|--------|----------------|---------|
+| DN @30L | 216.3M | **51.00** | baseline |
+| film @30L | 236.2M (+9%) | 50.75 | −0.5% |
+| **film @27L** | **218.2M** (param-matched) | **51.04** | **+0.08% (TIED)** |
+
+**The architectural advantage at 135M (controlling for params) is essentially zero.** The 0.5% win at 135M came almost entirely from the 9% extra params, not from the architecture.
+
+### Re-reading the scale trajectory
+
+| Scale | Architectural Δ (param-matched) |
+|-------|------------------------------------|
+| 30M | **−3.1%** (3 seeds, σ=0.9%) |
+| 135M | **+0.08%** (1 seed, tied) |
+
+The architectural win **vanishes by 135M**. Same pattern as multipass_dd: real win at 30M that didn't replicate at frontier scale.
+
+### Final honest verdict on cross-layer feedback
+
+- **Real win at small/medium scale** (~3% on code at 30M, reproducible).
+- **No clean win at 135M** when params are matched.
+- **Win on text disappeared earlier** (already gone at 30M TinyStories).
+
+This makes it the **best-validated small-scale finding of the session** but **not** a frontier-scale architectural improvement. Useful for:
+- Small coding models (e.g., on-device, edge)
+- Compute-constrained settings
+- As a regularizer-like effect at small N
+
+Not useful for:
+- Frontier-scale LMs
+- Replacing depth scaling
+
+### Bug fix during this run
+
+Discovered the `predictive` variant had a bug: `surprise_loss = (err.detach() ** 2)` killed all gradient. Fixed to detach only the target (pass1 state), keeping prediction `pred` attached. This makes predictive mode actually distinct from additive — but we didn't get to test the corrected version at scale before this writeup. May change predictive-mode behavior; worth re-running.
+
+### Recommendations going forward
+
+Given the consistent small-scale-only pattern (multipass_dd, film both):
+
+1. **Accept that small-scale architectural gains don't transfer.** Move research focus to scale-friendly improvements:
+   - Distillation (literature)
+   - Better cell internals (Gated DeltaProduct from literature)
+   - Inference-time innovations (S\* state-forking, MoR)
+
+2. **OR** focus on small-scale models specifically. If the user wants a competitive small/edge coder, film+DeltaNet at 30-100M may be a real improvement worth pursuing.
+
+3. **OR** test the now-bug-fixed predictive variant. Cleanest scientific framing per literature; might behave differently than additive/film.
+
+4. **HumanEval eval** would still be informative — PPL parity might hide generation-quality wins.

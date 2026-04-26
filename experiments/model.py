@@ -239,15 +239,18 @@ class TinyLM(nn.Module):
             else:
                 state_above_lagged = None
             if self.feedback_mode == "predictive" and state_above_lagged is not None:
-                # Predictive coding flavor: TopDown predicts the lower
-                # layer's pass-1 output; layer L's input gets the prediction
-                # added and we accumulate the surprise (prediction error)
-                # for an optional aux loss.
+                # Predictive coding flavor (Ali/Kietzmann lineage): TopDown
+                # predicts the lower layer's pass-1 output. Surprise =
+                # pass1_state - prediction; the aux loss trains W_fb to
+                # produce a good prediction (gradient flows through `pred`
+                # but pass1 target is detached so we don't push lower-layer
+                # outputs to match predictions — that would corrupt
+                # representations).
                 proj = self.feedback[L]
                 pred = proj.W_fb(state_above_lagged)
                 h_input = h + proj.alpha * pred
-                err = pass1_outs[L] - pred                 # surprise
-                surprise_loss = surprise_loss + (err.detach() ** 2).mean()
+                err = pass1_outs[L].detach() - pred        # detach target only
+                surprise_loss = surprise_loss + (err ** 2).mean()
                 h = blk(h_input, input_ids=input_ids)
             else:
                 h_input = self.feedback[L](h, state_above_lagged) \

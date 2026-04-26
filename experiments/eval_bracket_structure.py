@@ -49,10 +49,12 @@ def build_model_from_ckpt(ckpt_path: str):
                              n_symbols=cfg.get("n_symbols", 512))
     else:
         raise ValueError("checkpoint has neither arch nor layers_spec")
+    # Note: train_lm.py doesn't pass max_T to the constructor, so trained
+    # LM models have no positional embedding. Force max_T=0 here to match.
     model = TinyLM(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"],
         n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
-        d_head=cfg["d_head"], max_T=cfg["max_T"],
+        d_head=cfg["d_head"], max_T=0,
         feedback_mode=cfg.get("feedback_mode", "none"),
         **attn_kw,
     )

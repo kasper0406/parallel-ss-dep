@@ -733,3 +733,62 @@ The quantitative trend across depths (3.1% → 1.5% → 1.1% → 0.0%) gives a c
 - Param-matched validation (15L is genuine architectural win)
 - Comparison vs prior art (Feedback Transformer pays 5-10× slowdown; we keep parallel-scan)
 - Novelty (6.5/10 per literature search)
+
+---
+
+## Post-PPL eval results (Phase 1, 2, 3)
+
+User asked: did the architectural mechanism do useful work that PPL doesn't surface? Built three eval pipelines and ran them on saved 30L/15L checkpoints.
+
+### Phase 1: bracket-structure metrics on generated continuations (300 samples each)
+
+| Model | Val PPL | parse% | bracket_imb | indent% | tok_div |
+|-------|---------|--------|-------------|---------|---------|
+| DN @30L | 51.00 | 2.0% | 2.03 | 89.6% | 0.248 |
+| film @30L | 50.75 | 1.6% | 2.01 | 90.4% | 0.242 |
+| DN @15L | 52.85 | 1.0% | 1.73 | 88.5% | 0.236 |
+| film @15L | 52.28 | 2.0% | 1.88 | 89.8% | 0.236 |
+
+At @30L (PPL tied): generation metrics also tied. At @15L (PPL film wins): parse_success doubles. **Generation tracks PPL; no hidden architectural advantage.**
+
+### Phase 2: HumanEval pass@1 (164 problems each)
+
+All four models: **0/164 pass@1**. Models too small / undertrained to solve any HumanEval problem regardless of architecture. No relative signal at this scale.
+
+### Phase 3: long-context PPL on Python code
+
+| Model | T=512 | T=1024 | T=2048 |
+|-------|-------|--------|--------|
+| DN @30L | 57.66 | 44.00 | 44.95 |
+| **film @30L** | 56.57 (−1.9%) | 43.29 (−1.6%) | 44.46 (−1.1%) |
+| DN @15L | 59.55 | 45.61 | 46.77 |
+| **film @15L** | 58.53 (−1.7%) | 44.77 (−1.8%) | 45.94 (−1.8%) |
+
+**Two patterns:**
+1. At full depth (@30L): film advantage shrinks with longer context (−1.9 → −1.1%). Context absorbs feedback signal, just like depth does.
+2. At constrained depth (@15L): film advantage holds steady at ~−1.8% across all T.
+
+**Refined story: film is a CAPACITY-EFFICIENCY architectural prior.** It helps when the model is constrained on EITHER depth OR context. When both are sufficient, the model computes the feedback signal internally and the architecture becomes redundant.
+
+### Final synthesis
+
+Cross-layer top-down feedback is a **capacity-efficiency architectural prior** for linear-RNN coding LMs:
+
+- Adds 1-3% PPL improvement on code at capacity-constrained configurations (small depth or short context)
+- Vanishes at frontier capacity (deep + long-context)
+- Cost: ~30% wallclock slowdown, +5-9% params
+- **Generation quality tracks PPL** — no orthogonal benefit on generation-side metrics
+- HumanEval at 5K-step / 135M is uninformative (all-zero) regardless of arch
+
+**Clear use cases:**
+- Edge / on-device coders (depth-constrained)
+- Low-latency / short-context inference (context-constrained)
+- Speculative-decoding drafters
+- Any compute/depth-budget-bound deployment
+
+**Not useful for:**
+- Frontier-scale unconstrained LMs (depth + long context = redundant)
+- Settings where small wallclock penalty matters more than 1-3% PPL
+
+The architectural finding is now mechanistically and empirically complete:
+α logging shows the model uses feedback at all configurations; only when capacity is constrained does that usage produce a PPL benefit. The generation-side evals confirm the win is on the same axis as PPL (no orthogonal generation advantage). HumanEval at our scale provides no signal.

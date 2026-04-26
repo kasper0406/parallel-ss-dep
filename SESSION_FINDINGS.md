@@ -59,6 +59,52 @@ The hypothesis in `NOVEL_DIRECTIONS.md` was "code's most distinctive property is
 
 Direction E is the biggest "different from frontier" bet because no published autoregressive code LM uses verifier signal during pretraining (only post-training RLHF). It also addresses the *real* bottleneck Agent 07 flagged: "When Perplexity Lies" — a 7B distilled model matching teacher within 0.2pp PPL but losing by 20.8pp on HumanEval.
 
+---
+
+## Direction B (multi-pass) — tested 2026-04-26 evening
+
+**Setup:** `MultiPassAttention` runs K cells in parallel on the same residual, fuses outputs via softmax mixture (alpha learnable, init=zeros = uniform 1/K).
+
+### Three multi-pass variants
+
+1. **multipass_dh** (DeltaNet + Heisenberg): catastrophic failure.
+   - TinyStories PPL 30.21 vs DeltaNet 13.36 (+126% worse)
+   - Code PPL 237.69 vs DeltaNet 113.68 (+109% worse)
+   - Heisenberg is poor at LM; convex combination drags everything down.
+
+2. **multipass_dd** (DeltaNet + DeltaNet_negeig): marginal win vs same-depth baseline.
+   - TinyStories PPL 12.96 vs DeltaNet@4L 13.36 (-3.0%)
+   - Code PPL 108.50 vs DeltaNet@4L 113.68 (-4.6%)
+   - But uses 2× compute per layer.
+
+3. **DeltaNet@8L** (compute-parity baseline, 14.7M params):
+   - TinyStories PPL 12.25 → **beats multipass_dd by 5.5%**
+   - Code PPL 108.36 → **ties multipass_dd within 0.1%**
+
+### Honest verdict on Direction B
+- The "multi-pass win" is purely a compute artifact. At compute parity, deeper DeltaNet wins on text and ties on code.
+- The framework only gains marginal value when both cells are strong LMs *and* slightly different (here: delta vs delta_negeig is basically two flavors of the same cell).
+- Pairing a strong cell with a weak cell (multipass_dh) catastrophically destroys the strong cell.
+- The mechanistic intent ("every reading mode at every token") doesn't yield a real win at this scale.
+
+**Direction B is NOT the win.** Closest mechanism in published lit is Hymba's head-level mix of attention + Mamba, but that pairs cells of complementary type (recall + state-tracking). Our linear+linear pairing has no such complementarity to exploit.
+
+---
+
+## Updated state of the novel-directions queue
+
+- ~~Direction A (symbol-grounded scan)~~ — tested, tied with DeltaNet, not the win.
+- ~~Direction B (multi-pass parallel scans)~~ — tested, loses to deeper DeltaNet at compute parity.
+- **Direction C (event-driven irregular-time cells)** — untested. Cheap to test (~1 day).
+- **Direction D (tree-scan over the parse tree)** — untested. Expensive (~3-4 weeks).
+- **Direction E (verifier-coupled pretraining)** — untested. Most novel, ~1 week eng.
+
+**Next bet:** Direction E. Reasoning:
+1. A and B both failed at the cell-design level. The remaining novel cell-level designs (C, D) likely fail similarly — the small-scale-LM landscape is dominated by depth-scaling and well-tuned cells.
+2. Direction E is fundamentally different: it changes the *training objective*, not the cell. Less likely to fall into the "two cells averaged is worse than one cell deep" trap.
+3. Direction E directly addresses the PPL-vs-HumanEval gap that Agent 07 flagged. Even if it doesn't improve PPL, it might improve actual code generation quality.
+4. Distillation (literature) is the highest-confidence improvement, but the user wants novel.
+
 ## What to do next
 
 Two options, in order of expected info-per-effort:

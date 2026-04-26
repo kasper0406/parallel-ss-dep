@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader, IterableDataset
 from experiments.layers import (
     DeltaNetAttention, DeltaNetNegEigAttention,
     OrthogonalScanAttention, SymbolGroundedAttention,
+    HeisenbergAttention, MultiPassAttention,
 )
 from experiments.model import TinyLM
 
@@ -90,6 +91,30 @@ def build_arch(name: str, n_layers: int, vocab_size: int = 0, n_symbols: int = 5
         sg = _make_sg_factory(vocab_size, n_symbols)
         cls = [sg if i % 4 == 0 else DeltaNetAttention for i in range(n_layers)]
         return dict(attention_cls_per_layer=cls)
+    # Multi-pass — direction B. K cells in parallel within each layer.
+    if name == "multipass_dh":
+        # DeltaNet + Heisenberg in parallel at every layer.
+        def _mp(**kw):
+            return MultiPassAttention(
+                cells=[DeltaNetAttention, HeisenbergAttention], **kw
+            )
+        return dict(attention_cls=_mp)
+    if name == "multipass_dho":
+        # DeltaNet + Heisenberg + Ortho in parallel.
+        def _mp(**kw):
+            return MultiPassAttention(
+                cells=[DeltaNetAttention, HeisenbergAttention,
+                       OrthogonalScanAttention], **kw
+            )
+        return dict(attention_cls=_mp)
+    if name == "multipass_dd":
+        # Two strong LM cells: DeltaNet + DeltaNet_negeig (allow_neg_eigval).
+        # Tests whether multi-pass helps when both cells are competent LMs.
+        def _mp(**kw):
+            return MultiPassAttention(
+                cells=[DeltaNetAttention, DeltaNetNegEigAttention], **kw
+            )
+        return dict(attention_cls=_mp)
     raise ValueError(f"unknown arch: {name}")
 
 
@@ -136,7 +161,8 @@ def main():
                    choices=["deltanet", "deltanet_negeig", "ortho",
                             "hybrid", "hybrid_25_75", "hybrid_75_25",
                             "hybrid_negeig",
-                            "symgrounded", "hybrid_sg", "hybrid_sg_25_75"])
+                            "symgrounded", "hybrid_sg", "hybrid_sg_25_75",
+                            "multipass_dh", "multipass_dho", "multipass_dd"])
     p.add_argument("--n_symbols", type=int, default=512,
                    help="Hash bucket size for SymbolGrounded layer.")
     p.add_argument("--layers", type=str, default=None,

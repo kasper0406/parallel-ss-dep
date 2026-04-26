@@ -654,3 +654,64 @@ class SymbolGroundedAttention(nn.Module):
 
         out = torch.stack(outs, dim=2)                            # (B, H, T, D)
         return self.W_o(_merge_heads(out))
+
+
+# ---------------------------------------------------------------------------
+# Multi-pass parallel scans — novel direction B.
+#
+# Within a single layer, run K different cells on the SAME input residual,
+# fuse outputs with a learned mixture. The mechanistic intent: instead of
+# alternating (rotation, delta, rotation, delta) at the LAYER level (which
+# loses each cell's state across the gap), every reading mode is
+# simultaneously available at every token.
+#
+# Compute cost is K× a single cell. Pair this with reduced layer count
+# for a fair compute-matched comparison.
+# ---------------------------------------------------------------------------
+
+
+class MultiPassAttention(nn.Module):
+    """K cells in parallel on the same input; learned softmax mixture.
+
+    The cells argument is a tuple of (constructor, kwargs_dict) pairs, so
+    the user can mix cells that need different signatures (e.g. one that
+    requires `vocab_size`).
+
+    Output: weighted sum of cell outputs, with weights g = softmax(α)
+    where α is a learned (K,) parameter starting at zeros (uniform 1/K).
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_head: int,
+                 cells: list):
+        """
+        Args:
+            cells: list of cell constructors. Each must accept
+                (d_model=, n_heads=, d_head=) at minimum. If a cell needs
+                `input_ids`, it must declare `needs_input_ids = True`.
+                For SymbolGrounded use a closure that pre-binds vocab_size.
+        """
+        super().__init__()
+        self.K = len(cells)
+        self.cells = nn.ModuleList([
+            c(d_model=d_model, n_heads=n_heads, d_head=d_head)
+            for c in cells
+        ])
+        # Per-cell mixture logit; softmax over K.
+        self.alpha = nn.Parameter(torch.zeros(self.K))
+
+    @property
+    def needs_input_ids(self) -> bool:
+        return any(getattr(c, "needs_input_ids", False) for c in self.cells)
+
+    def forward(self, x: torch.Tensor,
+                input_ids: torch.Tensor | None = None) -> torch.Tensor:
+        outs = []
+        for c in self.cells:
+            if getattr(c, "needs_input_ids", False):
+                outs.append(c(x, input_ids=input_ids))
+            else:
+                outs.append(c(x))
+        gates = torch.softmax(self.alpha, dim=0)                  # (K,)
+        # outs is list of (B, T, d_model); stack to (K, B, T, d_model)
+        stacked = torch.stack(outs, dim=0)
+        return (gates.view(self.K, 1, 1, 1) * stacked).sum(dim=0)

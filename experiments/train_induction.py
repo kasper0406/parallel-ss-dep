@@ -72,12 +72,14 @@ def _val(model, T, vocab, batch_size, device):
 
 
 def train_one(arch, T, vocab, steps, batch_size, d_model, n_layers,
-              n_heads, d_head, lr, log_every, device="cuda", seed=0):
+              n_heads, d_head, lr, log_every, device="cuda", seed=0,
+              feedback="none"):
     torch.manual_seed(seed)
     cls = ARCHES[arch]
     model = TinyLM(
         vocab_size=vocab, d_model=d_model, n_layers=n_layers,
         n_heads=n_heads, d_head=d_head, attention_cls=cls, max_T=T,
+        feedback_mode=feedback,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95),
                             weight_decay=0.0)
@@ -131,6 +133,8 @@ def main():
     p.add_argument("--lr", type=float, default=3e-3)
     p.add_argument("--log_every", type=int, default=300)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--feedback", type=str, default="none",
+                   choices=["none", "additive", "film", "predictive"])
     args = p.parse_args()
 
     arches = args.arches.split(",")
@@ -146,6 +150,7 @@ def main():
                 d_model=args.d_model, n_layers=args.n_layers,
                 n_heads=args.n_heads, d_head=args.d_head,
                 lr=args.lr, log_every=args.log_every, seed=args.seed,
+                feedback=args.feedback,
             )
             results.append(r)
 

@@ -172,6 +172,12 @@ def main():
                    help="Weight on the aux loss term.")
     p.add_argument("--aux_max_depth", type=int, default=24,
                    help="Cap bracket depth at this value for the aux head.")
+    p.add_argument("--feedback", type=str, default="none",
+                   choices=["none", "additive", "film", "predictive"],
+                   help="Cross-layer top-down feedback mode (Day 1).")
+    p.add_argument("--surprise_weight", type=float, default=0.0,
+                   help="Weight on the surprise (prediction-error) aux "
+                        "loss for predictive feedback mode.")
     p.add_argument("--layers", type=str, default=None,
                    help="explicit comma-separated layer arch list, "
                         "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
@@ -252,9 +258,11 @@ def main():
     aux_dim = (args.aux_max_depth + 1) if args.aux_brackets else 0
     model = TinyLM(
         vocab_size=tok.vocab_size, d_model=args.d_model, n_layers=n_layers_actual,
-        n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim, **attn_kw,
+        n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim,
+        feedback_mode=args.feedback, **attn_kw,
     ).to("cuda")
-    print(f"  params: {model.num_params() / 1e6:.1f}M  aux_dim={aux_dim}")
+    print(f"  params: {model.num_params() / 1e6:.1f}M  aux_dim={aux_dim}  "
+          f"feedback={args.feedback}")
 
     if args.aux_brackets:
         print("Computing bracket-deltas table for tokenizer ...")
@@ -284,20 +292,31 @@ def main():
             train_iter = iter(train_loader)
             x, y = next(train_iter)
         x, y = x.to("cuda"), y.to("cuda")
-        if args.aux_brackets:
+        want_surprise = (args.feedback == "predictive" and args.surprise_weight > 0)
+        if args.aux_brackets and want_surprise:
+            logits, aux_logits, surprise = model(x, return_aux=True, return_surprise=True)
+        elif args.aux_brackets:
             logits, aux_logits = model(x, return_aux=True)
+            surprise = torch.zeros((), device="cuda")
+        elif want_surprise:
+            logits, surprise = model(x, return_surprise=True)
+            aux_logits = None
+        else:
+            logits = model(x)
+            aux_logits = None
+            surprise = torch.zeros((), device="cuda")
+        if args.aux_brackets:
             depth = bracket_depth(x, bracket_deltas).clamp(0, args.aux_max_depth)
             aux_loss = F.cross_entropy(
                 aux_logits.reshape(-1, args.aux_max_depth + 1),
                 depth.reshape(-1),
             )
         else:
-            logits = model(x)
             aux_loss = torch.zeros((), device="cuda")
         lm_loss = F.cross_entropy(
             logits.reshape(-1, tok.vocab_size), y.reshape(-1),
         )
-        loss = lm_loss + args.aux_weight * aux_loss
+        loss = lm_loss + args.aux_weight * aux_loss + args.surprise_weight * surprise
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

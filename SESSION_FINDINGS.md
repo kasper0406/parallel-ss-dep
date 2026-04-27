@@ -792,3 +792,80 @@ Cross-layer top-down feedback is a **capacity-efficiency architectural prior** f
 
 The architectural finding is now mechanistically and empirically complete:
 α logging shows the model uses feedback at all configurations; only when capacity is constrained does that usage produce a PPL benefit. The generation-side evals confirm the win is on the same axis as PPL (no orthogonal generation advantage). HumanEval at our scale provides no signal.
+
+---
+
+## 2026-04-27 follow-up: multi-scale exponential-distance feedback
+
+User asked: have you considered exponential-distance feedback (layer L sees L+1, L+2, L+4, L+8, L+16)? Implemented `MultiScaleFeedbackProjection` and tested.
+
+### Multi-scale results at training T (T=512 / 5K steps / Python code)
+
+| Variant | Params | Val PPL | Δ vs DN @30L |
+|---------|--------|---------|---------------|
+| DN @30L | 216M | 51.00 | baseline |
+| film @30L (single-scale) | 236M (+9%) | 50.75 | −0.5% |
+| **film_multi @30L (1,2,4,8,16)** | **316M (+46%)** | **50.22** | **−1.5%** |
+| film_multi @18L (depth-matched, 1,2,4,8,16) | 212M | 51.89 | **+1.7% (worse)** |
+| film_multi @30L d=512 (width-matched, 1,2,4,8,16) | 255M | 53.13 | **+4.2% (worse)** |
+| film_multi @15L (depth-constrained) | 176M | 52.11 | (different baseline) |
+
+### Initial extrapolation result looked promising
+
+Multi-scale @30L (with +46% params) showed **gap GROWING with T**:
+- T=512: −2.9%
+- T=1024: −3.1%
+- T=2048: −3.9% (peak)
+- T=4096: −3.5%
+- T=8192: −3.3%
+
+Suggested architectural advantage at long context.
+
+### But controlled experiments killed the architectural claim
+
+**Param-matched depth comparison (film_multi @18L vs DN @30L, both ~212-216M):**
+| T | DN @30L | film_multi @18L | Δ |
+|---|---------|-----------------|---|
+| 512 | (training T) | training-time worse: +1.7% | |
+| 4096 | 57.06 | 57.64 | +1.0% |
+| 8192 | 56.10 | 56.32 | +0.4% |
+
+→ At depth-matched param parity, film_multi loses on training PPL and only marginally beats DN at long T.
+
+**Width-matched comparison (film_multi @30L d=512 vs DN @30L d=576, both ~216-255M):**
+| T | DN @30L (216M) | film_multi d=512 (255M) | Δ |
+|---|----------------|-------------------------|---|
+| 512 | 64.47 | 65.04 | +0.9% |
+| 1024 | 71.49 | 74.73 | +4.5% |
+| 2048 | 56.81 | 60.09 | +5.8% |
+| 4096 | 55.80 | 58.22 | +4.3% |
+| 8192 | 44.08 | 45.85 | +4.0% |
+
+→ Width-matched film_multi LOSES at every T by 4-6%. **Gap is stable across T, NOT growing.**
+
+### Conclusion: extrapolation gap was a parameter effect
+
+The earlier "gap-growing-with-T" finding required the +46% extra params at d_model=576. Strip the params (either via depth or width reduction) and:
+- Training PPL: film_multi loses
+- Extrapolation PPL: film_multi loses by similar margin at every T
+
+**Cross-layer top-down feedback (single-scale or multi-scale) is NOT a frontier-scale architectural improvement.** It's a way to spend extra capacity that:
+- Marginally helps when you can spend more params (modest effect)
+- Marginally helps at depth-constrained scales (the ~3% finding at 30M)
+- Does NOT improve over plain DeltaNet at param parity, in any T regime
+
+The user's intuition was correct: the param-matched test exposed that multi-scale film's "win" was largely capacity-driven. A real architectural improvement would survive width-matched comparison; this doesn't.
+
+### What's left of the architectural claim
+
+The **only surviving architectural finding** is at small scale (30M code, 3 seeds): film @16L beats DN @16L by 3.1% at param parity. This is real but modest and does not transfer to frontier scales (135M+) at any T.
+
+### Implications for "should we integrate into a proper LLM"
+
+After the controlled tests: **no, not as a frontier architecture.** The training-PPL win at frontier scale was params, not architecture. The extrapolation win was params, not architecture. There's no defensible "this architecture is better" claim left to scale.
+
+The film mechanism remains a defensible engineering choice for:
+- Edge/on-device coders where you specifically want depth ≤ 8L (the −1.5% gap at @8L is real)
+- Speculative decoding drafters (need shallow models)
+
+But for frontier-scale coding LM development, the path forward is the boring-but-effective one from the original brainstorm: distillation from frontier coding teachers, depth scaling, attention+linear hybrids. Not novel cells.

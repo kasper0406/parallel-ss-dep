@@ -150,6 +150,38 @@ class FeedbackProjection(nn.Module):
         return x
 
 
+class MultiScaleFeedbackProjection(nn.Module):
+    """Multi-distance top-down feedback for one layer.
+
+    Holds K FeedbackProjections, one per distance d in `distances`.
+    In pass 2, each consumes the pass-1 output of layer L+d (shifted
+    right by 1), produces a modulation of x; modulations are applied
+    serially.
+
+    For a 30-layer stack with distances=(1, 2, 4, 8, 16):
+      - layer 0  sees feedback from layers {1, 2, 4, 8, 16}
+      - layer 13 sees feedback from layers {14, 15, 17, 21, 29}
+      - layer 29 sees nothing (no layers above)
+    Distances that exceed n_layers - 1 - L are skipped at runtime
+    (caller passes None for those slots).
+    """
+
+    def __init__(self, d_model: int, mode: str,
+                 distances: tuple[int, ...] = (1,)):
+        super().__init__()
+        self.distances = distances
+        self.projs = nn.ModuleList([
+            FeedbackProjection(d_model, mode) for _ in distances
+        ])
+
+    def forward(self, x: torch.Tensor,
+                states_above: list) -> torch.Tensor:
+        """states_above: list of K tensors (or None) aligned with self.distances."""
+        for proj, state in zip(self.projs, states_above):
+            x = proj(x, state)
+        return x
+
+
 class TinyLM(nn.Module):
     def __init__(
         self,
@@ -164,6 +196,7 @@ class TinyLM(nn.Module):
         attention_cls_per_layer: list[Callable[..., nn.Module]] | None = None,
         aux_dim: int = 0,                     # 0 = no aux head
         feedback_mode: str = "none",          # none / additive / film / predictive
+        feedback_distances: tuple[int, ...] = (1,),  # multi-scale top-down
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -199,14 +232,19 @@ class TinyLM(nn.Module):
         if aux_dim > 0:
             self.aux_head = nn.Linear(d_model, aux_dim, bias=True)
 
-        # Cross-layer top-down feedback. One FeedbackProjection per layer;
-        # layer L receives feedback from layer L+1 (so the topmost layer
-        # has a no-op feedback module). For mode='none', everything is a
-        # no-op and we degrade to the original 1-pass forward.
+        # Cross-layer top-down feedback. One MultiScaleFeedbackProjection
+        # per layer. With distances=(1,) this degrades to the single-step
+        # variant (FeedbackProjection wrapped in a 1-element ModuleList).
+        # With distances=(1,2,4,8,16) layer L sees pass-1 outputs from
+        # layers {L+d for d in distances} (shifted right by 1).
         self.feedback_mode = feedback_mode
+        self.feedback_distances = tuple(feedback_distances)
         if feedback_mode != "none":
             self.feedback = nn.ModuleList([
-                FeedbackProjection(d_model, mode=feedback_mode)
+                MultiScaleFeedbackProjection(
+                    d_model, mode=feedback_mode,
+                    distances=self.feedback_distances,
+                )
                 for _ in range(n_layers)
             ])
 
@@ -238,31 +276,39 @@ class TinyLM(nn.Module):
             pass1_outs.append(h)
 
         # Pass 2: forward with top-down feedback from pass-1 outputs,
-        # shifted right by 1 along T.
+        # shifted right by 1 along T. Multi-scale: each layer L sees
+        # states from layers {L+d for d in feedback_distances}.
         h = x
         surprise_loss = torch.zeros((), device=x.device)
+        N = len(self.blocks)
         for L, blk in enumerate(self.blocks):
-            if L + 1 < len(self.blocks):
-                state_above_lagged = _shift_right_by_1(pass1_outs[L + 1])
+            if self.feedback_mode == "none":
+                h = blk(h, input_ids=input_ids)
+                continue
+            # Gather multi-scale lagged states for layer L.
+            states_above: list = []
+            for d in self.feedback_distances:
+                src = L + d
+                if src < N:
+                    states_above.append(_shift_right_by_1(pass1_outs[src]))
+                else:
+                    states_above.append(None)
+            if self.feedback_mode == "predictive":
+                # Predictive coding (Ali/Kietzmann lineage). For multi-scale,
+                # surprise loss accumulates over each distance's prediction.
+                # Apply each modulation serially (same as MultiScale forward),
+                # but track surprise per distance.
+                multi = self.feedback[L]
+                for proj, state in zip(multi.projs, states_above):
+                    if state is None:
+                        continue
+                    pred = proj.W_fb(state)
+                    h = h + proj.get_alpha() * pred
+                    err = pass1_outs[L].detach() - pred
+                    surprise_loss = surprise_loss + (err ** 2).mean()
+                h = blk(h, input_ids=input_ids)
             else:
-                state_above_lagged = None
-            if self.feedback_mode == "predictive" and state_above_lagged is not None:
-                # Predictive coding flavor (Ali/Kietzmann lineage): TopDown
-                # predicts the lower layer's pass-1 output. Surprise =
-                # pass1_state - prediction; the aux loss trains W_fb to
-                # produce a good prediction (gradient flows through `pred`
-                # but pass1 target is detached so we don't push lower-layer
-                # outputs to match predictions — that would corrupt
-                # representations).
-                proj = self.feedback[L]
-                pred = proj.W_fb(state_above_lagged)
-                h_input = h + proj.get_alpha() * pred
-                err = pass1_outs[L].detach() - pred        # detach target only
-                surprise_loss = surprise_loss + (err ** 2).mean()
-                h = blk(h_input, input_ids=input_ids)
-            else:
-                h_input = self.feedback[L](h, state_above_lagged) \
-                    if self.feedback_mode != "none" else h
+                h_input = self.feedback[L](h, states_above)
                 h = blk(h_input, input_ids=input_ids)
 
         h = self.out_norm(h)
@@ -277,18 +323,25 @@ class TinyLM(nn.Module):
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def feedback_alphas(self) -> list[float]:
-        """Return current per-layer α values (FiLM/additive feedback strength).
+    def feedback_alphas(self) -> list[float] | list[list[float]]:
+        """Return current per-layer α values.
 
-        Empty list if feedback is disabled. Useful for diagnosing whether
-        the model has actually learned to use top-down feedback.
+        For single-distance feedback (distances=(1,)), returns a flat list
+        of n_layers floats (one α per layer).
+        For multi-scale, returns list of n_layers lists, each with K floats
+        (one α per distance per layer).
         """
         if self.feedback_mode == "none":
             return []
-        return [float(fb.alpha.detach().item()) for fb in self.feedback]
+        if len(self.feedback_distances) == 1:
+            return [float(fb.projs[0].alpha.detach().item())
+                    for fb in self.feedback]
+        return [[float(p.alpha.detach().item()) for p in fb.projs]
+                for fb in self.feedback]
 
     def freeze_alpha(self) -> None:
         """Diagnostic: lock α at 0 across all layers (no active feedback)."""
         if self.feedback_mode != "none":
             for fb in self.feedback:
-                fb.freeze_alpha = True
+                for p in fb.projs:
+                    p.freeze_alpha = True

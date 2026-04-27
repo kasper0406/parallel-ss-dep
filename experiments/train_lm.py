@@ -185,6 +185,10 @@ def main():
     p.add_argument("--save_ckpt", type=str, default=None,
                    help="Path to save final model checkpoint (for downstream "
                         "evals like HumanEval, bracket-structure, long-T PPL).")
+    p.add_argument("--feedback_distances", type=str, default="1",
+                   help="Comma-separated distances for multi-scale top-down "
+                        "feedback. '1' = single-step (default), "
+                        "'1,2,4,8,16' = exponential reach.")
     p.add_argument("--layers", type=str, default=None,
                    help="explicit comma-separated layer arch list, "
                         "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
@@ -263,15 +267,18 @@ def main():
                              vocab_size=tok.vocab_size, n_symbols=args.n_symbols)
         n_layers_actual = args.n_layers
     aux_dim = (args.aux_max_depth + 1) if args.aux_brackets else 0
+    fb_distances = tuple(int(d) for d in args.feedback_distances.split(",") if d)
     model = TinyLM(
         vocab_size=tok.vocab_size, d_model=args.d_model, n_layers=n_layers_actual,
         n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim,
-        feedback_mode=args.feedback, **attn_kw,
+        feedback_mode=args.feedback, feedback_distances=fb_distances,
+        **attn_kw,
     ).to("cuda")
     if args.freeze_alpha and args.feedback != "none":
         model.freeze_alpha()
     print(f"  params: {model.num_params() / 1e6:.1f}M  aux_dim={aux_dim}  "
-          f"feedback={args.feedback}{' (α frozen=0)' if args.freeze_alpha else ''}")
+          f"feedback={args.feedback}@d={args.feedback_distances}"
+          f"{' (α frozen=0)' if args.freeze_alpha else ''}")
 
     if args.aux_brackets:
         print("Computing bracket-deltas table for tokenizer ...")
@@ -341,7 +348,12 @@ def main():
                     f"{scheduler.get_last_lr()[0]:>9.2e}")
             if args.feedback != "none":
                 alphas = model.feedback_alphas()
-                line += f"  α=[{','.join(f'{a:+.3f}' for a in alphas)}]"
+                if alphas and isinstance(alphas[0], list):
+                    # Multi-scale: print max |α| per layer for compactness.
+                    summary = [max(abs(a) for a in row) for row in alphas]
+                    line += f"  max|α|=[{','.join(f'{a:.3f}' for a in summary)}]"
+                else:
+                    line += f"  α=[{','.join(f'{a:+.3f}' for a in alphas)}]"
             print(line)
             last_log = now
             last_log_step = step
@@ -377,6 +389,7 @@ def main():
                 "d_model": args.d_model, "n_heads": args.n_heads,
                 "d_head": args.d_head, "n_layers": n_layers_actual,
                 "max_T": args.T, "feedback_mode": args.feedback,
+                "feedback_distances": fb_distances,
                 "arch": args.arch, "layers_spec": args.layers,
                 "n_symbols": args.n_symbols,
                 "tokenizer": args.tokenizer,

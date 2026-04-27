@@ -56,9 +56,24 @@ def build_model_from_ckpt(ckpt_path: str):
         n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
         d_head=cfg["d_head"], max_T=0,
         feedback_mode=cfg.get("feedback_mode", "none"),
+        feedback_distances=tuple(cfg.get("feedback_distances", (1,))),
         **attn_kw,
     )
-    model.load_state_dict(ckpt["state_dict"])
+    # Backward-compat: old single-scale film checkpoints saved keys as
+    # `feedback.L.alpha` etc. (no MultiScale wrapper). Remap to the new
+    # nested form `feedback.L.projs.0.alpha`.
+    sd = ckpt["state_dict"]
+    if any(k.startswith("feedback.") and ".projs." not in k for k in sd):
+        new_sd = {}
+        for k, v in sd.items():
+            if k.startswith("feedback.") and ".projs." not in k:
+                parts = k.split(".", 2)
+                new_k = f"{parts[0]}.{parts[1]}.projs.0.{parts[2]}"
+                new_sd[new_k] = v
+            else:
+                new_sd[k] = v
+        sd = new_sd
+    model.load_state_dict(sd)
     model = model.to("cuda").eval()
     return model, cfg
 

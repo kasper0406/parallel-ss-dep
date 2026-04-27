@@ -18,19 +18,26 @@ DeltaNet stack gives:
   pass-1 divergence that defeats dense feedback variants (probe data
   in [`experiments/probe_feedback.py`](experiments/probe_feedback.py))
 
-### Roadmap for scaling (in order)
+### Pre-flight verification (2026-04-27, complete except #4)
 
-1. **3-seed reproducibility at @30L** — confirm the −3.5 % isn't
-   single-seed luck. ~15 h on 2× RTX 5090 (3 seeds in parallel pairs).
-2. **TinyStories test** — does the win hold on natural text or is it
-   code-specific? ~1 h.
-3. **Depth ablation @15L and @8L** — dense feedback gave bigger wins
-   at constrained depth; sparse may follow the same pattern. ~6 h.
-4. **Sparse-pair design ablation** — which target/source positions
-   actually matter? Try (5, 28), (2, 25), reverse-direction (28, 2),
-   multi-pair patterns. ~10 h, 2-3 variants.
-5. **Conditional on the above being positive**: pick one of two
-   scaling paths:
+1. **3-seed reproducibility at @30L** — ✅ **mean 49.40 ± 0.31 vs DN
+   51.00 → −3.14 %**. Real, reproducible.
+2. **TinyStories test** — ✅ −1.6 % on natural text. Win is not
+   code-specific (smaller delta consistent with simpler corpus).
+3. **Depth ablation @15L and @8L** — ✅ sparse beats DN at every
+   depth tested (−2.6 %, −0.8 %, −3.1 % at @8L/@15L/@30L). Dense
+   single-step has a small @15L sweet spot (loses to sparse at @8L
+   and @30L); sparse is the safer default.
+4. **Sparse-pair design ablation** — 🔄 in progress: `(28, 2)`
+   reverse direction and `(5, 28)` target shift running. Pending:
+   `(2, 25)` source shift, multi-pair patterns.
+
+### Next: scale-up decision (after #4 completes)
+
+Conditional on the design ablation confirming the (early-target ←
+late-source) pattern is the load-bearing piece, pick one of two
+scaling paths:
+
    - **Direct training**: 350-500 M / 10-20 B tokens / 1-2 weeks on
      2× 5090. Builds a real coder model with the sparse-feedback
      architecture.

@@ -631,17 +631,54 @@ context modulating low-level processing.
 - **Implementation-light**: a single `FeedbackProjection` (~660 K
   params at d=576), one extra `_shift_right_by_1` per training step.
 
-### Concrete next steps before scaling (per `NEXT_DIRECTIONS.md`)
+### Pre-flight verification (2026-04-27)
 
-1. 3-seed reproducibility at @30L (confirm −3.5 % isn't seed luck).
-2. TinyStories test (is the win code-specific or general?).
-3. Depth ablation @15L and @8L (dense pattern suggests bigger wins
-   at constrained depth).
-4. Sparse-pair design ablation (which target/source positions matter?
-   reverse direction? multi-pair patterns?).
-5. If all positive: distillation experiment from Qwen2.5-Coder-1.5B
-   into a sparse-feedback DeltaNet backbone, or direct scale-up to
-   350-500M / 10-20B tokens.
+Before committing to a scale-up, ran the four planned pre-flights:
+
+**(1) 3-seed reproducibility at @30L** — confirmed.
+
+| Seed | Sparse (2,28) PPL |
+|------|-------------------|
+| 0 | 49.23 |
+| 1 | 49.86 |
+| 2 | 49.11 |
+| **mean ± σ** | **49.40 ± 0.31** |
+
+vs DN baseline 51.00 → **−3.14 % ± 0.6 % (1 σ)**. The architectural win
+is real, not seed luck.
+
+**(2) TinyStories test** — held up at smaller scale.
+
+Sparse @30L on TinyStories: 5.56 vs DN 5.65 → **−1.6 %**. Smaller delta
+than on code (consistent with simpler text → less depth-tracking
+demand) but **not code-specific**.
+
+**(3) Depth ablation @15L and @8L** — depth-dependent, sparse safe.
+
+| Depth | DN | Dense film | Sparse | vs DN | vs Dense |
+|-------|-----|-----------|--------|-------|----------|
+| @8L  | 54.38 | 53.57 | **52.99** | **−2.56 %** | **−1.08 %** |
+| @15L | 52.85 | 52.28 | 52.45 | −0.76 % | +0.32 % (loses) |
+| @30L | 51.00 | 51.5  | **49.40** | **−3.14 %** | **−4.07 %** |
+
+Non-monotonic but **sparse beats DN at every depth**. The single
+"weak" point is @15L vs dense single-step, where dense slightly wins
+(0.3 %) — consistent with the divergence-is-depth-dependent story:
+@15L's 36 % divergence is tolerable; @30L's 67 % is not.
+
+**Practical reading:** sparse 1-pair is the safer choice — it's
+either competitive or strictly better than dense across all tested
+depths. Dense single-step's @15L sweet spot doesn't generalize.
+
+**(4) Sparse-pair design ablation** — currently running:
+   - `(28, 2)` reverse direction at @30L (does direction matter?)
+   - `(5, 28)` target-position shift at @30L (does early-target matter?)
+   - Pending: `(2, 25)` source-position shift, multi-pair patterns.
+
+Once the design ablation completes, we'll know which design choices
+load-bear, then proceed to scaling — distillation from
+Qwen2.5-Coder-1.5B into a sparse-feedback DeltaNet backbone, or
+direct scale-up to 350-500M / 10-20B tokens.
 
 ## Phase 13 — Overnight ablation: Dyck + code-PPL ratio sweep
 

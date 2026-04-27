@@ -57,6 +57,7 @@ def build_model_from_ckpt(ckpt_path: str):
         d_head=cfg["d_head"], max_T=0,
         feedback_mode=cfg.get("feedback_mode", "none"),
         feedback_distances=tuple(cfg.get("feedback_distances", (1,))),
+        feedback_pairs=tuple(cfg.get("feedback_pairs", ()) or ()),
         **attn_kw,
     )
     # Backward-compat: old single-scale film checkpoints saved keys as

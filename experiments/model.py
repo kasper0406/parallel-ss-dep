@@ -197,6 +197,8 @@ class TinyLM(nn.Module):
         aux_dim: int = 0,                     # 0 = no aux head
         feedback_mode: str = "none",          # none / additive / film / predictive
         feedback_distances: tuple[int, ...] = (1,),  # multi-scale top-down
+        feedback_pairs: tuple = (),           # sparse (target_L, source_L) pairs;
+                                              # if non-empty overrides distances
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -232,14 +234,26 @@ class TinyLM(nn.Module):
         if aux_dim > 0:
             self.aux_head = nn.Linear(d_model, aux_dim, bias=True)
 
-        # Cross-layer top-down feedback. One MultiScaleFeedbackProjection
-        # per layer. With distances=(1,) this degrades to the single-step
-        # variant (FeedbackProjection wrapped in a 1-element ModuleList).
-        # With distances=(1,2,4,8,16) layer L sees pass-1 outputs from
-        # layers {L+d for d in distances} (shifted right by 1).
+        # Cross-layer top-down feedback. Two modes:
+        # (a) Dense (default): one MultiScaleFeedbackProjection per layer
+        #     with `feedback_distances` covering nearby layers above.
+        # (b) Sparse: only specific (target, source) pairs get feedback.
+        #     Used to test "high-level layer modulates one early layer"
+        #     hypothesis — fewer connections = less compounding divergence
+        #     and tiny param overhead.
         self.feedback_mode = feedback_mode
         self.feedback_distances = tuple(feedback_distances)
-        if feedback_mode != "none":
+        self.feedback_pairs = tuple((int(t), int(s)) for t, s in feedback_pairs)
+        if feedback_mode != "none" and self.feedback_pairs:
+            # Sparse mode — one FeedbackProjection per (target, source) pair,
+            # indexed by target layer string for ModuleDict.
+            self.sparse_feedback = nn.ModuleDict({
+                str(t): FeedbackProjection(d_model, mode=feedback_mode)
+                for t, _ in self.feedback_pairs
+            })
+            # Inverse map: target_layer -> source_layer (for fast lookup).
+            self.sparse_target_to_source = {t: s for t, s in self.feedback_pairs}
+        elif feedback_mode != "none":
             self.feedback = nn.ModuleList([
                 MultiScaleFeedbackProjection(
                     d_model, mode=feedback_mode,
@@ -262,6 +276,31 @@ class TinyLM(nn.Module):
             for blk in self.blocks:
                 x = blk(x, input_ids=input_ids)
             h = self.out_norm(x)
+            lm_logits = self.lm_head(h)
+            if return_aux and self.aux_dim > 0:
+                return lm_logits, self.aux_head(h)
+            return lm_logits
+
+        # Sparse-pair feedback: only specific target layers receive feedback
+        # from specific source layers. Avoids compounding divergence.
+        if self.feedback_pairs:
+            # Pass 1: vanilla, collect outputs only at source layers.
+            source_layers = set(s for _, s in self.feedback_pairs)
+            pass1_at_sources: dict = {}
+            h1 = x
+            for L, blk in enumerate(self.blocks):
+                h1 = blk(h1, input_ids=input_ids)
+                if L in source_layers:
+                    pass1_at_sources[L] = h1
+            # Pass 2: forward with sparse modulation at target layers.
+            h = x
+            for L, blk in enumerate(self.blocks):
+                if L in self.sparse_target_to_source:
+                    src = self.sparse_target_to_source[L]
+                    state_above_lagged = _shift_right_by_1(pass1_at_sources[src])
+                    h = self.sparse_feedback[str(L)](h, state_above_lagged)
+                h = blk(h, input_ids=input_ids)
+            h = self.out_norm(h)
             lm_logits = self.lm_head(h)
             if return_aux and self.aux_dim > 0:
                 return lm_logits, self.aux_head(h)
@@ -323,16 +362,18 @@ class TinyLM(nn.Module):
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def feedback_alphas(self) -> list[float] | list[list[float]]:
-        """Return current per-layer α values.
-
-        For single-distance feedback (distances=(1,)), returns a flat list
-        of n_layers floats (one α per layer).
-        For multi-scale, returns list of n_layers lists, each with K floats
-        (one α per distance per layer).
+    def feedback_alphas(self) -> list:
+        """Return current α values. Format depends on mode:
+        - sparse: list of (target, source, alpha) triples.
+        - dense single: flat list of n_layers floats.
+        - dense multi: list of n_layers lists.
+        - none: empty list.
         """
         if self.feedback_mode == "none":
             return []
+        if self.feedback_pairs:
+            return [(t, s, float(self.sparse_feedback[str(t)].alpha.detach().item()))
+                    for t, s in self.feedback_pairs]
         if len(self.feedback_distances) == 1:
             return [float(fb.projs[0].alpha.detach().item())
                     for fb in self.feedback]
@@ -341,7 +382,12 @@ class TinyLM(nn.Module):
 
     def freeze_alpha(self) -> None:
         """Diagnostic: lock α at 0 across all layers (no active feedback)."""
-        if self.feedback_mode != "none":
+        if self.feedback_mode == "none":
+            return
+        if self.feedback_pairs:
+            for proj in self.sparse_feedback.values():
+                proj.freeze_alpha = True
+        else:
             for fb in self.feedback:
                 for p in fb.projs:
                     p.freeze_alpha = True

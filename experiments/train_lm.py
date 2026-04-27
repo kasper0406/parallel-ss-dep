@@ -189,6 +189,12 @@ def main():
                    help="Comma-separated distances for multi-scale top-down "
                         "feedback. '1' = single-step (default), "
                         "'1,2,4,8,16' = exponential reach.")
+    p.add_argument("--feedback_pairs", type=str, default="",
+                   help="Sparse (target,source) feedback connections; "
+                        "semicolon-separated. E.g. '2,28;3,27' means "
+                        "layer 2's input gets feedback from layer 28, "
+                        "and layer 3's input gets feedback from layer 27. "
+                        "If non-empty, overrides --feedback_distances.")
     p.add_argument("--layers", type=str, default=None,
                    help="explicit comma-separated layer arch list, "
                         "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
@@ -268,10 +274,17 @@ def main():
         n_layers_actual = args.n_layers
     aux_dim = (args.aux_max_depth + 1) if args.aux_brackets else 0
     fb_distances = tuple(int(d) for d in args.feedback_distances.split(",") if d)
+    fb_pairs = ()
+    if args.feedback_pairs:
+        fb_pairs = tuple(
+            tuple(int(x) for x in pair.split(","))
+            for pair in args.feedback_pairs.split(";") if pair
+        )
     model = TinyLM(
         vocab_size=tok.vocab_size, d_model=args.d_model, n_layers=n_layers_actual,
         n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim,
         feedback_mode=args.feedback, feedback_distances=fb_distances,
+        feedback_pairs=fb_pairs,
         **attn_kw,
     ).to("cuda")
     if args.freeze_alpha and args.feedback != "none":
@@ -348,8 +361,15 @@ def main():
                     f"{scheduler.get_last_lr()[0]:>9.2e}")
             if args.feedback != "none":
                 alphas = model.feedback_alphas()
-                if alphas and isinstance(alphas[0], list):
-                    # Multi-scale: print max |α| per layer for compactness.
+                if not alphas:
+                    pass
+                elif isinstance(alphas[0], tuple):
+                    # Sparse: list of (target, source, alpha) triples.
+                    line += "  α=[" + ",".join(
+                        f"{t}<-{s}:{a:+.3f}" for t, s, a in alphas
+                    ) + "]"
+                elif isinstance(alphas[0], list):
+                    # Dense multi-scale: max |α| per layer.
                     summary = [max(abs(a) for a in row) for row in alphas]
                     line += f"  max|α|=[{','.join(f'{a:.3f}' for a in summary)}]"
                 else:
@@ -390,6 +410,7 @@ def main():
                 "d_head": args.d_head, "n_layers": n_layers_actual,
                 "max_T": args.T, "feedback_mode": args.feedback,
                 "feedback_distances": fb_distances,
+                "feedback_pairs": fb_pairs,
                 "arch": args.arch, "layers_spec": args.layers,
                 "n_symbols": args.n_symbols,
                 "tokenizer": args.tokenizer,

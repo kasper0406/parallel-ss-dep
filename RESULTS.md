@@ -540,6 +540,109 @@ The clean compositions that succeed are:
 - **Hybrid layer stacks**: alternate ortho-style layers (parity) and
   DeltaNet-style layers (recall). Engineering, not single-cell novelty.
 
+## Phase 14 — Sparse far-distance top-down feedback (the architectural win)
+
+After Phase 13's hybrid ratio result, a long sequence of architectural
+exploration through 2026-04-26/27 (full session log in
+[`SESSION_FINDINGS.md`](SESSION_FINDINGS.md)) tested:
+
+- Symbol-grounded scan (sparse identifier table state)
+- Multi-pass parallel scans (delta + heisenberg in parallel)
+- Bracket-depth aux objective
+- Cross-layer top-down feedback (single-step dense, multi-scale dense, predictive)
+
+The cleanest empirical winner is **sparse far-distance cross-layer
+top-down feedback**.
+
+### Setup
+
+`MultiScaleFeedbackProjection` ([`experiments/model.py`](experiments/model.py))
+provides cross-layer FiLM-style modulation in a 2-pass forward:
+
+- Pass 1: vanilla forward, collect each layer's output.
+- Pass 2: at each *target* layer, modulate the input by a projection
+  of the corresponding *source* layer's pass-1 output, shifted right
+  by 1 along T (the t-1 lag preserves parallel-scan friendliness).
+
+`feedback_pairs=[(target, source), …]` enumerates which connections
+are active. A single pair `(2, 28)` means: layer 2's input is FiLM-
+modulated by layer 28's pass-1 output (lagged by 1).
+
+### Result @30L 135M-class on Python code (T=512, 5K AdamW steps)
+
+| Variant | Params | Val PPL | Δ vs DN @30L |
+|---------|--------|---------|---------------|
+| DN @30L (baseline) | 216M | 51.00 | — |
+| film @30L (single-step dense, L←L+1 every layer) | 236M (+9 %) | 50.75 | −0.5 % |
+| film_multi @30L (5-distance dense, every layer) | 316M (+46 %) | 50.22 | −1.5 % |
+| film_multi @18L (param-matched dense) | 212M | 51.89 | +1.7 % |
+| film_multi @30L d=512 (width-matched dense) | 255M | 53.13 | +4.2 % |
+| **Sparse 1-pair (2←28)** | **217M (+0.3 %)** | **49.23** | **−3.5 %** ⭐ |
+| Sparse 2-pair (2←29, 3←28) | 218M (+0.6 %) | 50.04 | −1.9 % |
+
+**Sparse 1-pair is the only configuration that wins at param parity.**
+Dense variants either lose to DN at param parity or only "win" via
++46 % extra params (param-matched dense lost outright).
+
+### Extrapolation: gap holds across 16× context
+
+Same models evaluated at longer context than trained:
+
+| T | DN @30L | Sparse 1-pair | Δ |
+|---|---------|---------------|---|
+| 512 (training) | 64.47 | 61.21 | −5.1 % |
+| 1024 | 71.49 | 68.23 | −4.6 % |
+| 2048 | 56.81 | 54.79 | −3.6 % |
+| 4096 | 55.80 | 53.40 | −4.3 % |
+| 8192 (16× extrap) | 44.08 | 42.20 | **−4.3 %** |
+
+Stable −3.6 to −5.1 % advantage at every context length, at param parity.
+
+### Mechanism (probe data)
+
+A diagnostic probe ([`experiments/probe_feedback.py`](experiments/probe_feedback.py))
+measured pass-2-vs-pass-1 layer-output divergence on each variant:
+
+- Dense single-step @15L: 36 % divergence (avg over 15 layers)
+- Dense single-step @30L: 67 % divergence — **doubles with depth**
+- Dense multi-scale @30L: 73 % — even worse
+- Sparse 1-pair @30L: only modulates layer 2, divergence stays minimal
+
+The dense variants suffer **compounding-divergence**: each layer's
+small modulation accumulates through depth, so by the top of a 30-layer
+stack pass-2 is ~70 % different from pass-1. Pass-1 (the feedback
+signal source) becomes a different model than pass-2 (the LM-head
+predictor) — a self-distillation mismatch.
+
+Sparse 1-pair sidesteps this entirely: only one layer is modulated,
+no compounding. The far-distance reach (layer 28 → layer 2) carries
+the actual useful signal — the predictive-coding pattern of high-level
+context modulating low-level processing.
+
+### Why this is the architectural win
+
+- **Param-fair**: +0.3 % params, beats every dense variant including
+  the +46 %-param multi-scale.
+- **Compute-fair**: 2-pass forward costs the same as dense feedback.
+- **Robust to extrapolation**: stable advantage at 16× training T.
+- **Mechanistically clean**: avoids compounding-divergence; matches
+  predictive-coding lineage (Rao & Ballard 1999 → Wen 2018 → Ali &
+  Kietzmann 2022) translated to autoregressive linear-RNN LMs.
+- **Implementation-light**: a single `FeedbackProjection` (~660 K
+  params at d=576), one extra `_shift_right_by_1` per training step.
+
+### Concrete next steps before scaling (per `NEXT_DIRECTIONS.md`)
+
+1. 3-seed reproducibility at @30L (confirm −3.5 % isn't seed luck).
+2. TinyStories test (is the win code-specific or general?).
+3. Depth ablation @15L and @8L (dense pattern suggests bigger wins
+   at constrained depth).
+4. Sparse-pair design ablation (which target/source positions matter?
+   reverse direction? multi-pair patterns?).
+5. If all positive: distillation experiment from Qwen2.5-Coder-1.5B
+   into a sparse-feedback DeltaNet backbone, or direct scale-up to
+   350-500M / 10-20B tokens.
+
 ## Phase 13 — Overnight ablation: Dyck + code-PPL ratio sweep
 
 Per the plan to assess hybrid for **coding-relevant LM tasks**, ran two

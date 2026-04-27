@@ -1,7 +1,66 @@
 # NEXT_DIRECTIONS.md
 
-Strategy for breaking past the T=128 parity wall, gated by **two
-constraints that interact**:
+## Current focus (2026-04-27): scaling sparse far-distance feedback
+
+After the architectural exploration logged in
+[`SESSION_FINDINGS.md`](SESSION_FINDINGS.md) and
+[`RESULTS.md`](RESULTS.md) Phase 14, the project's most defensible
+architectural finding is **sparse far-distance cross-layer top-down
+feedback**. A single `(target=2, source=28)` connection in a 30-layer
+DeltaNet stack gives:
+
+- **−3.5 % PPL vs DN @30L** at +0.3 % params on Python code (T=512)
+- **Stable −3.6 to −5.1 %** advantage from training T=512 to T=8192
+  (16× extrapolation)
+- Survives both param-matched (depth-reduced) and width-matched
+  (d_model-reduced) controlled comparisons
+- Mechanistically explained by avoiding the compounding pass-2-vs-
+  pass-1 divergence that defeats dense feedback variants (probe data
+  in [`experiments/probe_feedback.py`](experiments/probe_feedback.py))
+
+### Roadmap for scaling (in order)
+
+1. **3-seed reproducibility at @30L** — confirm the −3.5 % isn't
+   single-seed luck. ~15 h on 2× RTX 5090 (3 seeds in parallel pairs).
+2. **TinyStories test** — does the win hold on natural text or is it
+   code-specific? ~1 h.
+3. **Depth ablation @15L and @8L** — dense feedback gave bigger wins
+   at constrained depth; sparse may follow the same pattern. ~6 h.
+4. **Sparse-pair design ablation** — which target/source positions
+   actually matter? Try (5, 28), (2, 25), reverse-direction (28, 2),
+   multi-pair patterns. ~10 h, 2-3 variants.
+5. **Conditional on the above being positive**: pick one of two
+   scaling paths:
+   - **Direct training**: 350-500 M / 10-20 B tokens / 1-2 weeks on
+     2× 5090. Builds a real coder model with the sparse-feedback
+     architecture.
+   - **Distillation track**: LoLCATs/HALO from Qwen2.5-Coder-1.5 B
+     into a sparse-feedback DeltaNet backbone. ~3 GPU-weeks per
+     Agent 07 of the brainstorm, higher-confidence path to a
+     HumanEval-capable coder.
+
+### What this supersedes
+
+The Grazzi-clean-cell exploration (below) was the project's original
+2026-04 strategy. Several of those candidates were tested at small
+scale and either tied with DeltaNet or required non-trivial
+infrastructure not worth the engineering vs picking a known-strong
+cell + the new sparse-feedback inductive bias on top. The architectural
+emphasis has shifted from "design a better cell" to "design better
+information flow between cells," which the sparse-feedback finding
+empirically validates.
+
+The cell-level work (Heisenberg/RotConj/RotDelta/SO(n)/multi-pass)
+remains the documented architectural-decomposition story
+(`README.md` headline findings 1-8). Sparse far-distance feedback
+(headline finding 9) is the current actionable scaling target.
+
+---
+
+## Historical strategy (kept for context — superseded by the sparse-feedback finding above)
+
+The earlier framing was: break past the T=128 parity wall, gated by
+**two constraints that interact**:
 
 1. **Grazzi et al. ICLR'25** ([2411.12537](https://arxiv.org/abs/2411.12537)) —
    any linear RNN with transition spectrum in `[0, 1]^d` is stuck in TC⁰

@@ -84,6 +84,21 @@ clean diagnostic decomposition of why the dominant architectures
    DeltaNet wall-clock at the 25/75 ratio (was 14.5× before fixes
    and 1.74× at 50/50). 135M distillation from a coding teacher is
    now genuinely feasible.
+
+9. **Sparse far-distance top-down feedback wins at param parity AND
+   across 16× context extrapolation** (`SESSION_FINDINGS.md`,
+   `RESULTS.md` Phase 14). One sparse cross-layer connection
+   (layer 2 ← layer 28 in a 30-layer stack) gives **−3.5% PPL vs
+   pure DeltaNet @30L** on Python code at 135M-class params, with
+   only **+0.3% extra parameters**. The advantage holds at every T
+   from 512 (training) to 8192 (16× extrapolation) at 4-5%
+   improvement. Mechanistically clean: avoids the compounding-
+   divergence problem that defeats dense multi-scale variants
+   (which only "won" via +46% extra params and lost at param
+   parity). The cleanest novel architectural contribution of the
+   project — a depth-aware predictive-coding-style inductive bias
+   for linear-RNN coding LMs that survives every controlled
+   comparison and extends naturally to long context.
 4. The hybrid finding gives the empirical rank-ordering on parity:
    linear / heisenberg (✗ TC⁰) → DeltaNet default (T=128 only) → ortho
    / hybrid (T=512). And on recall: linear / ortho / rotconj / rotdelta
@@ -307,25 +322,37 @@ python experiments/train_hybrid.py --task parity    --layers ortho,deltanet,orth
 
 ## What's next
 
-The mechanistic-decomposition story leaves four concrete tasks:
+After the sparse far-distance feedback finding (headline #9), the
+project's research focus has shifted to **scaling and validating that
+specific architectural prior**, since it survives every controlled
+test (param-matched, width-matched, 16× extrapolation):
 
-1. **Modular counting (mod 3, 5, 7) experiment.** The single sharpest
-   prediction of our framing: `Z_p ⊂ SO(2)` for any p (rotation by 2π/p),
-   so SO(n)-scan and our hybrid solve any modular counting; DeltaNet
-   even with `allow_neg_eigval=True` only reaches `Z_2`. Likely the
-   cleanest separator from DeltaProduct as well (its Householder
-   eigenvalues are `±1` only).
-2. **S₅ word problem.** Tests *non-solvable* state-tracking. SO(n) for
-   n≥3 contains A₅ in principle; the question is whether SGD finds the
-   non-abelian rotations. DeltaProduct has the cleanest published
-   numbers here (NeurIPS 2025); we'd compare directly.
-3. **Lean: incompatibility theorem.** Formalise *"two-sided rotation
+1. **3-seed reproducibility** for sparse 1-pair (2←28) at @30L on
+   Python code. Confirms the −3.5% PPL win isn't single-seed luck.
+   ~15h compute on 2× RTX 5090 (3 seeds in parallel pairs).
+2. **TinyStories sanity** — does the win hold on natural text or is
+   it code-specific? Pattern from dense feedback says code-specific;
+   sparse may behave differently.
+3. **Depth ablation** — sparse 1-pair at @15L and @8L. Pattern
+   from dense suggests bigger wins at constrained depth.
+4. **Sparse-pair design ablation** — try (5, 28), (2, 25), reverse
+   direction (28, 2), and 3-pair variants. Helps identify which
+   target/source positions actually matter.
+5. **Scaling** — once #1-4 confirm: either direct scale-up to
+   350-500M / 10-20B tokens (1-2 weeks on 2× 5090) or
+   distillation track from Qwen2.5-Coder-1.5B with sparse-feedback
+   backbone (~3 GPU-weeks).
+
+Earlier directions still relevant for future work:
+
+6. **S₅ word problem** at long T — tests *non-solvable*
+   state-tracking. SO(n) for n≥3 contains A₅ in principle; SGD-
+   findability is open. DeltaProduct has the cleanest published
+   numbers here (NeurIPS 2025); a direct comparison would slot in.
+7. **Lean: incompatibility theorem.** Formalise *"two-sided rotation
    conjugation cannot host both Grazzi-clean spectrum and a fixed-frame
    recall basis simultaneously"* in Lean. New module
    `IncompatibilityTheorem.lean`.
-4. **SmolLM2-135M distillation** with hybrid layer stack (per
-   [`EVAL_PLAN.md`](EVAL_PLAN.md) §3.3). Stretches the result beyond
-   synthetics.
 
 [grazzi]: https://arxiv.org/abs/2411.12537
 [zoology]: https://arxiv.org/abs/2312.04927

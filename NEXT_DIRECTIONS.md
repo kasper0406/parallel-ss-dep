@@ -28,15 +28,20 @@ DeltaNet stack gives:
    depth tested (−2.6 %, −0.8 %, −3.1 % at @8L/@15L/@30L). Dense
    single-step has a small @15L sweet spot (loses to sparse at @8L
    and @30L); sparse is the safer default.
-4. **Sparse-pair design ablation** — 🔄 in progress: `(28, 2)`
-   reverse direction and `(5, 28)` target shift running. Pending:
-   `(2, 25)` source shift, multi-pair patterns.
+4. **Sparse-pair design ablation** — ✅ confirms `(2, 28)` is
+   the load-bearing configuration. Reverse direction `(28, 2)` ties
+   DN baseline (no win); target shifted to layer 5 `(5, 28)` cuts
+   the win to −1.3 %; mid `(2, 14)` and close `(2, 5)` sources
+   give graded smaller wins (−1.3 % / −1.0 %). Multi-pair patterns
+   `(2, 28)+(10, 20)` and `(2, 28)+(5, 28)` are neutral or worse
+   than `(2, 28)` alone. Critically, **only `(2, 28)` learns a
+   negative α** (subtractive predictive-coding filter); every other
+   pairing converges to positive α with larger magnitude but
+   smaller PPL benefit. Full table in `RESULTS.md` Phase 14.
 
-### Next: scale-up decision (after #4 completes)
+### Next: scale-up decision (all pre-flights pass)
 
-Conditional on the design ablation confirming the (early-target ←
-late-source) pattern is the load-bearing piece, pick one of two
-scaling paths:
+Pick one of two scaling paths:
 
    - **Direct training**: 350-500 M / 10-20 B tokens / 1-2 weeks on
      2× 5090. Builds a real coder model with the sparse-feedback

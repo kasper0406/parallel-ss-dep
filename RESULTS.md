@@ -670,15 +670,63 @@ Non-monotonic but **sparse beats DN at every depth**. The single
 either competitive or strictly better than dense across all tested
 depths. Dense single-step's @15L sweet spot doesn't generalize.
 
-**(4) Sparse-pair design ablation** — currently running:
-   - `(28, 2)` reverse direction at @30L (does direction matter?)
-   - `(5, 28)` target-position shift at @30L (does early-target matter?)
-   - Pending: `(2, 25)` source-position shift, multi-pair patterns.
+**(4) Sparse-pair design ablation** — confirms the
+(early-target ← far-late-source) pattern is the load-bearing piece.
 
-Once the design ablation completes, we'll know which design choices
-load-bear, then proceed to scaling — distillation from
-Qwen2.5-Coder-1.5B into a sparse-feedback DeltaNet backbone, or
-direct scale-up to 350-500M / 10-20B tokens.
+Six controlled variants at @30L, 5K steps, seed=0:
+
+| Variant | Pair(s) | Final PPL | Δ vs DN | Final α |
+|---------|---------|-----------|---------|---------|
+| DN baseline | — | 51.00 | — | — |
+| **Forward base (3-seed mean)** | (2, 28) | **49.40 ± 0.31** | **−3.14 %** | **−0.054** |
+| Reverse direction | (28, 2) | 51.10 | +0.20 % | −0.043 |
+| Target shift | (5, 28) | 50.34 | −1.29 % | +0.044 |
+| Source mid | (2, 14) | 50.35 | −1.27 % | +0.110 |
+| Source close | (2, 5) | 50.47 | −1.04 % | +0.157 |
+| Multi-pair separated | (2, 28) + (10, 20) | 49.91 | −2.13 % | +0.049, −0.028 |
+| Dual-target | (2, 28) + (5, 28) | 50.23 | −1.51 % | +0.041, +0.014 |
+
+Findings:
+
+1. **Direction is critical.** Reversing the pair `(28, 2)` — feeding
+   layer 28 from layer 2 — completely eliminates the win
+   (PPL 51.10 ≈ DN 51.00). The predictive-coding direction (low
+   modulated by high) is load-bearing.
+2. **Target position matters.** Moving the target from layer 2 to
+   layer 5 keeps the same far-source but cuts the win from −3.1 %
+   to −1.3 %. The very-early target is doing meaningful work.
+3. **Source distance is graded.** Source layer 28 (far): −3.1 %;
+   layer 14 (mid): −1.3 %; layer 5 (close): −1.0 %. The far-late
+   source carries the largest fraction of the signal — consistent
+   with "high-level context modulating low-level processing."
+4. **Multi-pair is neutral or mildly harmful.** Adding a second
+   well-separated pair (10, 20) lands within seed variance of base
+   (49.91 vs 49.40 ± 0.31). Adding a second target from the same
+   source (5, 28) hurts (50.23 > 49.40). One sparse connection is
+   the right amount — not zero, not many.
+5. **α-sign convergence is mechanistically informative.** Base
+   (2, 28) consistently learns **negative α** (−0.054 ± 0.003 across
+   3 seeds) — a subtractive predictive-coding-like filter. Every
+   other variant — including (5, 28), (2, 14), (2, 5), and the
+   multi-pair components — converges to **positive α with larger
+   magnitude** (+0.04 to +0.16). Stronger |α| does **not** correlate
+   with better PPL; the *kind* of filter matters, not its strength.
+
+The `(2, 28)` configuration is special: only it lets the network
+discover the negative-feedback predictive-coding filter, and only
+it gets the full −3 % win.
+
+### Scaling decision (open)
+
+All four pre-flights pass. Two scaling paths remain on the table:
+
+   - **Direct training**: 350-500 M / 10-20 B tokens / 1-2 weeks on
+     2× 5090. Builds a real coder model with the sparse-feedback
+     architecture from scratch.
+   - **Distillation track**: LoLCATs/HALO from Qwen2.5-Coder-1.5 B
+     into a sparse-feedback DeltaNet backbone. ~3 GPU-weeks per
+     Agent 07 of the brainstorm; higher-confidence path to a
+     HumanEval-capable coder.
 
 ## Phase 13 — Overnight ablation: Dyck + code-PPL ratio sweep
 

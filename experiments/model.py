@@ -198,6 +198,108 @@ class MultiSourceFiLMFeedbackMLP(nn.Module):
         return x * (1.0 + a * scale) + a * shift
 
 
+class MultiSourceFiLMTargetGated(nn.Module):
+    """Target-gated cross-layer feedback (no Q-K-V attention).
+
+    For each source layer i, the TARGET's hidden state x produces a
+    per-channel gate (via SwiGLU on a wide projection), and the SOURCE's
+    hidden state provides values:
+
+        gate_i  = silu(W_gate_i(x))            # from target, what to keep
+        value_i = W_value_i(source_i_lagged)   # from source, what's there
+        contribution_i_scale = gate_i_scale ⊙ value_i_scale
+        contribution_i_shift = gate_i_shift ⊙ value_i_shift
+
+    Sum across sources, apply multiplicatively as FiLM.
+
+    Differences from previously tested forms:
+      - vs film_sum:      gating depends on target (per-token routing)
+      - vs film_sum_glu:  gate is from TARGET, value is from SOURCE
+                          (vs both from source, which failed)
+      - vs sigmoid attn:  no Q-K dot product; per-channel gate directly
+                          from target's projection (more expressive than
+                          one scalar gate per source).
+    """
+
+    def __init__(self, d_model: int, n_sources: int):
+        super().__init__()
+        self.n_sources = n_sources
+        # Per source: target → 2d (gate_scale | gate_shift)
+        #             source → 2d (value_scale | value_shift)
+        self.W_target_gates = nn.ModuleList([
+            nn.Linear(d_model, 2 * d_model, bias=False) for _ in range(n_sources)
+        ])
+        self.W_source_values = nn.ModuleList([
+            nn.Linear(d_model, 2 * d_model, bias=False) for _ in range(n_sources)
+        ])
+        for m in [*self.W_target_gates, *self.W_source_values]:
+            nn.init.normal_(m.weight, std=1.0 / math.sqrt(d_model))
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.freeze_alpha = False
+
+    def get_alpha(self) -> torch.Tensor:
+        return torch.zeros_like(self.alpha) if self.freeze_alpha else self.alpha
+
+    def forward(self, x: torch.Tensor,
+                source_states_lagged: list) -> torch.Tensor:
+        scale_acc = x.new_zeros(x.shape)
+        shift_acc = x.new_zeros(x.shape)
+        for Wg, Wv, src in zip(self.W_target_gates, self.W_source_values,
+                                source_states_lagged):
+            gate = Wg(x)             # (B, T, 2d) per-channel target-side gate
+            value = Wv(src)          # (B, T, 2d) per-channel source value
+            g_scale, g_shift = gate.chunk(2, dim=-1)
+            v_scale, v_shift = value.chunk(2, dim=-1)
+            scale_acc = scale_acc + F.silu(g_scale) * v_scale
+            shift_acc = shift_acc + F.silu(g_shift) * v_shift
+        a = self.get_alpha()
+        return x * (1.0 + a * scale_acc) + a * shift_acc
+
+
+class MultiSourceFiLMFeedbackGLU(nn.Module):
+    """Multi-source FiLM-sum with SwiGLU-style per-channel gating.
+
+    Per source, project to 4·d_model and split into
+        [scale_value | scale_gate | shift_value | shift_gate]
+    then per-channel gate: v ⊙ silu(g). Sum across sources, then
+    apply multiplicatively as in FiLM:
+        x_out = x · (1 + α · scale) + α · shift
+
+    Differs from `film_sum_mlp` in *what* the nonlinearity is —
+    multiplicative gating (GLU) instead of additive nonlinearity
+    (Linear-GELU-Linear). Tests the hypothesis that the source
+    state has channel-dependent reliability that linear projections
+    can't express but per-channel gates can.
+    """
+
+    def __init__(self, d_model: int, n_sources: int):
+        super().__init__()
+        self.n_sources = n_sources
+        # One 4·d output projection per source: [s_v | s_g | h_v | h_g].
+        self.projs = nn.ModuleList([
+            nn.Linear(d_model, 4 * d_model, bias=False) for _ in range(n_sources)
+        ])
+        for m in self.projs:
+            nn.init.normal_(m.weight, std=1.0 / math.sqrt(d_model))
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.freeze_alpha = False
+
+    def get_alpha(self) -> torch.Tensor:
+        return torch.zeros_like(self.alpha) if self.freeze_alpha else self.alpha
+
+    def forward(self, x: torch.Tensor,
+                source_states_lagged: list) -> torch.Tensor:
+        scale_acc = x.new_zeros(x.shape)
+        shift_acc = x.new_zeros(x.shape)
+        for proj, src in zip(self.projs, source_states_lagged):
+            mix = proj(src)
+            sv, sg, hv, hg = mix.chunk(4, dim=-1)
+            scale_acc = scale_acc + sv * F.silu(sg)
+            shift_acc = shift_acc + hv * F.silu(hg)
+        a = self.get_alpha()
+        return x * (1.0 + a * scale_acc) + a * shift_acc
+
+
 class MultiSourceFiLMFeedback(nn.Module):
     """Multi-source FiLM with summed contributions (no softmax routing).
 
@@ -396,6 +498,98 @@ class SigmoidGatedFiLMAttentionFeedback(nn.Module):
         return x * (1.0 + a * scale) + a * shift
 
 
+class AllToAllSigmoidFeedback(nn.Module):
+    """All-to-all sigmoid-gated FiLM cross-layer attention with parameter
+    sharing across targets and sources.
+
+    Every target layer can attend over every later (or earlier — caller
+    decides) source layer with an independent sigmoid gate. To keep param
+    count tractable, projections are shared by role:
+      - per-target:   q_proj, alpha, out_proj_scale, out_proj_shift
+      - per-source:   k_proj, W_scale, W_shift   (shared across all targets
+                                                  that read this source)
+
+    Total params ≈ n_layers · 4·d² + n_layers · 3·d²  =  7·n_layers·d²
+    (vs naive (target,source) — quadratic in n_layers and prohibitive).
+
+    The user passes a target_to_sources mapping. For Idea 2 ("every layer
+    attends over every later layer") that mapping is
+        {L: [L+1, L+2, …, n_layers-1] for L in 0..n_layers-2}
+    """
+
+    def __init__(self, d_model: int, target_to_sources: dict,
+                 n_heads: int = 4, d_head: int | None = None):
+        super().__init__()
+        if d_head is None:
+            d_head = d_model // n_heads
+        assert n_heads * d_head == d_model
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.scale_qk = d_head ** -0.5
+        self.target_to_sources = {int(t): [int(s) for s in srcs]
+                                  for t, srcs in target_to_sources.items()}
+        # Union of source layers (anyone needs them).
+        all_sources = sorted({s for srcs in self.target_to_sources.values() for s in srcs})
+        all_targets = sorted(self.target_to_sources.keys())
+        self.all_sources = all_sources
+        self.all_targets = all_targets
+        # Per-target projections (Q, out_scale, out_shift, alpha).
+        self.q_projs = nn.ModuleDict({
+            str(t): nn.Linear(d_model, d_model, bias=False) for t in all_targets
+        })
+        self.out_proj_scales = nn.ModuleDict({
+            str(t): nn.Linear(d_model, d_model, bias=False) for t in all_targets
+        })
+        self.out_proj_shifts = nn.ModuleDict({
+            str(t): nn.Linear(d_model, d_model, bias=False) for t in all_targets
+        })
+        self.alphas = nn.ParameterDict({
+            str(t): nn.Parameter(torch.zeros(1)) for t in all_targets
+        })
+        # Per-source projections (K, W_scale, W_shift) — shared across targets.
+        self.k_projs_src = nn.ModuleDict({
+            str(s): nn.Linear(d_model, d_model, bias=False) for s in all_sources
+        })
+        self.W_scales_src = nn.ModuleDict({
+            str(s): nn.Linear(d_model, d_model, bias=False) for s in all_sources
+        })
+        self.W_shifts_src = nn.ModuleDict({
+            str(s): nn.Linear(d_model, d_model, bias=False) for s in all_sources
+        })
+        for m in [*self.q_projs.values(), *self.out_proj_scales.values(),
+                  *self.out_proj_shifts.values(), *self.k_projs_src.values(),
+                  *self.W_scales_src.values(), *self.W_shifts_src.values()]:
+            nn.init.normal_(m.weight, std=1.0 / math.sqrt(d_model))
+        self.freeze_alpha = False
+
+    def get_alpha(self, target: int) -> torch.Tensor:
+        a = self.alphas[str(target)]
+        return torch.zeros_like(a) if self.freeze_alpha else a
+
+    def forward_at_target(self, x: torch.Tensor, target: int,
+                          pass1_at_sources: dict) -> torch.Tensor:
+        """Apply the all-to-all sigmoid feedback at one target layer."""
+        srcs = self.target_to_sources[target]
+        if not srcs:
+            return x
+        B, T, D = x.shape
+        H, Dh = self.n_heads, self.d_head
+        q = self.q_projs[str(target)](x).view(B, T, H, Dh)
+        scale_acc = x.new_zeros((B, T, D))
+        shift_acc = x.new_zeros((B, T, D))
+        for s in srcs:
+            src = pass1_at_sources[s]   # already lagged by caller
+            k = self.k_projs_src[str(s)](src).view(B, T, H, Dh)
+            score = (q * k).sum(dim=-1) * self.scale_qk        # (B, T, H)
+            g = torch.sigmoid(score).unsqueeze(-1).expand(-1, -1, -1, Dh).reshape(B, T, D)
+            scale_acc = scale_acc + g * self.W_scales_src[str(s)](src)
+            shift_acc = shift_acc + g * self.W_shifts_src[str(s)](src)
+        scale = self.out_proj_scales[str(target)](scale_acc)
+        shift = self.out_proj_shifts[str(target)](shift_acc)
+        a = self.get_alpha(target)
+        return x * (1.0 + a * scale) + a * shift
+
+
 class CrossLayerAttentionFeedback(nn.Module):
     """Cross-layer attention top-down feedback.
 
@@ -574,11 +768,24 @@ class TinyLM(nn.Module):
             (int(t), tuple(int(s) for s in srcs)) for t, srcs in feedback_xattn_pairs
         )
         self.feedback_xattn_form = feedback_xattn_form
-        if self.feedback_xattn_pairs:
-            # Cross-layer attention mode. Three forms:
-            #   attn      — additive residual via Q-K-V softmax (default)
-            #   film_sum  — multi-source FiLM, contributions summed (no softmax)
-            #   film_attn — softmax routing + multiplicative FiLM-form output
+        self.xattn_target_to_sources = {t: srcs for t, srcs in self.feedback_xattn_pairs}
+        if self.feedback_xattn_pairs and feedback_xattn_form == "all_sigmoid":
+            # Single shared module across all (target, source) pairs with
+            # parameter sharing per source layer. Used when feedback_xattn=='all'
+            # or any large-target setting where naive instantiation would
+            # explode the param count.
+            self.xattn_all_module = AllToAllSigmoidFeedback(
+                d_model=d_model,
+                target_to_sources=self.xattn_target_to_sources,
+                n_heads=feedback_xattn_heads,
+            )
+        elif self.feedback_xattn_pairs:
+            # Per-target instantiation. Used by the 1- to ~10-target cases.
+            #   attn          — additive Q-K-V softmax residual (default)
+            #   film_sum      — multi-source FiLM, contributions summed (no softmax)
+            #   film_sum_mlp  — film_sum but each W is an MLP
+            #   film_attn     — softmax routing + multiplicative FiLM-form output
+            #   film_sigmoid  — independent sigmoid gates + FiLM output
             def _make_xattn(srcs):
                 if feedback_xattn_form == "attn":
                     return CrossLayerAttentionFeedback(
@@ -591,6 +798,14 @@ class TinyLM(nn.Module):
                     )
                 if feedback_xattn_form == "film_sum_mlp":
                     return MultiSourceFiLMFeedbackMLP(
+                        d_model=d_model, n_sources=len(srcs),
+                    )
+                if feedback_xattn_form == "film_sum_glu":
+                    return MultiSourceFiLMFeedbackGLU(
+                        d_model=d_model, n_sources=len(srcs),
+                    )
+                if feedback_xattn_form == "film_target_gated":
+                    return MultiSourceFiLMTargetGated(
                         d_model=d_model, n_sources=len(srcs),
                     )
                 if feedback_xattn_form == "film_attn":
@@ -608,7 +823,6 @@ class TinyLM(nn.Module):
                 str(t): _make_xattn(srcs)
                 for t, srcs in self.feedback_xattn_pairs
             })
-            self.xattn_target_to_sources = {t: srcs for t, srcs in self.feedback_xattn_pairs}
         elif feedback_mode != "none" and self.feedback_pairs:
             # Sparse mode — one FeedbackProjection per (target, source) pair,
             # indexed by target layer string for ModuleDict.
@@ -661,13 +875,21 @@ class TinyLM(nn.Module):
                 if L in needed_sources:
                     pass1_at_sources[L] = h1
             # Pass 2: at each target layer, gather lagged source states and
-            # apply CrossLayerAttentionFeedback before the block's forward.
+            # apply the chosen feedback module before the block's forward.
             h = x
+            # Pre-compute lagged source states once.
+            lagged_pass1 = {s: _shift_right_by_1(pass1_at_sources[s])
+                            for s in needed_sources}
             for L, blk in enumerate(self.blocks):
                 if L in self.xattn_target_to_sources:
-                    srcs = self.xattn_target_to_sources[L]
-                    src_states = [_shift_right_by_1(pass1_at_sources[s]) for s in srcs]
-                    h = self.xattn_feedback[str(L)](h, src_states)
+                    if self.feedback_xattn_form == "all_sigmoid":
+                        h = self.xattn_all_module.forward_at_target(
+                            h, target=L, pass1_at_sources=lagged_pass1,
+                        )
+                    else:
+                        srcs = self.xattn_target_to_sources[L]
+                        src_states = [lagged_pass1[s] for s in srcs]
+                        h = self.xattn_feedback[str(L)](h, src_states)
                 h = blk(h, input_ids=input_ids)
             h = self.out_norm(h)
             lm_logits = self.lm_head(h)
@@ -765,6 +987,10 @@ class TinyLM(nn.Module):
         - none:    empty list.
         """
         if self.feedback_xattn_pairs:
+            if self.feedback_xattn_form == "all_sigmoid":
+                return [(t, srcs,
+                         float(self.xattn_all_module.alphas[str(t)].detach().item()))
+                        for t, srcs in self.feedback_xattn_pairs]
             return [(t, srcs, float(self.xattn_feedback[str(t)].alpha.detach().item()))
                     for t, srcs in self.feedback_xattn_pairs]
         if self.feedback_mode == "none":
@@ -781,8 +1007,11 @@ class TinyLM(nn.Module):
     def freeze_alpha(self) -> None:
         """Diagnostic: lock α at 0 across all layers (no active feedback)."""
         if self.feedback_xattn_pairs:
-            for m in self.xattn_feedback.values():
-                m.freeze_alpha = True
+            if self.feedback_xattn_form == "all_sigmoid":
+                self.xattn_all_module.freeze_alpha = True
+            else:
+                for m in self.xattn_feedback.values():
+                    m.freeze_alpha = True
             return
         if self.feedback_mode == "none":
             return

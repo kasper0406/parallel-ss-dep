@@ -870,6 +870,95 @@ the scale-up student depends on stack depth:
   scale-up exposes any single-pair limitation; both are minor code
   swaps from the existing infrastructure.
 
+### Phase 14f — Comprehensive mechanism sweep (2026-04-28)
+
+The user pushed for a thorough mechanism investigation: *why* does
+single-pair sparse FiLM win, can attention be made to work, and
+what's the actual structure of the basin? Twenty-plus controlled
+@30L variants under matched compute. The results refine the
+original "(2, 28) is the architectural win" claim into something
+more precise *and* more general.
+
+**Multi-target / distributed variants:**
+
+| Variant | Description | Final α | PPL |
+|---------|-------------|---------|------|
+| Multi-target film_sigmoid | targets [2, 5, 8] each over [14, 21, 28] | mostly α₂=−0.030, others ≈ 0 | 50.38 |
+| Distributed sparse multi-pair | (2, 28) + (4, 24) + (8, 20) | α₂=−0.042, α₄=−0.010, α₈=−0.020 | **49.44** ⭐ |
+| Graded sparse multi-pair | (2, 20) + (4, 24) + (8, 28) — same sources, opposite assignment | α(2,20)=+0.037 (POS), others NEG | 50.24 |
+| Graded sigmoid hierarchy | 2:[12,14,16]; 4:[18,20,22]; 8:[24,26,28] | α₂=+0.040 (POS), others mild NEG | 51.34 (≈ DN) |
+| All-to-all sigmoid | every layer attends over every later layer | self-sparsifies to layer 0 only | did not converge (stopped) |
+| Target-gated FiLM (no attn) | target produces SwiGLU gate, source produces value | α=−0.028 | 50.99 |
+| Source-GLU film_sum | SwiGLU on source projection (Mech-J) | α stuck at +0.002 | did not converge (stopped) |
+
+The clean Mech-L vs Mech-O comparison (same source layers
+{20, 24, 28}, opposite target assignments) confirms what the
+single-pair design ablation already implied: **the (target=2 ←
+source=28) connection is the load-bearing piece**. Adding additional
+sparse pairs is neutral when (2, 28) is preserved (Mech-L: 49.44),
+and *harmful* when (2, 28) is broken in favor of (2, 20) (Mech-O:
+50.24).
+
+**Target-position sweep (source fixed at 28):**
+
+| Target | α | PPL | Δ vs DN |
+|--------|---|-----|---------|
+| 0 | +0.054 (POS) | 50.02 | −1.9 % |
+| 0 (with src=29) | +0.053 (POS) | 50.26 | −1.5 % |
+| 1 | **−0.063 (NEG)** | 50.23 | −1.5 % |
+| **2** | **−0.054 (NEG)** | **49.40** | **−3.1 %** ⭐ |
+| **3** | **+0.049 (POS)** | **49.57** | **−2.8 %** ⭐ |
+| 5 | +0.044 (POS) | 50.34 | −1.3 % |
+
+**Two key surprises here:**
+
+1. **The sweet spot is target ∈ {2, 3}, not just {2}.** Target=3
+   is within seed variance of target=2 (49.57 vs 49.40 ± 0.31).
+   The architecture has a *2-layer-wide* useful target window, not
+   a single point.
+
+2. **Target=3 reaches comparable PPL via the additive (POS-α) basin,
+   not the predictive-coding (NEG-α) one.** This was unexpected —
+   the original story said the negative-α subtractive filter was
+   *the* mechanism. It is for layer 2; for layer 3 there is a
+   second basin that gets nearly the same gain through additive
+   feedback. The two basins are reached by slightly different
+   architectural details, and both produce comparable PPL when
+   the target has enough representation depth.
+
+   Layer 0/1 with NEG basin (50.23 / 50.26) underperforms layer 3
+   with POS basin (49.57). So **basin sign alone does not predict
+   PPL** — the *target depth* effect is independent of basin sign.
+
+**Combined mechanism summary** (all data from this round):
+
+The negative-α basin is reached when:
+1. **Output form is multiplicative** (FiLM, not Q-K-V additive residual).
+2. **Aggregation is non-softmax** (sum, sigmoid; softmax dilutes 1/K).
+3. **Target depth ∈ {2}** with `n_layers=30`. (Layer 1 also reaches
+   negative basin but with lower PPL — needs more processing.)
+4. **Source depth = 28** for that target. (Layer 29 works for layer 0
+   only because layer 0 cannot reach the negative basin anyway.)
+
+Layer 3 finds an *additive* basin that, surprisingly, achieves
+comparable PPL — meaning sparse cross-layer feedback is genuinely
+useful in a 1-2 layer-wide target window (depending on basin), with
+the original (2, 28) configuration being the cleanest variant of
+the family.
+
+**Implication for scale-up.** The architectural choice for the
+distillation student is robust:
+
+- **`(2, 28)` single-pair FiLM** stays the recommended student arch:
+  simplest, lowest-param-overhead, and uniquely lands the negative
+  predictive-coding basin.
+- **Mech-L `(2,28)+(4,24)+(8,20)`** is a no-cost upgrade-or-tie if
+  scale-up exposes a single-pair limitation — same PPL, distributed
+  feedback signal across the early stack.
+- **`(3, 28)`** is a viable backup with a different mechanism
+  (additive); useful if seed variance at scale ever moves us off
+  the negative basin.
+
 ### Scaling decision
 
 Per the architectural saturation above, the chosen scaling path is

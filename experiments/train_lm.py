@@ -209,8 +209,9 @@ def main():
     p.add_argument("--feedback_xattn_heads", type=int, default=4,
                    help="Number of heads inside the cross-layer attention.")
     p.add_argument("--feedback_xattn_form", type=str, default="attn",
-                   choices=["attn", "film_sum", "film_sum_mlp", "film_attn",
-                            "film_sigmoid"],
+                   choices=["attn", "film_sum", "film_sum_mlp", "film_sum_glu",
+                            "film_target_gated",
+                            "film_attn", "film_sigmoid", "all_sigmoid"],
                    help="Form of the cross-layer feedback module: "
                         "'attn' = additive Q-K-V softmax residual (default); "
                         "'film_sum' = multi-source FiLM, sum (no softmax); "
@@ -220,7 +221,10 @@ def main():
                         "output (lets attention learn negative-α basin); "
                         "'film_sigmoid' = sigmoid (not softmax) per-source "
                         "gates + FiLM output (no 1/K dilution, per-token "
-                        "routing preserved).")
+                        "routing preserved); "
+                        "'all_sigmoid' = all-to-all sigmoid-gated FiLM with "
+                        "shared K/W projections per source (Idea 2); pair "
+                        "with --feedback_xattn 'all_above' or 'all'.")
     p.add_argument("--layers", type=str, default=None,
                    help="explicit comma-separated layer arch list, "
                         "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
@@ -315,6 +319,13 @@ def main():
             fb_xattn_pairs = tuple(
                 (tgt, tuple(s for s in range(n_layers_actual) if s != tgt))
                 for tgt in range(n_layers_actual)
+            )
+        elif args.feedback_xattn.strip() == "all_above":
+            # Every layer attends only over LATER layers (higher indices).
+            # Last layer has no sources and is skipped.
+            fb_xattn_pairs = tuple(
+                (tgt, tuple(range(tgt + 1, n_layers_actual)))
+                for tgt in range(n_layers_actual - 1)
             )
         else:
             tmp = []

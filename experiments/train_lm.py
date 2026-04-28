@@ -197,6 +197,17 @@ def main():
                         "layer 2's input gets feedback from layer 28, "
                         "and layer 3's input gets feedback from layer 27. "
                         "If non-empty, overrides --feedback_distances.")
+    p.add_argument("--feedback_xattn", type=str, default="",
+                   help="Cross-layer attention feedback. Each target attends "
+                        "over multiple source layers' lagged hidden states. "
+                        "Syntax 'target:src1,src2,...; target2:src3,src4,...'. "
+                        "Example '2:14,21,28' = layer 2's input attends over "
+                        "layers 14, 21, 28. 'all' = every layer attends over "
+                        "every later layer (Idea 2). If non-empty, overrides "
+                        "BOTH --feedback_distances and --feedback_pairs and "
+                        "ignores --feedback (attention is its own form).")
+    p.add_argument("--feedback_xattn_heads", type=int, default=4,
+                   help="Number of heads inside the cross-layer attention.")
     p.add_argument("--layers", type=str, default=None,
                    help="explicit comma-separated layer arch list, "
                         "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
@@ -282,17 +293,47 @@ def main():
             tuple(int(x) for x in pair.split(","))
             for pair in args.feedback_pairs.split(";") if pair
         )
+    # Cross-layer attention pairs.
+    # 'all'  -> every layer attends over every layer above it.
+    # else   -> 'tgt:src1,src2; tgt2:src3,...' explicit form.
+    fb_xattn_pairs = ()
+    if args.feedback_xattn:
+        if args.feedback_xattn.strip() == "all":
+            fb_xattn_pairs = tuple(
+                (tgt, tuple(s for s in range(n_layers_actual) if s != tgt))
+                for tgt in range(n_layers_actual)
+            )
+        else:
+            tmp = []
+            for group in args.feedback_xattn.split(";"):
+                group = group.strip()
+                if not group:
+                    continue
+                target_str, src_str = group.split(":")
+                tgt = int(target_str.strip())
+                srcs = tuple(int(s) for s in src_str.split(",") if s.strip())
+                tmp.append((tgt, srcs))
+            fb_xattn_pairs = tuple(tmp)
     model = TinyLM(
         vocab_size=tok.vocab_size, d_model=args.d_model, n_layers=n_layers_actual,
         n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim,
         feedback_mode=args.feedback, feedback_distances=fb_distances,
         feedback_pairs=fb_pairs,
+        feedback_xattn_pairs=fb_xattn_pairs,
+        feedback_xattn_heads=args.feedback_xattn_heads,
         **attn_kw,
     ).to("cuda")
-    if args.freeze_alpha and args.feedback != "none":
+    if args.freeze_alpha and (args.feedback != "none" or fb_xattn_pairs):
         model.freeze_alpha()
+    if fb_xattn_pairs:
+        n_total_pairs = sum(len(srcs) for _, srcs in fb_xattn_pairs)
+        feedback_desc = (f"xattn(targets={len(fb_xattn_pairs)},"
+                         f"src-edges={n_total_pairs},"
+                         f"heads={args.feedback_xattn_heads})")
+    else:
+        feedback_desc = f"{args.feedback}@d={args.feedback_distances}"
     print(f"  params: {model.num_params() / 1e6:.1f}M  aux_dim={aux_dim}  "
-          f"feedback={args.feedback}@d={args.feedback_distances}"
+          f"feedback={feedback_desc}"
           f"{' (α frozen=0)' if args.freeze_alpha else ''}")
 
     if args.aux_brackets:
@@ -361,15 +402,24 @@ def main():
             line = (f"{step:>6d}  {tok_per_sec:>8.0f}  "
                     f"{sum(losses[-args.log_every:]) / max(1, len(losses[-args.log_every:])):>8.4f}  "
                     f"{scheduler.get_last_lr()[0]:>9.2e}")
-            if args.feedback != "none":
+            if args.feedback != "none" or fb_xattn_pairs:
                 alphas = model.feedback_alphas()
                 if not alphas:
                     pass
                 elif isinstance(alphas[0], tuple):
-                    # Sparse: list of (target, source, alpha) triples.
-                    line += "  α=[" + ",".join(
-                        f"{t}<-{s}:{a:+.3f}" for t, s, a in alphas
-                    ) + "]"
+                    # Sparse-FiLM:    (target, source_int, alpha)
+                    # Cross-attn:     (target, sources_tuple, alpha)
+                    if fb_xattn_pairs:
+                        # Show first 4 (target<-K:α) entries to keep line short.
+                        head_n = 4
+                        items = [f"{t}<-{len(srcs)}:{a:+.3f}"
+                                 for t, srcs, a in alphas[:head_n]]
+                        suffix = f",… ({len(alphas) - head_n} more)" if len(alphas) > head_n else ""
+                        line += "  α=[" + ",".join(items) + suffix + "]"
+                    else:
+                        line += "  α=[" + ",".join(
+                            f"{t}<-{s}:{a:+.3f}" for t, s, a in alphas
+                        ) + "]"
                 elif isinstance(alphas[0], list):
                     # Dense multi-scale: max |α| per layer.
                     summary = [max(abs(a) for a in row) for row in alphas]
@@ -413,6 +463,8 @@ def main():
                 "max_T": args.T, "feedback_mode": args.feedback,
                 "feedback_distances": fb_distances,
                 "feedback_pairs": fb_pairs,
+                "feedback_xattn_pairs": fb_xattn_pairs,
+                "feedback_xattn_heads": args.feedback_xattn_heads,
                 "arch": args.arch, "layers_spec": args.layers,
                 "n_symbols": args.n_symbols,
                 "tokenizer": args.tokenizer,

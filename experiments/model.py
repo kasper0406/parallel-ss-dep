@@ -150,6 +150,77 @@ class FeedbackProjection(nn.Module):
         return x
 
 
+class CrossLayerAttentionFeedback(nn.Module):
+    """Cross-layer attention top-down feedback.
+
+    A single target layer's input attends over the (t-1 lagged) outputs of
+    several "above" source layers. The attention is per-token across the
+    source dimension only — no temporal mixing — so parallel-scan
+    friendliness is preserved (the lag on source states preserves causality).
+
+    Inputs:
+      x:                       (B, T, d) — target layer's input (pass-2)
+      source_states_lagged:    list of (B, T, d) — pass-1 outputs of each
+                               source layer, already shifted right by 1.
+    Output:
+      x + alpha * out_proj(attn_over_sources)
+    """
+
+    def __init__(self, d_model: int, n_sources: int,
+                 n_heads: int = 4, d_head: int | None = None):
+        super().__init__()
+        if d_head is None:
+            d_head = d_model // n_heads
+        assert n_heads * d_head == d_model, \
+            f"n_heads*d_head must equal d_model; got {n_heads}*{d_head} != {d_model}"
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.n_sources = n_sources
+        self.scale = d_head ** -0.5
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        # One K/V projection per source layer (learns source-specific channels).
+        self.k_projs = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False) for _ in range(n_sources)
+        ])
+        self.v_projs = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False) for _ in range(n_sources)
+        ])
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        # Init at non-zero magnitude so α has gradient on step 1.
+        for m in [self.q_proj, *self.k_projs, *self.v_projs, self.out_proj]:
+            nn.init.normal_(m.weight, std=1.0 / math.sqrt(d_model))
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.freeze_alpha = False
+
+    def get_alpha(self) -> torch.Tensor:
+        return torch.zeros_like(self.alpha) if self.freeze_alpha else self.alpha
+
+    def forward(self, x: torch.Tensor,
+                source_states_lagged: list) -> torch.Tensor:
+        # x: (B, T, d). source_states_lagged: list of (B, T, d).
+        B, T, D = x.shape
+        H, Dh = self.n_heads, self.d_head
+        S = self.n_sources
+        # Q: (B, T, H, Dh)
+        q = self.q_proj(x).view(B, T, H, Dh)
+        # K, V stacked across sources: (B, T, S, H, Dh)
+        k_stack = torch.stack(
+            [kp(s).view(B, T, H, Dh) for kp, s in zip(self.k_projs, source_states_lagged)],
+            dim=2,
+        )
+        v_stack = torch.stack(
+            [vp(s).view(B, T, H, Dh) for vp, s in zip(self.v_projs, source_states_lagged)],
+            dim=2,
+        )
+        # Attention scores per (b, t, h) over S sources: (B, T, H, S)
+        scores = torch.einsum("bthd,btshd->bths", q, k_stack) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        # Weighted sum of values over S: (B, T, H, Dh)
+        out = torch.einsum("bths,btshd->bthd", attn, v_stack)
+        out = out.reshape(B, T, D)
+        return x + self.get_alpha() * self.out_proj(out)
+
+
 class MultiScaleFeedbackProjection(nn.Module):
     """Multi-distance top-down feedback for one layer.
 
@@ -199,6 +270,12 @@ class TinyLM(nn.Module):
         feedback_distances: tuple[int, ...] = (1,),  # multi-scale top-down
         feedback_pairs: tuple = (),           # sparse (target_L, source_L) pairs;
                                               # if non-empty overrides distances
+        feedback_xattn_pairs: tuple = (),     # cross-layer attention: tuple of
+                                              # (target_L, (src1, src2, ...));
+                                              # if non-empty, overrides BOTH the
+                                              # dense and the sparse-FiLM modes
+                                              # and uses CrossLayerAttentionFeedback.
+        feedback_xattn_heads: int = 4,        # heads inside the cross-layer attention
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -244,7 +321,22 @@ class TinyLM(nn.Module):
         self.feedback_mode = feedback_mode
         self.feedback_distances = tuple(feedback_distances)
         self.feedback_pairs = tuple((int(t), int(s)) for t, s in feedback_pairs)
-        if feedback_mode != "none" and self.feedback_pairs:
+        self.feedback_xattn_pairs = tuple(
+            (int(t), tuple(int(s) for s in srcs)) for t, srcs in feedback_xattn_pairs
+        )
+        if self.feedback_xattn_pairs:
+            # Cross-layer attention mode (Idea 1 / Idea 2). Each target gets a
+            # CrossLayerAttentionFeedback module attending over its sources.
+            # Note: feedback_mode is not used here — attention is its own form.
+            self.xattn_feedback = nn.ModuleDict({
+                str(t): CrossLayerAttentionFeedback(
+                    d_model=d_model, n_sources=len(srcs),
+                    n_heads=feedback_xattn_heads,
+                )
+                for t, srcs in self.feedback_xattn_pairs
+            })
+            self.xattn_target_to_sources = {t: srcs for t, srcs in self.feedback_xattn_pairs}
+        elif feedback_mode != "none" and self.feedback_pairs:
             # Sparse mode — one FeedbackProjection per (target, source) pair,
             # indexed by target layer string for ModuleDict.
             self.sparse_feedback = nn.ModuleDict({
@@ -272,10 +364,39 @@ class TinyLM(nn.Module):
             pos = torch.arange(T, device=input_ids.device)
             x = x + self.pos_embed(pos)
 
-        if self.feedback_mode == "none":
+        if self.feedback_mode == "none" and not self.feedback_xattn_pairs:
             for blk in self.blocks:
                 x = blk(x, input_ids=input_ids)
             h = self.out_norm(x)
+            lm_logits = self.lm_head(h)
+            if return_aux and self.aux_dim > 0:
+                return lm_logits, self.aux_head(h)
+            return lm_logits
+
+        # Cross-layer attention feedback (Idea 1 / Idea 2). Target layers attend
+        # over the t-1 lagged pass-1 outputs of multiple source layers.
+        if self.feedback_xattn_pairs:
+            # Pass 1: vanilla. Collect outputs at every layer that any target
+            # references as a source (union across all targets).
+            needed_sources = set()
+            for _, srcs in self.feedback_xattn_pairs:
+                needed_sources.update(srcs)
+            pass1_at_sources: dict = {}
+            h1 = x
+            for L, blk in enumerate(self.blocks):
+                h1 = blk(h1, input_ids=input_ids)
+                if L in needed_sources:
+                    pass1_at_sources[L] = h1
+            # Pass 2: at each target layer, gather lagged source states and
+            # apply CrossLayerAttentionFeedback before the block's forward.
+            h = x
+            for L, blk in enumerate(self.blocks):
+                if L in self.xattn_target_to_sources:
+                    srcs = self.xattn_target_to_sources[L]
+                    src_states = [_shift_right_by_1(pass1_at_sources[s]) for s in srcs]
+                    h = self.xattn_feedback[str(L)](h, src_states)
+                h = blk(h, input_ids=input_ids)
+            h = self.out_norm(h)
             lm_logits = self.lm_head(h)
             if return_aux and self.aux_dim > 0:
                 return lm_logits, self.aux_head(h)
@@ -364,11 +485,15 @@ class TinyLM(nn.Module):
 
     def feedback_alphas(self) -> list:
         """Return current α values. Format depends on mode:
-        - sparse: list of (target, source, alpha) triples.
+        - xattn:   list of (target, sources_tuple, alpha) triples.
+        - sparse:  list of (target, source, alpha) triples.
         - dense single: flat list of n_layers floats.
-        - dense multi: list of n_layers lists.
-        - none: empty list.
+        - dense multi:  list of n_layers lists.
+        - none:    empty list.
         """
+        if self.feedback_xattn_pairs:
+            return [(t, srcs, float(self.xattn_feedback[str(t)].alpha.detach().item()))
+                    for t, srcs in self.feedback_xattn_pairs]
         if self.feedback_mode == "none":
             return []
         if self.feedback_pairs:
@@ -382,6 +507,10 @@ class TinyLM(nn.Module):
 
     def freeze_alpha(self) -> None:
         """Diagnostic: lock α at 0 across all layers (no active feedback)."""
+        if self.feedback_xattn_pairs:
+            for m in self.xattn_feedback.values():
+                m.freeze_alpha = True
+            return
         if self.feedback_mode == "none":
             return
         if self.feedback_pairs:

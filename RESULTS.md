@@ -716,17 +716,50 @@ The `(2, 28)` configuration is special: only it lets the network
 discover the negative-feedback predictive-coding filter, and only
 it gets the full −3 % win.
 
-### Scaling decision (open)
+### Phase 14b — Cross-layer attention extension (Idea 1, 2026-04-28)
 
-All four pre-flights pass. Two scaling paths remain on the table:
+Tested whether replacing the single FiLM connection at (2, 28) with a
+**cross-layer attention** module — where layer 2's input attends over
+the lagged hidden states of multiple late-layer sources — could
+improve over the single-pair sparse win. New module
+`CrossLayerAttentionFeedback` in `experiments/model.py`: per-token
+attention across sources only (no temporal mixing), so parallel-scan
+friendliness is preserved.
 
-   - **Direct training**: 350-500 M / 10-20 B tokens / 1-2 weeks on
-     2× 5090. Builds a real coder model with the sparse-feedback
-     architecture from scratch.
-   - **Distillation track**: LoLCATs/HALO from Qwen2.5-Coder-1.5 B
-     into a sparse-feedback DeltaNet backbone. ~3 GPU-weeks per
-     Agent 07 of the brainstorm; higher-confidence path to a
-     HumanEval-capable coder.
+| Variant | Sources | Params | Final PPL | vs DN | vs sparse (2,28) | Final α |
+|---------|---------|--------|-----------|-------|-------------------|---------|
+| DN baseline           | —              | 217 M | 51.00 | —      | +3.2 % (loses)  | —      |
+| **Sparse (2, 28)**    | 28             | 217 M | **49.40** | **−3.1 %** | —          | **−0.054** |
+| xattn 3-src           | 14, 21, 28     | 218.9 M | 50.57 | −0.85 % | +2.4 % (loses)  | +0.036 |
+| xattn 4-src           | 7, 14, 21, 28  | 219.6 M | 50.44 | −1.10 % | +2.1 % (loses)  | +0.035 |
+
+Cross-layer attention **beats DN** (any cross-layer signal helps
+slightly) but **clearly loses to the single sparse (2, 28) pair** by
+~2 % despite +1 % more parameters and per-token routing flexibility.
+
+**The α-sign signature explains why.** Both xattn variants converge
+to **positive α (≈ +0.035)** — the same additive regime that every
+non-(2, 28) sparse-FiLM variant fell into. Only the specific (2, 28)
+single-pair architecture lets the network discover the
+**negative-α subtractive predictive-coding filter** that drives the
+−3 % win. Adding flexibility (more sources / softmax routing) makes
+the negative basin harder to find, and the optimizer falls back to
+the lower-magnitude additive optimum.
+
+This is a strong cross-confirmation of the design ablation finding:
+the (2, 28) single sparse pair isn't just *a* useful connection,
+it's the *specific* configuration that funnels the network into the
+right optimization basin. Idea 2 (all-to-all cross-layer attention)
+was conditional on Idea 1 winning and is therefore **not pursued**.
+
+### Scaling decision
+
+Per the architectural saturation above, the chosen scaling path is
+**distillation from Qwen3.6-35B-A3B** (whose 30 of 40 layers are
+Gated DeltaNet — same algebraic family as our student). See
+`NEXT_DIRECTIONS.md` for the Phase-5 plan and the full hardware /
+infrastructure notes (vLLM in a separate venv to keep our
+nightly-torch student environment intact).
 
 ## Phase 13 — Overnight ablation: Dyck + code-PPL ratio sweep
 

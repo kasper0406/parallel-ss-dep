@@ -7,6 +7,13 @@ experiments in order, knowing what numbers to expect.
 ## Branch & state
 
 - Branch: `pd-ssm` (off `main` at commit 64a2956)
+- Pre-flight: run `python experiments/test_pd_closure.py` — six fast
+  numerical tests verifying PD closure, layer ↔ matmul-reference
+  equivalence, complex-D unit-disk constraint, and Muon end-to-end. All
+  pass on MPS in a few seconds.
+- Modal app: `modal_app.py` at the repo root has six entrypoints —
+  `smoke`, `priority1..5`, `all_priorities`, plus a `custom` escape hatch.
+  See the docstring at the top of the file.
 - Three new layers in `experiments/layers.py`:
   - `PDScanAttention` — vector-state PD-SSM (Terzić et al. 2025, arXiv:2509.22284)
   - `PDKVScanAttention` — matrix-state PD with rank-1 KV write (novel, the natural PD/DeltaNet hybrid)
@@ -46,15 +53,11 @@ publishable as an extension of PD-SSM (arXiv:2509.22284).
 
 **Goal:** confirm Landau-bound prediction at scale.
 
-**Action:** Force state_dim=4 for pd_ssm/complex_pd. Currently
-`train_modular.py` doesn't expose state_dim — add a `--state_dim N`
-arg and thread it through to the layer ctor. Roughly 5 lines of edit.
+**Action:** Force state_dim=4 for pd_ssm/complex_pd. The `--state_dim`
+arg is now wired through `train_modular.py` (and `train_mqar.py`).
+Just run:
 
 ```bash
-# Step 1: edit train_modular.py to accept --state_dim and pass it
-#         through to PDScanAttention/ComplexPDScanAttention.
-
-# Step 2: run the sweep
 python experiments/train_modular.py \
     --arches deltanet,deltanet_negeig,pd_ssm,complex_pd \
     --p 2 3 5 7 11 \
@@ -64,6 +67,8 @@ python experiments/train_modular.py \
     --d_model 128 --n_layers 4 --n_heads 4 --d_head 32 \
     --lr 3e-3
 ```
+
+Or via Modal: `modal run modal_app.py::priority1`
 
 **Predicted end_acc per (p, arch):**
 
@@ -115,18 +120,17 @@ python experiments/train_modular.py \
 vector-state PD-SSM cannot, at no expressivity cost.
 
 ```bash
-# Run train_mqar.py for K in {4, 8, 16, 32} — currently takes single --n_pairs.
-# Either (a) loop in shell, or (b) add nargs="+" to --n_pairs.
-for K in 4 8 16 32; do
-    python experiments/train_mqar.py \
-        --arches linear,deltanet,pd_ssm,pd_kv \
-        --T 256 \
-        --n_pairs $K \
-        --vocab 64 \
-        --steps 5000 --batch 256 \
-        --d_model 128 --n_layers 4 --n_heads 4 --d_head 32
-done
+# --n_pairs now accepts multiple values (one command sweeps all K).
+python experiments/train_mqar.py \
+    --arches linear,deltanet,pd_ssm,pd_kv \
+    --T 256 \
+    --n_pairs 4 8 16 32 \
+    --vocab 64 \
+    --steps 5000 --batch 256 \
+    --d_model 128 --n_layers 4 --n_heads 4 --d_head 32
 ```
+
+Or via Modal: `modal run modal_app.py::priority3`
 
 **Predicted recall@K (MQAR query-positions accuracy):**
 

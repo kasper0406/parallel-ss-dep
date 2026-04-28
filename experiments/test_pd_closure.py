@@ -200,12 +200,49 @@ def test_pd_with_zero_input_returns_zero_state_then_writes():
     print(f"✓ test_pd_with_zero_input_returns_zero_state_then_writes: max y = {err:.2e}")
 
 
+def test_muon_optimizer_runs():
+    """Muon end-to-end: forward, backward, step on a small 2D-param model."""
+    import torch
+    from experiments.optim_muon import Muon, muon_param_groups
+
+    torch.manual_seed(0)
+    # Model with mixed 1D and 2D params.
+    model = torch.nn.Sequential(
+        torch.nn.Linear(8, 16),
+        torch.nn.LayerNorm(16),  # has 1D weight + bias
+        torch.nn.Linear(16, 4),
+    )
+    muon_p, adam_p = muon_param_groups(model)
+    assert len(muon_p) > 0, "no 2D params went to Muon group"
+    assert len(adam_p) > 0, "no 1D/embed params went to AdamW group"
+
+    muon = Muon(muon_p, lr=0.02)
+    adam = torch.optim.AdamW(adam_p, lr=1e-3)
+
+    x = torch.randn(4, 8)
+    target = torch.randn(4, 4)
+    init_loss = float("inf")
+    for step in range(20):
+        muon.zero_grad(); adam.zero_grad()
+        out = model(x)
+        loss = (out - target).pow(2).mean()
+        if step == 0: init_loss = loss.item()
+        loss.backward()
+        muon.step(); adam.step()
+    final_loss = loss.item()
+    assert final_loss < init_loss, \
+        f"Muon failed to reduce loss: init {init_loss}, final {final_loss}"
+    print(f"✓ test_muon_optimizer_runs: loss {init_loss:.4f} -> {final_loss:.4f} "
+          f"({len(muon_p)} 2D params via Muon, {len(adam_p)} other via AdamW)")
+
+
 def main():
     test_pd_closure_real()
     test_pdscan_layer_matches_explicit_matmul()
     test_complex_pd_unit_disk()
     test_pdkv_layer_matches_explicit()
     test_pd_with_zero_input_returns_zero_state_then_writes()
+    test_muon_optimizer_runs()
     print("\nAll PD closure / sanity tests pass.")
 
 

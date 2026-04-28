@@ -746,11 +746,70 @@ single-pair architecture lets the network discover the
 the negative basin harder to find, and the optimizer falls back to
 the lower-magnitude additive optimum.
 
-This is a strong cross-confirmation of the design ablation finding:
-the (2, 28) single sparse pair isn't just *a* useful connection,
-it's the *specific* configuration that funnels the network into the
-right optimization basin. Idea 2 (all-to-all cross-layer attention)
-was conditional on Idea 1 winning and is therefore **not pursued**.
+### Phase 14c — Mechanism investigation (which factor breaks the basin?)
+
+To disentangle "why xattn loses," ran four further variants at @30L
+on Python code, 5 K steps, holding everything else equal. Two
+hypotheses to separate: (i) **softmax routing dilutes signal**, and
+(ii) **Q-K-V additive residual is the wrong output form** for the
+predictive-coding filter.
+
+| Variant | Output form | Routing across sources | α (final) | PPL | Δ vs base |
+|---------|-------------|-------------------------|-----------|------|-----------|
+| **Sparse (2, 28) FiLM** | mult `x*(1+αs)+αt` | single source | **−0.054** | **49.40** | — |
+| **`film_sum` [14, 21, 28]** | mult, **sum** of K sources | sum (no softmax) | **−0.037** | **49.42** | **tied** |
+| `film_sum_mlp` [14, 21, 28] | mult, MLP per source | sum | −0.021 | 49.97 | within seed σ |
+| Single-src attn (2:28) | additive `x + α·V` | one source (softmax = 1) | +0.019 | 50.35 | +1.9 % loses |
+| `film_attn` [14, 21, 28] | **mult** with softmax-mixed scale/shift | **softmax** | +0.042 | 50.47 | +2.2 % loses |
+| xattn 3-src (Phase 14b) | additive | softmax 3 | +0.036 | 50.57 | +2.4 % loses |
+
+The data is conclusive on three points:
+
+1. **Multi-source by *summation* preserves the basin.**
+   `film_sum` (K=3 source layers, FiLM form, no softmax) lands at
+   **PPL 49.42 with α = −0.037** — within seed variance of the
+   single-pair sparse base. The "specificity" of the (2, 28) finding
+   is *not* about being a *single* pair; it is about the
+   multiplicative form combined with non-softmax aggregation.
+
+2. **Softmax routing breaks the basin even with multiplicative form.**
+   `film_attn` uses the same FiLM-shape output as `film_sum` but
+   with softmax-weighted mixture across sources. It collapses back
+   to the **positive-α basin** (+0.042) and loses ~2 %, like the
+   pure-additive xattn variants. The most plausible mechanism: at
+   init the softmax assigns ≈ 1/K mass per source, attenuating each
+   contribution to ~1/K of its FiLM-sum equivalent; the gradient on
+   α is correspondingly ~K× smaller and α drifts to a small positive
+   value before the routing has time to sharpen.
+
+3. **Additive Q-K-V residual breaks the basin even with one source.**
+   Single-src `attn (2:28)` has the *exact* source the sparse base
+   uses, no routing dilution at all (softmax over 1 element = 1.0),
+   and still finds positive α (+0.019) and loses 1.9 %. The
+   gradient through `∂(x + α·V)/∂α = V` does not have the
+   x-correlated direction that `∂(x · scale)/∂α = x · scale` carries,
+   so the optimizer never gets the strong signal to push α negative.
+
+4. **MLP nonlinearity in the feedback path is neutral.**
+   `film_sum_mlp` (Linear → GELU → Linear per source projection)
+   lands at 49.97, within seed variance of `film_sum` (49.42). The
+   feedback projection capacity was not the bottleneck — adding
+   nonlinear expressivity does not move PPL.
+
+**Practical implication for scaling.** The architectural choice for
+the scale-up student is between two equivalent options:
+
+- **Sparse (2, 28) FiLM** — simplest, single connection, +0.3 % params,
+  proven across seed/depth/extrapolation/TinyStories sweeps.
+- **FiLM-sum on K curated late sources** — same negative-α
+  predictive-coding basin, slightly richer signal, +0.6-1 % params,
+  may generalize better at larger scales. Untested at scale.
+
+Going with **sparse single-pair (2, 28)** for the distillation
+student because every supporting result (3-seed σ, depth ablation,
+T extrapolation, TinyStories generalization) is on that exact
+architecture. `film_sum` is held in reserve as a low-risk
+architectural upgrade if scale-up exposes a single-pair limitation.
 
 ### Scaling decision
 

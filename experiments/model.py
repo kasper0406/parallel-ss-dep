@@ -150,6 +150,172 @@ class FeedbackProjection(nn.Module):
         return x
 
 
+class MultiSourceFiLMFeedbackMLP(nn.Module):
+    """Multi-source FiLM-sum with an MLP nonlinearity in the feedback path.
+
+    Same as MultiSourceFiLMFeedback (sum across sources, multiplicative form),
+    but each source's projection is an MLP (Linear → GELU → Linear) rather
+    than a single Linear, giving the feedback module nonlinear expressivity.
+
+    Tests whether the linear feedback projections were leaving margin on
+    the table.
+    """
+
+    def __init__(self, d_model: int, n_sources: int, d_hidden: int | None = None):
+        super().__init__()
+        if d_hidden is None:
+            d_hidden = 2 * d_model
+        self.n_sources = n_sources
+        self.W_scales = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_hidden, bias=False),
+                nn.GELU(),
+                nn.Linear(d_hidden, d_model, bias=False),
+            ) for _ in range(n_sources)
+        ])
+        self.W_shifts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_hidden, bias=False),
+                nn.GELU(),
+                nn.Linear(d_hidden, d_model, bias=False),
+            ) for _ in range(n_sources)
+        ])
+        # Init last linear of each MLP small so feedback magnitude is modest.
+        for seq in [*self.W_scales, *self.W_shifts]:
+            nn.init.normal_(seq[0].weight, std=1.0 / math.sqrt(d_model))
+            nn.init.normal_(seq[2].weight, std=1.0 / math.sqrt(d_hidden))
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.freeze_alpha = False
+
+    def get_alpha(self) -> torch.Tensor:
+        return torch.zeros_like(self.alpha) if self.freeze_alpha else self.alpha
+
+    def forward(self, x: torch.Tensor,
+                source_states_lagged: list) -> torch.Tensor:
+        a = self.get_alpha()
+        scale = sum(W(s) for W, s in zip(self.W_scales, source_states_lagged))
+        shift = sum(W(s) for W, s in zip(self.W_shifts, source_states_lagged))
+        return x * (1.0 + a * scale) + a * shift
+
+
+class MultiSourceFiLMFeedback(nn.Module):
+    """Multi-source FiLM with summed contributions (no softmax routing).
+
+    For sources s1, ..., sN with t-1 lagged hidden states, computes
+        scale = sum_i W_scale[i](s_i)
+        shift = sum_i W_shift[i](s_i)
+    and applies multiplicative FiLM:
+        x_out = x * (1 + alpha * scale) + alpha * shift
+
+    Same multiplicative form as the proven sparse-1-pair (2, 28) finding,
+    but with N source layers contributing additively. Tests whether
+    multi-source structure alone (without softmax) lands in the negative-α
+    predictive-coding basin. If it does, softmax was the culprit; if it
+    still falls into positive-α, the basin is specifically tied to
+    single-source FiLM.
+    """
+
+    def __init__(self, d_model: int, n_sources: int):
+        super().__init__()
+        self.n_sources = n_sources
+        self.W_scales = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False) for _ in range(n_sources)
+        ])
+        self.W_shifts = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False) for _ in range(n_sources)
+        ])
+        for m in [*self.W_scales, *self.W_shifts]:
+            nn.init.normal_(m.weight, std=1.0 / math.sqrt(d_model))
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.freeze_alpha = False
+
+    def get_alpha(self) -> torch.Tensor:
+        return torch.zeros_like(self.alpha) if self.freeze_alpha else self.alpha
+
+    def forward(self, x: torch.Tensor,
+                source_states_lagged: list) -> torch.Tensor:
+        a = self.get_alpha()
+        scale = sum(W(s) for W, s in zip(self.W_scales, source_states_lagged))
+        shift = sum(W(s) for W, s in zip(self.W_shifts, source_states_lagged))
+        return x * (1.0 + a * scale) + a * shift
+
+
+class FiLMAttentionFeedback(nn.Module):
+    """Cross-layer attention with FiLM-form multiplicative output.
+
+    Like CrossLayerAttentionFeedback, but the value vectors carry a
+    (scale, shift) pair, and the attention-weighted mixture is applied
+    via FiLM modulation rather than additive residual:
+
+        Q from x at target
+        K_i, V_scale_i, V_shift_i from each source layer
+        attn = softmax(QK)
+        scale = out_proj_scale(attn @ V_scale)
+        shift = out_proj_shift(attn @ V_shift)
+        x_out = x * (1 + alpha * scale) + alpha * shift
+
+    Combines softmax routing across sources with the multiplicative form
+    that produced the −3 % win. Tests whether the negative-α basin is
+    reachable when attention has the right output structure.
+    """
+
+    def __init__(self, d_model: int, n_sources: int,
+                 n_heads: int = 4, d_head: int | None = None):
+        super().__init__()
+        if d_head is None:
+            d_head = d_model // n_heads
+        assert n_heads * d_head == d_model
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.n_sources = n_sources
+        self.scale = d_head ** -0.5
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_projs = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False) for _ in range(n_sources)
+        ])
+        # V emits 2*d_model per source: scale-half and shift-half.
+        self.v_projs = nn.ModuleList([
+            nn.Linear(d_model, 2 * d_model, bias=False) for _ in range(n_sources)
+        ])
+        self.out_proj_scale = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj_shift = nn.Linear(d_model, d_model, bias=False)
+        for m in [self.q_proj, *self.k_projs, *self.v_projs,
+                  self.out_proj_scale, self.out_proj_shift]:
+            nn.init.normal_(m.weight, std=1.0 / math.sqrt(d_model))
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.freeze_alpha = False
+
+    def get_alpha(self) -> torch.Tensor:
+        return torch.zeros_like(self.alpha) if self.freeze_alpha else self.alpha
+
+    def forward(self, x: torch.Tensor,
+                source_states_lagged: list) -> torch.Tensor:
+        B, T, D = x.shape
+        H, Dh = self.n_heads, self.d_head
+        S = self.n_sources
+        q = self.q_proj(x).view(B, T, H, Dh)
+        k_stack = torch.stack(
+            [kp(s).view(B, T, H, Dh) for kp, s in zip(self.k_projs, source_states_lagged)],
+            dim=2,
+        )
+        # V split into scale-half and shift-half.
+        v_pairs = [vp(s) for vp, s in zip(self.v_projs, source_states_lagged)]
+        v_scales = torch.stack(
+            [v[..., :D].view(B, T, H, Dh) for v in v_pairs], dim=2,
+        )
+        v_shifts = torch.stack(
+            [v[..., D:].view(B, T, H, Dh) for v in v_pairs], dim=2,
+        )
+        scores = torch.einsum("bthd,btshd->bths", q, k_stack) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        scale_mix = torch.einsum("bths,btshd->bthd", attn, v_scales).reshape(B, T, D)
+        shift_mix = torch.einsum("bths,btshd->bthd", attn, v_shifts).reshape(B, T, D)
+        scale = self.out_proj_scale(scale_mix)
+        shift = self.out_proj_shift(shift_mix)
+        a = self.get_alpha()
+        return x * (1.0 + a * scale) + a * shift
+
+
 class CrossLayerAttentionFeedback(nn.Module):
     """Cross-layer attention top-down feedback.
 
@@ -276,6 +442,9 @@ class TinyLM(nn.Module):
                                               # dense and the sparse-FiLM modes
                                               # and uses CrossLayerAttentionFeedback.
         feedback_xattn_heads: int = 4,        # heads inside the cross-layer attention
+        feedback_xattn_form: str = "attn",    # 'attn'      = additive residual (Q-K-V)
+                                              # 'film_sum'  = multi-source FiLM, sum
+                                              # 'film_attn' = softmax routing + FiLM out
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -324,15 +493,34 @@ class TinyLM(nn.Module):
         self.feedback_xattn_pairs = tuple(
             (int(t), tuple(int(s) for s in srcs)) for t, srcs in feedback_xattn_pairs
         )
+        self.feedback_xattn_form = feedback_xattn_form
         if self.feedback_xattn_pairs:
-            # Cross-layer attention mode (Idea 1 / Idea 2). Each target gets a
-            # CrossLayerAttentionFeedback module attending over its sources.
-            # Note: feedback_mode is not used here — attention is its own form.
+            # Cross-layer attention mode. Three forms:
+            #   attn      — additive residual via Q-K-V softmax (default)
+            #   film_sum  — multi-source FiLM, contributions summed (no softmax)
+            #   film_attn — softmax routing + multiplicative FiLM-form output
+            def _make_xattn(srcs):
+                if feedback_xattn_form == "attn":
+                    return CrossLayerAttentionFeedback(
+                        d_model=d_model, n_sources=len(srcs),
+                        n_heads=feedback_xattn_heads,
+                    )
+                if feedback_xattn_form == "film_sum":
+                    return MultiSourceFiLMFeedback(
+                        d_model=d_model, n_sources=len(srcs),
+                    )
+                if feedback_xattn_form == "film_sum_mlp":
+                    return MultiSourceFiLMFeedbackMLP(
+                        d_model=d_model, n_sources=len(srcs),
+                    )
+                if feedback_xattn_form == "film_attn":
+                    return FiLMAttentionFeedback(
+                        d_model=d_model, n_sources=len(srcs),
+                        n_heads=feedback_xattn_heads,
+                    )
+                raise ValueError(f"unknown feedback_xattn_form: {feedback_xattn_form!r}")
             self.xattn_feedback = nn.ModuleDict({
-                str(t): CrossLayerAttentionFeedback(
-                    d_model=d_model, n_sources=len(srcs),
-                    n_heads=feedback_xattn_heads,
-                )
+                str(t): _make_xattn(srcs)
                 for t, srcs in self.feedback_xattn_pairs
             })
             self.xattn_target_to_sources = {t: srcs for t, srcs in self.feedback_xattn_pairs}

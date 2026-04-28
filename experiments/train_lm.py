@@ -208,6 +208,15 @@ def main():
                         "ignores --feedback (attention is its own form).")
     p.add_argument("--feedback_xattn_heads", type=int, default=4,
                    help="Number of heads inside the cross-layer attention.")
+    p.add_argument("--feedback_xattn_form", type=str, default="attn",
+                   choices=["attn", "film_sum", "film_sum_mlp", "film_attn"],
+                   help="Form of the cross-layer feedback module: "
+                        "'attn' = additive Q-K-V softmax residual (default); "
+                        "'film_sum' = multi-source FiLM, sum (no softmax); "
+                        "'film_sum_mlp' = film_sum but each W is an MLP "
+                        "(Linear-GELU-Linear) — tests nonlinear expressivity; "
+                        "'film_attn' = softmax routing + multiplicative FiLM "
+                        "output (lets attention learn negative-α basin).")
     p.add_argument("--layers", type=str, default=None,
                    help="explicit comma-separated layer arch list, "
                         "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
@@ -321,13 +330,15 @@ def main():
         feedback_pairs=fb_pairs,
         feedback_xattn_pairs=fb_xattn_pairs,
         feedback_xattn_heads=args.feedback_xattn_heads,
+        feedback_xattn_form=args.feedback_xattn_form,
         **attn_kw,
     ).to("cuda")
     if args.freeze_alpha and (args.feedback != "none" or fb_xattn_pairs):
         model.freeze_alpha()
     if fb_xattn_pairs:
         n_total_pairs = sum(len(srcs) for _, srcs in fb_xattn_pairs)
-        feedback_desc = (f"xattn(targets={len(fb_xattn_pairs)},"
+        feedback_desc = (f"xattn[{args.feedback_xattn_form}]"
+                         f"(targets={len(fb_xattn_pairs)},"
                          f"src-edges={n_total_pairs},"
                          f"heads={args.feedback_xattn_heads})")
     else:
@@ -465,6 +476,7 @@ def main():
                 "feedback_pairs": fb_pairs,
                 "feedback_xattn_pairs": fb_xattn_pairs,
                 "feedback_xattn_heads": args.feedback_xattn_heads,
+                "feedback_xattn_form": args.feedback_xattn_form,
                 "arch": args.arch, "layers_spec": args.layers,
                 "n_symbols": args.n_symbols,
                 "tokenizer": args.tokenizer,

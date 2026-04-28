@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset
 
 from experiments.layers import (
-    DeltaNetAttention, DeltaNetNegEigAttention,
+    DeltaNetAttention, DeltaNetNegEigAttention, GatedDeltaNetAttention,
     OrthogonalScanAttention, SymbolGroundedAttention,
     HeisenbergAttention, MultiPassAttention,
 )
@@ -38,6 +38,7 @@ from experiments.aux_brackets import compute_bracket_deltas, bracket_depth
 _NAME_TO_CLS = {
     "deltanet":   DeltaNetAttention,
     "deltanet_negeig": DeltaNetNegEigAttention,
+    "gated_deltanet": GatedDeltaNetAttention,
     "ortho":      OrthogonalScanAttention,
 }
 
@@ -159,7 +160,8 @@ class TokenisedStream(IterableDataset):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--arch", type=str, default=None,
-                   choices=["deltanet", "deltanet_negeig", "ortho",
+                   choices=["deltanet", "deltanet_negeig", "gated_deltanet",
+                            "ortho",
                             "hybrid", "hybrid_25_75", "hybrid_75_25",
                             "hybrid_negeig",
                             "symgrounded", "hybrid_sg", "hybrid_sg_25_75",

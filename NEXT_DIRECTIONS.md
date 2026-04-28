@@ -39,17 +39,61 @@ DeltaNet stack gives:
    pairing converges to positive α with larger magnitude but
    smaller PPL benefit. Full table in `RESULTS.md` Phase 14.
 
-### Next: scale-up decision (all pre-flights pass)
+### Next: distillation from Qwen3.6-35B-A3B (chosen path)
 
-Pick one of two scaling paths:
+Decision (2026-04-28): scaling track is **distillation from
+[Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)** in
+INT4 quant ([QuantTrio AWQ](https://huggingface.co/QuantTrio/Qwen3.6-35B-A3B-AWQ)).
 
-   - **Direct training**: 350-500 M / 10-20 B tokens / 1-2 weeks on
-     2× 5090. Builds a real coder model with the sparse-feedback
-     architecture.
-   - **Distillation track**: LoLCATs/HALO from Qwen2.5-Coder-1.5 B
-     into a sparse-feedback DeltaNet backbone. ~3 GPU-weeks per
-     Agent 07 of the brainstorm, higher-confidence path to a
-     HumanEval-capable coder.
+**Why this teacher specifically:**
+
+- **Architectural alignment.** Qwen3.6's 40 layers are 75 % Gated
+  DeltaNet (linear attention) + 25 % Gated Attention. Our student
+  is pure DeltaNet with sparse feedback. Most teacher hidden states
+  come from the same algebraic family, so layer-wise distillation
+  is meaningful (not the cross-architecture mismatch HALO/LoLCATs
+  was originally fighting).
+- **Frontier coder.** SWE-bench Verified 73.4 %, AIME 2026 92.7 %,
+  HumanEval frontier-level. Apache 2.0, released 2026-04-16.
+- **Hardware fit.** 35 B total / 3 B active MoE in INT4 ≈ 17 GB —
+  fits on one 5090; student trains on the other.
+- **Speculative decoding** with the multi-token-prediction head it
+  was trained with should give ~2-3× decode throughput.
+
+**Architectural choices we adopt from Qwen3.6 (none of attention):**
+
+1. **Gated DeltaNet** instead of plain DeltaNet (use_gate=True; same
+   library: `fla.layers.GatedDeltaNet`). Cheap test underway at
+   `gated_deltanet --feedback_pairs "2,28"` @30L.
+2. **MoE feedforward — deferred.** Worth revisiting at the 1 B+
+   stage, not at 217 M.
+3. **No attention layers** (per user direction). We stay pure RNN.
+4. **Keep our sparse (2, 28) feedback** as the main architectural
+   delta vs the teacher.
+
+**Concrete plan:**
+
+- **Phase 5a — quick architectural sanity** (~30 min): does Gated
+  DeltaNet at @30L with sparse (2, 28) beat plain-DN sparse at 49.40
+  PPL? Pick whichever wins for the student.
+- **Phase 5b — teacher inference** (~1-2 days): set up INT4 inference
+  for Qwen3.6 on one 5090 with speculative decoding. vLLM if it
+  builds for sm_120, transformers + autoawq if not. Validate teacher
+  generates sensible code at >50 tok/s.
+- **Phase 5c — mini distillation** (~2-3 days): 217 M (Gated)DN +
+  sparse student, KL on output logits + optional last-layer
+  hidden-state alignment, 100 M tokens of code. Compare vs
+  same-arch trained from scratch (no teacher). The ablation that
+  matters: does sparse feedback help distillation more than plain
+  DN does?
+- **Phase 5d — full scale** (~2 weeks): if 5c wins, push student to
+  350-500 M params, 5-10 B tokens. Eval on HumanEval, MBPP, and a
+  small SWE-bench-Lite slice.
+
+**Tokenizer note:** student moves to Qwen tokenizer for
+distillation (same vocab as teacher → clean logit alignment). Loses
+SmolLM2-135M baseline comparability, but that comparability was
+never load-bearing for the architectural finding.
 
 ### What this supersedes
 

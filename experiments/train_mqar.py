@@ -79,11 +79,24 @@ def _val(model, T, n_pairs, vocab, batch_size, device):
     return loss.item(), recall
 
 
+_PD_FAMILY = (PDScanAttention, PDKVScanAttention)
+
+
+def _wrap_with_state_dim(cls, state_dim):
+    """Inject state_dim into PD-family layer ctors; passthrough otherwise."""
+    if state_dim is None or cls not in _PD_FAMILY:
+        return cls
+    def _factory(d_model, n_heads, d_head):
+        return cls(d_model=d_model, n_heads=n_heads, d_head=d_head,
+                   state_dim=state_dim)
+    return _factory
+
+
 def train_one(arch, T, n_pairs, vocab, steps, batch_size,
               d_model, n_layers, n_heads, d_head, lr, log_every,
-              device="cuda", seed=0):
+              device="cuda", seed=0, state_dim=None):
     torch.manual_seed(seed)
-    cls = ARCHES[arch]
+    cls = _wrap_with_state_dim(ARCHES[arch], state_dim)
     model = TinyLM(
         vocab_size=vocab, d_model=d_model, n_layers=n_layers,
         n_heads=n_heads, d_head=d_head, attention_cls=cls,
@@ -135,7 +148,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--arches", type=str, default="linear,ortho,rotconj,deltanet")
     p.add_argument("--T", type=int, nargs="+", default=[256])
-    p.add_argument("--n_pairs", type=int, default=16)
+    p.add_argument("--n_pairs", type=int, nargs="+", default=[16],
+                   help="Number of KV bindings per example. Pass multiple to sweep.")
     p.add_argument("--vocab", type=int, default=64)
     p.add_argument("--steps", type=int, default=5000)
     p.add_argument("--batch", type=int, default=256)
@@ -146,6 +160,8 @@ def main():
     p.add_argument("--lr", type=float, default=3e-3)
     p.add_argument("--log_every", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--state_dim", type=int, default=None,
+                   help="Per-head state dim N for PD-family layers.")
     args = p.parse_args()
 
     arches = args.arches.split(",")
@@ -154,15 +170,17 @@ def main():
 
     results = []
     for T in args.T:
-        for a in arches:
-            r = train_one(
-                arch=a, T=T, n_pairs=args.n_pairs, vocab=args.vocab,
-                steps=args.steps, batch_size=args.batch,
-                d_model=args.d_model, n_layers=args.n_layers,
-                n_heads=args.n_heads, d_head=args.d_head,
-                lr=args.lr, log_every=args.log_every, seed=args.seed,
-            )
-            results.append(r)
+        for K in args.n_pairs:
+            for a in arches:
+                r = train_one(
+                    arch=a, T=T, n_pairs=K, vocab=args.vocab,
+                    steps=args.steps, batch_size=args.batch,
+                    d_model=args.d_model, n_layers=args.n_layers,
+                    n_heads=args.n_heads, d_head=args.d_head,
+                    lr=args.lr, log_every=args.log_every, seed=args.seed,
+                    state_dim=args.state_dim,
+                )
+                results.append(r)
 
     print("\n" + "=" * 80)
     print(f"{'arch':<12} {'T':>5} {'pairs':>5} {'recall':>8} "

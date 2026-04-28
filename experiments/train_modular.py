@@ -94,19 +94,35 @@ def _val(model, T, p, batch_size, device):
     return loss, per_tok_acc, end_tok_acc, quartiles
 
 
+_PD_FAMILY = (PDScanAttention, PDKVScanAttention, ComplexPDScanAttention)
+
+
+def _wrap_with_state_dim(cls, state_dim):
+    """Wrap a layer class so that PD-family classes get state_dim injected."""
+    if state_dim is None or cls not in _PD_FAMILY:
+        return cls
+    def _factory(d_model, n_heads, d_head):
+        return cls(d_model=d_model, n_heads=n_heads, d_head=d_head,
+                   state_dim=state_dim)
+    return _factory
+
+
 def train_one(arch_or_layers, T, p, steps, batch_size, d_model, n_layers,
-              n_heads, d_head, lr, log_every, device="cuda", seed=0):
+              n_heads, d_head, lr, log_every, device="cuda", seed=0,
+              state_dim=None):
     torch.manual_seed(seed)
 
     # arch_or_layers may be either a single arch name (homogeneous model)
     # or a comma-separated list (hybrid/heterogeneous).
     if "," in arch_or_layers:
-        cls_list = [ARCHES[p_.strip()] for p_ in arch_or_layers.split(",")]
+        cls_list = [_wrap_with_state_dim(ARCHES[p_.strip()], state_dim)
+                    for p_ in arch_or_layers.split(",")]
         n_layers = len(cls_list)
         attn_kw = dict(attention_cls_per_layer=cls_list)
         label = arch_or_layers
     else:
-        attn_kw = dict(attention_cls=ARCHES[arch_or_layers])
+        cls = _wrap_with_state_dim(ARCHES[arch_or_layers], state_dim)
+        attn_kw = dict(attention_cls=cls)
         label = arch_or_layers
 
     model = TinyLM(
@@ -170,6 +186,8 @@ def main():
     p.add_argument("--lr", type=float, default=3e-3)
     p.add_argument("--log_every", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--state_dim", type=int, default=None,
+                   help="Per-head state dim N for PD-family layers (overrides d_head default).")
     args = p.parse_args()
 
     if args.arches is None and args.layers is None:
@@ -194,6 +212,7 @@ def main():
                 d_model=args.d_model, n_layers=n_layers,
                 n_heads=args.n_heads, d_head=args.d_head,
                 lr=args.lr, log_every=args.log_every, seed=args.seed,
+                state_dim=args.state_dim,
             )
             results.append(r)
 

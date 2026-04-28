@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, IterableDataset
 
 from experiments.layers import (
     DeltaNetAttention, DeltaNetNegEigAttention,
-    OrthogonalScanAttention,
+    OrthogonalScanAttention, PDScanAttention,
 )
 from experiments.model import TinyLM
 
@@ -37,6 +37,7 @@ _NAME_TO_CLS = {
     "deltanet":   DeltaNetAttention,
     "deltanet_negeig": DeltaNetNegEigAttention,
     "ortho":      OrthogonalScanAttention,
+    "pd_ssm":     PDScanAttention,
 }
 
 

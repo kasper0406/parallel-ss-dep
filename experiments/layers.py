@@ -549,3 +549,358 @@ class Mamba2Attention(_FlaWrapper):
             n_groups=1,
             chunk_size=64,
         ))
+
+
+class PDScanAttention(nn.Module):
+    """PD-SSM (Permutation × Diagonal) state-space scan.
+
+    Per channel, state is a vector h ∈ ℝ^N. The per-token transition is
+
+        A_t = P_t · D_t
+
+    where P_t ∈ {0,1}^{N×N} is a column-one-hot matrix encoding a function
+    σ_t : {0..N-1} → {0..N-1} (an element of the full transformation monoid
+    T_N), and D_t is real-diagonal with entries in [-1, 1]. Recurrence:
+
+        h_t[i] = D_t[σ_t⁻¹(i)] · h_{t-1}[σ_t⁻¹(i)] + w_t[i]
+
+    Closure: (P_a D_a)(P_b D_b) = (P_a P_b)(D_a' · D_b) with D_a'[j] = D_a[σ_b(j)],
+    so cumulative products stay in the PD class — O(N) per compose,
+    O(L · N) parallel scan.
+
+    Why this escapes both walls of the repo's analysis:
+      - Eigenvalues lie on the closed real interval [-1, 1] in this
+        implementation (D real); negative real ⇒ parity, mod-2.
+        Cycles of length k in σ_t with D = -1 give k-th roots of unity
+        in the cumulative spectrum ⇒ mod-k counting is reachable.
+      - σ_t is the full transformation monoid T_N per token (not just
+        Householder reflections), so by Cayley's theorem one layer
+        recognises any FSA with ≤ N states (Terzić et al. 2025
+        Proposition 2). This includes non-solvable groups (A_5, S_5)
+        when N ≥ 5 — strictly more than DeltaProduct's n_h reflections.
+
+    Differentiability: σ_t is discrete. We use straight-through:
+    forward = argmax (one-hot), backward = softmax. This is the standard
+    Bengio-Léonard-Courville trick. The N×N logits tensor has size
+    O(B · T · H · N²); keep N modest (8–32) at the kill-gate scale.
+
+    Reference: Terzić et al., "Structured Sparse Transition Matrices to
+    Enable State Tracking in State-Space Models" (arXiv:2509.22284).
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_head: int,
+                 state_dim: int | None = None,
+                 use_short_conv: bool = True,
+                 conv_size: int = 4,
+                 use_silu_input: bool = True):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_head
+        # Per-head state dim. Default N = d_head — the per-head output
+        # is the full state vector at time t.
+        self.N = state_dim if state_dim is not None else d_head
+        N = self.N
+        self.use_short_conv = use_short_conv
+        self.conv_size = conv_size
+        self.use_silu_input = use_silu_input
+
+        # Optional kernel-K causal 1D conv before projections — same
+        # short-conv trick as fla DeltaNet / OrthogonalScanAttention.
+        if use_short_conv:
+            self.short_conv = nn.Conv1d(
+                d_model, d_model, kernel_size=conv_size,
+                padding=conv_size - 1, groups=d_model, bias=False,
+            )
+
+        # Per-output-slot logits over N input candidates. Picks σ_t⁻¹.
+        self.W_sigma = nn.Linear(d_model, n_heads * N * N, bias=False)
+        # Real diagonal in [-1, 1] via 2·sigmoid − 1 ⇒ negative-eig unlocked.
+        self.W_D = nn.Linear(d_model, n_heads * N, bias=False)
+        # Per-token additive write into the state.
+        self.W_w = nn.Linear(d_model, n_heads * N, bias=False)
+        # Output projection (n_heads · N → d_model).
+        self.W_o = nn.Linear(n_heads * N, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        H, N = self.n_heads, self.N
+
+        # Optional pre-conv (causal): kernel-`conv_size` 1D conv mixes a
+        # local window before projections. Same trick as DeltaNet's
+        # `use_short_conv=True`.
+        x_in = x
+        if self.use_short_conv:
+            x_perm = x.transpose(1, 2)
+            x_conv = self.short_conv(x_perm)              # (B, D, T + conv_size − 1)
+            x_conv = x_conv[..., : T]                     # causal trim
+            x_in = x_conv.transpose(1, 2)
+        if self.use_silu_input:
+            x_in = F.silu(x_in)
+
+        # Permutation logits: (B, T, H, N, N). Each output slot i has a
+        # softmax over N input candidates j; argmax picks σ_t⁻¹(i).
+        sigma_logits = self.W_sigma(x_in).view(B, T, H, N, N)
+        sigma_soft = F.softmax(sigma_logits, dim=-1)
+        sigma_idx = sigma_logits.argmax(dim=-1)            # (B, T, H, N)
+        sigma_hard = F.one_hot(sigma_idx, num_classes=N).to(x.dtype)
+        # Straight-through: forward = hard, backward = soft.
+        P_inv = sigma_hard + (sigma_soft - sigma_soft.detach())
+
+        # Diagonal in [-1, 1].
+        D = 2.0 * torch.sigmoid(self.W_D(x_in).view(B, T, H, N)) - 1.0
+
+        # Additive write per token.
+        w = self.W_w(x_in).view(B, T, H, N)
+
+        # Sequential scan: h_0 = 0; h_t = (P_inv_t · (D_t * h_{t-1}_gathered)) + w_t.
+        # Vectorised inside batch + heads via batched matmul.
+        h = torch.zeros(B, H, N, device=x.device, dtype=x.dtype)
+        out = torch.empty(B, T, H, N, device=x.device, dtype=x.dtype)
+        for t in range(T):
+            P_inv_t = P_inv[:, t]                          # (B, H, N, N)
+            D_t = D[:, t]                                  # (B, H, N)
+            w_t = w[:, t]                                  # (B, H, N)
+            # gather_h[i] = h_prev[σ⁻¹(i)] = (P_inv · h_prev)[i].
+            gather_h = (P_inv_t @ h.unsqueeze(-1)).squeeze(-1)
+            # gather_D[i] = D[σ⁻¹(i)] — same gather pattern via P_inv.
+            gather_D = (P_inv_t @ D_t.unsqueeze(-1)).squeeze(-1)
+            h = gather_D * gather_h + w_t
+            out[:, t] = h
+
+        return self.W_o(out.reshape(B, T, H * N))
+
+
+class PDKVScanAttention(nn.Module):
+    """PD-KV — matrix-state PD-SSM with rank-1 KV write.
+
+    Generalises PDScanAttention by lifting the vector state h ∈ ℝ^N to a
+    matrix state S ∈ ℝ^{N × D}, and adding a DeltaNet-style rank-1 KV
+    write. Combines PD-SSM's transformation-monoid transitions on rows
+    of S with linear-attention's outer-product memory writes.
+
+    Recurrence:
+        S_t = (P_t · D_t) S_{t-1} + k_t v_tᵀ
+        o_t = q_tᵀ S_t                       (∈ ℝ^D)
+
+    where:
+        P_t ∈ {0,1}^{N×N} is column-one-hot (full T_N monoid),
+        D_t ∈ ℝ^{N} is real-diagonal in [-1, 1] (acts on rows),
+        k_t ∈ ℝ^N is the per-slot write key,
+        v_t ∈ ℝ^D is the value,
+        q_t ∈ ℝ^N is the read query.
+
+    Closure: (P_a D_a)(P_b D_b) is still PD, so the cumulative-transition
+    monoid stays PD; rank-1 writes accumulate as in linear attention.
+    Per-token cost: O(N · D) for both the gather-transition and rank-1
+    write — strictly cheaper than DeltaNet's O(d²) when N · D ≤ d².
+
+    Why this is the natural PD/DeltaNet hybrid:
+      - From PD-SSM: transformation monoid T_N per token ⇒ all FSAs ≤ N
+        states recognised in one layer (Terzić et al. 2025).
+      - From DeltaNet: matrix state with rank-1 KV write ⇒ associative
+        recall up to ~N · D bindings (Arora et al. 2023, MQAR).
+      - Combined: closes the capacity gap of pure PD-SSM (vector state
+        ⇒ ~N bindings) without giving up its non-solvable group reach.
+
+    This combination does not appear in the published literature as of
+    arXiv:2509.22284 (PD-SSM uses pure vector state) or arXiv:2406.06484
+    (DeltaNet uses Householder I − β k kᵀ rather than P · D).
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_head: int,
+                 state_dim: int | None = None,
+                 use_short_conv: bool = True,
+                 conv_size: int = 4,
+                 use_silu_input: bool = True):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_head
+        # N = per-head permutation dim. Default N = d_head matches the
+        # square-state convention of DeltaNet (state size = d_head²).
+        self.N = state_dim if state_dim is not None else d_head
+        N, D = self.N, d_head
+        self.use_short_conv = use_short_conv
+        self.conv_size = conv_size
+        self.use_silu_input = use_silu_input
+
+        if use_short_conv:
+            self.short_conv = nn.Conv1d(
+                d_model, d_model, kernel_size=conv_size,
+                padding=conv_size - 1, groups=d_model, bias=False,
+            )
+
+        # Per-output-slot logits over N input candidates (σ_t⁻¹).
+        self.W_sigma = nn.Linear(d_model, n_heads * N * N, bias=False)
+        # Real diagonal in [-1, 1] via 2·sigmoid − 1.
+        self.W_D = nn.Linear(d_model, n_heads * N, bias=False)
+        # KV: k picks slot, v is value.
+        self.W_k = nn.Linear(d_model, n_heads * N, bias=False)
+        self.W_v = nn.Linear(d_model, n_heads * D, bias=False)
+        # Q: read slot.
+        self.W_q = nn.Linear(d_model, n_heads * N, bias=False)
+        # Output projection (n_heads · D → d_model).
+        self.W_o = nn.Linear(n_heads * D, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        H, N, D = self.n_heads, self.N, self.d_head
+
+        x_in = x
+        if self.use_short_conv:
+            x_perm = x.transpose(1, 2)
+            x_conv = self.short_conv(x_perm)[..., : T]
+            x_in = x_conv.transpose(1, 2)
+        if self.use_silu_input:
+            x_in = F.silu(x_in)
+
+        # Permutation logits and straight-through softmax.
+        sigma_logits = self.W_sigma(x_in).view(B, T, H, N, N)
+        sigma_soft = F.softmax(sigma_logits, dim=-1)
+        sigma_idx = sigma_logits.argmax(dim=-1)
+        sigma_hard = F.one_hot(sigma_idx, num_classes=N).to(x.dtype)
+        P_inv = sigma_hard + (sigma_soft - sigma_soft.detach())  # (B, T, H, N, N)
+
+        # Diagonal in [-1, 1].
+        Dvec = 2.0 * torch.sigmoid(self.W_D(x_in).view(B, T, H, N)) - 1.0
+
+        # KVQ.
+        k = self.W_k(x_in).view(B, T, H, N)            # (B, T, H, N)
+        v = self.W_v(x_in).view(B, T, H, D)            # (B, T, H, D)
+        q = self.W_q(x_in).view(B, T, H, N)            # (B, T, H, N)
+
+        # Sequential scan over T. State S ∈ (B, H, N, D).
+        S = torch.zeros(B, H, N, D, device=x.device, dtype=x.dtype)
+        out = torch.empty(B, T, H, D, device=x.device, dtype=x.dtype)
+        for t in range(T):
+            P_inv_t = P_inv[:, t]                       # (B, H, N, N)
+            D_t = Dvec[:, t]                            # (B, H, N)
+            k_t = k[:, t]                               # (B, H, N)
+            v_t = v[:, t]                               # (B, H, D)
+            q_t = q[:, t]                               # (B, H, N)
+
+            # Gather rows of S via P_inv: gathered_S[b, h, i, :] = S[b, h, σ⁻¹(i), :].
+            gathered_S = P_inv_t @ S                                   # (B, H, N, D)
+            gathered_D = (P_inv_t @ D_t.unsqueeze(-1)).squeeze(-1)     # (B, H, N)
+            # Apply diagonal scaling per row.
+            transitioned = gathered_D.unsqueeze(-1) * gathered_S       # (B, H, N, D)
+            # Add rank-1 KV write.
+            S = transitioned + k_t.unsqueeze(-1) * v_t.unsqueeze(-2)    # (B, H, N, D)
+
+            # Read: o_t = qᵀ S → (B, H, D).
+            out[:, t] = (q_t.unsqueeze(-2) @ S).squeeze(-2)
+
+        return self.W_o(out.reshape(B, T, H * D))
+
+
+class ComplexPDScanAttention(nn.Module):
+    """Complex-PD — PD-SSM with complex unit-disk diagonal.
+
+    Same recurrence as PDScanAttention but with D_t complex-valued
+    (|D_t[j]| ≤ 1, arbitrary phase). State is complex too, represented
+    as a real tensor of shape (..., N, 2) where the last axis holds
+    (real, imag) — MPS-compatible without native complex tensor support.
+
+    Why this generalisation matters:
+      Real-only D constrains achievable group orders to those embeddable
+      in S_N as permutation cycles. By Landau's function g(N), the
+      maximum element-order is g(4)=4, g(5)=6, g(6)=6, g(7)=12, g(8)=15.
+      So PDScanAttention with N=4 cannot do mod-p for p ≥ 5; with N=6
+      cannot do mod-7; etc.
+
+      With complex D = e^{2πi k/p}, a single non-trivial element of D on
+      any 1-cycle of σ realises Z_p exactly via |D|=1, θ=2π/p — for ANY
+      p, regardless of N. This lifts PD-SSM out of the Landau bound:
+      mod-p becomes solvable at N=2 for any p.
+
+    Real-pair complex multiplication:
+      (a + bi)(c + di) = (ac − bd) + (ad + bc)i
+
+    Recurrence (component-wise):
+      h_re_t[i] = D_re·h_re − D_im·h_im   (gathered via σ⁻¹) + w_re_t[i]
+      h_im_t[i] = D_re·h_im + D_im·h_re   (gathered via σ⁻¹) + w_im_t[i]
+
+    Output: real part of h_t (or concatenation of re+im, then projected).
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_head: int,
+                 state_dim: int | None = None,
+                 use_short_conv: bool = True,
+                 conv_size: int = 4,
+                 use_silu_input: bool = True):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.N = state_dim if state_dim is not None else d_head
+        N = self.N
+        self.use_short_conv = use_short_conv
+        self.conv_size = conv_size
+        self.use_silu_input = use_silu_input
+
+        if use_short_conv:
+            self.short_conv = nn.Conv1d(
+                d_model, d_model, kernel_size=conv_size,
+                padding=conv_size - 1, groups=d_model, bias=False,
+            )
+
+        self.W_sigma = nn.Linear(d_model, n_heads * N * N, bias=False)
+        # Complex D parameterised as |D| ∈ (0, 1) and angle θ ∈ ℝ.
+        # |D| via sigmoid; θ via raw linear (any real → wrapped phase).
+        self.W_D_mag = nn.Linear(d_model, n_heads * N, bias=False)
+        self.W_D_phase = nn.Linear(d_model, n_heads * N, bias=False)
+        # Complex write — (real, imag) pair.
+        self.W_w_re = nn.Linear(d_model, n_heads * N, bias=False)
+        self.W_w_im = nn.Linear(d_model, n_heads * N, bias=False)
+        # Output projection: read both re+im of state ⇒ 2N per head.
+        self.W_o = nn.Linear(n_heads * 2 * N, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        H, N = self.n_heads, self.N
+
+        x_in = x
+        if self.use_short_conv:
+            x_perm = x.transpose(1, 2)
+            x_conv = self.short_conv(x_perm)[..., : T]
+            x_in = x_conv.transpose(1, 2)
+        if self.use_silu_input:
+            x_in = F.silu(x_in)
+
+        sigma_logits = self.W_sigma(x_in).view(B, T, H, N, N)
+        sigma_soft = F.softmax(sigma_logits, dim=-1)
+        sigma_idx = sigma_logits.argmax(dim=-1)
+        sigma_hard = F.one_hot(sigma_idx, num_classes=N).to(x.dtype)
+        P_inv = sigma_hard + (sigma_soft - sigma_soft.detach())
+
+        # Complex D in unit disk: |D| ∈ (0, 1), phase ∈ ℝ.
+        D_mag = torch.sigmoid(self.W_D_mag(x_in).view(B, T, H, N))
+        D_phase = self.W_D_phase(x_in).view(B, T, H, N)
+        D_re = D_mag * torch.cos(D_phase)
+        D_im = D_mag * torch.sin(D_phase)
+
+        w_re = self.W_w_re(x_in).view(B, T, H, N)
+        w_im = self.W_w_im(x_in).view(B, T, H, N)
+
+        # State carries (re, im) — sequential scan.
+        h_re = torch.zeros(B, H, N, device=x.device, dtype=x.dtype)
+        h_im = torch.zeros(B, H, N, device=x.device, dtype=x.dtype)
+        out = torch.empty(B, T, H, 2 * N, device=x.device, dtype=x.dtype)
+        for t in range(T):
+            P_inv_t = P_inv[:, t]                      # (B, H, N, N)
+            D_re_t = D_re[:, t]                        # (B, H, N)
+            D_im_t = D_im[:, t]
+            # Gather state and D via σ⁻¹ — same gather pattern as PD-SSM.
+            g_h_re = (P_inv_t @ h_re.unsqueeze(-1)).squeeze(-1)
+            g_h_im = (P_inv_t @ h_im.unsqueeze(-1)).squeeze(-1)
+            g_D_re = (P_inv_t @ D_re_t.unsqueeze(-1)).squeeze(-1)
+            g_D_im = (P_inv_t @ D_im_t.unsqueeze(-1)).squeeze(-1)
+            # Complex multiplication: (D_re + i·D_im)(h_re + i·h_im).
+            new_h_re = g_D_re * g_h_re - g_D_im * g_h_im + w_re[:, t]
+            new_h_im = g_D_re * g_h_im + g_D_im * g_h_re + w_im[:, t]
+            h_re, h_im = new_h_re, new_h_im
+            out[:, t, :, :N] = h_re
+            out[:, t, :, N:] = h_im
+
+        return self.W_o(out.reshape(B, T, H * 2 * N))

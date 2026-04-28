@@ -27,6 +27,7 @@ from experiments.layers import (
     DeltaNetAttention, DeltaNetNegEigAttention,
     GatedDeltaNetAttention, Mamba2Attention,
     OrthogonalScanAttention, RotConjAttention, RotDeltaAttention,
+    PDScanAttention,
 )
 from experiments.model import TinyLM
 from experiments.tasks.dyck import make_batch as dyck_batch
@@ -43,6 +44,7 @@ ARCHES = {
     "ortho":      OrthogonalScanAttention,
     "rotconj":    RotConjAttention,
     "rotdelta":   RotDeltaAttention,
+    "pd_ssm":     PDScanAttention,
 }
 
 

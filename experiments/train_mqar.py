@@ -25,7 +25,8 @@ import torch.nn.functional as F
 from experiments.layers import (
     LinearAttention, HeisenbergAttention, SoftmaxAttention,
     DeltaNetAttention, GatedDeltaNetAttention, Mamba2Attention,
-    OrthogonalScanAttention, RotConjAttention,
+    OrthogonalScanAttention, RotConjAttention, PDScanAttention,
+    PDKVScanAttention,
 )
 from experiments.model import TinyLM
 from experiments.tasks.mqar import make_batch as mqar_batch
@@ -40,6 +41,8 @@ ARCHES = {
     "mamba2":     Mamba2Attention,
     "ortho":      OrthogonalScanAttention,
     "rotconj":    RotConjAttention,
+    "pd_ssm":     PDScanAttention,
+    "pd_kv":      PDKVScanAttention,            # matrix-state PD-SSM, KV write
 }
 
 

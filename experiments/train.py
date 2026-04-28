@@ -32,6 +32,7 @@ from experiments.layers import (
     DeltaNetAttention, DeltaNetNegEigAttention,
     GatedDeltaNetAttention, Mamba2Attention,
     OrthogonalScanAttention, RotConjAttention, RotDeltaAttention,
+    PDScanAttention, PDKVScanAttention, ComplexPDScanAttention,
 )
 from experiments.model import TinyLM
 from experiments.tasks.parity import make_batch
@@ -48,6 +49,9 @@ ARCHES = {
     "ortho":       OrthogonalScanAttention,        # SO(n) scan — Grazzi-clean
     "rotconj":     RotConjAttention,               # SO(n) ⋉ ℝ^{n×n} — semidirect, novel
     "rotdelta":    RotDeltaAttention,              # rotation + delta-rule erase (variant α)
+    "pd_ssm":      PDScanAttention,                 # P×D state scan, T_N transformation monoid (Terzić 2025)
+    "pd_kv":       PDKVScanAttention,                # PD transition + rank-1 KV write (matrix state)
+    "complex_pd":  ComplexPDScanAttention,            # PD with complex unit-disk D (escapes Landau bound)
 }
 
 

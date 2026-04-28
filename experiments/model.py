@@ -97,6 +97,14 @@ def _shift_right_by_1(o: torch.Tensor) -> torch.Tensor:
     return torch.cat([pad, o[:, :-1]], dim=1)
 
 
+def _shift_right_by_k(o: torch.Tensor, k: int) -> torch.Tensor:
+    """(B, T, d) -> (B, T, d), o[:, t] := original o[:, t-k]; first k zeroed."""
+    if k <= 0:
+        return o
+    pad = torch.zeros_like(o[:, :k])
+    return torch.cat([pad, o[:, :-k]], dim=1)
+
+
 class FeedbackProjection(nn.Module):
     """Per-layer top-down feedback module — mode-specific projection.
 
@@ -105,9 +113,11 @@ class FeedbackProjection(nn.Module):
     Output: feedback contribution to layer L's residual input.
     """
 
-    def __init__(self, d_model: int, mode: str):
+    def __init__(self, d_model: int, mode: str,
+                 per_channel_alpha: bool = False):
         super().__init__()
         self.mode = mode
+        self.per_channel_alpha = per_channel_alpha
         # IMPORTANT: keep W_fb / W_scale / W_shift at *normal* init so the
         # gradient on α is non-zero from the first step. Earlier bug: with
         # both α=0 AND W_*=0, gradient on α is zero and α never moves.
@@ -127,7 +137,9 @@ class FeedbackProjection(nn.Module):
         # starts as a pure feedforward stack and has to *earn* feedback use,
         # but the gradient on α is non-zero (because W_* are non-zero) so
         # the optimizer can move it.
-        self.alpha = nn.Parameter(torch.zeros(1))
+        # Scalar (1,) by default; per-channel (d_model,) when requested.
+        alpha_shape = (d_model,) if per_channel_alpha else (1,)
+        self.alpha = nn.Parameter(torch.zeros(alpha_shape))
         # Diagnostic: freeze α at 0 (ablation — film with feedback machinery
         # but no actual feedback application). Tests whether "dead weights"
         # alone hurt PPL.
@@ -719,6 +731,12 @@ class TinyLM(nn.Module):
         feedback_xattn_form: str = "attn",    # 'attn'      = additive residual (Q-K-V)
                                               # 'film_sum'  = multi-source FiLM, sum
                                               # 'film_attn' = softmax routing + FiLM out
+        feedback_lag: int = 1,                # Lag (in tokens) for source state
+                                              # before feeding to target. 1 = t-1
+                                              # (default, parallel-scan friendly).
+        feedback_position: str = "pre",       # 'pre' = modulate target's input
+                                              # 'post' = modulate target's output
+        feedback_per_channel_alpha: bool = False,  # per-channel α for sparse FiLM
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -764,6 +782,11 @@ class TinyLM(nn.Module):
         self.feedback_mode = feedback_mode
         self.feedback_distances = tuple(feedback_distances)
         self.feedback_pairs = tuple((int(t), int(s)) for t, s in feedback_pairs)
+        self.feedback_lag = int(feedback_lag)
+        self.feedback_position = feedback_position
+        self.feedback_per_channel_alpha = bool(feedback_per_channel_alpha)
+        if feedback_position not in ("pre", "post"):
+            raise ValueError(f"feedback_position must be 'pre' or 'post', got {feedback_position!r}")
         self.feedback_xattn_pairs = tuple(
             (int(t), tuple(int(s) for s in srcs)) for t, srcs in feedback_xattn_pairs
         )
@@ -827,7 +850,10 @@ class TinyLM(nn.Module):
             # Sparse mode — one FeedbackProjection per (target, source) pair,
             # indexed by target layer string for ModuleDict.
             self.sparse_feedback = nn.ModuleDict({
-                str(t): FeedbackProjection(d_model, mode=feedback_mode)
+                str(t): FeedbackProjection(
+                    d_model, mode=feedback_mode,
+                    per_channel_alpha=feedback_per_channel_alpha,
+                )
                 for t, _ in self.feedback_pairs
             })
             # Inverse map: target_layer -> source_layer (for fast lookup).
@@ -909,13 +935,21 @@ class TinyLM(nn.Module):
                 if L in source_layers:
                     pass1_at_sources[L] = h1
             # Pass 2: forward with sparse modulation at target layers.
+            # feedback_position: 'pre' = modulate input, 'post' = modulate output.
+            # feedback_lag: how many tokens to shift the source state right.
             h = x
             for L, blk in enumerate(self.blocks):
-                if L in self.sparse_target_to_source:
+                if L in self.sparse_target_to_source and self.feedback_position == "pre":
                     src = self.sparse_target_to_source[L]
-                    state_above_lagged = _shift_right_by_1(pass1_at_sources[src])
+                    state_above_lagged = _shift_right_by_k(pass1_at_sources[src],
+                                                            self.feedback_lag)
                     h = self.sparse_feedback[str(L)](h, state_above_lagged)
                 h = blk(h, input_ids=input_ids)
+                if L in self.sparse_target_to_source and self.feedback_position == "post":
+                    src = self.sparse_target_to_source[L]
+                    state_above_lagged = _shift_right_by_k(pass1_at_sources[src],
+                                                            self.feedback_lag)
+                    h = self.sparse_feedback[str(L)](h, state_above_lagged)
             h = self.out_norm(h)
             lm_logits = self.lm_head(h)
             if return_aux and self.aux_dim > 0:
@@ -986,22 +1020,25 @@ class TinyLM(nn.Module):
         - dense multi:  list of n_layers lists.
         - none:    empty list.
         """
+        # Use .mean().item() throughout so per-channel α (if enabled in
+        # sparse_feedback) reduces to a scalar summary cleanly; for scalar
+        # α it's a no-op.
         if self.feedback_xattn_pairs:
             if self.feedback_xattn_form == "all_sigmoid":
                 return [(t, srcs,
-                         float(self.xattn_all_module.alphas[str(t)].detach().item()))
+                         float(self.xattn_all_module.alphas[str(t)].detach().mean().item()))
                         for t, srcs in self.feedback_xattn_pairs]
-            return [(t, srcs, float(self.xattn_feedback[str(t)].alpha.detach().item()))
+            return [(t, srcs, float(self.xattn_feedback[str(t)].alpha.detach().mean().item()))
                     for t, srcs in self.feedback_xattn_pairs]
         if self.feedback_mode == "none":
             return []
         if self.feedback_pairs:
-            return [(t, s, float(self.sparse_feedback[str(t)].alpha.detach().item()))
+            return [(t, s, float(self.sparse_feedback[str(t)].alpha.detach().mean().item()))
                     for t, s in self.feedback_pairs]
         if len(self.feedback_distances) == 1:
-            return [float(fb.projs[0].alpha.detach().item())
+            return [float(fb.projs[0].alpha.detach().mean().item())
                     for fb in self.feedback]
-        return [[float(p.alpha.detach().item()) for p in fb.projs]
+        return [[float(p.alpha.detach().mean().item()) for p in fb.projs]
                 for fb in self.feedback]
 
     def freeze_alpha(self) -> None:

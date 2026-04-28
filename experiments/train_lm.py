@@ -208,6 +208,17 @@ def main():
                         "ignores --feedback (attention is its own form).")
     p.add_argument("--feedback_xattn_heads", type=int, default=4,
                    help="Number of heads inside the cross-layer attention.")
+    p.add_argument("--feedback_lag", type=int, default=1,
+                   help="Lag in tokens for the source state before feeding "
+                        "to target (default 1 = t-1, parallel-scan friendly).")
+    p.add_argument("--feedback_position", type=str, default="pre",
+                   choices=["pre", "post"],
+                   help="'pre' (default) modulates target's input; "
+                        "'post' modulates target's output.")
+    p.add_argument("--feedback_per_channel_alpha", action="store_true",
+                   help="Use per-channel α (d_model floats) instead of scalar α "
+                        "for sparse FiLM. Tests whether channel-dependent gating "
+                        "can mix the negative- and positive-α basins per channel.")
     p.add_argument("--feedback_xattn_form", type=str, default="attn",
                    choices=["attn", "film_sum", "film_sum_mlp", "film_sum_glu",
                             "film_target_gated",
@@ -346,6 +357,9 @@ def main():
         feedback_xattn_pairs=fb_xattn_pairs,
         feedback_xattn_heads=args.feedback_xattn_heads,
         feedback_xattn_form=args.feedback_xattn_form,
+        feedback_lag=args.feedback_lag,
+        feedback_position=args.feedback_position,
+        feedback_per_channel_alpha=args.feedback_per_channel_alpha,
         **attn_kw,
     ).to("cuda")
     if args.freeze_alpha and (args.feedback != "none" or fb_xattn_pairs):

@@ -959,6 +959,67 @@ distillation student is robust:
   (additive); useful if seed variance at scale ever moves us off
   the negative basin.
 
+### Phase 14g — Final architectural sweep (Tier-1, 2026-04-28)
+
+Last batch of *cheap* architectural tweaks before scale-up. Four
+controlled variants of `(2, 28)` sparse FiLM:
+
+| Tweak | What changed | α | PPL | vs sparse base |
+|-------|--------------|---|------|----------------|
+| **Tier1-C: post-block** | modulate target's *output* not input | **+0.049** | **49.57** | **tied** |
+| Tier1-D: dual (2,28)+(3,28) | both winning targets, same source | α₂=−0.040, α₃=+0.013 | 50.24 | +1.7% loses |
+| Tier1-A: per-channel α | α is `(d_model,)` instead of scalar | mean=−0.002, σ=0.032, 52%NEG/48%POS | 50.03 | +1.3% loses |
+| Tier1-B: lag = 4 (was 1) | source shifted t−4 instead of t−1 | −0.046 (NEG) | 51.03 | ≈ DN |
+
+**Key new finding (Tier1-C):**
+**Post-block feedback application reaches the same PPL ceiling via
+the *additive (positive-α) basin*.** Same architecture, same source,
+same target — but modulating layer 2's *output* finds α = +0.049
+(POS) instead of pre-block's α = −0.054 (NEG). Both end at PPL ~49.5.
+This reveals an architectural **duality**: subtraction-on-input ≡
+addition-on-output. Feedback is useful in this exact target-source
+configuration regardless of which side of the block it lands on; the
+optimizer chooses the basin that matches the modulation site.
+
+**Other outcomes are intuitive given prior findings:**
+
+- **Per-channel α (Tier1-A)** found a roughly symmetric mixed-sign
+  per-channel solution (52% NEG, 48% POS, |α| typically > 0.01) but
+  underperforms scalar α. Homogeneous gating direction outperforms
+  per-channel heterogeneity, even though the latter has more
+  expressivity. Hypothesis: a consistent direction makes the
+  modulation more interpretable to downstream layers and the
+  W_scale/W_shift matrices learn cleaner directions.
+
+- **Dual `(2,28)+(3,28)` (Tier1-D)** loses to either alone (50.24 vs
+  49.40 / 49.57). The (3, 28) component lands smaller α magnitude
+  (+0.013 vs its standalone +0.049) — the (2, 28) modulation
+  changes layer 3's input in pass-2, weakening (3, 28)'s gradient
+  signal. Mini compounding-divergence in two adjacent targets.
+
+- **Lag = 4 (Tier1-B)** breaks the predictive-coding correspondence
+  even with α going clearly negative (−0.046). The source state at
+  t−4 is too "stale" to predict layer 2's input at t — there's no
+  longer a useful t-step prediction relationship.
+
+### Final architectural set: four variants tie the basin
+
+After the full mechanism sweep, **four architectures all reach
+PPL 49.4-49.6 at @30L, by different mechanisms**:
+
+| Architecture | Mechanism | α |
+|--------------|-----------|---|
+| Sparse (2, 28) pre-block FiLM | subtractive predictive coding | −0.054 |
+| Sparse (3, 28) pre-block FiLM | additive feedback | +0.049 |
+| Sparse (2, 28) **post-block** FiLM | additive output correction | +0.049 |
+| FiLM-sum / FiLM-sigmoid 3-source | basin-via-aggregation | NEG |
+| Distributed (2,28)+(4,24)+(8,20) | mixed, dominated by (2, 28) | NEG-mix |
+
+The *negative* and *positive* α basins are both reachable from
+nearby architectures, and they yield the same PPL ceiling.
+Single-pair `(2, 28)` pre-block FiLM remains the simplest exemplar
+and the recommended scale-up choice.
+
 ### Scaling decision
 
 Per the architectural saturation above, the chosen scaling path is

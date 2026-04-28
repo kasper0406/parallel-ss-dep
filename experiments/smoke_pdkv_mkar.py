@@ -99,7 +99,7 @@ def train_one(arch_cls, label: str, K: int, T: int, steps: int, batch: int,
     n_params = sum(p.numel() for p in model.parameters())
 
     print(f"\n[{label}] K={K} T={T} N={state_dim} optim={optim_name} "
-          f"params={n_params:,}")
+          f"params={n_params:,}", flush=True)
     print(f"{'step':>5}  {'loss':>7}  {'q_acc':>7}")
 
     t0 = time.perf_counter()
@@ -129,7 +129,7 @@ def train_one(arch_cls, label: str, K: int, T: int, steps: int, batch: int,
                 q_acc = (pv[mv] == yv[mv]).float().mean().item()
                 last_q = q_acc
             model.train()
-            print(f"{step:>5d}  {last_loss:>7.4f}  {q_acc:>7.3f}")
+            print(f"{step:>5d}  {last_loss:>7.4f}  {q_acc:>7.3f}", flush=True)
     secs = time.perf_counter() - t0
     return dict(label=label, K=K, params=n_params,
                 final_loss=last_loss, q_acc=last_q, secs=secs)

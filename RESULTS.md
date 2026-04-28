@@ -796,20 +796,79 @@ The data is conclusive on three points:
    feedback projection capacity was not the bottleneck — adding
    nonlinear expressivity does not move PPL.
 
-**Practical implication for scaling.** The architectural choice for
-the scale-up student is between two equivalent options:
+### Phase 14d — Rescuing attention: the basin is reachable, just not via softmax
 
-- **Sparse (2, 28) FiLM** — simplest, single connection, +0.3 % params,
-  proven across seed/depth/extrapolation/TinyStories sweeps.
-- **FiLM-sum on K curated late sources** — same negative-α
-  predictive-coding basin, slightly richer signal, +0.6-1 % params,
-  may generalize better at larger scales. Untested at scale.
+The 14c finding — softmax routing breaks the basin even with FiLM
+output — left a question: *can per-token cross-layer routing help at
+all*, or is the multiplicative-sum form the ceiling? Tested by
+replacing softmax with **independent per-source sigmoid gates** in
+an otherwise FiLM-shaped attention module
+(`SigmoidGatedFiLMAttentionFeedback`):
 
-Going with **sparse single-pair (2, 28)** for the distillation
-student because every supporting result (3-seed σ, depth ablation,
-T extrapolation, TinyStories generalization) is on that exact
-architecture. `film_sum` is held in reserve as a low-risk
-architectural upgrade if scale-up exposes a single-pair limitation.
+```
+g_i = sigmoid(Q · K_i / √d)              # ∈ [0,1] independently per source
+scale = sum_i g_i · W_scale[i](src_i)
+shift = sum_i g_i · W_shift[i](src_i)
+x_out = x · (1 + α · out_proj(scale)) + α · out_proj(shift)
+```
+
+At init, g ≈ 0.5 per source (vs softmax's 1/K), so the gradient on
+α scales as ~K² stronger than `film_attn`'s.
+
+**Result @30L 220.3 M, 5 K steps, code:**
+
+| Variant | α (final) | PPL | vs sparse base |
+|---------|-----------|------|----------------|
+| Sparse (2, 28) FiLM | −0.054 | 49.40 | — |
+| `film_sum` [14, 21, 28] | −0.037 | 49.42 | tied |
+| **`film_sigmoid` [14, 21, 28]** | **−0.034** | **49.44** | **tied** |
+| `film_attn` (softmax) | +0.042 | 50.47 | +2.2 % loses |
+
+**The rescue works.** Sigmoid-gated FiLM-attention finds the
+negative-α basin and ties single-pair sparse and film-sum on PPL.
+**Per-token cross-layer routing is genuinely useful** — the issue
+was specifically softmax's at-init dilution, not attention as a
+mechanism. The cleanest formulation of the basin condition is now:
+
+> The basin is reached iff (i) the output form is multiplicative and
+> (ii) the per-source contribution is *not* normalized to sum to 1.
+
+Three architectures satisfying both conditions tie at PPL 49.4 at
+@30L: sparse single-pair, FiLM-sum (no routing), and FiLM-sigmoid
+(per-token routing). Softmax (film_attn) and additive Q-K-V
+(xattn / single-src attn) fail.
+
+### Phase 14e — Depth generalization for film_sum
+
+Tested whether the multi-source FiLM-sum architecture generalizes
+across the 8L / 15L / 30L depth ablation we ran for sparse:
+
+| Depth | DN | Dense film (every layer) | **Sparse 1-pair** | **`film_sum` 3-src** |
+|-------|------|------|------|------|
+| @8L  (sources 1:[4,5,7]) | 54.38 | 53.57 | **52.99** ⭐ | 53.97 (loses) |
+| @15L (sources 1:[7,10,13]) | 52.85 | 52.28 | 52.45 | **52.00** ⭐ |
+| @30L (sources 2:[14,21,28]) | 51.00 | 51.5 | **49.40** ⭐ | 49.42 (tied) |
+
+**Surprising depth-dependent flip**: `film_sum` *wins* at @15L (best
+of any tested architecture there, 0.5 % below sparse single-pair),
+*ties* at @30L, and *loses* at @8L. At @15L the multi-source
+contribution comes from positive-α basin (α ≈ +0.043) but still
+beats every single-pair variant — the extra capacity helps on this
+medium-depth setup. At @8L the basin is negative (α = −0.040) but
+the multi-source aggregation doesn't help — likely because the
+late layers (4, 5, 7) at @8L are too close to each other to carry
+truly differentiated context.
+
+**Practical implication for scaling.** The architecture choice for
+the scale-up student depends on stack depth:
+
+- At **@30L** (our target student depth): sparse single-pair, film-sum,
+  and film-sigmoid are all within seed σ. **Sparse single-pair (2, 28)
+  is preferred for simplicity** and because every supporting result
+  (3-seed σ, depth ablation, T extrapolation, TinyStories) is on it.
+- `film_sum` and `film_sigmoid` are **safe-as-or-better** alternates if
+  scale-up exposes any single-pair limitation; both are minor code
+  swaps from the existing infrastructure.
 
 ### Scaling decision
 

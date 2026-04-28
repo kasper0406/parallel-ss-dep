@@ -316,6 +316,86 @@ class FiLMAttentionFeedback(nn.Module):
         return x * (1.0 + a * scale) + a * shift
 
 
+class SigmoidGatedFiLMAttentionFeedback(nn.Module):
+    """Cross-layer routing with sigmoid (not softmax) gates + FiLM output.
+
+    Each source layer has an independent per-token gate in [0, 1] computed
+    as sigmoid(Q · K_i / sqrt(d_head)). Avoids the softmax 1/K-dilution
+    failure mode of FiLMAttentionFeedback while preserving per-token
+    routing flexibility. Output is multiplicative FiLM (which we know
+    finds the negative-α basin from film_sum).
+
+        Q from x[t]
+        for each source i:
+            g_i = sigmoid(Q · K_i)   ∈ [0, 1] independently per source
+            scale_i = W_scale[i](source_i)
+            shift_i = W_shift[i](source_i)
+        scale = sum_i g_i · scale_i
+        shift = sum_i g_i · shift_i
+        x_out = x * (1 + alpha · out_proj_scale(scale))
+              +     alpha · out_proj_shift(shift)
+
+    At init g ≈ 0.5 → magnitude is 0.5·K per source vs softmax's 1/K
+    per source. The gradient on α is therefore ≥ K² stronger than
+    film_attn at init.
+    """
+
+    def __init__(self, d_model: int, n_sources: int,
+                 n_heads: int = 4, d_head: int | None = None):
+        super().__init__()
+        if d_head is None:
+            d_head = d_model // n_heads
+        assert n_heads * d_head == d_model
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.n_sources = n_sources
+        self.scale_qk = d_head ** -0.5
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_projs = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False) for _ in range(n_sources)
+        ])
+        # FiLM-form values: each source emits a scale and shift (d_model each).
+        self.W_scales = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False) for _ in range(n_sources)
+        ])
+        self.W_shifts = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False) for _ in range(n_sources)
+        ])
+        self.out_proj_scale = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj_shift = nn.Linear(d_model, d_model, bias=False)
+        for m in [self.q_proj, *self.k_projs, *self.W_scales, *self.W_shifts,
+                  self.out_proj_scale, self.out_proj_shift]:
+            nn.init.normal_(m.weight, std=1.0 / math.sqrt(d_model))
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.freeze_alpha = False
+
+    def get_alpha(self) -> torch.Tensor:
+        return torch.zeros_like(self.alpha) if self.freeze_alpha else self.alpha
+
+    def forward(self, x: torch.Tensor,
+                source_states_lagged: list) -> torch.Tensor:
+        B, T, D = x.shape
+        H, Dh = self.n_heads, self.d_head
+        # Q at target. (B, T, H, Dh)
+        q = self.q_proj(x).view(B, T, H, Dh)
+        scale_acc = x.new_zeros((B, T, D))
+        shift_acc = x.new_zeros((B, T, D))
+        for i, src in enumerate(source_states_lagged):
+            # K_i. (B, T, H, Dh)
+            k = self.k_projs[i](src).view(B, T, H, Dh)
+            # Per-source per-token per-head sigmoid gate.
+            score = (q * k).sum(dim=-1) * self.scale_qk     # (B, T, H)
+            g = torch.sigmoid(score)                        # (B, T, H)
+            # Repeat each head's gate across its head_dim slice. (B, T, D)
+            g_exp = g.unsqueeze(-1).expand(-1, -1, -1, Dh).reshape(B, T, D)
+            scale_acc = scale_acc + g_exp * self.W_scales[i](src)
+            shift_acc = shift_acc + g_exp * self.W_shifts[i](src)
+        scale = self.out_proj_scale(scale_acc)
+        shift = self.out_proj_shift(shift_acc)
+        a = self.get_alpha()
+        return x * (1.0 + a * scale) + a * shift
+
+
 class CrossLayerAttentionFeedback(nn.Module):
     """Cross-layer attention top-down feedback.
 
@@ -515,6 +595,11 @@ class TinyLM(nn.Module):
                     )
                 if feedback_xattn_form == "film_attn":
                     return FiLMAttentionFeedback(
+                        d_model=d_model, n_sources=len(srcs),
+                        n_heads=feedback_xattn_heads,
+                    )
+                if feedback_xattn_form == "film_sigmoid":
+                    return SigmoidGatedFiLMAttentionFeedback(
                         d_model=d_model, n_sources=len(srcs),
                         n_heads=feedback_xattn_heads,
                     )

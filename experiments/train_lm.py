@@ -209,14 +209,18 @@ def main():
     p.add_argument("--feedback_xattn_heads", type=int, default=4,
                    help="Number of heads inside the cross-layer attention.")
     p.add_argument("--feedback_xattn_form", type=str, default="attn",
-                   choices=["attn", "film_sum", "film_sum_mlp", "film_attn"],
+                   choices=["attn", "film_sum", "film_sum_mlp", "film_attn",
+                            "film_sigmoid"],
                    help="Form of the cross-layer feedback module: "
                         "'attn' = additive Q-K-V softmax residual (default); "
                         "'film_sum' = multi-source FiLM, sum (no softmax); "
                         "'film_sum_mlp' = film_sum but each W is an MLP "
                         "(Linear-GELU-Linear) — tests nonlinear expressivity; "
                         "'film_attn' = softmax routing + multiplicative FiLM "
-                        "output (lets attention learn negative-α basin).")
+                        "output (lets attention learn negative-α basin); "
+                        "'film_sigmoid' = sigmoid (not softmax) per-source "
+                        "gates + FiLM output (no 1/K dilution, per-token "
+                        "routing preserved).")
     p.add_argument("--layers", type=str, default=None,
                    help="explicit comma-separated layer arch list, "
                         "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "

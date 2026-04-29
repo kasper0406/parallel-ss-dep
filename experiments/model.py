@@ -737,6 +737,9 @@ class TinyLM(nn.Module):
         feedback_position: str = "pre",       # 'pre' = modulate target's input
                                               # 'post' = modulate target's output
         feedback_per_channel_alpha: bool = False,  # per-channel α for sparse FiLM
+        tie_embeddings: bool = False,         # share weights between embedding
+                                              # and lm_head (~halves params for
+                                              # large-vocab Qwen tokenizer).
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -767,6 +770,16 @@ class TinyLM(nn.Module):
         ])
         self.out_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        if tie_embeddings:
+            # Share parameters between embedding and lm_head. With tied
+            # embeddings the embedding init also determines the logit
+            # magnitude — default N(0, 1) gives logit std ≈ √d_model
+            # (huge for d=576). Rescale to N(0, 1/√d_model) so initial
+            # logits have unit-ish scale and softmax doesn't degenerate.
+            nn.init.normal_(self.embed.weight, mean=0.0,
+                            std=1.0 / math.sqrt(d_model))
+            self.lm_head.weight = self.embed.weight
+        self.tie_embeddings = bool(tie_embeddings)
         # Optional aux head — e.g. for bracket-depth supervision (direction E).
         self.aux_dim = aux_dim
         if aux_dim > 0:

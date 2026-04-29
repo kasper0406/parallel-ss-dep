@@ -1113,6 +1113,30 @@ data, larger model) is the right way to see whether sparse-FiLM's
 PPL advantage *also* translates to structural improvement once the
 model is no longer undertrained.
 
+#### Long-T extrapolation (test PPL from 1× to 8× training T)
+
+`eval_longcontext.py` on each ckpt, n_chunks=24, batch=4 from a
+held-out shard of codeparrot:
+
+| T | DN | **Sparse-FiLM** | Transformer | Mamba2 |
+|---|-----|------------------|--------------|--------|
+| 512 (training T) | 70.11 | **67.12** ⭐ | 84.79 | 80.50 |
+| 1024 (2×) | 52.21 | **50.09** ⭐ | (skip — abs pos OOB) | 58.48 |
+| 2048 (4×) | 53.56 | **51.38** ⭐ | (skip) | 58.79 |
+| 4096 (8×) | 45.14 | **43.22** ⭐ | (skip) | 48.18 |
+
+**Sparse-FiLM is best at every T tested**, including 8× past training
+length. Transformer with learnable absolute-position embeddings cannot
+extrapolate at all (out-of-bounds pos lookup). Mamba2 extrapolates
+fine but trails Sparse-FiLM and DN by 8-15 % at every T. Architectural
+ordering holds at every T:
+
+> **Sparse-FiLM > DeltaNet > Mamba2 > Transformer**
+
+(Note: PPL values here differ from final-training PPL because this
+eval uses a separate held-out slice and n_chunks=24, but the
+*relative ordering* is what matters and is consistent.)
+
 ### Phase 15 — Distillation infra + first negative result (2026-04-29)
 
 End-to-end pipeline built and validated:

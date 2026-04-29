@@ -79,7 +79,15 @@ def main():
         print(f"  feedback={cfg.get('feedback_mode')}  n_layers={cfg['n_layers']}  d_model={cfg['d_model']}")
         tok = AutoTokenizer.from_pretrained(cfg.get("tokenizer", "HuggingFaceTB/SmolLM2-135M"))
         results = {}
+        # Transformer with absolute positional embedding cannot extend
+        # past its trained max_T (pos_embed lookup is OOB). Detect that
+        # case and skip those Ts cleanly.
+        max_T_model = getattr(model, "max_T", 0)
         for T in args.T:
+            if max_T_model > 0 and T > max_T_model:
+                results[T] = float("nan")
+                print(f"  T={T}: SKIPPED (model has max_T={max_T_model})")
+                continue
             ppl = eval_ppl(model, tok, T, n_chunks=args.n_chunks,
                            batch=args.batch, dataset=args.dataset,
                            text_field=args.text_field)
@@ -97,7 +105,10 @@ def main():
     print(header)
     for ckpt, results in all_results.items():
         name = pathlib.Path(ckpt).stem
-        row = f"{name:<48}" + "".join(f"  {results[T]:<8.2f}" for T in Ts)
+        row = f"{name:<48}"
+        for T in Ts:
+            v = results[T]
+            row += f"  {v:<8.2f}" if v == v else f"  {'(skip)':<8}"
         print(row)
     return 0
 

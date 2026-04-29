@@ -30,6 +30,7 @@ from experiments.layers import (
     DeltaNetAttention, DeltaNetNegEigAttention, GatedDeltaNetAttention,
     OrthogonalScanAttention, SymbolGroundedAttention,
     HeisenbergAttention, MultiPassAttention,
+    SoftmaxAttention, Mamba2Attention,
 )
 from experiments.model import TinyLM
 from experiments.aux_brackets import compute_bracket_deltas, bracket_depth
@@ -40,6 +41,8 @@ _NAME_TO_CLS = {
     "deltanet_negeig": DeltaNetNegEigAttention,
     "gated_deltanet": GatedDeltaNetAttention,
     "ortho":      OrthogonalScanAttention,
+    "transformer": SoftmaxAttention,
+    "mamba2":     Mamba2Attention,
 }
 
 
@@ -161,7 +164,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--arch", type=str, default=None,
                    choices=["deltanet", "deltanet_negeig", "gated_deltanet",
-                            "ortho",
+                            "ortho", "transformer", "mamba2",
                             "hybrid", "hybrid_25_75", "hybrid_75_25",
                             "hybrid_negeig",
                             "symgrounded", "hybrid_sg", "hybrid_sg_25_75",
@@ -241,6 +244,14 @@ def main():
                         "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
                         "Overrides --arch.")
     p.add_argument("--T", type=int, default=512)
+    p.add_argument("--max_T", type=int, default=0,
+                   help="Max sequence length for the (optional) absolute "
+                        "positional embedding. Set to >= --T (e.g. equal) "
+                        "for the Transformer baseline (softmax attention "
+                        "is permutation-invariant without position info). "
+                        "Linear-RNN architectures (DeltaNet, Mamba2, etc.) "
+                        "have implicit position via state and do not need "
+                        "this. Default 0 = no positional embedding.")
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--steps", type=int, default=5000)
     p.add_argument("--d_model", type=int, default=576)
@@ -352,6 +363,7 @@ def main():
     model = TinyLM(
         vocab_size=tok.vocab_size, d_model=args.d_model, n_layers=n_layers_actual,
         n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim,
+        max_T=args.max_T,
         feedback_mode=args.feedback, feedback_distances=fb_distances,
         feedback_pairs=fb_pairs,
         feedback_xattn_pairs=fb_xattn_pairs,

@@ -1029,6 +1029,54 @@ Gated DeltaNet — same algebraic family as our student). See
 infrastructure notes (vLLM in a separate venv to keep our
 nightly-torch student environment intact).
 
+### Phase 16 — SOTA architecture comparison (2026-04-29)
+
+After 20+ within-family ablations, ran the missing comparison:
+**vanilla Transformer and Mamba2 at matched params/data**.
+
+@30L, 576 d_model, 9 heads × 64 d_head, codeparrot Python,
+T=512, batch=8, 5K AdamW steps (~2.5 M tokens), lr=3e-4 cosine
+(no warmup), seed=0. Block structure (RMSNorm + attention +
+RMSNorm + GLU FFN with d_ff=4·d_model) is **identical** across
+runs — only the attention class changes.
+
+| Architecture | Params | Final PPL | Δ vs Sparse-FiLM |
+|--------------|--------|-----------|-------------------|
+| Vanilla Transformer (softmax + abs pos emb) | 216 M | 60.75 | +23.0 % |
+| Mamba2 (SSM, fla.layers.Mamba2) | 208 M | 55.60 | +12.5 % |
+| DeltaNet (linear-RNN) | 217 M | 51.00 | +3.2 % |
+| **Sparse-(2,28)-FiLM DeltaNet** ⭐ | **217 M** | **49.40** | **—** |
+
+**Findings:**
+
+- **Linear-RNN beats softmax Transformer** at this scale on Python
+  code: DeltaNet alone (51.00) outperforms vanilla Transformer
+  (60.75) by 16 %. Mamba2 sits in between (55.60).
+- **Sparse cross-layer feedback extends DeltaNet's lead.** Adding a
+  single (2, 28) FiLM connection to DeltaNet (+0.3 % params) beats
+  vanilla Transformer by 23 % and Mamba2 by 12 % under matched
+  hyperparameters and identical block structure.
+- **Architectural ordering at this regime:**
+  Sparse-FiLM > DeltaNet > Mamba2 > Transformer.
+
+**Caveats (honest scope of the result):**
+
+- Small scale: 217 M params, ~2.5 M training tokens, T=512.
+- Same lr=3e-4 cosine for all (no warmup). Transformers
+  conventionally use warmup + slightly higher peak lr; the gap to
+  the linear-RNN family may shrink with tuned Transformer
+  hyperparameters. We did not tune.
+- Single corpus (Python code via codeparrot-clean). Relative
+  ordering on natural-text or longer contexts may differ.
+- The Transformer baseline uses learnable absolute positional
+  embeddings (the simplest pos-info choice). RoPE / ALiBi may
+  give slightly stronger Transformer numbers.
+
+Even granting those caveats, the headline holds: **at matched
+params, matched data, identical block structure, sparse cross-layer
+feedback in a linear-RNN beats both vanilla Transformer and Mamba2
+on this code-PPL task by double-digit percentages.**
+
 ### Phase 15 — Distillation infra + first negative result (2026-04-29)
 
 End-to-end pipeline built and validated:

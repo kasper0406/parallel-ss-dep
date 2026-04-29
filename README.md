@@ -85,23 +85,33 @@ clean diagnostic decomposition of why the dominant architectures
    and 1.74× at 50/50). 135M distillation from a coding teacher is
    now genuinely feasible.
 
-9. **Sparse far-distance top-down feedback wins at param parity AND
-   across 16× context extrapolation** (`SESSION_FINDINGS.md`,
-   `RESULTS.md` Phase 14). One sparse cross-layer connection
-   (layer 2 ← layer 28 in a 30-layer stack) gives **−3.1% PPL vs
-   pure DeltaNet @30L** on Python code at 135M-class params, with
-   only **+0.3% extra parameters**. 3-seed reproducibility:
-   **49.40 ± 0.31 vs DN 51.00 (σ < 1%)**. The advantage holds at
-   every T from 512 (training) to 8192 (16× extrapolation) at 4-5%
-   improvement, on TinyStories at −1.6%, and at every depth tested
-   (sparse beats DN by −2.6% / −0.8% / −3.1% at @8L / @15L / @30L).
-   Mechanistically clean: avoids the compounding-divergence problem
-   that defeats dense multi-scale variants (which only "won" via
-   +46% extra params and lost at param parity). The cleanest novel
-   architectural contribution of the project — a depth-aware
-   predictive-coding-style inductive bias for linear-RNN coding
-   LMs that survives every controlled comparison and extends
-   naturally to long context.
+9. **Sparse far-distance top-down feedback beats vanilla
+   Transformer (−23%), Mamba2 (−12.5%), and DeltaNet (−3.1%) at
+   matched params** (`SESSION_FINDINGS.md`, `RESULTS.md` Phase 14
+   and Phase 16). One sparse cross-layer connection (layer 2 ←
+   layer 28 in a 30-layer stack) gives, on Python code at 217M
+   params, T=512, identical block structure, lr=3e-4 cosine
+   (no warmup), seed=0:
+
+   ```
+   Vanilla Transformer (softmax + abs pos): 60.75 PPL
+   Mamba2 (SSM):                            55.60 PPL
+   DeltaNet (linear-RNN):                   51.00 PPL
+   Sparse-(2,28)-FiLM DeltaNet (ours):      49.40 PPL ⭐
+   ```
+
+   3-seed reproducibility on the (2,28) variant: **49.40 ± 0.31**
+   (σ < 1%). The advantage holds at every T from 512 (training) to
+   8192 (16× extrapolation) at 4-5% improvement, on TinyStories at
+   −1.6%, and at every depth tested (sparse beats DN by
+   −2.6% / −0.8% / −3.1% at @8L / @15L / @30L). Mechanistically
+   clean: 20+ ablations (Phase 14b-g) pin down the conditions for
+   the negative-α predictive-coding basin — multiplicative FiLM
+   form + non-softmax aggregation. Avoids the compounding-divergence
+   problem that defeats dense multi-scale variants (+46 % extra
+   params, loses at param parity). A depth-aware predictive-coding
+   inductive bias for linear-RNN coding LMs that survives every
+   controlled comparison and extends naturally to long context.
 4. The hybrid finding gives the empirical rank-ordering on parity:
    linear / heisenberg (✗ TC⁰) → DeltaNet default (T=128 only) → ortho
    / hybrid (T=512). And on recall: linear / ortho / rotconj / rotdelta

@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader, IterableDataset
 
 from experiments.layers import (
     DeltaNetAttention, DeltaNetNegEigAttention, GatedDeltaNetAttention,
+    GatedDeltaProductAttention,
     OrthogonalScanAttention, SymbolGroundedAttention,
     HeisenbergAttention, MultiPassAttention,
     SoftmaxAttention, Mamba2Attention,
@@ -40,6 +41,7 @@ _NAME_TO_CLS = {
     "deltanet":   DeltaNetAttention,
     "deltanet_negeig": DeltaNetNegEigAttention,
     "gated_deltanet": GatedDeltaNetAttention,
+    "gated_deltaproduct": GatedDeltaProductAttention,
     "ortho":      OrthogonalScanAttention,
     "transformer": SoftmaxAttention,
     "mamba2":     Mamba2Attention,
@@ -164,6 +166,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--arch", type=str, default=None,
                    choices=["deltanet", "deltanet_negeig", "gated_deltanet",
+                            "gated_deltaproduct",
                             "ortho", "transformer", "mamba2",
                             "hybrid", "hybrid_25_75", "hybrid_75_25",
                             "hybrid_negeig",

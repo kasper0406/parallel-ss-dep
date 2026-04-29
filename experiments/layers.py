@@ -245,6 +245,35 @@ class GatedDeltaNetAttention(_FlaWrapper):
         ))
 
 
+class GatedDeltaProductAttention(_FlaWrapper):
+    """fla GatedDeltaProduct — DeltaNet + K Householder products + gating.
+
+    DeltaProduct ([Yang et al. NeurIPS 2025][deltaproduct]) generalizes
+    DeltaNet by using K Householder transformations per token (vs DeltaNet's
+    single rank-1 erase). With allow_neg_eigval=True the spectrum extends
+    beyond DeltaNet's, escaping Grazzi's TC⁰ wall at the cell level.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_head: int,
+                 num_householder: int = 2):
+        from fla.layers import GatedDeltaProduct
+        assert d_model == n_heads * d_head, \
+            f"GatedDeltaProduct expects d_model == n_heads*d_head; got {d_model} vs {n_heads*d_head}"
+        super().__init__(GatedDeltaProduct(
+            hidden_size=d_model,
+            expand_v=1.0,
+            head_dim=d_head,
+            num_heads=n_heads,
+            num_v_heads=n_heads,
+            mode="chunk",
+            use_output_gate=True,
+            use_short_conv=True,
+            use_forget_gate=False,  # forget-gate kernel hits sm_120 misalign bug
+            allow_neg_eigval=True,
+            num_householder=num_householder,
+        ))
+
+
 class OrthogonalScanAttention(nn.Module):
     """SO(n) scan — Grazzi-clean NC¹-accessible parallel-scan primitive.
 

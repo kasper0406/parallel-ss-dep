@@ -1,13 +1,28 @@
 # state-dep-parallel
 
 Mapping the design space of **state-dependent, parallelizable RNN cells**
-— with a specific finding: in a 30-layer DeltaNet stack, a *single*
+— with a specific finding: in a DeltaNet stack, a *single*
 sparse late-to-early FiLM connection (a minimal-form descendant of
-GF-RNN-style top-down feedback) beats vanilla Transformer (−23 %),
-Mamba2 (−12.5 %), and pure DeltaNet (−3.1 %) at matched params on
-Python code. Mechanistically explained (the network discovers a
-negative-α subtractive predictive-coding basin) and extrapolates
-cleanly to 16× training context.
+GF-RNN-style top-down feedback) gives a robust ~3-5 % PPL lift over
+the underlying linear-RNN cell, **growing with scale**: from −3.1 %
+at 217 M / AdamW to −5.4 % at 360 M / Muon. Mechanistically
+characterized (Phase 14b–g) — multiplicative form + non-softmax
+aggregation finds a previously-unreported optimization basin —
+and extrapolates cleanly to 16× training context.
+
+**Honest scale-up scoreboard** (360 M, Muon, codeparrot, 15 K steps):
+
+```
+Vanilla Transformer (Muon-tuned):   18.78 PPL  ← strongest at this scale
+Sparse-(2, 28)-FiLM DeltaNet:        21.57 PPL  ← strongest in linear-RNN family
+DeltaNet baseline:                   22.79 PPL
+```
+
+At smaller-scale + AdamW (217 M / 5 K) the Transformer was the worst
+(60.75); at 360 M / Muon (the optimizer it was designed for) it
+catches up and surpasses. The **architectural lift of sparse-FiLM
+over DeltaNet holds and grows at scale**, but the comparative claim
+against Transformer is scale- and optimizer-dependent.
 
 The high-level idea of upper-to-lower-layer feedback in stacked RNNs
 is not new — see *Related work* below — but the **specific minimal

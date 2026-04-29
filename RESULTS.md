@@ -1120,9 +1120,44 @@ connection is the right level of abstraction for cross-layer feedback
 in this regime. More elaborate "scratchpad" mechanisms (selective
 write, content-addressed retrieval, surprise gating) need either
 much more training data or stronger task pressure (long-context
-agentic workloads) to pay off. Open follow-up: revisit at scale
-(350-500 M params, 5-10 B tokens) where surprise estimation should be
-more reliable.
+agentic workloads) to pay off.
+
+#### Phase 18 follow-up — disentangling write (surprise) vs read (content)
+
+To isolate which side of the scratchpad — write-time saliency or
+read-time content addressing — contributes the lift, ran the 2×2
+ablation at @30L 217M:
+
+| | content (Q·K) | uniform read |
+|---|---|---|
+| **surprise write** | Scratch-B sigmoid: 50.79 (α=−0.018) | Scratch-D: 51.06 (α=−0.016) |
+| **uniform write** | Scratch-C: 50.68 (α=−0.019) | DN baseline: 51.00 |
+
+Reference: **DN + sparse (2,28) FiLM = 49.40**.
+
+**Surprise gating contributes ~0 % to the lift on PPL.** Scratch-D
+(saliency-only, no content addressing) lands at 51.06 — identical
+to DN baseline. Content addressing (Scratch-C) gives a marginal
+0.5 % lift over baseline; the marginal additional improvement from
+adding surprise on top of content is essentially zero.
+
+**The simple fixed sparse FiLM still wins by ~2.5 %** over the most
+expressive scratchpad. All of the Q·K matching + surprise gating
+machinery underperforms a single well-placed lagged connection.
+
+**Why surprise didn't help on PPL:**
+- At 5K training steps, per-position surprise from CE loss is noisy —
+  the model is barely converged so its uncertainty estimates are
+  unreliable.
+- Codeparrot Python code-LM PPL doesn't stress recall heavily
+  (which is the regime where surprise-gated memory would shine).
+- The CE-loss surprise signal correlates with token frequency more
+  than with task-relevant saliency at this scale.
+
+**Open follow-up:** test scratchpad on **MQAR / induction-heads**
+where recall is the bottleneck. The user's intuition was specifically
+about recall, which we have not yet evaluated. The scratchpad's value
+might still show up there.
 
 ### Phase 17 — Cross-cell generalization of sparse-(2, 28)-FiLM (2026-04-29)
 

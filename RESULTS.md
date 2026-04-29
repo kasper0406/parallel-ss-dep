@@ -1029,6 +1029,58 @@ Gated DeltaNet — same algebraic family as our student). See
 infrastructure notes (vLLM in a separate venv to keep our
 nightly-torch student environment intact).
 
+### Phase 18 — Scratchpad prototype: surprise-gated cross-layer attention (2026-04-29)
+
+Tested whether a *surprise-gated cross-layer attention scratchpad* can
+beat the simple fixed `(2, 28)` FiLM connection. Architecture: at
+layer 2, attend over layer 28's pass-1 outputs (causal), with attention
+scores biased by per-position surprise (CE loss − running mean,
+stop-grad), FiLM-form output. Two variants of the routing across
+key positions:
+
+- **Scratch-A: softmax over keys + surprise log-bias.**
+- **Scratch-B: sigmoid gates × surprise (multiplicative).**
+
+| Variant | α | PPL | vs DN baseline |
+|---------|---|-----|----------------|
+| DN baseline | — | 51.00 | — |
+| **DN + sparse (2, 28) FiLM** | **−0.054** | **49.40** | **−3.1 %** ⭐ |
+| Scratch-A (softmax) | −0.008 | 52.17 | +2.3 % (loses) |
+| **Scratch-B (sigmoid)** | **−0.018** | **50.79** | **−0.4 % (marginal win)** |
+
+**Findings:**
+
+1. **Softmax scratchpad reproduces the 1/T-dilution failure mode**
+   from Phase 14c. α stays at ≈ −0.008 (essentially zero), the
+   architecture adds dead-weight overhead that costs PPL. Predicted
+   in advance and confirmed.
+2. **Sigmoid rescue (Phase 14d pattern) partially works.** α grows to
+   ≈ −0.018 (2× larger), PPL flips to a marginal win (−0.4 % vs DN).
+   But still ~2.8 % behind the simple sparse FiLM connection.
+3. **Surprise gating doesn't pay for itself at this scale.** The
+   cost of the broader attention surface (T × T causal attention,
+   non-trivial parameter overhead, second LM head pass for surprise)
+   outweighs the benefit of selective attention to surprising past
+   tokens.
+
+**Why it didn't help:**
+
+- At 5K training steps, per-position surprise is noisy — the model
+  is barely converged so its uncertainty estimates are unreliable.
+- The DeltaNet state may already filter to relevant past content,
+  making explicit retrieval redundant.
+- The fixed lag-1 connection from layer 28 to layer 2 captures most
+  of the cross-layer signal; selective access isn't worth the cost.
+
+**Implication for the architecture:** the simple fixed sparse FiLM
+connection is the right level of abstraction for cross-layer feedback
+in this regime. More elaborate "scratchpad" mechanisms (selective
+write, content-addressed retrieval, surprise gating) need either
+much more training data or stronger task pressure (long-context
+agentic workloads) to pay off. Open follow-up: revisit at scale
+(350-500 M params, 5-10 B tokens) where surprise estimation should be
+more reliable.
+
 ### Phase 17 — Cross-cell generalization of sparse-(2, 28)-FiLM (2026-04-29)
 
 To test whether the sparse cross-layer feedback finding generalizes

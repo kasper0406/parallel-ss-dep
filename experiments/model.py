@@ -602,6 +602,105 @@ class AllToAllSigmoidFeedback(nn.Module):
         return x * (1.0 + a * scale) + a * shift
 
 
+class SurpriseScratchpadFeedback(nn.Module):
+    """Surprise-gated cross-layer attention scratchpad with FiLM output.
+
+    For target layer t with source layer s:
+      - At each query position p, the scratchpad is the *causal* sequence
+        of source-layer pass-1 outputs at positions ≤ p (with the
+        standard t−1 lag for parallel-scan friendliness).
+      - Attention scores are *biased* by per-position surprise scores —
+        high-surprise positions in the past get larger weight.
+      - Output is FiLM-form (multiplicative scale + additive shift) since
+        the mechanism analysis (Phase 14b–g) showed multiplicative form
+        is required for the negative-α basin.
+
+    Surprise is computed externally from the pass-1 logits and passed in
+    as a (B, T) tensor with non-negative values (clamped at 0).
+
+    Memory at training time: O(T) (full causal attention over T keys).
+    At inference time: only the *latest* source state is needed per token,
+    so memory is O(K) for a fixed-budget K-slot cache; we use full T
+    here for simplicity in this prototype.
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 4,
+                 d_head: int | None = None,
+                 routing: str = "softmax"):
+        super().__init__()
+        if d_head is None:
+            d_head = d_model // n_heads
+        assert n_heads * d_head == d_model
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.scale_qk = d_head ** -0.5
+        # 'softmax' (default) — surprise biases scores additively in log-space, then
+        #                       softmax over key positions (1/T dilution at init).
+        # 'sigmoid' — independent sigmoid gates per (q, k) pair, multiplied by
+        #             surprise directly (no normalization across keys; no 1/T
+        #             dilution; matches the basin-finding form from Phase 14e).
+        assert routing in ("softmax", "sigmoid"), f"unknown routing: {routing!r}"
+        self.routing = routing
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        # V emits 2·d_model per source — split into scale-half and shift-half.
+        self.v_proj = nn.Linear(d_model, 2 * d_model, bias=False)
+        self.out_proj_scale = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj_shift = nn.Linear(d_model, d_model, bias=False)
+        for m in [self.q_proj, self.k_proj, self.v_proj,
+                  self.out_proj_scale, self.out_proj_shift]:
+            nn.init.normal_(m.weight, std=1.0 / math.sqrt(d_model))
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.freeze_alpha = False
+
+    def get_alpha(self) -> torch.Tensor:
+        return torch.zeros_like(self.alpha) if self.freeze_alpha else self.alpha
+
+    def forward(self, x_target: torch.Tensor,
+                source_states_lagged: torch.Tensor,
+                surprise: torch.Tensor) -> torch.Tensor:
+        # x_target:              (B, T, d) — pass-2 hidden state at target layer
+        # source_states_lagged:  (B, T, d) — pass-1 output of source layer, t−1 lagged
+        # surprise:              (B, T)    — per-position surprise score, ≥ 0
+        B, T, D = x_target.shape
+        H, Dh = self.n_heads, self.d_head
+
+        q = self.q_proj(x_target).view(B, T, H, Dh)            # (B, T_q, H, Dh)
+        k = self.k_proj(source_states_lagged).view(B, T, H, Dh)  # (B, T_k, H, Dh)
+        v_pair = self.v_proj(source_states_lagged)              # (B, T_k, 2D)
+        v_scale, v_shift = v_pair.chunk(2, dim=-1)              # (B, T_k, D) each
+        v_scale = v_scale.view(B, T, H, Dh)
+        v_shift = v_shift.view(B, T, H, Dh)
+
+        # Attention scores: (B, T_q, T_k, H)
+        scores = torch.einsum("bthd,bshd->btsh", q, k) * self.scale_qk
+
+        # Causal mask: query position t can attend to key positions ≤ t.
+        mask = torch.ones(T, T, dtype=torch.bool, device=x_target.device).triu(diagonal=1)
+
+        if self.routing == "softmax":
+            # Surprise enters in log-space, then softmax (1/T dilution).
+            surprise_bias = torch.log(surprise.clamp(min=0) + 1e-4)  # (B, T_k)
+            scores = scores + surprise_bias.unsqueeze(1).unsqueeze(-1)
+            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(-1), float("-inf"))
+            attn = F.softmax(scores, dim=2)
+        else:
+            # 'sigmoid' — independent gates × surprise; no normalization over keys.
+            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(-1), -50.0)
+            gates = torch.sigmoid(scores)                    # (B, T_q, T_k, H)
+            attn = gates * surprise.unsqueeze(1).unsqueeze(-1)  # multiplicative
+            # Optional normalization to keep magnitude bounded as T grows.
+            attn = attn / (attn.sum(dim=2, keepdim=True) + 1e-6)
+
+        # Weighted sums of v_scale and v_shift.
+        scale_mix = torch.einsum("btsh,bshd->bthd", attn, v_scale).reshape(B, T, D)
+        shift_mix = torch.einsum("btsh,bshd->bthd", attn, v_shift).reshape(B, T, D)
+        scale = self.out_proj_scale(scale_mix)
+        shift = self.out_proj_shift(shift_mix)
+        a = self.get_alpha()
+        return x_target * (1.0 + a * scale) + a * shift
+
+
 class CrossLayerAttentionFeedback(nn.Module):
     """Cross-layer attention top-down feedback.
 
@@ -740,6 +839,14 @@ class TinyLM(nn.Module):
         tie_embeddings: bool = False,         # share weights between embedding
                                               # and lm_head (~halves params for
                                               # large-vocab Qwen tokenizer).
+        feedback_scratchpad_pairs: tuple = (),  # surprise-gated scratchpad
+                                              # tuple of (target_L, source_L);
+                                              # at each target the cross-layer
+                                              # attention is biased by per-pos
+                                              # surprise (computed from pass-1
+                                              # logits, stop-grad).
+        feedback_scratchpad_heads: int = 4,
+        feedback_scratchpad_routing: str = "softmax",  # 'softmax' or 'sigmoid'
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -805,6 +912,24 @@ class TinyLM(nn.Module):
         )
         self.feedback_xattn_form = feedback_xattn_form
         self.xattn_target_to_sources = {t: srcs for t, srcs in self.feedback_xattn_pairs}
+        # Surprise-gated scratchpad pairs (target → source; one source per target).
+        self.feedback_scratchpad_pairs = tuple(
+            (int(t), int(s)) for t, s in feedback_scratchpad_pairs
+        )
+        self.feedback_scratchpad_routing = feedback_scratchpad_routing
+        if self.feedback_scratchpad_pairs:
+            self.scratchpad_feedback = nn.ModuleDict({
+                str(t): SurpriseScratchpadFeedback(
+                    d_model=d_model, n_heads=feedback_scratchpad_heads,
+                    routing=feedback_scratchpad_routing,
+                )
+                for t, _ in self.feedback_scratchpad_pairs
+            })
+            self.scratchpad_target_to_source = {
+                t: s for t, s in self.feedback_scratchpad_pairs
+            }
+        else:
+            self.scratchpad_target_to_source = {}
         if self.feedback_xattn_pairs and feedback_xattn_form == "all_sigmoid":
             # Single shared module across all (target, source) pairs with
             # parameter sharing per source layer. Used when feedback_xattn=='all'
@@ -890,10 +1015,59 @@ class TinyLM(nn.Module):
             pos = torch.arange(T, device=input_ids.device)
             x = x + self.pos_embed(pos)
 
-        if self.feedback_mode == "none" and not self.feedback_xattn_pairs:
+        if (self.feedback_mode == "none"
+                and not self.feedback_xattn_pairs
+                and not self.feedback_scratchpad_pairs):
             for blk in self.blocks:
                 x = blk(x, input_ids=input_ids)
             h = self.out_norm(x)
+            lm_logits = self.lm_head(h)
+            if return_aux and self.aux_dim > 0:
+                return lm_logits, self.aux_head(h)
+            return lm_logits
+
+        # Surprise-gated scratchpad feedback. Pass 1 vanilla, pass 1 logits to
+        # compute per-position surprise (stop-grad), pass 2 applies the
+        # scratchpad attention biased by surprise at the target layer(s).
+        if self.feedback_scratchpad_pairs:
+            needed_sources = set(s for _, s in self.feedback_scratchpad_pairs)
+            pass1_at_sources: dict = {}
+            h1 = x
+            for L, blk in enumerate(self.blocks):
+                h1 = blk(h1, input_ids=input_ids)
+                if L in needed_sources:
+                    pass1_at_sources[L] = h1
+            # Pass-1 logits → per-position CE → surprise = CE − running mean.
+            pass1_top = self.out_norm(h1)
+            pass1_logits = self.lm_head(pass1_top)             # (B, T, V)
+            B, T, V = pass1_logits.shape
+            with torch.no_grad():
+                if T > 1:
+                    ce_pp = F.cross_entropy(
+                        pass1_logits[:, :-1].reshape(-1, V),
+                        input_ids[:, 1:].reshape(-1),
+                        reduction="none",
+                    ).reshape(B, T - 1)
+                    # Causal cumulative mean.
+                    cum_ce = ce_pp.cumsum(dim=-1)
+                    pos = torch.arange(1, T, device=x.device, dtype=ce_pp.dtype)
+                    running_mean = cum_ce / pos
+                    surprise = (ce_pp - running_mean).clamp(min=0.0)
+                    # Pad position 0 (no prediction yet) with 0 surprise.
+                    surprise = F.pad(surprise, (1, 0), value=0.0)
+                else:
+                    surprise = torch.zeros(B, T, device=x.device)
+            # Pass 2 with scratchpad feedback.
+            h = x
+            for L, blk in enumerate(self.blocks):
+                if L in self.scratchpad_target_to_source:
+                    src = self.scratchpad_target_to_source[L]
+                    state_above_lagged = _shift_right_by_1(pass1_at_sources[src])
+                    h = self.scratchpad_feedback[str(L)](
+                        h, state_above_lagged, surprise=surprise,
+                    )
+                h = blk(h, input_ids=input_ids)
+            h = self.out_norm(h)
             lm_logits = self.lm_head(h)
             if return_aux and self.aux_dim > 0:
                 return lm_logits, self.aux_head(h)

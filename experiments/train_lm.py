@@ -225,6 +225,21 @@ def main():
                    help="Use per-channel α (d_model floats) instead of scalar α "
                         "for sparse FiLM. Tests whether channel-dependent gating "
                         "can mix the negative- and positive-α basins per channel.")
+    p.add_argument("--feedback_scratchpad", type=str, default="",
+                   help="Surprise-gated scratchpad pairs, semicolon-separated. "
+                        "Each is 'target,source' where target attends causally "
+                        "over source-layer pass-1 outputs with attention scores "
+                        "biased by per-position surprise. E.g. '2,28' applies "
+                        "the scratchpad at layer 2 reading from layer 28.")
+    p.add_argument("--feedback_scratchpad_heads", type=int, default=9,
+                   help="Number of heads inside the scratchpad attention.")
+    p.add_argument("--feedback_scratchpad_routing", type=str, default="softmax",
+                   choices=["softmax", "sigmoid"],
+                   help="'softmax' (default) — softmax over key positions, "
+                        "biased by surprise; suffers 1/T dilution at init. "
+                        "'sigmoid' — independent gates × surprise (multiplicative); "
+                        "no normalization across keys, mirrors the film_sigmoid "
+                        "rescue from Phase 14d.")
     p.add_argument("--feedback_xattn_form", type=str, default="attn",
                    choices=["attn", "film_sum", "film_sum_mlp", "film_sum_glu",
                             "film_target_gated",
@@ -338,6 +353,12 @@ def main():
     # Cross-layer attention pairs.
     # 'all'  -> every layer attends over every layer above it.
     # else   -> 'tgt:src1,src2; tgt2:src3,...' explicit form.
+    fb_scratchpad_pairs = ()
+    if args.feedback_scratchpad:
+        fb_scratchpad_pairs = tuple(
+            tuple(int(x) for x in pair.split(","))
+            for pair in args.feedback_scratchpad.split(";") if pair
+        )
     fb_xattn_pairs = ()
     if args.feedback_xattn:
         if args.feedback_xattn.strip() == "all":
@@ -375,6 +396,9 @@ def main():
         feedback_lag=args.feedback_lag,
         feedback_position=args.feedback_position,
         feedback_per_channel_alpha=args.feedback_per_channel_alpha,
+        feedback_scratchpad_pairs=fb_scratchpad_pairs,
+        feedback_scratchpad_heads=args.feedback_scratchpad_heads,
+        feedback_scratchpad_routing=args.feedback_scratchpad_routing,
         **attn_kw,
     ).to("cuda")
     if args.freeze_alpha and (args.feedback != "none" or fb_xattn_pairs):

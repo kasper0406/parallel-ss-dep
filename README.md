@@ -1,309 +1,108 @@
 # state-dep-parallel
 
 Mapping the design space of **state-dependent, parallelizable RNN cells**
-— Lean formalisation, Triton kernels for Blackwell sm_120, and a
-clean diagnostic decomposition of why the dominant architectures
-(DeltaNet, Mamba2, AUSSM, …) succeed where they do.
+— with a specific architectural finding: a single sparse cross-layer
+feedback connection in a 30-layer DeltaNet stack beats vanilla
+Transformer (−23 %), Mamba2 (−12.5 %), and pure DeltaNet (−3.1 %) at
+matched params on Python code, mechanistically explained, and
+extrapolating cleanly to 16× training context.
 
-- [`RESULTS.md`](RESULTS.md) — full empirical writeup
-- [`NEXT_DIRECTIONS.md`](NEXT_DIRECTIONS.md) — strategy doc with literature search
-- [`EVAL_PLAN.md`](EVAL_PLAN.md) — GPU + evaluation plan
-- [`PLAN.md`](PLAN.md) — original research plan
-- [`IDEAS.md`](IDEAS.md), [`LITERATURE.md`](LITERATURE.md) — earlier brainstorm + lit search
-- [`StateDep/`](StateDep/) — Lean project
-- [`kernels/`](kernels/) — Triton kernels
+- [`RESULTS.md`](RESULTS.md) — full empirical writeup, Phases 1-16
+- [`NEXT_DIRECTIONS.md`](NEXT_DIRECTIONS.md) — current research plan
+- [`HISTORY.md`](HISTORY.md) — earlier hybrid + Lean + Triton-kernel
+  work that preceded the architectural finding (Phases 1-13)
+- [`SESSION_FINDINGS.md`](SESSION_FINDINGS.md) — chronological session log
+- [`StateDep/`](StateDep/) — Lean project (13 monoids proved associative)
+- [`kernels/`](kernels/) — Triton kernels for sm_120
 - [`experiments/`](experiments/) — training drivers and architecture modules
 
-## Headline findings
+## Headline finding
 
-1. **Two architecturally distinct walls** in the parallel-scan-friendly
-   design space, each with a published characterisation:
-   - **Grazzi's TC⁰ wall** ([Grazzi et al. ICLR'25][grazzi]) — a linear
-     RNN with transition spectrum in `[0, 1]^d` cannot express parity
-     at unbounded T. Escape requires negative or unit-circle eigenvalues.
-   - **The recall wall** ([Zoology / MQAR][zoology]) — recall requires
-     a **rank-1 erase `(I − β k kᵀ)` applied per token in a fixed
-     frame**. Architectures without it fail induction-heads and MQAR
-     even at small scale.
-2. **The two walls are mechanically incompatible inside a single state.**
-   The rotation that escapes wall 1 (input-dependent two-sided action
-   `c → O c Oᵀ`) is the same conjugation that destroys the fixed-frame
-   structure recall depends on. We tested four single-cell architectures
-   that try to escape both — all fail recall (chance) regardless of
-   parameterisation, including a tanh-bounded variant that should
-   minimise frame disruption.
-3. **The minimum architectural escape is a heterogeneous layer stack.**
-   `[ortho, deltanet, ortho, deltanet]` — alternating SO(n) scan layers
-   (Grazzi-clean parity) and DeltaNet layers (fixed-frame recall) —
-   solves both walls cleanly:
-   - Parity at T=512: **100 %** (converges step 1500)
-   - Induction-heads recall: **100 %** (converges step 1200)
-   - All at 0.94 M params, 4 layers total, 3000 AdamW steps.
-3a. **Hybrid empirically dominates `DeltaNet+allow_neg_eigval=True`
-    (the strongest published single-cell baseline) on modular addition
-    mod-p**, especially at long T:
-    - T=128 mod-3 / mod-5: hybrid solves at step 1500-2000, deltanet_negeig
-      at step 4000 (2-3× faster).
-    - T=512 mod-3: hybrid 100 %, deltanet_negeig 93 %.
-    - **T=512 mod-5: hybrid 100 %, deltanet_negeig catastrophically
-      diverges to 9.1 % (below random 20 %).**
-4. **Honest task-dependent picture** (`RESULTS.md` Phases 10-12):
-   - Hybrid wins **continuous-angle modular arithmetic** (Z_p ⊂ SO(2)).
-   - DeltaNet+`allow_neg_eigval=True` wins **discrete-reflection
-     non-solvable group state-tracking** (S₅ word problem at T=128:
-     0.98 pos_recall vs hybrid's 0.71). Householder reflectors are a
-     more direct fit for transpositions than rotations.
-   - Pure DeltaNet (with `use_short_conv=True`) wins **real-text LM
-     out of the box** (TinyStories, 135M, 5000 steps: PPL 5.65 vs
-     hybrid v1's 9.79).
-5. **Hybrid v2 with engineering tricks closes the LM gap to 1.19×**
-   (`RESULTS.md` Phase 12). Adding `use_short_conv=True`, SiLU input
-   activation, and L2-normalised rotation target to the ortho layer
-   brought hybrid PPL from 9.79 → **6.73** (DeltaNet 5.65), shrinking
-   the gap from 73 % worse to 19 % worse. Critically: the mod-p
-   advantage is *preserved and strengthened* (mod-3 T=128 converges
-   at step 1500 with v2 vs step 2000 with v1).
-6. **Hybrid 25/75 ratio (deltanet-heavy) is the right recipe for
-   code-LM** (`RESULTS.md` Phase 13). On Python code at 135M for
-   5000 steps, the ratio ablation gives:
-   - 0 % ortho (pure DeltaNet): PPL 51.00
-   - **25 % ortho (1 per 4 layers): PPL 54.73 (1.07×)** ⭐
-   - 50 % ortho (alternating): PPL 62.13 (1.22×)
-   - 75 % ortho: PPL 78.74 (1.54×)
+**Sparse far-distance top-down feedback** beats the obvious SOTA
+baselines at matched params on Python code:
 
-   At 25/75 the LM gap is 7 %, the wall-clock penalty 1.27×, and the
-   architecture preserves the long-T mod-p win.
-
-7. **Dyck-2 bracket depth-tracking does *not* separate the architectures**
-   — both deltanet+conv and hybrid solve to 100 % even at T=512. So
-   the synthetic proxy for "scope tracking in code" doesn't show
-   hybrid's algebraic structure; deltanet+conv is sufficient.
-   Hybrid's empirical home is in continuous-angle modular state-
-   tracking (mod-3, mod-5 at long T), not in plain depth-counting.
-8. Hybrid Triton kernel + custom autograd brings hybrid to 1.27×
-   DeltaNet wall-clock at the 25/75 ratio (was 14.5× before fixes
-   and 1.74× at 50/50). 135M distillation from a coding teacher is
-   now genuinely feasible.
-
-9. **Sparse far-distance top-down feedback beats vanilla
-   Transformer (−23%), Mamba2 (−12.5%), and DeltaNet (−3.1%) at
-   matched params** (`SESSION_FINDINGS.md`, `RESULTS.md` Phase 14
-   and Phase 16). One sparse cross-layer connection (layer 2 ←
-   layer 28 in a 30-layer stack) gives, on Python code at 217M
-   params, T=512, identical block structure, lr=3e-4 cosine
-   (no warmup), seed=0:
-
-   ```
-   Vanilla Transformer (softmax + abs pos): 60.75 PPL
-   Mamba2 (SSM):                            55.60 PPL
-   DeltaNet (linear-RNN):                   51.00 PPL
-   Sparse-(2,28)-FiLM DeltaNet (ours):      49.40 PPL ⭐
-   ```
-
-   3-seed reproducibility on the (2,28) variant: **49.40 ± 0.31**
-   (σ < 1%). The advantage holds at every T from 512 (training) to
-   8192 (16× extrapolation) at 4-5% improvement, on TinyStories at
-   −1.6%, and at every depth tested (sparse beats DN by
-   −2.6% / −0.8% / −3.1% at @8L / @15L / @30L). Mechanistically
-   clean: 20+ ablations (Phase 14b-g) pin down the conditions for
-   the negative-α predictive-coding basin — multiplicative FiLM
-   form + non-softmax aggregation. Avoids the compounding-divergence
-   problem that defeats dense multi-scale variants (+46 % extra
-   params, loses at param parity). A depth-aware predictive-coding
-   inductive bias for linear-RNN coding LMs that survives every
-   controlled comparison and extends naturally to long context.
-4. The hybrid finding gives the empirical rank-ordering on parity:
-   linear / heisenberg (✗ TC⁰) → DeltaNet default (T=128 only) → ortho
-   / hybrid (T=512). And on recall: linear / ortho / rotconj / rotdelta
-   (✗ chance) → DeltaNet / hybrid (✓ 100 %).
-5. **Triton kernels for sm_120 (Blackwell consumer / RTX 5090) ship
-   for** `linear_attn`, `heisenberg_d` (with fused-readout variant),
-   `unipotent_u4`, and `ortho_son` (matrix-multiplication scan).
-   Three kernel bugs found and fixed; no pytorch#176426 segfault.
-
-## How this work relates to AUSSM (and what's actually new)
-
-We discovered mid-session that
-**[AUSSM (Karuvally et al., July 2025, arXiv:2507.05238)][aussm]**
-independently proposed the same skew-symmetric input-dependent matrix-
-exp construction we built as `OrthogonalScanAttention`. They shipped
-it ~3 months before us. Honest accounting of what overlaps and what
-doesn't:
-
-|  | AUSSM | This project |
-|---|---|---|
-| **Cell algebra** (skew → exp → unit-circle eigenvalues) | ✓ | concurrent |
-| **State per channel** | scalar / vector (diagonal SSM, S6 drop-in) | **n×n matrix**, non-commuting transitions across t |
-| **Parity / mod-p / solvable-group automata** | ✓ shown | ✓ shown |
-| **MQAR / associative recall benchmarks** | not evaluated, gap unacknowledged | ✗ ortho fails by construction; addressed via DeltaNet layer in hybrid |
-| **Combined with DeltaNet rank-1 erase** | suggested as future work | **hybrid layer stack tested at LM scale** |
-| **Mechanistic incompatibility theorem** | not stated | **explicit**: rotation ⨯ delta-rule cannot share a state (Phases 7, 12) |
-| **Per-layer specialisation framing** (Krohn-Rhodes / Barrington) | absent | central organising principle |
-| **Engineering tricks on rotation cell** | polar diagonalisation | short_conv + silu + L2 v-norm (hybrid v2) |
-| **Diagnostic per-task scorecard** | small-scale only, "modest scale" admitted | mod-3 / mod-5 / parity / induction / S₅ / LM-PPL on TinyStories + Python |
-| **Triton kernel for sm_120 (Blackwell consumer)** | absent | **ships**, with custom-autograd Triton-backed scan |
-
-**The AUSSM-equivalent piece is `OrthogonalScanAttention`.** That cell
-should not be claimed as a from-scratch novelty; we acknowledge AUSSM
-as concurrent prior art for the construction.
-
-**The new contributions of this project are everything below the cell
-level and everything above it:**
-
-1. The architectural decomposition (rotation specialist + delta-rule
-   specialist + their incompatibility argument) and the empirical
-   scoreboard demonstrating that the hybrid escapes both Grazzi's TC⁰
-   wall (Phase 4-7) and the Zoology recall wall (Phase 8) at the
-   network level.
-2. The mod-p result: hybrid solves T=512 mod-5 at 100 % where
-   `DeltaNet+allow_neg_eigval=True` (the strongest single-cell baseline
-   per Grazzi et al. ICLR'25) catastrophically fails to 9 %
-   (Phase 9). AUSSM does not test this regime.
-3. The 135M-scale practical demonstration: hybrid v2 within 1.19× of
-   DeltaNet PPL on TinyStories while preserving the mod-p win
-   (Phase 11-12). AUSSM admits its evaluation is small-scale only.
-4. The Triton sm_120 kernel for the matmul-scan with custom autograd
-   (4.2× speedup over PyTorch loop). AUSSM uses Mamba's selective-scan
-   kernel.
-5. The Lean library formalising 13 monoids whose associativity gives
-   parallel-scan correctness for free (separate from AUSSM's framing
-   entirely).
-
-## Approach
-
-### The reframing
-
-Every known state-dependent parallelizable RNN cell corresponds to a
-**finite-dimensional associative algebra** `A` over ℝ (or an ordered
-semiring), where:
-
-- state ∈ A,
-- each step is left-multiplication by an input-dependent element of A,
-- composition across steps is A's multiplication table.
-
-The abstract parallel-scan correctness theorem ([`StateDep/Scan.lean`](StateDep/Scan.lean))
-says: for any monoid, any binary-tree re-association of a fold equals
-the sequential fold. So *the only* algebraic content a kernel needs is
-a `Monoid` instance on the parameter type. The design problem reduces
-to finding an `A` that is:
-
-1. low-dimensional (memory bandwidth),
-2. cheap to multiply (compute),
-3. expressively nonlinear in a useful way.
-
-### The wall framing
-
-After eight rounds of architecture iteration, the empirical surface of
-this design space looks like:
+@30L, 217 M params, T=512, codeparrot Python, 5 K AdamW steps,
+identical block structure (RMSNorm + attention + RMSNorm + GLU FFN
+with d_ff=4·d_model), lr=3e-4 cosine (no warmup), seed=0:
 
 ```
-                                       ┌─ recall wall ──┐
-                                       │  (Zoology /    │
-                                       │   MQAR — needs │
-                                       │   fixed-frame  │
-                                       │   rank-1       │
-                                       │   erase)       │
-                                       └────────────────┘
-                                              │
-                            ┌─────────────────┴─────────────────┐
-                            │                                   │
-                ┌─ Grazzi   │                                   │ ─┐
-                │  TC⁰ wall │       SINGLE CELL                  │  │ HYBRID
-                │  (parity  │       cannot escape both          │  │ STACK
-                │  needs    │       (rotation breaks frame)     │  │ escapes
-                │  spectrum │                                   │  │ both
-                │  outside  │                                   │  │
-                │  [0, 1])  │                                   │  │
-                └───────────┘                                   └──┘
+Vanilla Transformer (softmax + abs pos emb): 60.75 PPL
+Mamba2 (SSM):                                55.60 PPL
+DeltaNet (linear-RNN):                       51.00 PPL
+Sparse-(2, 28)-FiLM DeltaNet (ours):         49.40 PPL ⭐
 ```
 
-Each axis has a clean published characterisation; the *incompatibility*
-across them in a single state is the new observation. The minimum
-escape is alternating specialist layers.
+The architecture: a **single FiLM-style cross-layer connection** from
+layer 28's output (lagged by 1 token) to layer 2's input, with one
+learnable scalar α. +0.3 % extra parameters. The network discovers
+α ≈ −0.054 from data — a *subtractive* predictive-coding filter that
+forms a previously-unreported optimization basin in this class of
+architectures.
 
-## Solutions tested, with results and literature placement
+3-seed reproducibility on the (2, 28) variant: **49.40 ± 0.31** (σ < 1 %).
 
-Eight architectures tested at matched ~1 M params, 4 layers, 3-5 k AdamW
-steps, on parity (state-tracking) and induction-heads (recall).
+```python
+                     pass-1 (vanilla forward)
+   x → L0 → L1 → L2 → ... → L28 → ... → L29 → out
+                      ↑                ↓
+                      └── lag(t-1) ────┤
+                          FiLM α≈−0.054 │
+                                         pass-2 input
+```
 
-### 1. **Heisenberg cross-pair** `c_t = Σ_{i<j} aᵢ ⊗ bⱼ`  *(our original novelty)*
+## Validation matrix
 
-- Lean: [`StateDep/HeisenbergD.lean`](StateDep/HeisenbergD.lean), bilinear ordered-pair sum, proved associative.
-- Triton: [`kernels/heisenberg_d/`](kernels/heisenberg_d/) with fused readout — 1.8-4.5× `linear_attn` cost.
-- Result: solves T=64 parity (+32.6 pp end-tok over linear-attn), **fails T=128 (TC⁰ stuck)**.
-- Literature: HLA (Zhang 2025, [arXiv:2510.27258](https://arxiv.org/abs/2510.27258)) uses *symmetric* `(Σ kᵢkᵢᵀ)(Σ qⱼvⱼᵀ)`; DeltaNet uses single-index `Σ kᵢvᵢᵀ`. The strictly-triangular ordered-pair sum as scan state is novel; the cell as defined is TC⁰-stuck, so it doesn't compete with Grazzi-clean architectures.
-
-### 2. **SO(n) scan (`ortho`)** `O_t = exp(skew(W_skew · x_t))`, `R_t = O_t R_{t-1}`
-
-- PyTorch impl: [`experiments/layers.py:OrthogonalScanAttention`](experiments/layers.py).
-- Triton: [`kernels/ortho_son/`](kernels/ortho_son/) — matrix-multiplication parallel scan.
-- Result: solves parity at **T=64, 128, 256, 512 all 100 %** (convergence 1000-2000 steps); **fails induction (chance)**.
-- Literature: **AUSSM** ([Karuvally et al., July 2025, arXiv:2507.05238][aussm]) independently proposed the same skew-symmetric input-dependent matrix-exp construction; their state is per-channel diagonal, ours is matrix; otherwise concurrent. **DeltaProduct** ([Yang et al. NeurIPS 2025, arXiv:2502.10297][deltaproduct]) achieves O(n) via products of K Householders — equivalent image at K=n. Our distinct angle: matrix-state rather than acting-on-vector, sm_120 Triton kernel.
-
-### 3. **Semidirect `SO(n) ⋉ ℝ^{n×n}` (`rotconj`)** state `(R_t, c_t)`, `c_t = O_t c_{t-1} O_tᵀ + k ⊗ v`
-
-- PyTorch impl: [`experiments/layers.py:RotConjAttention`](experiments/layers.py).
-- Result: solves parity at T=64-256 (slower than ortho); **fails induction (chance)**.
-- Literature: novel — no published architecture uses semidirect product `G ⋉ V` with `G` a Lie group acting on matrix-valued `V` by conjugation as the parallel-scan monoid. **Diagnosis after running**: additive c-update saturates with noise from distractor positions; rotation conjugation alone does not enable recall.
-
-### 4. **Rotation + delta-rule (`rotdelta`)** `c_t = (I − β k kᵀ)(O_t c_{t-1} O_tᵀ) + β k vᵀ`
-
-- PyTorch impl: [`experiments/layers.py:RotDeltaAttention`](experiments/layers.py).
-- Result: solves parity (slower); **fails induction at chance** in two variants (unbounded skew + tanh-bounded skew ≤ 0.5 rad).
-- Literature: novel by combination — an agent verified the two-sided action `c → A c B` is distinct from DeltaProduct's left-only `c → A c`. Triple-monoid `(A, B, d) · (A', B', d') = (A'A, BB', A'dB' + d')` is associative, chunkwise-WY-able. **The empirical result IS the contribution**: this combination *cannot work* mechanistically because rotation conjugation rotates stored keys away from their original frame; the inner-product alignment delta-rule recall depends on is broken regardless of rotation magnitude. **Mechanistic incompatibility**.
-
-### 5. **Hybrid layer stack `[ortho, deltanet, ortho, deltanet]`** *(the answer)*
-
-- PyTorch impl: [`experiments/train_hybrid.py`](experiments/train_hybrid.py) + `attention_cls_per_layer` arg in [`experiments/model.py`](experiments/model.py).
-- Result: parity at T=128 → **100 %** (step 1200), parity at T=512 → **100 %** (step 1500), induction → **100 %** (step 1200). Both walls escaped.
-- Literature: the closest published precedent is **Olmo-Hybrid** ([Merrill, Li et al. 2026, arXiv:2604.03444](https://arxiv.org/abs/2604.03444)) which combines transformer + Gated DeltaNet and ties it to a TC⁰ → NC¹ argument — but their state-tracking layer is *DeltaNet's internal Householder*; nobody else uses an explicit SO(n) / orthogonal / unitary layer alongside DeltaNet. Other hybrid-layer-stack papers (**Qwen3-Next** 75/25 GDN+softmax, **Hymba**, **Samba**, **Jamba**, **Zamba**, **MAD**) frame the layer split via empirical capability decomposition (recall vs context summarisation), not via the two specific walls we identify.
-
-### Where this places us
-
-- The cell-level novelty (`heisenberg_d`, `rotconj`, `rotdelta`) is real — those scan structures are not in the published literature — but the cells we tested don't out-perform DeltaProduct or DeltaNet+`allow_neg_eigval=True` at single-cell expressivity. **Single-cell unification of parity + recall is essentially solved by DeltaProduct** ([Yang et al. 2025][deltaproduct]); we add nothing to that picture beyond extra cells in the same equivalence class.
-- The cleanest novel contribution is the **two-walls + incompatibility framing** and the corresponding **minimum hybrid stack**. Olmo-Hybrid argues "transformer + DeltaNet ⇒ TC⁰ ∪ NC¹" but doesn't decompose into rotation + erase as separate primitives, and doesn't state the impossibility direction. Our `[ortho, deltanet]` alternating stack is the smallest concrete witness we know of.
-
-## What's formalised in Lean
-
-Thirteen monoids / groups proved associative in Lean 4 + mathlib, ~1845
-lines, no `sorry`s, builds clean from a warm cache in ~2 seconds. Full
-table:
-
-| # | Module | Structure | Combine | State | Cross-term |
-|---|---|---|---|---|---|
-| 1 | `Scan.lean` | abstract parallel-scan theorem over any monoid | — | — | — |
-| 2 | `Affine.lean` | scalar affine `(a, b)` — SSM backbone | O(1) | 2 | linear |
-| 3 | `Jet.lean` | first-order jets / dual numbers | O(1) | 2 | Leibniz |
-| 4 | `Tropical.lean` | `Tropical R` + direct `Viterbi (A, b)` cell | O(1) | 2 | (min, +) |
-| 5 | `Heisenberg.lean` | scalar Heisenberg `H_3` | O(1) | 3 | bilinear |
-| 6 | `GF2Heisenberg.lean` | Heisenberg over `ZMod 2`; parity via popcount-choose-2 | O(1) | 3 bits | bilinear over GF(2) |
-| 7 | `Rotor.lean` | quaternion rotor cell (non-commutative) | O(1) | 4 | non-commutative group |
-| 8 | `Dyck.lean` | parenthesis-balance `(c, d) ∈ ℕ²`, `min`-cancel | O(1) | 2 | nested `min` |
-| 9 | `Unipotent.lean` | `U_4` as a 6-parameter group | O(1) | 6 | trilinear ordered triple |
-| 10 | `HeisenbergD.lean` | multi-dim Heisenberg, vector `a, b`, matrix `c` | O(d²) | 2d + d² | bilinear outer product |
-| 11 | `Delta.lean` | Sherman-Morrison composition of rank-1 perts | O(d²) | — | rank-1 → rank-2 |
-| 12 | `Magnus.lean` | BCH-truncated-at-2 over matrix pairs `(A, B)` | O(d³) | 2d² | commutator `[A, A']` |
-| 13 | `Signature.lean` | level-3 truncated tensor-algebra signature `(s, v, M, T)` | O(d³) | 1 + d + d² + d³ | graded tensor product |
-
-## Triton kernels
-
-Four cells with PyTorch reference + Triton source + Mac-runnable
-correctness tests:
-
-| Kernel | Purpose | Status on sm_120 (RTX 5090) |
+| Metric | Result | Reference |
 |---|---|---|
-| [`kernels/linear_attn/`](kernels/linear_attn/) | baseline linear attention | ✓ correctness, ~893 Mtok/s peak |
-| [`kernels/heisenberg_d/`](kernels/heisenberg_d/) | bilinear cross-pair, with fused-readout variant | ✓ correctness, 1.8-4.5× linear_attn |
-| [`kernels/unipotent_u4/`](kernels/unipotent_u4/) | trilinear ordered triple | ✓ correctness, 5-11× linear_attn |
-| [`kernels/ortho_son/`](kernels/ortho_son/) | matrix-multiplication scan (SO(n)) | ✓ correctness on FP32 |
+| Reproducibility (3 seeds) | 49.40 ± 0.31 (σ < 1 %) | RESULTS Phase 14 pre-flight |
+| Depth ablation | beats DN at 8L / 15L / 30L (−2.6 % / −0.8 % / −3.1 %) | Phase 14 |
+| TinyStories | −1.6 % vs DN (not code-specific) | Phase 14 |
+| 16× T extrapolation | stable −4–5 % at T=512 → 8192 | Phase 14 |
+| 8× T extrapolation, all SOTA baselines | wins at every T tested | Phase 16 |
+| Mechanism: 7+ controlled ablations | direction/target/source/aggregation/form all matter | Phase 14b–g |
+| Mechanism: cross-layer attention forms tested | sparse single-pair = FiLM-sum = sigmoid-attn (basin tied) | Phase 14d–g |
 
-No pytorch#176426 (sm_120 multi-`tl.load`) segfault on any kernel. BF16
-in / FP32 accum within `EVAL_PLAN.md` §2.3 tolerances.
+## Mechanism
 
-Three kernel bugs found and fixed during the port:
-1. `linear_attn` BF16-input dtype mismatch in `tl.dot(q, S)`;
-2. `heisenberg_d` / `unipotent_u4` writing state outputs in BF16 (overflow at T=2048);
-3. `linear_attn` / `unipotent_u4` deriving head-index from `tl.num_programs(1)` on a 1-D grid (heads aliased onto head 0; out-of-bounds writes for `B*H > B`).
+The negative-α basin is reached **iff** two conditions hold:
+
+1. **Multiplicative output form** (FiLM-shaped `x · (1 + α·s) + α·t`,
+   not additive Q-K-V residual). The gradient on α flows through an
+   `x · scale` term that gives a strong, x-correlated direction. Pure
+   additive residuals lack this.
+2. **Non-softmax aggregation** across sources. Sum (`film_sum`) and
+   independent sigmoid gates (`film_sigmoid`) both work; softmax
+   routing causes 1/K-dilution at init that forces α toward 0.
+
+Either failure mode alone is sufficient to break the basin. With
+both conditions met, multiple architectures converge to PPL ≈ 49.4 at
+@30L:
+- Sparse single-pair (2, 28) FiLM
+- Multi-source FiLM-sum 3-source
+- Sigmoid-gated cross-layer attention
+- Distributed multi-pair (2, 28)+(4, 24)+(8, 20)
+
+## What's next
+
+Confirmation step before any paper writeup:
+
+- **Literature search** — thorough check for prior work on backward /
+  cross-layer / top-down state propagation in RNN architectures. The
+  finding looks novel relative to what we know, but we need to verify
+  before claiming so.
+
+Then:
+
+- **Generalize the cell** — swap DeltaNet for **DeltaProduct**
+  ([Yang et al. NeurIPS 2025][deltaproduct]) or **PD-SSM** as the base
+  RNN cell, test if sparse cross-layer feedback gives the same
+  architectural lift on top of stronger linear-RNN cells.
+- **Scale-up validation** — train at 350-500 M params on 5-10 B tokens
+  to check the architectural ordering doesn't flip with more data.
+- **Distillation revisit** — initial Qwen3.6 distillation (Phase 15)
+  was a negative result due to teacher–data misalignment; a coder-
+  aligned teacher (DeepSeek-Coder, Qwen3-Coder-Next) might change
+  this.
 
 ## Build
 
@@ -322,50 +121,47 @@ uv pip install torch --index-url https://download.pytorch.org/whl/nightly/cu132
 uv pip install numpy flash-linear-attention
 ```
 
-Smoke + bench + experiments:
+For the distillation pipeline (vLLM teacher in a separate venv):
 ```bash
-python kernels/smoke_gpu.py                 # all kernels correctness
-python kernels/bench_gpu.py                 # throughput grid
-python experiments/train.py --T 64 128 256 --steps 5000 --batch 256 \
-    --arches linear,heisenberg,deltanet,mamba2,ortho,rotconj,rotdelta
-python experiments/train_induction.py --arches linear,ortho,rotconj,rotdelta,deltanet
-python experiments/train_hybrid.py --task induction --layers ortho,deltanet,ortho,deltanet
-python experiments/train_hybrid.py --task parity    --layers ortho,deltanet,ortho,deltanet --T 512
+uv venv .venv-vllm
+VIRTUAL_ENV=$(pwd)/.venv-vllm uv pip install vllm transformers datasets
 ```
 
-## What's next
+## Reproduce the headline finding
 
-After the sparse far-distance feedback finding (headline #9), the
-project's research focus has shifted to **scaling and validating that
-specific architectural prior**, since it survives every controlled
-test (param-matched, width-matched, 16× extrapolation):
+```bash
+# DeltaNet baseline
+python experiments/train_lm.py --arch deltanet --feedback none \
+  --steps 5000 --d_model 576 --n_heads 9 --d_head 64 --n_layers 30
 
-1. **3-seed reproducibility** for sparse 1-pair (2←28) at @30L on
-   Python code. Confirms the −3.5% PPL win isn't single-seed luck.
-   ~15h compute on 2× RTX 5090 (3 seeds in parallel pairs).
-2. **TinyStories sanity** — does the win hold on natural text or is
-   it code-specific? Pattern from dense feedback says code-specific;
-   sparse may behave differently.
-3. **Depth ablation** — sparse 1-pair at @15L and @8L. Pattern
-   from dense suggests bigger wins at constrained depth.
-4. **Sparse-pair design ablation** — try (5, 28), (2, 25), reverse
-   direction (28, 2), and 3-pair variants. Helps identify which
-   target/source positions actually matter.
-5. **Scaling** — once #1-4 confirm: either direct scale-up to
-   350-500M / 10-20B tokens (1-2 weeks on 2× 5090) or
-   distillation track from Qwen2.5-Coder-1.5B with sparse-feedback
-   backbone (~3 GPU-weeks).
+# Sparse (2, 28) FiLM
+python experiments/train_lm.py --arch deltanet --feedback film \
+  --feedback_pairs "2,28" --steps 5000 --d_model 576 --n_heads 9 \
+  --d_head 64 --n_layers 30
 
-Earlier directions still relevant for future work:
+# Vanilla Transformer baseline (needs --max_T because softmax attention
+# is permutation-invariant without positional info)
+python experiments/train_lm.py --arch transformer --max_T 512 \
+  --feedback none --steps 5000 --d_model 576 --n_heads 9 --d_head 64 \
+  --n_layers 30
 
-6. **S₅ word problem** at long T — tests *non-solvable*
-   state-tracking. SO(n) for n≥3 contains A₅ in principle; SGD-
-   findability is open. DeltaProduct has the cleanest published
-   numbers here (NeurIPS 2025); a direct comparison would slot in.
-7. **Lean: incompatibility theorem.** Formalise *"two-sided rotation
-   conjugation cannot host both Grazzi-clean spectrum and a fixed-frame
-   recall basis simultaneously"* in Lean. New module
-   `IncompatibilityTheorem.lean`.
+# Mamba2 baseline
+python experiments/train_lm.py --arch mamba2 --feedback none \
+  --steps 5000 --d_model 576 --n_heads 9 --d_head 64 --n_layers 30
+```
+
+All runs use codeparrot/codeparrot-clean, T=512, batch=8, lr=3e-4
+cosine.
+
+## Earlier work
+
+The cell-level architectural exploration that preceded the sparse-
+feedback finding (hybrid `[ortho, deltanet]` stack, AUSSM concurrent
+prior art, Lean library, Triton kernels) is documented in
+[`HISTORY.md`](HISTORY.md). That work led to the empirical observation
+that motivated this finding: cell-level architecture saturates before
+the inter-cell information flow. Sparse cross-layer feedback is the
+inter-cell flow that turned out to matter.
 
 [grazzi]: https://arxiv.org/abs/2411.12537
 [zoology]: https://arxiv.org/abs/2312.04927

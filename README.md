@@ -1,11 +1,17 @@
 # state-dep-parallel
 
 Mapping the design space of **state-dependent, parallelizable RNN cells**
-— with a specific architectural finding: a single sparse cross-layer
-feedback connection in a 30-layer DeltaNet stack beats vanilla
-Transformer (−23 %), Mamba2 (−12.5 %), and pure DeltaNet (−3.1 %) at
-matched params on Python code, mechanistically explained, and
-extrapolating cleanly to 16× training context.
+— with a specific finding: in a 30-layer DeltaNet stack, a *single*
+sparse late-to-early FiLM connection (a minimal-form descendant of
+GF-RNN-style top-down feedback) beats vanilla Transformer (−23 %),
+Mamba2 (−12.5 %), and pure DeltaNet (−3.1 %) at matched params on
+Python code. Mechanistically explained (the network discovers a
+negative-α subtractive predictive-coding basin) and extrapolates
+cleanly to 16× training context.
+
+The high-level idea of upper-to-lower-layer feedback in stacked RNNs
+is not new — see *Related work* below — but the **specific minimal
+form, the modern linear-RNN context, and the mechanism analysis are.**
 
 - [`RESULTS.md`](RESULTS.md) — full empirical writeup, Phases 1-16
 - [`NEXT_DIRECTIONS.md`](NEXT_DIRECTIONS.md) — current research plan
@@ -82,23 +88,71 @@ both conditions met, multiple architectures converge to PPL ≈ 49.4 at
 - Sigmoid-gated cross-layer attention
 - Distributed multi-pair (2, 28)+(4, 24)+(8, 20)
 
+## Related work — honest novelty accounting
+
+The high-level construct (top-down feedback in stacked RNNs) is not
+new. Three prior works are direct antecedents and must be cited:
+
+| Paper | What's theirs | What's still ours |
+|---|---|---|
+| **[GF-RNN][gfrnn]** (Chung, Gulcehre, Cho, Bengio, ICML 2015) | The *idea* of top-down feedback from upper RNN layers to lower layers, with learnable gates per layer pair. Tested with tanh / LSTM / GRU on character LM and Python program eval. | They use *gated additive* updates (not multiplicative FiLM); feedback at *all* layer pairs (not single sparse pair); sequential RNNs (not parallel-scan-friendly); no mechanism characterization (no negative-α basin observation); small scale. |
+| **[BRIMs][brims]** (Mittal, Lamb, Goyal et al., ICML 2020) | The *t−1 lag trick* for parallel-scan friendliness with this kind of feedback — the higher-layer-to-lower-layer signal looks at the previous timestep precisely to preserve causality. | Attention-based (not FiLM); modular RIM cells; every adjacent layer pair (not sparse single-pair); small models. |
+| **[SparX][sparx]** (Lou, Cao et al., AAAI 2025) | The *"sparse cross-layer connection"* terminology and a sparse adjacency pattern in the Mamba/Transformer family. | They do **forward** DenseNet-style feature aggregation in a vision backbone (not late→early feedback in language); cross-attention with channel-wise routing (not FiLM); vision domain only. |
+
+Adjacent but mechanically distinct:
+**Feedback Transformer** ([Fan et al. 2020][feedbackt]),
+**Staircase Attention** ([Ju et al. 2021][staircase]),
+**TransformerFAM** ([Hwang et al. 2024][fam]) — feedback/memory
+mechanisms in Transformer blocks, mostly within-block or temporal
+rather than cross-layer in stacked RNN.
+**Universal Transformer** ([Dehghani et al. 2019][ut]),
+**Loop-Residual** ([Loop-Residual NN][loopres]),
+**Depth-Recurrent Transformer** — depth-recurrence with parameter
+sharing rather than a fixed sparse inter-layer connection.
+**PredNet** ([Lotter, Kreiman, Cox 2017][prednet]) — predictive
+coding for video with conv layers; theoretical inspiration only.
+The predictive coding lineage from Rao & Ballard (1999) onward is the
+theoretical frame the negative-α basin matches.
+
+### What's actually new here
+
+What the prior art does not have, that this project contributes:
+
+1. **The "minimal form" empirical finding.** Among the family of
+   GF-RNN-style top-down feedbacks, the *minimum* useful structure
+   for a linear-RNN coding LM is a single sparse pair `(2, 28)` with
+   FiLM modulation. Multi-pair, all-pair, attention-routed, dense-
+   feedback, and cross-attention variants all *fail* to beat this —
+   in many cases they fail to find the basin at all.
+2. **The mechanism characterization.** 20+ controlled ablations
+   identify that a previously-unreported *negative-α subtractive
+   basin* exists, and is reachable iff (i) the modulation is
+   *multiplicative* (FiLM-form, not Q-K-V additive) and (ii)
+   aggregation across sources is *non-softmax* (sum or independent
+   sigmoid; softmax dilutes by 1/K and forces α toward 0). Either
+   failure alone breaks the basin.
+3. **Modern linear-RNN, matched-everything-except-attention vs SOTA.**
+   Identical block structure across Sparse-FiLM / DeltaNet / Mamba2
+   / vanilla Transformer, sole variable is the attention class, at
+   217 M params on Python code; sparse-FiLM beats by 23 / 12.5 / 3.1 %.
+4. **Long-T extrapolation comparison** across all four architectures.
+   Sparse-FiLM wins at every T from 512 to 4096 (8×); Transformer
+   with absolute-position embeddings can't extrapolate at all.
+
+So the claim shifts from "novel architecture" to **"minimal-form
+empirical demonstration plus mechanism, of an idea that has been
+around since GF-RNN 2015, in a modern linear-RNN coding LM where it
+hasn't been tested."** That's still publishable, just honest.
+
 ## What's next
 
-Confirmation step before any paper writeup:
-
-- **Literature search** — thorough check for prior work on backward /
-  cross-layer / top-down state propagation in RNN architectures. The
-  finding looks novel relative to what we know, but we need to verify
-  before claiming so.
-
-Then:
-
 - **Generalize the cell** — swap DeltaNet for **DeltaProduct**
-  ([Yang et al. NeurIPS 2025][deltaproduct]) or **PD-SSM** as the base
-  RNN cell, test if sparse cross-layer feedback gives the same
-  architectural lift on top of stronger linear-RNN cells.
-- **Scale-up validation** — train at 350-500 M params on 5-10 B tokens
-  to check the architectural ordering doesn't flip with more data.
+  ([Yang et al. NeurIPS 2025][deltaproduct]) or **PD-SSM** as the
+  base RNN cell, test if the sparse cross-layer feedback gives the
+  same architectural lift on top of stronger linear-RNN cells.
+- **Scale-up validation** — train at 350-500 M params on 5-10 B
+  tokens to check the architectural ordering doesn't flip with more
+  data.
 - **Distillation revisit** — initial Qwen3.6 distillation (Phase 15)
   was a negative result due to teacher–data misalignment; a coder-
   aligned teacher (DeepSeek-Coder, Qwen3-Coder-Next) might change
@@ -167,3 +221,12 @@ inter-cell flow that turned out to matter.
 [zoology]: https://arxiv.org/abs/2312.04927
 [aussm]: https://arxiv.org/abs/2507.05238
 [deltaproduct]: https://arxiv.org/abs/2502.10297
+[gfrnn]: https://arxiv.org/abs/1502.02367
+[brims]: https://arxiv.org/abs/2006.16981
+[sparx]: https://arxiv.org/abs/2409.09649
+[feedbackt]: https://arxiv.org/abs/2002.09402
+[staircase]: https://arxiv.org/abs/2106.04279
+[fam]: https://arxiv.org/abs/2404.09173
+[ut]: https://arxiv.org/abs/1807.03819
+[loopres]: https://arxiv.org/abs/2409.14199
+[prednet]: https://arxiv.org/abs/1605.08104

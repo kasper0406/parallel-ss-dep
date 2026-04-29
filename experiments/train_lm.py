@@ -234,12 +234,15 @@ def main():
     p.add_argument("--feedback_scratchpad_heads", type=int, default=9,
                    help="Number of heads inside the scratchpad attention.")
     p.add_argument("--feedback_scratchpad_routing", type=str, default="softmax",
-                   choices=["softmax", "sigmoid"],
-                   help="'softmax' (default) — softmax over key positions, "
-                        "biased by surprise; suffers 1/T dilution at init. "
-                        "'sigmoid' — independent gates × surprise (multiplicative); "
-                        "no normalization across keys, mirrors the film_sigmoid "
-                        "rescue from Phase 14d.")
+                   choices=["softmax", "sigmoid", "sigmoid_uniform",
+                            "uniform_surprise"],
+                   help="Routing for the scratchpad attention. Disentangling: "
+                        "'softmax' = content (Q·K) softmax + surprise log-bias; "
+                        "'sigmoid' = content sigmoid × surprise (multiplicative); "
+                        "'sigmoid_uniform' = content only, surprise IGNORED "
+                        "(tests pure content retrieval); "
+                        "'uniform_surprise' = surprise only, content IGNORED "
+                        "(tests pure saliency-based retrieval).")
     p.add_argument("--feedback_xattn_form", type=str, default="attn",
                    choices=["attn", "film_sum", "film_sum_mlp", "film_sum_glu",
                             "film_target_gated",
@@ -277,6 +280,16 @@ def main():
     p.add_argument("--d_head", type=int, default=64)
     p.add_argument("--n_layers", type=int, default=30)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--optimizer", type=str, default="adamw",
+                   choices=["adamw", "muon"],
+                   help="'adamw' (default) — single AdamW for all params. "
+                        "'muon' — Muon for ≥2D hidden-layer matrices, AdamW "
+                        "for embeddings, lm_head, and 1D params. Typically "
+                        "30-50% faster convergence per Keller Jordan / NanoGPT "
+                        "speedrunning. Pair with --lr_muon ~1e-3.")
+    p.add_argument("--lr_muon", type=float, default=1e-3,
+                   help="Muon learning rate (used only when --optimizer muon). "
+                        "AdamW LR for the remaining params is taken from --lr.")
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--val_every", type=int, default=500)
     p.add_argument("--tokenizer", type=str,
@@ -423,11 +436,47 @@ def main():
     else:
         bracket_deltas = None
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
-                            weight_decay=0.1)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=args.steps, eta_min=args.lr * 0.1,
-    )
+    # Optimizer construction — single AdamW (default) or Muon + AdamW split.
+    if args.optimizer == "adamw":
+        opts = [torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                   betas=(0.9, 0.95), weight_decay=0.1)]
+        scheds = [torch.optim.lr_scheduler.CosineAnnealingLR(
+            opts[0], T_max=args.steps, eta_min=args.lr * 0.1)]
+    else:  # muon
+        # Split params: ≥2D hidden-layer matrices → Muon; embeddings, lm_head,
+        # and 1D params (alphas, RMSNorm scales) → AdamW.
+        embed_or_head_names = {"embed.weight", "pos_embed.weight", "lm_head.weight"}
+        muon_params, adamw_params = [], []
+        seen = set()
+        for name, p in model.named_parameters():
+            if not p.requires_grad or id(p) in seen:
+                continue
+            seen.add(id(p))
+            # Muon supports strictly 2D matrices. Embeddings/lm_head + 1D
+            # params + 3D+ tensors (short_conv kernels, etc.) go to AdamW.
+            if name in embed_or_head_names or p.ndim != 2:
+                adamw_params.append(p)
+            else:
+                muon_params.append(p)
+        print(f"  optimizer split: {len(muon_params)} Muon params "
+              f"({sum(p.numel() for p in muon_params)/1e6:.1f}M), "
+              f"{len(adamw_params)} AdamW params "
+              f"({sum(p.numel() for p in adamw_params)/1e6:.1f}M)")
+        opts = [
+            torch.optim.Muon(muon_params, lr=args.lr_muon,
+                             momentum=0.95, weight_decay=0.1),
+            torch.optim.AdamW(adamw_params, lr=args.lr,
+                              betas=(0.9, 0.95), weight_decay=0.1),
+        ]
+        scheds = [
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                opts[0], T_max=args.steps, eta_min=args.lr_muon * 0.1),
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                opts[1], T_max=args.steps, eta_min=args.lr * 0.1),
+        ]
+    # Backwards-compat aliases used elsewhere in the loop.
+    opt = opts[0]
+    scheduler = scheds[0]
 
     # 3. Train loop.
     print(f"\n{'step':>6}  {'tok/s':>8}  {'tloss':>8}  {'lr':>9}")
@@ -468,11 +517,14 @@ def main():
             logits.reshape(-1, tok.vocab_size), y.reshape(-1),
         )
         loss = lm_loss + args.aux_weight * aux_loss + args.surprise_weight * surprise
-        opt.zero_grad(set_to_none=True)
+        for o in opts:
+            o.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        scheduler.step()
+        for o in opts:
+            o.step()
+        for s in scheds:
+            s.step()
         losses.append(lm_loss.item())  # track LM loss alone for comparison
 
         if step % args.log_every == 0 or step == args.steps:

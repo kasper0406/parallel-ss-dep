@@ -634,12 +634,15 @@ class SurpriseScratchpadFeedback(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_head
         self.scale_qk = d_head ** -0.5
-        # 'softmax' (default) — surprise biases scores additively in log-space, then
-        #                       softmax over key positions (1/T dilution at init).
-        # 'sigmoid' — independent sigmoid gates per (q, k) pair, multiplied by
-        #             surprise directly (no normalization across keys; no 1/T
-        #             dilution; matches the basin-finding form from Phase 14e).
-        assert routing in ("softmax", "sigmoid"), f"unknown routing: {routing!r}"
+        # Routing modes — disentangling write vs read contributions:
+        #   'softmax'           — content (Q·K) softmax + surprise log-bias
+        #   'sigmoid'           — content (Q·K) sigmoid + surprise multiplicative
+        #   'sigmoid_uniform'   — content (Q·K) sigmoid, surprise IGNORED
+        #                         (tests pure content addressing on the write set)
+        #   'uniform_surprise'  — Q·K IGNORED, just surprise-weighted average
+        #                         (tests pure saliency-based retrieval)
+        assert routing in ("softmax", "sigmoid", "sigmoid_uniform",
+                            "uniform_surprise"), f"unknown routing: {routing!r}"
         self.routing = routing
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
@@ -679,18 +682,33 @@ class SurpriseScratchpadFeedback(nn.Module):
         mask = torch.ones(T, T, dtype=torch.bool, device=x_target.device).triu(diagonal=1)
 
         if self.routing == "softmax":
-            # Surprise enters in log-space, then softmax (1/T dilution).
+            # Content (Q·K) softmax + surprise log-bias.
             surprise_bias = torch.log(surprise.clamp(min=0) + 1e-4)  # (B, T_k)
             scores = scores + surprise_bias.unsqueeze(1).unsqueeze(-1)
             scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(-1), float("-inf"))
             attn = F.softmax(scores, dim=2)
-        else:
-            # 'sigmoid' — independent gates × surprise; no normalization over keys.
+        elif self.routing == "sigmoid":
+            # Content (Q·K) sigmoid + surprise multiplicative.
             scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(-1), -50.0)
-            gates = torch.sigmoid(scores)                    # (B, T_q, T_k, H)
-            attn = gates * surprise.unsqueeze(1).unsqueeze(-1)  # multiplicative
-            # Optional normalization to keep magnitude bounded as T grows.
+            gates = torch.sigmoid(scores)
+            attn = gates * surprise.unsqueeze(1).unsqueeze(-1)
             attn = attn / (attn.sum(dim=2, keepdim=True) + 1e-6)
+        elif self.routing == "sigmoid_uniform":
+            # Content-only — Q·K sigmoid, surprise IGNORED (uniform writes).
+            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(-1), -50.0)
+            gates = torch.sigmoid(scores)
+            # Causal mask in float (1 inside causal region, 0 outside).
+            causal_float = (~mask).float().unsqueeze(0).unsqueeze(-1)
+            attn = gates * causal_float
+            attn = attn / (attn.sum(dim=2, keepdim=True) + 1e-6)
+        else:  # 'uniform_surprise'
+            # Saliency-only — Q·K IGNORED, surprise-weighted average.
+            # Per query position t, just weighted-avg by surprise of keys 0..t.
+            causal_float = (~mask).float()  # (T_q, T_k)
+            attn_flat = surprise.unsqueeze(1) * causal_float.unsqueeze(0)  # (B, T_q, T_k)
+            attn_flat = attn_flat / (attn_flat.sum(dim=-1, keepdim=True) + 1e-6)
+            # Broadcast same weights over heads.
+            attn = attn_flat.unsqueeze(-1).expand(-1, -1, -1, self.n_heads)
 
         # Weighted sums of v_scale and v_shift.
         scale_mix = torch.einsum("btsh,bshd->bthd", attn, v_scale).reshape(B, T, D)

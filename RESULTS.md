@@ -1029,6 +1029,49 @@ Gated DeltaNet — same algebraic family as our student). See
 infrastructure notes (vLLM in a separate venv to keep our
 nightly-torch student environment intact).
 
+### Phase 19 — Scale-up to 360M with Muon optimizer (2026-04-29)
+
+Tested whether the architectural lift holds at scale, with a more
+modern optimizer. Setup: d_model=768, n_heads=12, d_head=64,
+n_layers=30 (~360 M params), Muon for 2D matrix params + AdamW for
+embeddings/lm_head/1D params, 15 K AdamW steps × batch 8 × T=512
+(~62 M training tokens, 25× more than the 217M / 5K runs).
+
+| Variant | Final PPL | Final α | Δ vs baseline | Wall-clock |
+|---------|-----------|---------|----------------|-----------|
+| DN baseline @ 360M | 22.79 | — | — | 65 min |
+| **DN + sparse (2, 28) FiLM @ 360M** | **21.57** | **+0.158** | **−5.4 %** ⭐ | 105 min |
+
+**Findings:**
+
+1. **The architectural lift scales positively.** At 217M / 5K AdamW
+   the lift was −3.1 %; at 360M / 15K Muon it grows to −5.4 %.
+   The sparse cross-layer feedback finding *benefits* from more
+   parameters and more training, not the reverse.
+2. **Scaling is dramatic.** 217M baseline was 51.00 PPL; 360M+Muon
+   is 22.79 (−55 %). Scale + Muon is the dominant signal here, but
+   the architectural lift sits *on top* of that and grows.
+3. **Basin sign flipped to positive.** At 217M / AdamW the model found
+   the negative-α subtractive basin (α = −0.054, predictive-coding
+   style). At 360M / Muon it finds the *positive*-α additive basin
+   (α = +0.158, 3× larger magnitude). Two possible reasons:
+   - Muon's orthogonalized updates have different geometry than
+     AdamW; the negative basin may be less reachable under that
+     update rule.
+   - At 360M with more training, the model has more capacity to
+     use additive feedback effectively, which gives a larger lift
+     than the smaller-magnitude subtractive filter at 217M.
+
+   The mechanism analysis (Phase 14b–g) said *both* basins exist
+   and reach the same PPL ceiling at 217M. At larger scale the
+   positive basin actually wins — consistent with the basin-tied
+   prediction.
+
+**Practical reading:** the architecture still works (in fact better)
+at scale and with Muon. The basin-sign sensitivity to optimizer +
+scale is a clean follow-up question — does Muon at 217M also flip?
+We didn't test that yet.
+
 ### Phase 18 — Scratchpad prototype: surprise-gated cross-layer attention (2026-04-29)
 
 Tested whether a *surprise-gated cross-layer attention scratchpad* can

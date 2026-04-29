@@ -1072,6 +1072,51 @@ at scale and with Muon. The basin-sign sensitivity to optimizer +
 scale is a clean follow-up question — does Muon at 217M also flip?
 We didn't test that yet.
 
+#### Phase 19 follow-up — Transformer at 360M Muon flips the SOTA ordering
+
+We also ran the vanilla Transformer baseline at 360M with Muon (same
+schedule, max_T=512 for absolute-position embedding):
+
+| Variant @ 360M Muon, 15K steps | Final PPL | vs Sparse-FiLM |
+|---|---|---|
+| **Vanilla Transformer** (softmax + abs pos emb) | **18.78** ⭐ | **−12.9 %** |
+| Sparse-(2, 28)-FiLM DeltaNet | 21.57 | — |
+| DeltaNet baseline | 22.79 | +5.7 % (loses) |
+
+**The SOTA ordering flipped from the 217M finding** (Phase 16). At 217M
+with AdamW (no warmup) Transformer was the worst (60.75, 23 % behind
+sparse-FiLM). At 360M with Muon Transformer wins by 13 %.
+
+**Honest reading of why the ordering flipped:**
+
+1. **Muon was designed for Transformer attention matrices** (the
+   NanoGPT speedrun results that established Muon were on Transformers).
+   Linear-RNN cells like DeltaNet were not the design target; their
+   structured Householder updates may not benefit as much from Muon's
+   orthogonalized step.
+2. **AdamW + no warmup at 217M handicapped the Transformer.**
+   Transformers conventionally use linear warmup; without it the
+   Phase 16 result was not optimizer-tuned.
+3. **More training favors quadratic attention.** 62M tokens (vs 2.5M
+   in Phase 16) is enough for the Transformer's O(T²) computation
+   per layer to extract more signal than the constant-memory
+   linear-RNN state can carry.
+
+**What this means for the paper claim:**
+
+- The **sparse-FiLM lift over DeltaNet** still holds at scale and
+  with Muon, and *grows* (−3.1 % at 217M → −5.4 % at 360M).
+  That's the architectural claim.
+- The **"sparse-FiLM beats SOTA Transformer"** claim from Phase 16 is
+  scale- and optimizer-dependent. At 360M with Muon the Transformer
+  is the SOTA on this corpus. The claim should be reframed as
+  "sparse-FiLM is the strongest known modification *within the
+  linear-RNN family*", not "best across all attention classes."
+
+This is the right kind of result to surface honestly. The
+architectural contribution stands; the comparative ranking against
+Transformer needs to be qualified.
+
 ### Phase 18 — Scratchpad prototype: surprise-gated cross-layer attention (2026-04-29)
 
 Tested whether a *surprise-gated cross-layer attention scratchpad* can

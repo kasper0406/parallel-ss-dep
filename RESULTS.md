@@ -1077,6 +1077,42 @@ params, matched data, identical block structure, sparse cross-layer
 feedback in a linear-RNN beats both vanilla Transformer and Mamba2
 on this code-PPL task by double-digit percentages.**
 
+#### Structural quality eval (PPL ≠ structure)
+
+Ran `eval_bracket_structure.py` on each: greedy 64-token generations
+on 100 codeparrot prefixes, measure parse-success, bracket
+imbalance, indent consistency, token diversity.
+
+| Model | PPL | parse % | bracket_imb | indent % | tok_div |
+|-------|-----|---------|-------------|----------|---------|
+| Vanilla Transformer | 60.75 | 0 % | 2.52 | 87.9 % | 0.174 |
+| **Mamba2** | 55.60 | 0 % | **0.72** ⭐ | **92.7 %** ⭐ | **0.316** ⭐ |
+| DeltaNet | 51.00 | 0 % | 3.48 | 87.9 % | 0.222 |
+| **Sparse-(2,28)-FiLM** | **49.40** ⭐ | 0 % | 2.94 | 89.9 % | 0.212 |
+
+**PPL and structural quality are partially decorrelated.** All models
+score 0 % parse success (expected at 217 M params / 2.5 M training
+tokens — the generations rarely complete a full Python statement).
+Among non-parsing metrics:
+
+- **Mamba2 wins all three structure metrics** despite losing 12.5 %
+  PPL to sparse-FiLM. Its generations are far better-bracketed
+  (4× lower imbalance), more indent-consistent, and more token-diverse.
+- **Sparse-FiLM has the lowest token diversity (0.212)** — it makes
+  more confident / repetitive predictions, which is consistent with
+  its PPL win (lower entropy on actual tokens) but suggests the
+  generation-time quality is *not* better than DN.
+- **DN and Transformer tie on indent consistency** (87.9 %); DN's
+  higher bracket imbalance (3.48 vs 2.52) is the worst result.
+
+Honest reading: the architectures occupy different points on a
+PPL-vs-structure tradeoff. Sparse-FiLM and DN are PPL-strong and
+structure-medium; Mamba2 is PPL-medium and structure-strong;
+vanilla Transformer trails on both. A larger-scale rerun (more
+data, larger model) is the right way to see whether sparse-FiLM's
+PPL advantage *also* translates to structural improvement once the
+model is no longer undertrained.
+
 ### Phase 15 — Distillation infra + first negative result (2026-04-29)
 
 End-to-end pipeline built and validated:

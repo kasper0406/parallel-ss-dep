@@ -49,12 +49,19 @@ def build_model_from_ckpt(ckpt_path: str):
                              n_symbols=cfg.get("n_symbols", 512))
     else:
         raise ValueError("checkpoint has neither arch nor layers_spec")
-    # Note: train_lm.py doesn't pass max_T to the constructor, so trained
-    # LM models have no positional embedding. Force max_T=0 here to match.
+    # Linear-RNN architectures train with max_T=0 (no pos embed); the
+    # Transformer baseline trains with max_T=args.T (learnable abs pos
+    # embed). Detect from the saved state_dict whether the ckpt has a
+    # pos_embed and infer the correct max_T.
+    sd_keys = ckpt["state_dict"].keys() if "state_dict" in ckpt else {}
+    if "pos_embed.weight" in sd_keys:
+        max_T_inferred = ckpt["state_dict"]["pos_embed.weight"].shape[0]
+    else:
+        max_T_inferred = 0
     model = TinyLM(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"],
         n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
-        d_head=cfg["d_head"], max_T=0,
+        d_head=cfg["d_head"], max_T=max_T_inferred,
         feedback_mode=cfg.get("feedback_mode", "none"),
         feedback_distances=tuple(cfg.get("feedback_distances", (1,))),
         feedback_pairs=tuple(cfg.get("feedback_pairs", ()) or ()),

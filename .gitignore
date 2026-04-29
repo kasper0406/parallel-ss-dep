@@ -1,4 +1,8 @@
 StateDep/.lake/
 .venv/
+.venv-vllm/
+.claude/
+checkpoints/
+data/
 __pycache__/
 *.pyc

@@ -1029,6 +1029,66 @@ Gated DeltaNet — same algebraic family as our student). See
 infrastructure notes (vLLM in a separate venv to keep our
 nightly-torch student environment intact).
 
+### Phase 15 — Distillation infra + first negative result (2026-04-29)
+
+End-to-end pipeline built and validated:
+
+- **Phase 5b**: vLLM in dedicated `~/.venv-vllm` (torch 2.11/cu130);
+  Qwen3.6-35B-A3B-AWQ loads at 29.67 GB / 31.36 GB on a single 5090,
+  generates at 50 tok/s eager-mode, scores prompts at 8,775 tok/s
+  batched (top-20 logprobs per position).
+- **Phase 5c-extract**: `extract_teacher_logprobs.py` streams
+  codeparrot through Qwen tokenizer + vLLM teacher, writes NPZ
+  shards. 10M-token extraction = 23 minutes on one 5090.
+- **Phase 5c-train**: `train_distill.py` reads NPZ shards, trains
+  sparse-(2,28)-FiLM @30L student (303 M params, Qwen vocab,
+  tied embeddings) with KL on top-20 + CE on ground-truth.
+
+#### Head-to-head: distillation vs CE-only baseline @ 10M tokens
+
+Same architecture, same data, same training schedule, same seed.
+Difference is **only** the loss weighting.
+
+| Run | Loss | VAL CE | VAL KL | **VAL PPL** | Final α |
+|-----|------|--------|--------|-------------|---------|
+| Distillation (kl=1.0, ce=0.5) | 2.76 | 3.65 | 0.94 | **38.45** | −0.044 |
+| **Baseline (CE only)** | 3.34 | 3.34 | 1.50 | **28.23** ⭐ | −0.045 |
+
+**The CE-only baseline beats KL+CE distillation by 36 % PPL.**
+
+Both find the negative-α predictive-coding basin at scale (α ≈ −0.045,
+matching our small-scale 49.40 PPL finding's α = −0.054). The
+architecture transfers cleanly to Qwen tokenizer. The distillation
+problem is *strategic*, not architectural.
+
+**Why distillation hurts here (teacher-data misalignment):**
+
+- Qwen3.6 was trained for *agentic* code with reasoning/RLHF flavor
+  and a 248K-vocab tokenizer including chat-style tokens.
+- codeparrot-clean is raw GitHub Python — different style, no chat
+  framing, no instruction tuning patterns.
+- The student fits teacher better (lower KL: 0.94 vs baseline's 1.50)
+  but ground truth worse (higher CE: 3.65 vs 3.34).
+- Top-20 truncation at V=248K may also drop too much tail mass.
+
+The negative result is informative — distillation is sensitive to
+teacher–data alignment, which our setup does not have. Strategic
+choices for the next phase:
+
+1. **Use a coder-aligned teacher** (Qwen3-Coder-Next, DeepSeek-Coder)
+   so teacher and corpus match.
+2. **Lower KL weight** (e.g., kl=0.2, ce=1.0) — distillation as light
+   regularizer rather than primary signal.
+3. **Drop distillation altogether** for our PoC; train sparse-FiLM
+   from scratch on codeparrot at scale and benchmark it as an
+   architecture (not a coder model).
+4. **Realign the corpus** — train on a code corpus that matches
+   Qwen's distribution (instruction-style, agent traces).
+
+The architectural finding is unaffected. Distillation is a
+secondary research question for which we now have working
+infrastructure.
+
 ## Phase 13 — Overnight ablation: Dyck + code-PPL ratio sweep
 
 Per the plan to assess hybrid for **coding-relevant LM tasks**, ran two

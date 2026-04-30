@@ -3,26 +3,37 @@
 Mapping the design space of **state-dependent, parallelizable RNN cells**
 — with a specific finding: in a DeltaNet stack, a *single*
 sparse late-to-early FiLM connection (a minimal-form descendant of
-GF-RNN-style top-down feedback) gives a robust ~3-5 % PPL lift over
-the underlying linear-RNN cell, **growing with scale**: from −3.1 %
-at 217 M / AdamW to −5.4 % at 360 M / Muon. Mechanistically
-characterized (Phase 14b–g) — multiplicative form + non-softmax
-aggregation finds a previously-unreported optimization basin —
-and extrapolates cleanly to 16× training context.
+GF-RNN-style top-down feedback) gives a robust **~3-5 % PPL lift**
+over the underlying linear-RNN cell that survives a **3.3× parameter
+scale-up** (217 M → 708 M) and an optimizer change (AdamW → Muon).
+Mechanistically characterized (Phase 14b–g) — multiplicative form +
+non-softmax aggregation finds a previously-unreported optimization
+basin — and extrapolates cleanly to 16× training context.
 
-**Honest scale-up scoreboard** (360 M, Muon, codeparrot, 15 K steps):
+**Architectural lift over DeltaNet, all three scales:**
+
+| Scale / optimizer | DN baseline | + Sparse FiLM | Δ | α |
+|---|---|---|---|---|
+| 217 M / AdamW / 5 K | 51.00 | 49.40 | **−3.1 %** | −0.054 |
+| 360 M / Muon  / 15 K | 22.79 | 21.57 | **−5.4 %** | +0.158 |
+| 708 M / Muon  / 15 K | 35.38 | 34.26 | **−3.2 %** | −0.198 |
+
+**Cross-architecture scoreboard** (codeparrot, Muon-tuned, T=512):
 
 ```
-Vanilla Transformer (Muon-tuned):   18.78 PPL  ← strongest at this scale
-Sparse-(2, 28)-FiLM DeltaNet:        21.57 PPL  ← strongest in linear-RNN family
-DeltaNet baseline:                   22.79 PPL
+Vanilla Transformer @ 360M:                   18.78 PPL  ← strongest at this scale
+Sparse-(2, 34)-FiLM DeltaNet @ 708M:           34.26 PPL  ← deployment-memory-fair
+DeltaNet @ 708M:                               35.38 PPL
 ```
 
-At smaller-scale + AdamW (217 M / 5 K) the Transformer was the worst
-(60.75); at 360 M / Muon (the optimizer it was designed for) it
-catches up and surpasses. The **architectural lift of sparse-FiLM
-over DeltaNet holds and grows at scale**, but the comparative claim
-against Transformer is scale- and optimizer-dependent.
+The 708 M RNN is sized so its inference-time state is comparable to
+a 360 M Transformer's KV cache (deployment-memory parity). At this
+token budget (~30 M, far below Chinchilla-optimal for 708 M) the
+Transformer still wins on raw quality — we do **not** close the
+cross-class gap. What we do show is that the **architectural lift
+of sparse-FiLM over DeltaNet is robust** across 217 M → 360 M →
+708 M; the comparative claim against Transformer is scale- and
+optimizer-dependent.
 
 The high-level idea of upper-to-lower-layer feedback in stacked RNNs
 is not new — see *Related work* below — but the **specific minimal
@@ -40,37 +51,44 @@ form, the modern linear-RNN context, and the mechanism analysis are.**
 ## Headline finding
 
 **A single sparse late-to-early FiLM connection in a DeltaNet stack
-gives a robust ~3-5 % PPL lift over the underlying linear-RNN cell,
-with the lift growing at scale.**
+gives a robust ~3-5 % PPL lift over the underlying linear-RNN cell.
+The lift survives 3.3× parameter scale-up and an optimizer change.**
 
-| Setup | DN baseline | + Sparse (2, 28) FiLM | Δ | α |
+| Setup | DN baseline | + Sparse FiLM | Δ | α |
 |---|---|---|---|---|
-| 217 M / AdamW / 5 K steps | 51.00 | 49.40 | **−3.1 %** | −0.054 |
-| 360 M / Muon  / 15 K steps | 22.79 | 21.57 | **−5.4 %** | +0.158 |
+| 217 M / AdamW / 5 K steps  | 51.00 | 49.40 (2, 28) | **−3.1 %** | −0.054 |
+| 360 M / Muon  / 15 K steps | 22.79 | 21.57 (2, 28) | **−5.4 %** | +0.158 |
+| 708 M / Muon  / 15 K steps | 35.38 | 34.26 (2, 34) | **−3.2 %** | −0.198 |
 
 The architecture: a **single FiLM-style cross-layer connection** from
-layer 28's output (lagged by 1 token) to layer 2's input, with one
-learnable scalar α. +0.3 % extra parameters. The network discovers
-α from data; sign and magnitude depend on optimizer + scale, but
-both reach the same architectural lift over the underlying cell.
+a late layer's output (lagged by 1 token) to layer 2's input, with one
+learnable scalar α. +0.3 % extra parameters. The network discovers α
+from data; sign and magnitude depend on optimizer + scale (sign is
+*not* monotone in scale — see Phase 20), but the architectural lift
+holds across all three configurations we tested. Pair index scales
+with depth (`(2, 28)/30 ≈ (2, 34)/36`).
 
-3-seed reproducibility on the 217M variant: **49.40 ± 0.31** (σ < 1 %).
+3-seed reproducibility on the 217 M variant: **49.40 ± 0.31** (σ < 1 %).
 
-**Honest scale-up note** — the comparative ranking against attention
-flips at scale. At 217 M / AdamW (no warmup) sparse-FiLM beat vanilla
-Transformer by 23 %; at 360 M with Muon (which was *designed* for
-Transformer attention matrices), Transformer wins:
+**Honest cross-architecture framing.** At 217 M / AdamW sparse-FiLM
+beat vanilla Transformer by 23 %; at 360 M with Muon (which was
+*designed* for Transformer attention matrices), Transformer wins.
+The 708 M run was sized for **deployment-memory parity** with a
+360 M Transformer (RNN state ≈ Transformer KV cache budget):
 
 ```
-Vanilla Transformer (Muon-tuned):     18.78 PPL  ← strongest at this scale
-Sparse-(2, 28)-FiLM DeltaNet:          21.57 PPL  ← strongest in linear-RNN family
-DeltaNet baseline:                     22.79 PPL
+Vanilla Transformer @ 360M Muon:                    18.78 PPL
+Sparse-(2, 34)-FiLM DeltaNet @ 708M Muon:            34.26 PPL  ← deployment-memory-fair
+DeltaNet @ 708M Muon:                                35.38 PPL
 ```
 
-The architectural lift over DeltaNet holds across scales; the cross-
-attention-class ranking depends on optimizer choice. Honest framing:
-*sparse-FiLM is the strongest known modification within the linear-RNN
-family at modern scale*.
+At ~30 M training tokens (well below Chinchilla-optimal for 708 M),
+deployment-memory parity does **not** close the cross-class gap.
+What survives at scale is the architectural lift *within* the
+linear-RNN family. Honest framing: *sparse-FiLM is the strongest
+known modification within the linear-RNN family at the scales we
+can afford to train; the cross-architecture comparison would need a
+Chinchilla-scale or frontier-finetune follow-up*.
 
 ```python
                      pass-1 (vanilla forward)

@@ -1029,6 +1029,97 @@ Gated DeltaNet — same algebraic family as our student). See
 infrastructure notes (vLLM in a separate venv to keep our
 nightly-torch student environment intact).
 
+### Phase 20 — 708M scale-up: deployment-memory-fair vs Transformer (2026-04-30)
+
+Tested whether the architectural lift survives a **3.3× parameter
+scale-up** to ~708 M params, and whether the resulting RNN — at a model
+size where its inference-time state is comparable to a Transformer's
+KV cache — closes the cross-architecture gap that opened at 360 M.
+
+**Setup.** `d_model=1024`, `n_heads=16`, `d_head=64`, `n_layers=36`
+(~707.8 M params). Same Muon (≥2-D matrices) + AdamW (everything
+else) optimizer split as Phase 19, same codeparrot dataset, same
+`T=512`, batch 4, 15 K steps (~30 M training tokens — note this is
+substantially *under* Chinchilla-optimal for 708 M, so absolute PPLs
+are higher than 360 M; the relative architectural lift is what's
+informative). Pair `(2, 34)` chosen per-scale (≈ same depth fraction
+as `(2, 28)/30 ≈ 0.93` → `(2, 34)/36 ≈ 0.94`).
+
+| Variant @ 708M Muon, 15 K steps | Final PPL | Final α | Δ vs baseline | Wall-clock |
+|----------------------------------|-----------|---------|----------------|-----------|
+| DN baseline @ 708M | 35.38 | — | — | 82 min |
+| **DN + sparse (2, 34) FiLM @ 708M** | **34.26** | **−0.198** | **−3.2 %** ⭐ | 124 min |
+
+**Architectural lift across all three scales:**
+
+| Scale / optimizer | DN baseline | + Sparse FiLM | Δ | Final α | Basin sign |
+|---|---|---|---|---|---|
+| 217 M / AdamW / 5 K | 51.00 | 49.40 | −3.1 % | −0.054 | − (predictive coding) |
+| 360 M / Muon / 15 K | 22.79 | 21.57 | −5.4 % | +0.158 | + (additive) |
+| 708 M / Muon / 15 K | 35.38 | 34.26 | −3.2 % | −0.198 | − (predictive coding) |
+
+**Findings:**
+
+1. **Architectural lift survives 3.3× scale-up.** −3.2 % at 708 M is
+   in the same range as −3.1 % at 217 M (and below the −5.4 % peak
+   at 360 M). The architectural contribution does not vanish at
+   scale — it's a real, robust effect across the parameter range we
+   can afford to train.
+
+2. **Basin sign is not monotone in scale.** 217 M (negative) → 360 M
+   (positive) → 708 M (negative). The sign appears to depend on the
+   joint configuration of optimizer, init, LR schedule, and gradient
+   geometry rather than scale alone. The *magnitude* of the lift,
+   not the sign of α, is the architecturally robust quantity. This
+   is consistent with the Phase 14b–g mechanism story: the basin
+   exists in both polarities; what matters is that the multiplicative
+   FiLM form + non-softmax aggregation can find one of them.
+
+3. **708 M trajectory.** Sparse-FiLM trails DN through most of the
+   run and overtakes only in the final cosine-tail (step 12500 →
+   PPL 36.71 vs DN at PPL 35.66 nearby). With longer training the
+   gap likely widens — both runs are far below Chinchilla-optimal
+   at 30 M tokens / 708 M params (~2 % of optimal).
+
+**Honest cross-architecture comparison.**
+
+A motivating thought experiment: at deployment, a Transformer pays
+inference memory in *parameters + KV cache* (which scales with
+context). An RNN pays only in *parameters + a fixed-size state*. If
+we equalize total inference memory, the RNN can spend more on
+parameters. The 708 M sparse-FiLM RNN is roughly the size you can
+afford if you swap the KV cache budget of a 360 M Transformer @
+8 K context for parameters.
+
+| Model @ deployment-memory budget | Params | Final PPL on codeparrot |
+|---|---|---|
+| Transformer + Muon | 360 M | **18.78** |
+| DN + Muon | 708 M | 35.38 |
+| **Sparse-(2,34)-FiLM DN + Muon** | 708 M | **34.26** |
+
+At this token budget the Transformer still wins by ~82 % on raw
+quality. We do **not** claim the RNN beats Transformer at scale —
+both linear-RNN models are far from saturated at 30 M tokens, and
+Transformer attention extracts more signal per training token. The
+honest framing remains:
+
+- **Within the linear-RNN family**, sparse-FiLM is the strongest
+  modification we know of, lift confirmed across 217 M → 360 M →
+  708 M.
+- **Across architecture classes** at modern (Muon-tuned) scale,
+  Transformer wins on this corpus and token budget.
+- The deployment-memory-parity argument **does not close the gap**
+  at the token budget we can afford here — it would need either
+  much longer training (Chinchilla-scale tokens) or a fundamentally
+  different scaling story (e.g. distillation from a frontier
+  GatedDeltaNet teacher).
+
+**Implication.** The architectural finding is robust and worth
+publishing as a linear-RNN-internal contribution. A full
+cross-architecture claim requires a Chinchilla-scale follow-up or
+a frontier-scale fine-tune (e.g. adding the FiLM connection to
+Qwen3.6-35B-A3B as a partial fine-tune) — see `NEXT_DIRECTIONS.md`.
+
 ### Phase 19 — Scale-up to 360M with Muon optimizer (2026-04-29)
 
 Tested whether the architectural lift holds at scale, with a more

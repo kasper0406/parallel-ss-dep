@@ -42,15 +42,20 @@ from tilelang import language as T
 
 
 def _make_buggy_arena_kernel(M, N, K, BM, BN, BK):
-    """Standard 2-stage pipelined bf16 GEMM with a tiny T.float32 shared
-    scalar allocated *before* the TMA-loaded buffers. The scalar pushes
-    the TMA destinations off the 128-byte boundary in the merged
-    dynamic-smem arena if the planner doesn't enforce 1024-byte
-    per-buffer alignment for TMA-capable targets.
+    """2-stage pipelined bf16 GEMM with a tiny T.float32 shared scalar
+    whose lifetime *overlaps* the TMA-loaded tiles. The scalar is
+    written before the loop, accumulated inside it, and read after.
+    That overlapping lifetime forces the smem-allocation planner to
+    keep the scalar alive in the merged dynamic-smem arena alongside
+    the TMA destinations — a shorter-lived scalar (e.g. one that is
+    only used before the loop) gets reordered to a higher offset and
+    masks the bug.
 
     Modelled on the structure of the fla
-    `chunk_bwd_dqkwg_tilelang` kernel (small dg-last accumulator allocated
-    before the larger TMA-loaded `s_v` / `s_do` / `s_h` / `s_dh` tiles).
+    `chunk_bwd_dqkwg_tilelang` kernel (small dg-last accumulator that
+    is updated *inside* the V-loop alongside the TMA-loaded
+    `s_v` / `s_do` / `s_h` / `s_dh` tiles, then used in the K-loop
+    after).
     """
 
     @T.prim_func
@@ -58,8 +63,12 @@ def _make_buggy_arena_kernel(M, N, K, BM, BN, BK):
         a: T.Tensor((M, K), "bfloat16"),
         b: T.Tensor((K, N), "bfloat16"),
         c: T.Tensor((M, N), "bfloat16"),
+        c_scalar: T.Tensor((1,), "float32"),
     ):
         with T.Kernel(T.ceildiv(M, BM), T.ceildiv(N, BN), threads=128) as (bx, by):
+            # Small scalar with a lifetime that spans the whole pipelined
+            # loop — it is initialised before the loop, updated inside
+            # the loop, and used after the loop.
             s_acc_scalar = T.alloc_shared((1,), "float32")
             for _i in T.Parallel(1):
                 s_acc_scalar[0] = 0.0
@@ -74,7 +83,21 @@ def _make_buggy_arena_kernel(M, N, K, BM, BN, BK):
                 T.copy(a[bx * BM:(bx + 1) * BM, k * BK:(k + 1) * BK], s_a)
                 T.copy(b[k * BK:(k + 1) * BK, by * BN:(by + 1) * BN], s_b)
                 T.gemm(s_a, s_b, c_local)
+                # Touch the scalar *inside* the loop so its lifetime
+                # overlaps the TMA-loaded `s_a` / `s_b` tiles. Without
+                # this overlap the planner reorders the scalar past the
+                # TMA buffers and the misalignment goes undetected.
+                # Read a single element of an already-TMA-loaded buffer
+                # so we don't conflict with `c_local`'s gemm layout.
+                for _i in T.Parallel(1):
+                    s_acc_scalar[0] = s_acc_scalar[0] + T.cast(s_a[0, 0], "float32")
+
             T.copy(c_local, c[bx * BM:(bx + 1) * BM, by * BN:(by + 1) * BN])
+            # Use s_acc_scalar after the loop so it can't be dead-code
+            # eliminated.
+            for _i in T.Parallel(1):
+                if bx == 0 and by == 0:
+                    c_scalar[0] = s_acc_scalar[0]
 
     return gemm
 
@@ -255,7 +278,8 @@ def test_tma_smem_alignment_runtime_hostarch():
     a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
     c = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
-    kernel(a, b, c)
+    c_scalar = torch.empty(1, device="cuda", dtype=torch.float32)
+    kernel(a, b, c, c_scalar)
     torch.cuda.synchronize()
     ref = (a.float() @ b.float()).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, rtol=2e-2, atol=2e-2)

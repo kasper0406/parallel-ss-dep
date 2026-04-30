@@ -22,12 +22,17 @@ Use `TargetHasBulkCopy(target)` instead, which is true for any target with
 TMA (arch >= 90), so sm_100, sm_120 and any future TMA-capable target get
 the same strict alignment automatically.
 
-Reproduces with the standalone TileLang script under "How to reproduce" in
-the issue.
-
+Adds `testing/python/issue/test_tilelang_issue_sm120_tma_smem_alignment.py`
+as a host-independent regression test that compiles for explicit
+`cuda -arch=sm_{90,100,120}` targets and asserts every emitted
+`tl::tma_load(...)` destination offset is 128-byte aligned. Pre-fix the
+test fails on sm_100 and sm_120 (additive base = 16 bytes); post-fix it
+passes for all three arches.
 ---
- src/transform/merge_shared_memory_allocations.cc | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ src/transform/merge_shared_memory_allocations.cc                                |   2 +-
+ testing/python/issue/test_tilelang_issue_sm120_tma_smem_alignment.py            | 237 +++++++++++++++++++++++++
+ 2 files changed, 238 insertions(+), 1 deletion(-)
+ create mode 100644 testing/python/issue/test_tilelang_issue_sm120_tma_smem_alignment.py
 
 diff --git a/src/transform/merge_shared_memory_allocations.cc b/src/transform/merge_shared_memory_allocations.cc
 index f6f61b0..5bfac6b 100644
@@ -42,5 +47,246 @@ index f6f61b0..5bfac6b 100644
        shmem_alignment_map_[op] = alignment;
      }
    }
---
-2.34.1
+diff --git a/testing/python/issue/test_tilelang_issue_sm120_tma_smem_alignment.py b/testing/python/issue/test_tilelang_issue_sm120_tma_smem_alignment.py
+new file mode 100644
+index 0000000..aaaef0d
+--- /dev/null
++++ b/testing/python/issue/test_tilelang_issue_sm120_tma_smem_alignment.py
+@@ -0,0 +1,237 @@
++"""Regression test for the sm_120 (Blackwell consumer) TMA shared-memory
++alignment bug.
++
++Pre-fix `SharedMemoryAlignmentPlanner` (`merge_shared_memory_allocations.cc`)
++gated the 1024-byte alignment of TMA-touched smem buffers on
++`TargetIsHopper(target)` (arch in `[90, 100)`). For sm_100 / sm_120 (also
++TMA-capable: see `cp.async.bulk.tensor.{1..5}d.shared::cta.global.*` PTX
++support gated by `TargetHasBulkCopy(target)` in `src/target/utils.cc`)
++the planner fell back to the global default (16 bytes) and TMA destinations
++landed at 16-byte-aligned offsets. `cp.async.bulk.tensor.*` requires the
++destination smem pointer to be 128-byte aligned, so on sm_100/sm_120 this
++caused `CUDA_ERROR_MISALIGNED_ADDRESS` whenever the dynamic-smem arena
++started with a small (e.g. 4-byte float) buffer that pushed subsequent TMA
++buffers off the 128-byte boundary.
++
++Post-fix the predicate is `TargetHasBulkCopy(target)`, which is true for
++arch >= 90 (sm_90, sm_100, sm_103, sm_120 and any future TMA-capable
++target) — the correct set, since TMA support and TMA's alignment
++requirements are coextensive.
++
++The test is GPU-host independent: it only inspects the generated CUDA
++source after compiling for an explicit `cuda -arch=...` target. Running on
++a non-matching host is fine because the kernel is never launched.
++"""
++import ast
++import re
++
++import tilelang
++import tilelang.testing
++from tilelang import language as T
++
++
++def _make_buggy_arena_kernel(M, N, BM, BN):
++    """Two-buffer pipelined add kernel with a small shared scalar allocated
++    BEFORE the TMA-loaded buffers — the layout that exposes the alignment
++    bug. The scalar pushes the TMA buffer offsets within the merged arena
++    off the 128-byte boundary if the planner doesn't enforce 1024-byte
++    per-buffer alignment.
++    """
++
++    @T.prim_func
++    def kernel(
++        a: T.Tensor((M, N), "bfloat16"),
++        b: T.Tensor((M, N), "bfloat16"),
++        c: T.Tensor((M, N), "bfloat16"),
++    ):
++        with T.Kernel(M // BM, threads=128) as i_m:
++            s_acc = T.alloc_shared((1,), "float32")
++            for _i in T.Parallel(1):
++                s_acc[0] = 0.0
++            T.sync_threads()
++
++            s_a = T.alloc_shared((BM, BN), "bfloat16")
++            s_b = T.alloc_shared((BM, BN), "bfloat16")
++
++            for i_n in T.Pipelined(N // BN, num_stages=2):
++                T.copy(a[i_m * BM:(i_m + 1) * BM, i_n * BN:(i_n + 1) * BN], s_a)
++                T.copy(b[i_m * BM:(i_m + 1) * BM, i_n * BN:(i_n + 1) * BN], s_b)
++                for _i, _j in T.Parallel(BM, BN):
++                    c[i_m * BM + _i, i_n * BN + _j] = s_a[_i, _j] + s_b[_i, _j]
++
++    return kernel
++
++
++_TMA_DST_RE = re.compile(
++    r"tma_load\([^;]*?"               # tma_load call
++    r"\(\s*&\s*\(*\s*"                # (&  optional cast wrappers
++    r"\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\*\s*\)\s*"  # element type cast e.g. (bfloat16_t*)
++    r"buf_dyn_shmem\s*\)*\s*"
++    r"\[\s*([^]]+?)\s*\]"             # element-index expression
++)
++
++_DTYPE_BYTES = {
++    "bfloat16_t": 2, "half_t": 2, "uint16_t": 2, "int16_t": 2,
++    "float": 4, "uint32_t": 4, "int32_t": 4,
++    "double": 8, "uint64_t": 8, "int64_t": 8,
++    "uchar": 1, "uint8_t": 1, "int8_t": 1,
++}
++
++
++def _parse_offset_constants(expr: str):
++    """Parse a TileLang-emitted offset expression and return
++    `(additive_base, [variable_coefficients])`.
++
++    `additive_base` is the sum of integer literals that appear as
++    top-level additive terms (not inside any subexpression).
++    `variable_coefficients` are the integer literals that multiply
++    a sub-expression containing at least one variable (the per-stage
++    or per-thread strides).
++
++    Both quantities — multiplied by sizeof(element) — must be a
++    multiple of 128 for the destination pointer to be guaranteed
++    128-byte aligned for *every* runtime value of the variables.
++
++    C-style bitwise operators (`&`, `|`, `^`) are remapped to `+` so
++    Python's `ast` can parse the expression; we only care about the
++    structural placement of integer literals, not the operator's
++    semantics.
++    """
++    py_src = expr.replace("&", "+").replace("|", "+").replace("^", "+")
++    tree = ast.parse(py_src, mode="eval").body
++
++    base = 0
++    strides: list[int] = []
++
++    def _has_name(node) -> bool:
++        return any(isinstance(n, ast.Name) for n in ast.walk(node))
++
++    def _classify_term(term):
++        nonlocal base
++        if isinstance(term, ast.Constant) and isinstance(term.value, int):
++            base += term.value
++            return
++        if isinstance(term, ast.BinOp) and isinstance(term.op, ast.Mult):
++            left, right = term.left, term.right
++            const = var_side = None
++            if isinstance(left, ast.Constant) and isinstance(left.value, int):
++                const, var_side = left.value, right
++            elif isinstance(right, ast.Constant) and isinstance(right.value, int):
++                const, var_side = right.value, left
++            if const is not None and _has_name(var_side):
++                strides.append(const)
++                return
++        # Otherwise: variable-only term or unrecognized form. We ignore
++        # these — they cannot violate alignment unless their structure
++        # carries a non-128-aligned constant (which the recursive walk
++        # below catches for the common cases we emit).
++        if isinstance(term, ast.BinOp):
++            _walk_addends(term.left)
++            _walk_addends(term.right)
++
++    def _walk_addends(node):
++        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
++            _walk_addends(node.left)
++            _walk_addends(node.right)
++        else:
++            _classify_term(node)
++
++    _walk_addends(tree)
++    return base, strides
++
++
++def _tma_dst_byte_terms(src: str):
++    """Extract `(byte_base, byte_strides, raw_index_expr, elt_type)` for every
++    `tl::tma_load(..., (&((T*)buf_dyn_shmem)[expr]), ...)` in `src`.
++
++    `byte_base` is the additive constant in `expr` * sizeof(T).
++    `byte_strides` are the runtime-variable coefficients * sizeof(T).
++    Both must be multiples of 128 for the dst pointer to be
++    128-aligned at every iteration.
++    """
++    out = []
++    for m in _TMA_DST_RE.finditer(src):
++        elt_type = m.group(1)
++        idx_expr = m.group(2)
++        bytes_per = _DTYPE_BYTES.get(elt_type)
++        assert bytes_per is not None, (
++            f"unrecognized element type '{elt_type}' in tma_load destination"
++        )
++        base, strides = _parse_offset_constants(idx_expr)
++        out.append((base * bytes_per, [s * bytes_per for s in strides], idx_expr, elt_type))
++    return out
++
++
++def _compile_for(arch: str):
++    """Compile the buggy-arena kernel for an explicit `arch` target and
++    return the generated CUDA source.
++
++    Compiling for an explicit `cuda -arch=sm_X` target on a different host
++    is fine: codegen doesn't run the kernel — and we never try to.
++    """
++    M, N, BM, BN = 64, 128, 64, 32
++    tilelang.disable_cache()
++    try:
++        kernel = tilelang.compile(
++            _make_buggy_arena_kernel(M, N, BM, BN),
++            target=f"cuda -arch={arch}",
++            execution_backend="tvm_ffi",
++        )
++    finally:
++        tilelang.enable_cache()
++    return kernel.get_kernel_source()
++
++
++def _assert_tma_destinations_128_aligned(arch: str, src: str):
++    terms = _tma_dst_byte_terms(src)
++    assert terms, (
++        f"[{arch}] expected at least one tl::tma_load(...buf_dyn_shmem...) "
++        "in generated source — the kernel layout should produce TMA loads"
++    )
++    for byte_base, byte_strides, idx_expr, elt_type in terms:
++        assert byte_base % 128 == 0, (
++            f"[{arch}] TMA load destination has non-128-aligned additive "
++            f"base: byte_base={byte_base} "
++            f"(idx_expr=({idx_expr}) elt_type={elt_type}). "
++            f"cp.async.bulk.tensor.{{1..5}}d.shared::cta.global.* requires "
++            f"the destination pointer to be 128-byte aligned at every "
++            f"iteration. See merge_shared_memory_allocations.cc:393."
++        )
++        for stride in byte_strides:
++            assert stride % 128 == 0, (
++                f"[{arch}] TMA load destination has non-128-aligned "
++                f"variable stride: stride={stride} "
++                f"(idx_expr=({idx_expr}) elt_type={elt_type}). "
++                f"See merge_shared_memory_allocations.cc:393."
++            )
++
++
++@tilelang.testing.requires_cuda
++def test_tma_smem_alignment_sm90_hopper():
++    """sm_90 (Hopper) — covered by the original `TargetIsHopper` predicate,
++    pinned here as a regression test against re-narrowing."""
++    src = _compile_for("sm_90")
++    _assert_tma_destinations_128_aligned("sm_90", src)
++
++
++@tilelang.testing.requires_cuda
++def test_tma_smem_alignment_sm100_blackwell_dc():
++    """sm_100 (Blackwell DC) — TMA-capable. Pre-fix this fell back to
++    16-byte alignment because `TargetIsHopper` is true only for arch
++    `[90, 100)`."""
++    src = _compile_for("sm_100")
++    _assert_tma_destinations_128_aligned("sm_100", src)
++
++
++@tilelang.testing.requires_cuda
++def test_tma_smem_alignment_sm120_blackwell_consumer():
++    """sm_120 (Blackwell consumer / RTX 5090) — TMA-capable. Pre-fix this
++    fell back to 16-byte alignment and triggered
++    `CUDA_ERROR_MISALIGNED_ADDRESS` at runtime on real Blackwell consumer
++    silicon."""
++    src = _compile_for("sm_120")
++    _assert_tma_destinations_128_aligned("sm_120", src)
++
++
++if __name__ == "__main__":
++    tilelang.testing.main()

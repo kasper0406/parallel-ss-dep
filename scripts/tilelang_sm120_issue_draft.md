@@ -165,6 +165,31 @@ Verified on the minimal repro and on the real-world fla
 `GatedDeltaProduct(use_forget_gate=True)` end-to-end backward + 3 optimizer
 steps; gradients match the Triton fallback (`FLA_TILELANG=0`) bit-exactly.
 
+## Regression test
+
+The patch adds
+`testing/python/issue/test_tilelang_issue_sm120_tma_smem_alignment.py`, a
+host-independent regression test. It compiles a kernel with the
+buggy-arena layout (small `T.float32` shared scalar allocated *before*
+the TMA-loaded buffers) for explicit `cuda -arch=sm_{90,100,120}`
+targets, then walks every emitted `tl::tma_load(..., (&((T*)buf_dyn_shmem)[expr]), ...)`
+and asserts that the additive constant in `expr`, scaled by `sizeof(T)`,
+is divisible by 128 (the alignment requirement for
+`cp.async.bulk.tensor.*`). Variable strides in `expr` are checked the
+same way so the assertion holds for every iteration value.
+
+Behaviour before and after the patch:
+
+| arch    | pre-fix | post-fix |
+|---------|---------|----------|
+| sm_90   | PASS    | PASS     |
+| sm_100  | FAIL (additive base = 16 bytes) | PASS |
+| sm_120  | FAIL (additive base = 16 bytes) | PASS |
+
+The test is GPU-host independent — it compiles for explicit `cuda -arch=...`
+targets and never launches the kernel, so CI hosts without a Blackwell GPU
+exercise the regression too.
+
 ## Workaround for users without rebuilding TileLang
 
 Force the global `align_bytes` from 16 → 1024 in the Python-side wrapper

@@ -1,0 +1,235 @@
+{
+  "decode": {
+    "DN_T=512": {
+      "median_ms": 14.487630018265918,
+      "p95_ms": 14.721021536388434,
+      "n_steps": 120
+    },
+    "DN_T=2048": {
+      "median_ms": 14.50363450567238,
+      "p95_ms": 14.757358041242696,
+      "n_steps": 120
+    },
+    "DN_T=4096": {
+      "median_ms": 14.540444506565109,
+      "p95_ms": 14.847014515544288,
+      "n_steps": 120
+    },
+    "DN_T=8192": {
+      "median_ms": 14.527608989737928,
+      "p95_ms": 15.035847394028679,
+      "n_steps": 120
+    },
+    "FILM_T=512": {
+      "median_ms": 14.564264012733474,
+      "p95_ms": 15.00792393926531,
+      "n_steps": 120
+    },
+    "FILM_T=2048": {
+      "median_ms": 14.600744005292654,
+      "p95_ms": 15.033989935182035,
+      "n_steps": 120
+    },
+    "FILM_T=4096": {
+      "median_ms": 14.564158482244238,
+      "p95_ms": 14.881242992123589,
+      "n_steps": 120
+    },
+    "FILM_T=8192": {
+      "median_ms": 14.53914400190115,
+      "p95_ms": 14.86075499560684,
+      "n_steps": 120
+    },
+    "FILM2P_T=512": {
+      "median_ms": 28.69820498744957,
+      "p95_ms": 29.01596146984957,
+      "n_steps": 120
+    },
+    "FILM2P_T=2048": {
+      "median_ms": 28.56705049634911,
+      "p95_ms": 29.127976956078783,
+      "n_steps": 120
+    },
+    "FILM2P_T=4096": {
+      "median_ms": 28.832464013248682,
+      "p95_ms": 29.364797522430308,
+      "n_steps": 120
+    },
+    "FILM2P_T=8192": {
+      "median_ms": 28.781749511836097,
+      "p95_ms": 29.975117434514686,
+      "n_steps": 120
+    },
+    "TX_T=512": {
+      "median_ms": 4.576703999191523,
+      "p95_ms": 4.6368595038075,
+      "n_steps": 120
+    },
+    "TX_T=2048": {
+      "median_ms": 4.576159990392625,
+      "p95_ms": 4.623015411198139,
+      "n_steps": 120
+    },
+    "TX_T=4096": {
+      "median_ms": 4.583499481668696,
+      "p95_ms": 4.638933480600826,
+      "n_steps": 120
+    },
+    "TX_T=8192": {
+      "median_ms": 4.637728998204693,
+      "p95_ms": 4.695442912634462,
+      "n_steps": 120
+    }
+  },
+  "prefill": {
+    "DN_T=512": {
+      "median_secs": 0.02457774296635762,
+      "p95_secs": 0.02470838020090014,
+      "median_tok_per_s": 20831.855907226032
+    },
+    "DN_T=2048": {
+      "median_secs": 0.050154750992078334,
+      "p95_secs": 0.05018240680219606,
+      "median_tok_per_s": 40833.61913856317
+    },
+    "DN_T=4096": {
+      "median_secs": 0.1011914560222067,
+      "p95_secs": 0.10124404679518192,
+      "median_tok_per_s": 40477.72569950099
+    },
+    "DN_T=8192": {
+      "median_secs": 0.19745172100374475,
+      "p95_secs": 0.19757645879872143,
+      "median_tok_per_s": 41488.62293200592
+    },
+    "FILM_T=512": {
+      "median_secs": 0.045819434977602214,
+      "p95_secs": 0.04714117180556059,
+      "median_tok_per_s": 11174.297549724904
+    },
+    "FILM_T=2048": {
+      "median_secs": 0.098748610005714,
+      "p95_secs": 0.09877857399405912,
+      "median_tok_per_s": 20739.53243373749
+    },
+    "FILM_T=4096": {
+      "median_secs": 0.2006428120075725,
+      "p95_secs": 0.20066447000717744,
+      "median_tok_per_s": 20414.38693475554
+    },
+    "FILM_T=8192": {
+      "median_secs": 0.4040637179859914,
+      "p95_secs": 0.40435960300965235,
+      "median_tok_per_s": 20274.03014760165
+    },
+    "FILM2P_T=512": {
+      "median_secs": 0.04821984103182331,
+      "p95_secs": 0.048315058206208045,
+      "median_tok_per_s": 10618.035834296903
+    },
+    "FILM2P_T=2048": {
+      "median_secs": 0.09953603497706354,
+      "p95_secs": 0.09966033216333016,
+      "median_tok_per_s": 20575.462951401754
+    },
+    "FILM2P_T=4096": {
+      "median_secs": 0.20174108498031273,
+      "p95_secs": 0.20189070339547469,
+      "median_tok_per_s": 20303.251568215346
+    },
+    "FILM2P_T=8192": {
+      "median_secs": 0.40599371399730444,
+      "p95_secs": 0.4064722233684734,
+      "median_tok_per_s": 20177.652307332006
+    },
+    "TX_T=512": {
+      "median_secs": 0.01122258702525869,
+      "p95_secs": 0.011228205787483602,
+      "median_tok_per_s": 45622.27932362128
+    },
+    "TX_T=2048": {
+      "median_secs": 0.029935063037555665,
+      "p95_secs": 0.02993949423544109,
+      "median_tok_per_s": 68414.75487894041
+    },
+    "TX_T=4096": {
+      "median_secs": 0.056878092989791185,
+      "p95_secs": 0.05689777820371091,
+      "median_tok_per_s": 72013.66615324416
+    },
+    "TX_T=8192": {
+      "median_secs": 0.12099395500263199,
+      "p95_secs": 0.12108228121651336,
+      "median_tok_per_s": 67705.86183269898
+    }
+  },
+  "memory": {
+    "DN_708M": {
+      "per_layer_recurrent_bytes": 262144,
+      "per_layer_conv_bytes": 24576,
+      "per_layer_total_bytes": 286720,
+      "n_layers": 36,
+      "total_bytes": 10321920,
+      "total_MB": 9.84375
+    },
+    "FILM_708M": {
+      "per_layer_recurrent_bytes": 262144,
+      "per_layer_conv_bytes": 24576,
+      "per_layer_total_bytes": 286720,
+      "n_layers": 36,
+      "total_bytes": 10323968,
+      "total_MB": 9.845703125,
+      "fb_lagged_source_bytes": 2048
+    },
+    "TX_360M_T=512": {
+      "n_layers": 30,
+      "n_heads": 12,
+      "d_head": 64,
+      "T": 512,
+      "total_bytes": 47185920,
+      "total_MB": 45.0
+    },
+    "TX_360M_T=2048": {
+      "n_layers": 30,
+      "n_heads": 12,
+      "d_head": 64,
+      "T": 2048,
+      "total_bytes": 188743680,
+      "total_MB": 180.0
+    },
+    "TX_360M_T=4096": {
+      "n_layers": 30,
+      "n_heads": 12,
+      "d_head": 64,
+      "T": 4096,
+      "total_bytes": 377487360,
+      "total_MB": 360.0
+    },
+    "TX_360M_T=8192": {
+      "n_layers": 30,
+      "n_heads": 12,
+      "d_head": 64,
+      "T": 8192,
+      "total_bytes": 754974720,
+      "total_MB": 720.0
+    },
+    "DN_708M_empirical": {
+      "post_prefill_delta_bytes": 10387456,
+      "post_prefill_delta_MB": 9.90625,
+      "peak_during_prefill_delta_bytes": 597590016,
+      "peak_during_prefill_delta_MB": 569.90625
+    },
+    "FILM_708M_empirical": {
+      "post_prefill_delta_bytes": 10391552,
+      "post_prefill_delta_MB": 9.91015625,
+      "peak_during_prefill_delta_bytes": 631148544,
+      "peak_during_prefill_delta_MB": 601.91015625
+    },
+    "TX_360M_T=8192_empirical": {
+      "post_prefill_delta_bytes": 755040256,
+      "post_prefill_delta_MB": 720.0625,
+      "peak_during_prefill_delta_bytes": 1170341888,
+      "peak_during_prefill_delta_MB": 1116.125
+    }
+  }
+}

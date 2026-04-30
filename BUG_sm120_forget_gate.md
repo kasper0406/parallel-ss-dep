@@ -1,10 +1,27 @@
 # `RuntimeError: Triton Error [CUDA]: misaligned address` — fla forget-gate backward on RTX 5090 (sm_120)
 
-A `prepare_wy_repr_bwd_kernel` launch in **`fla` 0.5.0** crashes on the first
-backward pass when the **forget gate is enabled**, on **RTX 5090 (sm_120)**
-running **PyTorch cu132 nightly** with **Triton 3.7**. Forward succeeds; the
-crash happens at backward kernel-handle initialisation, before any user code
-runs.
+> **Root cause (2026-04-30):** TileLang `SharedMemoryAlignmentPlanner` only
+> enforces 1024-byte alignment for TMA-touched smem buffers when
+> `TargetIsHopper(target)` is true, so sm_120 falls back to 16-byte alignment
+> while `cp.async.bulk.tensor.*.shared::cta.global.*` requires 128-byte. The
+> originally-reported `prepare_wy_repr_bwd_kernel` crash is a deferred-error
+> red herring — the actual misalignment is in the TileLang-compiled
+> `chunk_bwd_dqkwg_tilelang` kernel that runs immediately before. See
+> `scripts/tilelang_sm120_issue_draft.md` for the upstream report and
+> `scripts/sm120_tilelang_workaround.py` for the in-process Python
+> workaround.
+
+A `prepare_wy_repr_bwd_kernel` launch in **`fla` 0.5.0** appears to crash on
+the first backward pass when the **forget gate is enabled**, on **RTX 5090
+(sm_120)** running **PyTorch cu132 nightly** with **Triton 3.7**. Forward
+succeeds; the crash happens at backward kernel-handle initialisation, before
+any user code runs.
+
+With `CUDA_LAUNCH_BLOCKING=1` the crash actually surfaces in the
+TileLang-compiled `chunk_bwd_dqkwg_tilelang` kernel that runs *before*
+`prepare_wy_repr_bwd_kernel`. Without blocking, CUDA's deferred error
+machinery raises the misalignment when the next launch (`prepare_wy_repr_bwd_kernel`)
+tries to initialise its handles.
 
 ## Affected paths
 
@@ -170,16 +187,24 @@ Flipping `use_forget_gate=False` makes the same script return `ok`.
 
 ## Pointers for the upstream report
 
-- fla repo: <https://github.com/fla-org/flash-linear-attention> — file under
-  `ops/gated_delta_rule/wy_fast.py`.
-- Triton repo: <https://github.com/triton-lang/triton> — relevant if the
-  generated PTX is what the driver rejects; attach
-  `TRITON_DEBUG=1 TRITON_DUMP_DIR=/tmp/triton_dump` output from the repro.
-- Useful extra knobs to attach to the report:
-  ```bash
-  TRITON_DEBUG=1 TRITON_PRINT_AUTOTUNING=1 \
-  CUDA_LAUNCH_BLOCKING=1 \
-  python scripts/repro_sm120_forget_gate.py
-  ```
-- It's worth retrying on the next stable Triton release and on the next
-  cu132 nightly — sm_120 codegen has been actively churning.
+The bug belongs upstream at **`tile-ai/tilelang`** — see the prepared
+draft at `scripts/tilelang_sm120_issue_draft.md` and the unified diff
+at `scripts/tilelang_sm120_fix.patch`.
+
+- TileLang repo: <https://github.com/tile-ai/tilelang> — file the issue,
+  attach `scripts/repro_sm120_pure_tilelang.py` as the minimal repro.
+- One-line fix in `src/transform/merge_shared_memory_allocations.cc:393`:
+  swap `TargetIsHopper(target)` → `TargetHasBulkCopy(target)` so any
+  TMA-capable target (sm_90 / sm_100 / sm_120 / future) gets the strict
+  alignment automatically.
+
+End-to-end verification on this hardware (RTX 5090, cu132 nightly) of
+the workaround at `scripts/sm120_tilelang_workaround.py`:
+
+1. `rm -rf ~/.tilelang/cache/*/kernels/*` (clear stale cached kernels).
+2. `import scripts.sm120_tilelang_workaround` before any fla import.
+3. Run `scripts/repro_sm120_forget_gate.py` with `USE_FORGET_GATE=True`.
+
+→ Forward and backward both succeed; `chunk_bwd_dqkwg_tilelang`
+recompiles under the 1024-byte aligner and the deferred Triton
+`misaligned address` error disappears.

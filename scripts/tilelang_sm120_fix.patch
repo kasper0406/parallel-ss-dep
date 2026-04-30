@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Fix TMA shared memory alignment for sm_120 (Blackwell consumer)
+
+`SharedMemoryAlignmentPlanner` previously enforced 1024-byte alignment on
+TMA-touched shared-memory buffers only when the target is Hopper
+(arch in [90, 100)).  Blackwell consumer GPUs (sm_120, e.g. RTX 5090) and
+data-center Blackwell (sm_100) also support and require TMA, but the
+planner falls back to 16-byte alignment for them.
+
+`cp.async.bulk.tensor.{1..5}d.shared::cta.global.*` requires the
+destination shared memory pointer to be 128-byte aligned.  When the
+dynamic-smem arena begins with any small (e.g. 4-byte float) buffer, the
+TMA buffers placed after it land at 16-byte (but not 128-byte) aligned
+offsets, and the load raises `CUDA_ERROR_MISALIGNED_ADDRESS` on sm_120.
+
+Hopper appeared to tolerate this misalignment in the wild
+(possibly because of more permissive enforcement on sm_90 + the buffer
+positions happening to be 128-aligned for most kernels); sm_120 strictly
+enforces 128-byte alignment.
+
+Use `TargetHasBulkCopy(target)` instead, which is true for any target with
+TMA (arch >= 90), so sm_100, sm_120 and any future TMA-capable target get
+the same strict alignment automatically.
+
+Reproduces with the standalone TileLang script under "How to reproduce" in
+the issue.
+
+---
+ src/transform/merge_shared_memory_allocations.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/transform/merge_shared_memory_allocations.cc b/src/transform/merge_shared_memory_allocations.cc
+index f6f61b0..5bfac6b 100644
+--- a/src/transform/merge_shared_memory_allocations.cc
++++ b/src/transform/merge_shared_memory_allocations.cc
+@@ -390,7 +390,7 @@ private:
+     if (scope == "shared" || scope == "shared.dyn") {
+       auto target = Target::Current();
+       ICHECK(target.defined()) << "Target is not defined";
+-      const int alignment = TargetIsHopper(target) ? 1024 : 16;
++      const int alignment = TargetHasBulkCopy(target) ? 1024 : 16;
+       shmem_alignment_map_[op] = alignment;
+     }
+   }
+--
+2.34.1

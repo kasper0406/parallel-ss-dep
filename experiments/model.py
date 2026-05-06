@@ -865,6 +865,17 @@ class TinyLM(nn.Module):
                                               # logits, stop-grad).
         feedback_scratchpad_heads: int = 4,
         feedback_scratchpad_routing: str = "softmax",  # 'softmax' or 'sigmoid'
+        feedback_self_k: int = 0,             # K-iteration self-feeding training.
+                                              # 0 = off, 2 = K=2 (cold start +
+                                              # one self-feed), 3 = K=3
+                                              # (cold start + two self-feeds).
+                                              # Only meaningful with sparse
+                                              # feedback_pairs + feedback_mode
+                                              # 'film' / 'additive'. Trains
+                                              # pass K to be self-consistent —
+                                              # closes the train/inference gap
+                                              # for the lagged-cached deploy
+                                              # protocol.
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -925,6 +936,15 @@ class TinyLM(nn.Module):
         self.feedback_per_channel_alpha = bool(feedback_per_channel_alpha)
         if feedback_position not in ("pre", "post"):
             raise ValueError(f"feedback_position must be 'pre' or 'post', got {feedback_position!r}")
+        self.feedback_self_k = int(feedback_self_k)
+        if self.feedback_self_k not in (0, 2, 3):
+            raise ValueError(
+                f"feedback_self_k must be 0, 2, or 3 (got {feedback_self_k!r})"
+            )
+        if self.feedback_self_k > 0 and not feedback_pairs:
+            raise ValueError(
+                "feedback_self_k requires sparse feedback_pairs to be non-empty"
+            )
         self.feedback_xattn_pairs = tuple(
             (int(t), tuple(int(s) for s in srcs)) for t, srcs in feedback_xattn_pairs
         )
@@ -1022,6 +1042,42 @@ class TinyLM(nn.Module):
                 )
                 for _ in range(n_layers)
             ])
+
+    def _sparse_pass_collect_sources(self,
+                                      x: torch.Tensor,
+                                      source_layers: set,
+                                      film_sources_lagged: dict | None,
+                                      input_ids: torch.Tensor | None,
+                                      ) -> dict:
+        """One sparse-FiLM forward pass — collect source-layer outputs for
+        use as next iteration's FiLM input.
+
+        - x: input embeddings (B, T, d).
+        - film_sources_lagged: dict[source_L -> (B, T, d)] — lagged source
+          states to feed at FiLM target layers. If None, no FiLM (cold-start
+          iteration 0).
+
+        Returns dict[source_L -> (B, T, d)] of THIS pass's source-layer
+        outputs (un-lagged; the caller is responsible for applying the lag
+        before feeding to the next iteration).
+        """
+        h = x
+        out_src: dict = {}
+        for L, blk in enumerate(self.blocks):
+            if (film_sources_lagged is not None
+                    and L in self.sparse_target_to_source
+                    and self.feedback_position == "pre"):
+                src = self.sparse_target_to_source[L]
+                h = self.sparse_feedback[str(L)](h, film_sources_lagged[src])
+            h = blk(h, input_ids=input_ids)
+            if (film_sources_lagged is not None
+                    and L in self.sparse_target_to_source
+                    and self.feedback_position == "post"):
+                src = self.sparse_target_to_source[L]
+                h = self.sparse_feedback[str(L)](h, film_sources_lagged[src])
+            if L in source_layers:
+                out_src[L] = h
+        return out_src
 
     def forward(self, input_ids: torch.Tensor,
                 return_aux: bool = False,
@@ -1131,8 +1187,79 @@ class TinyLM(nn.Module):
         # Sparse-pair feedback: only specific target layers receive feedback
         # from specific source layers. Avoids compounding divergence.
         if self.feedback_pairs:
-            # Pass 1: vanilla, collect outputs only at source layers.
             source_layers = set(s for _, s in self.feedback_pairs)
+
+            # ----------------------------------------------------------------
+            # Self-feeding training (K-iteration fixed-point).
+            #
+            # At convergence the FiLM input the model uses at iteration K
+            # equals the FiLM input it would generate at deployment under the
+            # lagged-cached protocol — so deployment is a single forward.
+            #
+            # K=2: cold start (FiLM=0) → produce source state → feed it (lagged)
+            #      to second pass; loss on second pass.
+            # K=3: cold start → pass-2 with lag(pass-1) → pass-3 with lag(pass-2);
+            #      loss on third pass.
+            # All `.detach()`s mean backward only flows through the FINAL pass,
+            # giving us 1× backward cost (same as current 2-pass training)
+            # but K× forward cost (K=2 same as today; K=3 ~50 % more).
+            # ----------------------------------------------------------------
+            if self.feedback_self_k > 0:
+                K = self.feedback_self_k
+                # Iteration 0: cold start — no FiLM, vanilla forward.
+                # We only need to collect source-layer outputs (for use as the
+                # next iter's FiLM input).
+                with torch.no_grad():
+                    src_states = self._sparse_pass_collect_sources(
+                        x, source_layers, film_sources_lagged=None,
+                        input_ids=input_ids,
+                    )
+                # Iterations 1 .. K-2 (if K>2): self-feed. Detached so backward
+                # never reaches them.
+                for _ in range(K - 2):
+                    with torch.no_grad():
+                        film_in = {s: _shift_right_by_k(v, self.feedback_lag)
+                                    for s, v in src_states.items()}
+                        src_states = self._sparse_pass_collect_sources(
+                            x, source_layers, film_sources_lagged=film_in,
+                            input_ids=input_ids,
+                        )
+                # Final iteration K-1: this is the loss-bearing pass. Backprop
+                # flows through this forward only. FiLM inputs come from the
+                # PREVIOUS iter's source outputs (already-detached / no_grad
+                # produced), shifted right by feedback_lag.
+                film_in = {s: _shift_right_by_k(v, self.feedback_lag)
+                            for s, v in src_states.items()}
+                # Run the final forward end-to-end with grad enabled.
+                final_src_states: dict = {}
+                h = x
+                for L, blk in enumerate(self.blocks):
+                    if L in self.sparse_target_to_source and self.feedback_position == "pre":
+                        src = self.sparse_target_to_source[L]
+                        h = self.sparse_feedback[str(L)](h, film_in[src])
+                    h = blk(h, input_ids=input_ids)
+                    if L in self.sparse_target_to_source and self.feedback_position == "post":
+                        src = self.sparse_target_to_source[L]
+                        h = self.sparse_feedback[str(L)](h, film_in[src])
+                    if L in source_layers:
+                        final_src_states[L] = h
+                h_norm = self.out_norm(h)
+                lm_logits = self.lm_head(h_norm)
+                # Cache final pass's source states so the eval/diagnostic
+                # callers can compute self-consistency norms cheaply.
+                self._last_self_feed_final_src = {
+                    s: v.detach() for s, v in final_src_states.items()
+                }
+                self._last_self_feed_prev_src = {
+                    s: v.detach() for s, v in src_states.items()
+                }
+                if return_aux and self.aux_dim > 0:
+                    return lm_logits, self.aux_head(h_norm)
+                return lm_logits
+            # ----------------------------------------------------------------
+            # Standard 2-pass sparse FiLM (existing path).
+            # ----------------------------------------------------------------
+            # Pass 1: vanilla, collect outputs only at source layers.
             pass1_at_sources: dict = {}
             h1 = x
             for L, blk in enumerate(self.blocks):

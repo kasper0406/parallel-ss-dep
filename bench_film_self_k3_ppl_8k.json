@@ -1,0 +1,49 @@
+{
+  "ckpt": "checkpoints/film_self_k3_2_28_30L_217M.pt",
+  "T": 512,
+  "n_chunks": 16,
+  "n_eval_tokens": 8192,
+  "config": {
+    "d_model": 576,
+    "n_layers": 30,
+    "feedback_pairs": [
+      [
+        2,
+        28
+      ]
+    ],
+    "feedback_mode": "film",
+    "feedback_self_k": 3
+  },
+  "training_protocol": {
+    "ce": 3.8332135677337646,
+    "ppl": 46.21080142012139,
+    "n_tokens": 8192,
+    "elapsed_s": 0.5917471189750358
+  },
+  "self_consistency": {
+    "feedback_self_k": 3,
+    "n_batches": 4,
+    "abs_norm_mean": 1732.0011901855469,
+    "final_norm_mean": 11299.2099609375,
+    "rel_norm_mean": 0.15347030022331623
+  },
+  "2pass": {
+    "ce": 3.8533920645713806,
+    "ppl": 47.152737395903415,
+    "n_tokens": 8192,
+    "elapsed_s": 0.16150687006302178
+  },
+  "lagged_cached": {
+    "ce": 3.8318618535995483,
+    "ppl": 46.14837982426942,
+    "n_tokens": 8192,
+    "elapsed_s": 103.63173319294583
+  },
+  "gap": {
+    "lc_vs_training_abs": -0.06242159585197271,
+    "lc_vs_training_rel": -0.0013508009801533698,
+    "lc_vs_2pass_abs": -1.0043575716339959,
+    "lc_vs_2pass_rel": -0.021300090452887544
+  }
+}

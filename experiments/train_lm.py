@@ -228,6 +228,17 @@ def main():
                    help="Use per-channel α (d_model floats) instead of scalar α "
                         "for sparse FiLM. Tests whether channel-dependent gating "
                         "can mix the negative- and positive-α basins per channel.")
+    p.add_argument("--feedback_self_k", type=int, default=0,
+                   choices=[0, 2, 3],
+                   help="K-iteration self-feeding training for sparse FiLM. "
+                        "0 (default) = standard 2-pass training. "
+                        "2 = cold start + one self-feed; loss on iter 2 "
+                        "(same compute as default 2-pass). "
+                        "3 = cold start + two self-feeds; loss on iter 3 "
+                        "(~50%% more compute). Trains the model to be "
+                        "self-consistent under lagged-cached deployment, "
+                        "closing the train/inference gap. Requires "
+                        "--feedback_pairs to be set.")
     p.add_argument("--feedback_scratchpad", type=str, default="",
                    help="Surprise-gated scratchpad pairs, semicolon-separated. "
                         "Each is 'target,source' where target attends causally "
@@ -415,6 +426,7 @@ def main():
         feedback_scratchpad_pairs=fb_scratchpad_pairs,
         feedback_scratchpad_heads=args.feedback_scratchpad_heads,
         feedback_scratchpad_routing=args.feedback_scratchpad_routing,
+        feedback_self_k=args.feedback_self_k,
         **attn_kw,
     ).to("cuda")
     if args.freeze_alpha and (args.feedback != "none" or fb_xattn_pairs):
@@ -600,6 +612,7 @@ def main():
                 "feedback_xattn_pairs": fb_xattn_pairs,
                 "feedback_xattn_heads": args.feedback_xattn_heads,
                 "feedback_xattn_form": args.feedback_xattn_form,
+                "feedback_self_k": args.feedback_self_k,
                 "arch": args.arch, "layers_spec": args.layers,
                 "n_symbols": args.n_symbols,
                 "tokenizer": args.tokenizer,

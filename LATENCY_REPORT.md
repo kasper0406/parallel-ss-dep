@@ -339,3 +339,99 @@ for _ in range(9):
     ids_full = torch.cat([ids_full, nt], dim=1)
 assert gen == gold, f"2-pass mismatch: {gen} vs {gold}"
 ```
+
+## Lagged-cached PPL parity check
+
+Settles the principal open question from above: does the cheap
+lagged-cached decode protocol produce the same val PPL as the
+training-faithful 2-pass forward on the 708 M sparse-(2, 34) FiLM
+checkpoint? Method: streaming, token-by-token forward (option **a** in
+the spec) on the **same** 32 768-token codeparrot val tail used at
+training time (`shuffle(seed=42).skip(10_000)`, T=512, batch 4 — the
+exact `TokenisedStream` + `DataLoader` pipeline from `train_lm.py`).
+
+- **Bench script**: [`experiments/eval_filmed_ppl.py`](experiments/eval_filmed_ppl.py)
+- **Raw JSON output**: [`bench_film_ppl.json`](bench_film_ppl.json)
+- **Date**: 2026-04-30
+- **Hardware**: 1× RTX 5090 (sm_120, 32 GB), CUDA 13.2, PyTorch nightly cu132
+- **Eval slice**: 64 chunks × T=512 = 32 768 tokens (same budget as
+  training-time val cap; reproduces the reported 34.26 PPL bit-for-bit).
+
+### Result
+
+| Protocol | CE (nats/tok) | PPL | Δ vs 2-pass abs | Δ vs 2-pass rel |
+|---|---:|---:|---:|---:|
+| **2-pass** (gold, training-faithful) | 3.5340 | **34.26** | — | — |
+| **Lagged-cached** (deployment proxy) | 3.6102 | **36.97** | **+2.71** | **+7.9 %** |
+
+### Conclusion
+
+**The ≤1 % decode-tax claim is NOT defensible.** The lagged-cached
+decode protocol produces a **+7.9 % relative PPL increase** on the
+training-time val set — well above the 1 % threshold and on the same
+order of magnitude as the architectural lift it was meant to deliver
+(−3.2 % at 708 M). Specifically, the FiLM model's quality advantage
+over the DN baseline (PPL 35.38) only survives in the lagged-cached
+protocol if you compare 36.97 against 35.38, which is a **+4.5 %
+quality regression** — i.e. the "lagged-cached FiLM" model is
+*worse than the plain DN baseline*. The −3.2 % win evaporates.
+
+The safe, defensible deployment protocol is the **2-pass +99 % decode
+tax** (+97–98 % per-token decode cost, 1×–18 % wall-clock cost on
+realistic chat / long-output / code-completion workloads per the
+"Workload analysis" table above). Under the 2-pass protocol, the
+architectural lift is real and the decode cost is honest (~2× plain DN
+at decode, 2× plain DN at prefill).
+
+### What divergence looks like (sanity check)
+
+Token-position diagnostics on a 16-token random sequence — max abs
+logit difference between 2-pass and lagged-cached at each position:
+
+| Pos | Max |Δlogit| | Reason |
+|---:|---:|---|
+| 0 | 0.0013 | Both protocols feed FiLM zeros at t=0 (per `_shift_right_by_1`). |
+| 1 | 0.0037 | Lagged-cached's FiLM input at t=1 = pass-2's layer-34 at t=0; equals pass-1's layer-34 at t=0 because FiLM was zeroed. |
+| 2 | 0.379 | First step where the FiLM-perturbed pass-2 trajectory differs from pass-1. |
+| 15 | 2.524 | Drift accumulates across the sequence. |
+
+The first-position-equivalence is structural (zero FiLM input ⇒
+identical output); the divergence after t=1 is the cost of the
+proxy substitution.
+
+### How to reproduce
+
+```
+cd /home/knielsen/ml/parallel-ss-dep
+CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python experiments/eval_filmed_ppl.py \
+    --n_tokens 32768 --out bench_film_ppl.json
+```
+
+Run time: ~9 minutes on a single RTX 5090 (≈64 tok/s for the
+streaming token-by-token lagged-cached pass; the 2-pass eval is ~2 s
+at batch 4).
+
+### Implication for the deployment story
+
+The "cheaper memory, slower compute" framing in §4 ("Honest
+interpretation") still holds, but the **lagged-cached** column should
+be removed from the headline TL;DR table, or annotated as quality-
+broken. Specifically:
+
+- **Safe story**: Sparse-FiLM 708 M, **2-pass decode**, +99 % decode
+  tax, **PPL 34.26**, 9.8 MB inference state, −3.2 % vs DN baseline.
+  Workload-amortised wall-clock cost: +0 % (chat) to +99 %
+  (RAG-style long-prompt + short-output) per the "Workload analysis"
+  table above.
+- **Broken story** (do not claim): Sparse-FiLM 708 M with lagged-
+  cached decode at ≤1 % tax. The latency claim is correct (≤1 % tax
+  is real) but quality drops to PPL 36.97, **worse than plain DN
+  (35.38)** — so the architecture would deliver no quality benefit
+  at all and 2× the prefill compute, a strict negative-value
+  trade-off.
+
+The 2-pass story is what the architectural finding actually
+supports: a memory-efficient (74× smaller state than the Transformer
+360 M reference), compute-doubled DN variant that is −3.2 % PPL
+better than the same-params plain DN at the linear-RNN deployment
+ceiling.

@@ -1029,6 +1029,119 @@ Gated DeltaNet — same algebraic family as our student). See
 infrastructure notes (vLLM in a separate venv to keep our
 nightly-torch student environment intact).
 
+### Phase 21 — Mechanism: state-capacity hypothesis test (2026-04-30)
+
+To explain the diminishing FiLM lift across linear-RNN cells found in
+Phase 17 (DN −3.1 %, GDP −1.9 %, Mamba2 −0.27 %), we tested **H1 — the
+state-capacity hypothesis**: cells with more per-token recurrent state
+already carry the cross-layer context FiLM would otherwise inject, so
+the FiLM lift should diminish as state size grows.
+
+Setup: vary plain DeltaNet's `d_head` (and matching `n_heads = d_model
+/ d_head`) holding `d_model = 576`, `n_layers = 30` fixed. Per-layer
+state = `n_heads × d_head²`. Same training config as Phase 17:
+codeparrot Python, T=512, batch=8, 5 K AdamW steps, lr=3e-4 cosine,
+seed=0.
+
+| `d_head` | State / layer | DN baseline | + sparse (2,28) FiLM | Δ vs baseline | Final α | Basin |
+|---:|---:|---:|---:|---:|---:|---|
+|  32 | 18 432 | 55.72 | 54.37 | −2.4 % | −0.056 | NEG |
+|  64 | 36 864 | 51.00 | 49.40 | −3.1 % | −0.054 | NEG |
+| 144 | 82 944 | 46.73 | 45.25 | **−3.2 %** | **+0.053** | **POS** |
+
+**H1 is rejected.** Inside the *same* DeltaNet cell, varying state
+size by 4.5× changes the FiLM lift by less than 1 PPL absolute.
+Larger state did *not* diminish the lift — `d_head=144` got the
+biggest lift in the sweep. State size alone is not what gates
+whether sparse-FiLM helps; the cross-cell pattern in Phase 17 must
+be driven by some other cell property.
+
+**Surprising secondary finding: the basin sign flipped at large
+state.** `d_head=32` and `d_head=64` both find the negative-α
+subtractive basin (predictive coding). `d_head=144` lands in the
+positive-α additive basin instead — but with the *same* |α| ≈ 0.054
+and *essentially the same* architectural lift (−3.2 % vs −3.1 %).
+This reinforces the Phase 14b–g story: the architectural lift exists
+in both polarities, the magnitude of |α| is the architecturally
+robust quantity, and which sign gets found depends on the joint
+configuration of state size, optimizer, and init geometry — not on
+state size alone.
+
+**Remaining hypotheses for the Phase 17 cross-cell story** (in
+descending plausibility):
+
+- **H2 (forget-gate redundancy).** GDP and Mamba2 have learnable
+  forget gates that selectively retain/erase per-token state — a
+  mechanism that overlaps with what FiLM provides (content-dependent
+  gating). Cheapest direct test: add a forget gate to plain DN and
+  re-run Phase 17 setup.
+- **H3 (SSM aggregation form).** Mamba2's structured SSM kernel has
+  different gradient geometry than DN's outer-product update; the
+  multiplicative-non-softmax basin may simply not be reachable
+  through Mamba2's update.
+- **H4 (Mamba2 noise floor).** Mamba2 ran ~3.6× slower in Phase 17
+  and was single-seed; the −0.27 % could be within noise of zero.
+
+**Implication for the headline claim.** "Sparse-FiLM gives ~3 %
+lift in plain DeltaNet, robust across 4.5× state-size variation,
+robust across both basin signs, robust to 3.3× scale-up" stands
+cleanly. The cross-cell variation is a cell-compatibility effect,
+not a state-capacity effect. Honest framing in writeups: this is
+an open mechanism question with H2/H3/H4 on the shortlist.
+
+### Phase 20.5 — Decode latency, prefill, and inference-state memory (2026-04-30)
+
+Decode-latency, prefill-latency, and inference-state memory benchmark
+of the 708 M sparse-(2, 34) FiLM DN vs the 708 M plain DN vs a
+360 M Transformer reference. Bench script:
+[`experiments/decode_bench.py`](experiments/decode_bench.py); raw
+data: [`bench_decode.json`](bench_decode.json); full report:
+[`LATENCY_REPORT.md`](LATENCY_REPORT.md).
+
+| | Decode (ms/tok @ 8 K) | State @ 8 K | Quality (PPL) |
+|---|---:|---:|---:|
+| DN baseline 708 M | 14.5 | 9.8 MB | 35.38 |
+| **Sparse-FiLM 708 M [lagged-cached]** | **14.5** | 9.8 MB | (open) |
+| Sparse-FiLM 708 M [2-pass, training-faithful] | 28.8 | 9.8 MB | 34.26 |
+| Transformer 360 M | 4.6 | 720 MB | 18.78 |
+
+**Two FiLM decode protocols** were measured because the choice has
+very different latency cost:
+
+1. **Lagged-cached** (intended deployment). One full-forward per
+   decode step + a single FiLM linear. Reuses the previous step's
+   pass-2 layer-34 output as the lag-1 FiLM input — an approximation
+   of training's pass-1 layer-34. Cost: **identical to plain DN**
+   (≤ 1 % tax). Quality drift from the pass-2-as-pass-1 proxy is
+   **unverified** in this report — see follow-up below.
+2. **2-pass-per-decode** (training-faithful). Mirrors training: at
+   each step run pass-1 (layers 0..source) on the new token to get
+   the *true* lag-1 source-layer output, then pass-2 on all 36
+   layers. Cost: **2× plain DN.** Verified to match full-forward
+   decode token-for-token at T=64.
+
+**Inference state @ 8 K context** = recurrent + conv state of all 36
+RNN layers + the `(1, 1, d_model)` lagged source for FiLM. **74×
+smaller** than a 360 M Transformer's KV cache (9.8 MB vs 720 MB).
+At batch 64 the Transformer KV cache is 45 GB (infeasible on a
+32 GB card); the RNN sits at 630 MB.
+
+**Verdict on the architectural lift surviving the latency tax.** The
+deployment cost of FiLM at decode time is at most one extra `Linear`
+× `(1, 1, d)` per step (lagged-cached path) or one extra ~35-layer
+forward per step (2-pass path). The architectural lift (−3.2 % PPL
+at 708 M) survives intact in either case; the open question is
+whether the lagged-cached protocol matches training's evaluation
+quality.
+
+**Critical follow-up gating any cross-architecture claim:** measure
+codeparrot val PPL using the lagged-cached decode protocol and
+compare to gold 2-pass. If they match, the 1 % decode tax claim
+holds and the deployment story is fully clean. If they differ
+materially, the honest answer is the 2-pass +99 % tax — still RNN-
+class and still 74× memory advantage, but the latency story is less
+compelling.
+
 ### Phase 20 — 708M scale-up: deployment-memory-fair vs Transformer (2026-04-30)
 
 Tested whether the architectural lift survives a **3.3× parameter

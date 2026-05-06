@@ -1,0 +1,47 @@
+GPU: NVIDIA GeForce RTX 5090  arch=deltanet
+Loading tokeniser HuggingFaceTB/SmolLM2-135M ...
+  vocab size: 49152
+Loading dataset codeparrot/codeparrot-clean (streaming) ...
+  no val/test split — using shuffled train tail as validation
+  params: 216.2M  aux_dim=0  feedback=none@d=1
+
+  step     tok/s     tloss         lr
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (93413 > 8192). Running this sequence through the model will result in indexing errors
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (45285 > 8192). Running this sequence through the model will result in indexing errors
+   200     27847    6.3221   2.99e-04
+   400     28494    5.1663   2.96e-04
+   600     28564    4.6880   2.91e-04
+   800     28533    4.8587   2.83e-04
+  1000     28341    4.5457   2.74e-04
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=4.7457  ppl=115.09
+  1200     27610    4.4417   2.63e-04
+  1400     28450    3.9453   2.51e-04
+  1600     28321    4.3387   2.37e-04
+  1800     28337    4.2117   2.22e-04
+  2000     28487    4.1284   2.07e-04
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=4.3980  ppl=81.29
+  2200     27634    3.9938   1.90e-04
+  2400     28328    3.9648   1.73e-04
+  2600     28476    3.7653   1.57e-04
+  2800     28490    3.7993   1.40e-04
+  3000     28344    3.7842   1.23e-04
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=4.1125  ppl=61.10
+  3200     27631    3.5143   1.08e-04
+  3400     28329    3.7682   9.27e-05
+  3600     28484    3.4953   7.89e-05
+  3800     28495    3.6780   6.66e-05
+  4000     28341    3.7498   5.58e-05
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=3.9453  ppl=51.69
+  4200     27640    3.4245   4.67e-05
+  4400     28370    3.4279   3.95e-05
+  4600     28502    3.6190   3.42e-05
+  4800     28370    3.5706   3.11e-05
+  5000     28512    3.5271   3.00e-05
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=3.8443  ppl=46.73
+
+Done in 725s (145 ms/step avg).

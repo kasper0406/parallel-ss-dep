@@ -435,3 +435,132 @@ supports: a memory-efficient (74× smaller state than the Transformer
 360 M reference), compute-doubled DN variant that is −3.2 % PPL
 better than the same-params plain DN at the linear-RNN deployment
 ceiling.
+
+## Async overlap prototype
+
+Phase 20.5 follow-up: the **2-pass-per-decode** protocol is the safe
+deployment choice (the lagged-cached proxy was just shown to break
+quality, +7.9 % PPL). To **recover wall-clock latency on top of 2-pass**,
+I prototyped an async overlap: at each decode step, pass-1 and pass-2
+are independent (pass-2 reads the *previous* step's pass-1 output via
+the lagged FiLM cache), so they can be issued on two CUDA streams and
+co-execute on the SMs. Token dependency reasserts at end-of-step
+(pass-2's logits → next token → next step's input for both passes).
+Compute stays 2×; wall-clock target is `max(pass-1, pass-2)` instead
+of `pass-1 + pass-2`.
+
+- **New protocol**: `decode_filmed_2pass_overlap` in
+  [`experiments/decode_bench.py`](experiments/decode_bench.py)
+  (`decode_step_film_2pass_overlap`). ~50 LOC of stream orchestration
+  on top of the existing pass-1 / pass-2 primitives.
+- **Validation**: `validate_overlap_equivalence` runs the overlap
+  decode and the sequential 2-pass decode side-by-side from the same
+  T=512 prefill and seed, for 64 greedy decode steps. **65/65 tokens
+  match, max |Δlogit| = 0.0e+00** — bit-exact equivalence. The two
+  protocols are numerically identical; the overlap is a pure
+  scheduling rewrite.
+- **Hardware**: 1× RTX 5090 (sm_120, 32 GB), CUDA 13.2, PyTorch
+  nightly cu132, GPU 0 only.
+- **Date**: 2026-04-30.
+
+### Measured decode ms/token (batch=1, median over 5 outer × 24 steps)
+
+| Context T | Plain DN | 2-pass (sequential) | 2-pass (overlap) | Overlap → DN ratio | Overlap → 2-pass-seq |
+|----------:|---------:|--------------------:|-----------------:|-------------------:|---------------------:|
+| 512       | 14.49    | 28.70               | **27.85**        | 1.92×              | 0.97× (−3.0 %)       |
+| 2 048     | 14.50    | 28.57               | **27.75**        | 1.91×              | 0.97× (−2.9 %)       |
+| 4 096     | 14.54    | 28.83               | **27.69**        | 1.90×              | 0.96× (−4.0 %)       |
+| 8 192     | 14.53    | 28.78               | **27.86**        | 1.92×              | 0.97× (−3.2 %)       |
+
+### Pass-1 / pass-2 isolation diagnostic
+
+Single-stream timings of pass-1 alone (35/36 layers; layers 0..34) and
+pass-2 alone (all 36 layers, FiLM injected at L=2):
+
+| Context T | pass-1 only | pass-2 only | max(p1, p2) | sum(p1, p2) | Sequential 2-pass measured |
+|----------:|------------:|------------:|------------:|------------:|---------------------------:|
+| 512       | 13.69       | 14.29       | 14.29       | 27.98       | 28.70                      |
+| 2 048     | 13.63       | 14.24       | 14.24       | 27.87       | 28.57                      |
+| 4 096     | 13.71       | 14.32       | 14.32       | 28.04       | 28.83                      |
+| 8 192     | 13.73       | 14.29       | 14.29       | 28.02       | 28.78                      |
+
+The sum-of-isolation closely matches the sequential-2-pass measurement
+(δ ≤ 0.8 ms ≈ 3 %), confirming the timing decomposition.
+
+### Verdict
+
+The overlap protocol is **numerically correct (bit-exact) but only
+~3 % faster** than sequential 2-pass — far short of the
+`max(p1, p2)` ≈ pass-2 ≈ 14.3 ms/tok target.
+
+**Why the speedup is small:**
+
+1. **The decode workload is memory-bandwidth-bound, not SM-bound.**
+   At batch 1, each decode step reads ~1.4 GB of model weights (708 M
+   bf16 params) once through the SMs. Pass-1 reads ~95 % of the
+   model; pass-2 reads ~100 %. Running them on two streams just makes
+   them fight for the same DRAM channel — total DRAM traffic is the
+   same as sequential, and DRAM is the bottleneck, so wall-clock can
+   barely fall.
+
+2. **Pass-1 is *not* `1/35` cheaper than pass-2.** A priori one might
+   hope pass-1 saves ~3 % from skipping the last layer. The
+   measurement says pass-1 = 13.69 ms vs pass-2 = 14.29 ms — only
+   −4 %. Even if the streams perfectly overlapped, the best wall-
+   clock would be `max(13.69, 14.29) = 14.29 ms/tok` — at most
+   −50 % vs sequential. We get ~3 %, well under that ceiling.
+
+3. **Stream-launch overhead is small but not zero.** PyTorch dispatches
+   per-op kernels, and at batch 1 each op is short enough that the
+   launch is a meaningful fraction of total time. Two-stream
+   orchestration adds a few extra synchronization waits and event
+   records per step.
+
+4. **The kernels themselves do not yield SMs cleanly.** The DeltaNet
+   triton kernels are tuned for full-occupancy single-stream
+   execution; two streams of large kernels arrive at the SM scheduler
+   simultaneously and serialize on memory access.
+
+**Headline ratios at T = 8 192**:
+
+- Overlap vs sequential 2-pass: **0.97× (−3.2 %)**
+- Overlap vs plain DN: **1.92× (still close to 2× plain DN)**
+
+The overlap protocol does not recover wall-clock parity with plain
+DN. The honest 2-pass tax is ~+92–97 % across all measured context
+lengths.
+
+### What would close the gap
+
+The hardware ceiling here is DRAM bandwidth on the model weights, not
+compute. Two avenues to recover further:
+
+- **Fused 2-pass kernel.** Instead of running pass-1 and pass-2 as
+  two separate weight-streams, fuse the per-layer ops so each weight
+  matrix is loaded once and used for both passes' GEMMs. This is the
+  same DRAM-coalescing technique speculative decoding uses for
+  multi-token verification. Implementation cost: substantial — would
+  require touching the fla DeltaNet kernels.
+- **Larger batch.** At batch ≥ 32 the per-token DRAM traffic per byte
+  of compute drops sharply, and the 2-pass tax should compress to
+  closer to compute ratio ~2× → wall-clock ratio closer to 1× via
+  overlap. Not measured here (single-batch report).
+- **torch.compile / CUDA graphs.** Both eliminate the per-op launch
+  overhead and may allow tighter kernel fusion across the two passes.
+  Estimated 30–50 % decode speedup on the linear-RNN side per the
+  base report's caveat #9; the overlap pattern would compose with
+  this naturally.
+
+### How to reproduce
+
+```
+cd /home/knielsen/ml/parallel-ss-dep
+CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python experiments/decode_bench.py \
+    --bench decode --overlap_only --include_pass_isolation \
+    --n_warmup 2 --n_meas 5 --n_decode 24 \
+    --out bench_overlap.json
+```
+
+Run time: ~3 minutes on a single RTX 5090. Validates equivalence at
+T=512/64-step decode, then bench the overlap protocol + pass
+isolation at T = 512 / 2 048 / 4 096 / 8 192.

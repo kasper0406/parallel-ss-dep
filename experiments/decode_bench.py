@@ -363,6 +363,96 @@ def decode_step_film_2pass(model: TinyLM,
     return logits, new_pass1_source_out
 
 
+@torch.inference_mode()
+def _decode_pass1_step(model: TinyLM,
+                        next_token: torch.Tensor,
+                        cache_p1: FLACache,
+                        source: int = 34) -> torch.Tensor:
+    """Run only pass-1 (layers 0..source) on a single new token. Returns
+    (B, 1, D) — pass-1 source-layer output at this step (i.e. the lag-1
+    FiLM input for *next* step's pass-2).
+    """
+    x_p1 = model.embed(next_token)
+    new_pass1_source_out = None
+    for L, blk in enumerate(model.blocks):
+        x_p1 = _block_with_cache(blk, x_p1, past=cache_p1, use_cache=True)
+        if L == source:
+            new_pass1_source_out = x_p1.clone()
+            break
+    assert new_pass1_source_out is not None
+    return new_pass1_source_out
+
+
+@torch.inference_mode()
+def _decode_pass2_step(model: TinyLM,
+                        next_token: torch.Tensor,
+                        cache_p2: FLACache,
+                        lagged_pass1_source: torch.Tensor,
+                        target: int = 2) -> torch.Tensor:
+    """Run only pass-2 (all layers, with FiLM at `target`) on a single
+    new token. Returns logits (B, 1, V).
+    """
+    x = model.embed(next_token)
+    for L, blk in enumerate(model.blocks):
+        if L == target:
+            x = model.sparse_feedback[str(target)](x, lagged_pass1_source)
+        x = _block_with_cache(blk, x, past=cache_p2, use_cache=True)
+    h = model.out_norm(x)
+    logits = model.lm_head(h)
+    return logits
+
+
+@torch.inference_mode()
+def decode_step_film_2pass_overlap(model: TinyLM,
+                                    next_token: torch.Tensor,
+                                    cache_p1: FLACache,
+                                    cache_p2: FLACache,
+                                    lagged_pass1_source: torch.Tensor,
+                                    stream_pass1: torch.cuda.Stream,
+                                    stream_pass2: torch.cuda.Stream,
+                                    target: int = 2,
+                                    source: int = 34) -> tuple:
+    """Async-overlapped 2-pass decode step.
+
+    Pass-1 and pass-2 at the same decode step are mutually independent
+    (pass-2 reads the *previous* step's pass-1 output via
+    `lagged_pass1_source`). We dispatch them on two CUDA streams so they
+    can co-execute on the SMs.
+
+    Logical equivalence to `decode_step_film_2pass`:
+      - Same input cache state, same `lagged_pass1_source`,
+        same `next_token` ⇒ produces same `(logits, new_pass1_source)`.
+
+    Returns: (logits, new_lagged_pass1_source)
+    """
+    current_stream = torch.cuda.current_stream()
+
+    # Both new streams need to wait for any in-flight work on the current
+    # stream that produced our inputs (cache state, lagged_pass1_source,
+    # next_token).
+    stream_pass1.wait_stream(current_stream)
+    stream_pass2.wait_stream(current_stream)
+
+    # Pass 2 (the real model output) on stream_pass2.
+    with torch.cuda.stream(stream_pass2):
+        logits = _decode_pass2_step(
+            model, next_token, cache_p2, lagged_pass1_source, target=target,
+        )
+
+    # Pass 1 (produces lag-1 FiLM input for *next* step) on stream_pass1.
+    with torch.cuda.stream(stream_pass1):
+        new_pass1_source_out = _decode_pass1_step(
+            model, next_token, cache_p1, source=source,
+        )
+
+    # Make the current stream wait for both branches to finish before the
+    # caller consumes their outputs (logits, new_pass1_source_out, and the
+    # mutated caches).
+    current_stream.wait_stream(stream_pass2)
+    current_stream.wait_stream(stream_pass1)
+    return logits, new_pass1_source_out
+
+
 # ---------------------------------------------------------------------------
 # Decode / prefill loops for the Transformer reference.
 #
@@ -611,6 +701,208 @@ def bench_film_2pass(model: TinyLM, T: int, n_warmup: int = 3, n_meas: int = 10,
     )
 
 
+def bench_film_pass1_only(model: TinyLM, T: int, n_warmup: int = 3,
+                            n_meas: int = 10, n_decode: int = 32) -> TimingResult:
+    """Bench pass-1 alone (layers 0..source on a single new token) — the
+    cheap branch of the 2-pass. Used to confirm pass-1 is much cheaper
+    than pass-2, which is required for the overlap protocol to be useful.
+    """
+    device = next(model.parameters()).device
+    vocab = model.embed.num_embeddings
+    decode_ms: list[float] = []
+    target, source = model.feedback_pairs[0]
+
+    for it in range(n_warmup + n_meas):
+        torch.manual_seed(0xABCDEF + it)
+        ids = torch.randint(0, vocab, (1, T), device=device)
+        torch.cuda.synchronize()
+
+        _, c1, _, _ = stateful_prefill_film_2pass(
+            model, ids, target=target, source=source,
+        )
+        next_tok = torch.randint(0, vocab, (1, 1), device=device)
+        torch.cuda.synchronize()
+
+        per_step_ms: list[float] = []
+        for s in range(n_decode):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            _ = _decode_pass1_step(model, next_tok, c1, source=source)
+            torch.cuda.synchronize()
+            per_step_ms.append((time.perf_counter() - t0) * 1000)
+        if it >= n_warmup:
+            decode_ms.extend(per_step_ms)
+        del c1
+
+    return TimingResult(
+        name="Sparse-(2,34)-FiLM DN [pass-1 only]",
+        T=T, decode_ms=decode_ms, prefill_secs=[],
+    )
+
+
+def bench_film_pass2_only(model: TinyLM, T: int, n_warmup: int = 3,
+                            n_meas: int = 10, n_decode: int = 32) -> TimingResult:
+    """Bench pass-2 alone (full forward through all layers, FiLM at
+    `target`) on a single new token, with a stale `lagged_pass1_source`
+    that we don't update — only the pass-2 work is measured.
+    """
+    device = next(model.parameters()).device
+    vocab = model.embed.num_embeddings
+    decode_ms: list[float] = []
+    target, source = model.feedback_pairs[0]
+
+    for it in range(n_warmup + n_meas):
+        torch.manual_seed(0xABCDEF + it)
+        ids = torch.randint(0, vocab, (1, T), device=device)
+        torch.cuda.synchronize()
+
+        _, _, c2, lagged_p1 = stateful_prefill_film_2pass(
+            model, ids, target=target, source=source,
+        )
+        next_tok = torch.randint(0, vocab, (1, 1), device=device)
+        torch.cuda.synchronize()
+
+        per_step_ms: list[float] = []
+        for s in range(n_decode):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            _ = _decode_pass2_step(model, next_tok, c2, lagged_p1, target=target)
+            torch.cuda.synchronize()
+            per_step_ms.append((time.perf_counter() - t0) * 1000)
+        if it >= n_warmup:
+            decode_ms.extend(per_step_ms)
+        del c2
+
+    return TimingResult(
+        name="Sparse-(2,34)-FiLM DN [pass-2 only]",
+        T=T, decode_ms=decode_ms, prefill_secs=[],
+    )
+
+
+@torch.inference_mode()
+def validate_overlap_equivalence(model: TinyLM, T: int = 512,
+                                  n_decode: int = 64,
+                                  seed: int = 0xABCDEF) -> dict:
+    """Verify the async-overlap 2-pass decode produces *identical* outputs
+    to the sequential 2-pass decode at every step. Same RNG seed, greedy
+    sampling, T-token prefill, n_decode steps.
+
+    Returns a dict of diagnostics (max abs logit diff per step, token
+    match count, etc.).
+    """
+    device = next(model.parameters()).device
+    vocab = model.embed.num_embeddings
+    target, source = model.feedback_pairs[0]
+
+    torch.manual_seed(seed)
+    ids = torch.randint(0, vocab, (1, T), device=device)
+
+    # Sequential 2-pass reference.
+    logits_seq, c1_seq, c2_seq, lagged_seq = stateful_prefill_film_2pass(
+        model, ids, target=target, source=source,
+    )
+    next_tok_seq = logits_seq.argmax(dim=-1)
+    seq_tokens: list[int] = [int(next_tok_seq.item())]
+    seq_logits_per_step: list[torch.Tensor] = []
+    for _ in range(n_decode):
+        new_logits, lagged_seq = decode_step_film_2pass(
+            model, next_tok_seq, c1_seq, c2_seq, lagged_seq,
+            target=target, source=source,
+        )
+        seq_logits_per_step.append(new_logits.detach().clone())
+        next_tok_seq = new_logits.argmax(dim=-1)
+        seq_tokens.append(int(next_tok_seq.item()))
+
+    # Async-overlap 2-pass under test.
+    logits_ov, c1_ov, c2_ov, lagged_ov = stateful_prefill_film_2pass(
+        model, ids.clone(), target=target, source=source,
+    )
+    next_tok_ov = logits_ov.argmax(dim=-1)
+    ov_tokens: list[int] = [int(next_tok_ov.item())]
+    ov_logits_per_step: list[torch.Tensor] = []
+    stream_pass1 = torch.cuda.Stream(device=device)
+    stream_pass2 = torch.cuda.Stream(device=device)
+    for _ in range(n_decode):
+        new_logits, lagged_ov = decode_step_film_2pass_overlap(
+            model, next_tok_ov, c1_ov, c2_ov, lagged_ov,
+            stream_pass1=stream_pass1, stream_pass2=stream_pass2,
+            target=target, source=source,
+        )
+        ov_logits_per_step.append(new_logits.detach().clone())
+        next_tok_ov = new_logits.argmax(dim=-1)
+        ov_tokens.append(int(next_tok_ov.item()))
+
+    # Diagnostics.
+    n_match = sum(int(a == b) for a, b in zip(seq_tokens, ov_tokens))
+    max_diffs = [
+        float((a.float() - b.float()).abs().max().item())
+        for a, b in zip(seq_logits_per_step, ov_logits_per_step)
+    ]
+    return {
+        "T_prefill": T, "n_decode": n_decode,
+        "tokens_seq": seq_tokens,
+        "tokens_overlap": ov_tokens,
+        "tokens_match": n_match,
+        "tokens_total": len(seq_tokens),
+        "max_logit_diff_per_step": max_diffs,
+        "max_logit_diff_overall": max(max_diffs) if max_diffs else 0.0,
+    }
+
+
+def bench_film_2pass_overlap(model: TinyLM, T: int, n_warmup: int = 3,
+                               n_meas: int = 10, n_decode: int = 32) -> TimingResult:
+    """Bench sparse-(2,34) FiLM DN with the *async-overlap* 2-pass decode
+    protocol. Pass 1 and pass 2 run on separate CUDA streams; they're
+    independent at any decode step (pass 2 reads pass 1's output from the
+    PREVIOUS step). End-of-step sync re-establishes the token dependency.
+    """
+    device = next(model.parameters()).device
+    vocab = model.embed.num_embeddings
+    decode_ms: list[float] = []
+    prefill_secs: list[float] = []
+    target, source = model.feedback_pairs[0]
+
+    stream_pass1 = torch.cuda.Stream(device=device)
+    stream_pass2 = torch.cuda.Stream(device=device)
+
+    for it in range(n_warmup + n_meas):
+        torch.manual_seed(0xABCDEF + it)
+        ids = torch.randint(0, vocab, (1, T), device=device)
+        torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        logits, c1, c2, lagged_p1 = stateful_prefill_film_2pass(
+            model, ids, target=target, source=source,
+        )
+        torch.cuda.synchronize()
+        prefill_secs.append(time.perf_counter() - t0)
+
+        next_tok = logits.argmax(dim=-1)
+
+        per_step_ms: list[float] = []
+        for s in range(n_decode):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            logits, lagged_p1 = decode_step_film_2pass_overlap(
+                model, next_tok, c1, c2, lagged_p1,
+                stream_pass1=stream_pass1, stream_pass2=stream_pass2,
+                target=target, source=source,
+            )
+            torch.cuda.synchronize()
+            per_step_ms.append((time.perf_counter() - t0) * 1000)
+            next_tok = logits.argmax(dim=-1)
+        if it >= n_warmup:
+            decode_ms.extend(per_step_ms)
+        del c1, c2, logits
+
+    return TimingResult(
+        name="Sparse-(2,34)-FiLM DN [2-pass overlap]",
+        T=T,
+        decode_ms=decode_ms,
+        prefill_secs=prefill_secs[n_warmup:],
+    )
+
+
 def bench_transformer(model: TinyLM, T: int, n_warmup: int = 3, n_meas: int = 10,
                        n_decode: int = 32) -> TimingResult:
     """Bench Transformer reference."""
@@ -740,6 +1032,19 @@ def main():
     p.add_argument("--no_dn", dest="include_dn", action="store_false")
     p.add_argument("--include_film", action="store_true", default=True)
     p.add_argument("--no_film", dest="include_film", action="store_false")
+    p.add_argument("--overlap_only", action="store_true",
+                   help="Run only the async-overlap 2-pass FiLM bench (and "
+                        "validation), then exit. Skips DN, lagged FiLM, and "
+                        "Transformer benches.")
+    p.add_argument("--validate_overlap", action="store_true",
+                   help="Run the 2-pass-vs-overlap equivalence check on the "
+                        "FiLM model (T=512, 64 decode steps).")
+    p.add_argument("--include_overlap", action="store_true", default=True,
+                   help="Include the 2-pass async-overlap bench (default on).")
+    p.add_argument("--no_overlap", dest="include_overlap", action="store_false")
+    p.add_argument("--include_pass_isolation", action="store_true",
+                   help="Bench pass-1-only and pass-2-only standalone "
+                        "(diagnostic — confirms pass-2 dominates).")
     args = p.parse_args()
 
     Ts = args.T or list(CONTEXT_LENGTHS)
@@ -748,6 +1053,72 @@ def main():
     print(f"Context lengths: {Ts}")
 
     results: dict = {"decode": {}, "prefill": {}, "memory": {}}
+
+    # Fast-path: overlap-only bench. Loads FiLM ckpt, runs validation
+    # (T=512, 64 steps) and then the async-overlap decode bench at every
+    # requested context length. Optionally also pass-1/pass-2 standalone.
+    if args.overlap_only:
+        print("\n--- Sparse-(2,34) FiLM DN [2-pass async-overlap] (overlap_only) ---")
+        film = load_dn_or_film(CKPT_FILM, device=args.device)
+        print(f"  params: {film.num_params() / 1e6:.1f} M")
+
+        print("\n  validating overlap == sequential 2-pass (T=512, 64 steps)...")
+        v = validate_overlap_equivalence(film, T=512, n_decode=64)
+        print(f"    tokens match: {v['tokens_match']}/{v['tokens_total']}  "
+              f"max |Δlogit| over 64 steps = {v['max_logit_diff_overall']:.2e}")
+        results.setdefault("validation", {})["overlap_vs_sequential"] = {
+            "T_prefill": v["T_prefill"], "n_decode": v["n_decode"],
+            "tokens_match": v["tokens_match"],
+            "tokens_total": v["tokens_total"],
+            "max_logit_diff_overall": v["max_logit_diff_overall"],
+            "tokens_seq": v["tokens_seq"],
+            "tokens_overlap": v["tokens_overlap"],
+        }
+
+        if args.include_pass_isolation:
+            print("\n  pass-1-only / pass-2-only diagnostic bench:")
+            for T in Ts:
+                r1 = bench_film_pass1_only(film, T, n_warmup=args.n_warmup,
+                                            n_meas=args.n_meas, n_decode=args.n_decode)
+                r2 = bench_film_pass2_only(film, T, n_warmup=args.n_warmup,
+                                            n_meas=args.n_meas, n_decode=args.n_decode)
+                results["decode"][f"FILMP1_T={T}"] = {
+                    "median_ms": median(r1.decode_ms),
+                    "p95_ms": percentile(r1.decode_ms, 0.95),
+                    "n_steps": len(r1.decode_ms),
+                }
+                results["decode"][f"FILMP2_T={T}"] = {
+                    "median_ms": median(r2.decode_ms),
+                    "p95_ms": percentile(r2.decode_ms, 0.95),
+                    "n_steps": len(r2.decode_ms),
+                }
+                print(f"    T={T:5d}: pass-1 {median(r1.decode_ms):.2f} ms/tok  "
+                      f"pass-2 {median(r2.decode_ms):.2f} ms/tok  "
+                      f"max(p1,p2) {max(median(r1.decode_ms), median(r2.decode_ms)):.2f} ms")
+
+        for T in Ts:
+            print(f"  overlap T={T} ...")
+            r = bench_film_2pass_overlap(film, T, n_warmup=args.n_warmup,
+                                          n_meas=args.n_meas, n_decode=args.n_decode)
+            results["decode"][f"FILM2POV_T={T}"] = {
+                "median_ms": median(r.decode_ms),
+                "p95_ms": percentile(r.decode_ms, 0.95),
+                "n_steps": len(r.decode_ms),
+            }
+            results["prefill"][f"FILM2POV_T={T}"] = {
+                "median_secs": median(r.prefill_secs),
+                "p95_secs": percentile(r.prefill_secs, 0.95),
+                "median_tok_per_s": T / median(r.prefill_secs),
+            }
+            print(f"    decode {fmt_ms(median(r.decode_ms), percentile(r.decode_ms, 0.95))} ms/tok")
+        del film
+        torch.cuda.empty_cache()
+
+        out = pathlib.Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(results, indent=2))
+        print(f"\nResults written to {out}")
+        return 0
 
     # Models — load lazily to avoid holding everything at once.
     if args.bench in ("decode", "prefill", "all"):
@@ -811,6 +1182,35 @@ def main():
                 }
                 print(f"    decode {fmt_ms(median(r.decode_ms), percentile(r.decode_ms, 0.95))} ms/tok  "
                       f"prefill {median(r.prefill_secs)*1000:.1f} ms ({T/median(r.prefill_secs):.0f} tok/s)")
+            if args.include_overlap:
+                print(f"\n--- Sparse-(2,34) FiLM DN [2-pass async-overlap] ---")
+                v = validate_overlap_equivalence(film, T=512, n_decode=64)
+                print(f"  validation tokens match: {v['tokens_match']}/{v['tokens_total']}  "
+                      f"max |Δlogit| = {v['max_logit_diff_overall']:.2e}")
+                results.setdefault("validation", {})["overlap_vs_sequential"] = {
+                    "T_prefill": v["T_prefill"], "n_decode": v["n_decode"],
+                    "tokens_match": v["tokens_match"],
+                    "tokens_total": v["tokens_total"],
+                    "max_logit_diff_overall": v["max_logit_diff_overall"],
+                    "tokens_seq": v["tokens_seq"],
+                    "tokens_overlap": v["tokens_overlap"],
+                }
+                for T in Ts:
+                    print(f"  T={T} ...")
+                    r = bench_film_2pass_overlap(film, T, n_warmup=args.n_warmup,
+                                                   n_meas=args.n_meas, n_decode=args.n_decode)
+                    results["decode"][f"FILM2POV_T={T}"] = {
+                        "median_ms": median(r.decode_ms),
+                        "p95_ms": percentile(r.decode_ms, 0.95),
+                        "n_steps": len(r.decode_ms),
+                    }
+                    results["prefill"][f"FILM2POV_T={T}"] = {
+                        "median_secs": median(r.prefill_secs),
+                        "p95_secs": percentile(r.prefill_secs, 0.95),
+                        "median_tok_per_s": T / median(r.prefill_secs),
+                    }
+                    print(f"    decode {fmt_ms(median(r.decode_ms), percentile(r.decode_ms, 0.95))} ms/tok  "
+                          f"prefill {median(r.prefill_secs)*1000:.1f} ms ({T/median(r.prefill_secs):.0f} tok/s)")
             del film
             torch.cuda.empty_cache()
 

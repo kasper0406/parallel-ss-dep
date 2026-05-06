@@ -102,18 +102,105 @@ descending plausibility based on this and prior data):
 
 ## Suggested follow-up
 
-1. **H2 test (cheapest, ~30 min):** add a scalar forget gate to plain
-   DN and re-run the Phase 17 setup. If FiLM lift drops to near GDP's
-   −1.9 % range, H2 is supported. If lift stays near DN's −3.1 %, H2
-   is rejected and the residual cross-cell variance must be H3 or H4.
+1. ~~**H2 test:** add a scalar forget gate to plain DN and re-run the
+   Phase 17 setup.~~ → **Done in Phase 21b below — H2 also rejected.**
 2. **H4 noise floor (~30 min):** repeat Mamba2 + sparse-FiLM at a
    second seed. If the second seed gives a similar near-zero lift,
    the Mamba2 result is real; otherwise it was noise.
 3. **Re-frame the cross-cell narrative.** The clean architectural
    claim is "−3 % lift in plain DeltaNet, robust across 4.5× state-
    size variation, robust across both basin signs, robust to 3.3× scale-
-   up." The diminishing lift in stronger cells is a *cell-level*
-   compatibility effect, not a *state-capacity* effect. The blog/paper
-   should be honest that this is an open question with H2-H3-H4 on the
-   shortlist.
+   up, robust to adding a forget gate." The diminishing lift in
+   stronger cells is a *cell-level* compatibility effect with the
+   specific structured-SSM aggregation form (most likely H3), not a
+   state-capacity (H1) or forget-gate-redundancy (H2) effect.
+
+# Phase 21b — H2 (forget-gate redundancy) test (2026-04-30)
+
+**Question:** does adding a learnable forget gate to plain DeltaNet
+reduce the sparse-FiLM lift toward GatedDeltaProduct's −1.9 % range
+(vs plain DN's −3.1 %)? Phase 17 showed GDP benefits less from FiLM,
+and a natural hypothesis is that GDP's forget gate already provides
+a content-dependent gating mechanism that overlaps with what FiLM
+contributes.
+
+## Setup
+
+Add a forget-gate-only variant of plain DN — instantiated as fla's
+`GatedDeltaNet` with `use_gate=False` (output gate disabled,
+forget-gate-only). New layer wrapper `DeltaNetForgetGateAttention`
+in `experiments/layers.py`. Same training config as Phase 17:
+codeparrot Python, T=512, batch=8, 5 K AdamW steps, lr=3e-4 cosine,
+seed=0, no warmup. `d_model=576, n_heads=9, d_head=64, n_layers=30`.
+
+Two new runs: forget-gated DN baseline + forget-gated DN + sparse-(2, 28)
+FiLM. Plain DN reference is reused from Phase 17.
+
+## Results
+
+| Cell | Baseline | + sparse (2, 28) FiLM | Δ vs baseline | Final α | Basin |
+|------|---------:|----------------------:|--------------:|--------:|-------|
+| Plain DN (Phase 17) | 51.00 | 49.40 | −3.1 % | −0.054 | NEG |
+| **DN + forget gate** | **46.36** | **44.86** | **−3.23 %** | **−0.044** | **NEG** |
+
+(For reference: GatedDeltaProduct in Phase 17 had lift −1.9 %.)
+
+## Interpretation
+
+**H2 is rejected.**
+
+Adding a forget gate to plain DN substantially improves the baseline
+(51.00 → 46.36, **−9 % PPL**) — confirming the forget gate is a
+genuinely useful mechanism in its own right. But the sparse-FiLM
+lift on top of forget-gated DN is **−3.23 %**, virtually identical
+to plain DN's −3.1 %. So the FiLM mechanism is *not* redundant with
+the forget-gate mechanism — they're complementary contributions.
+
+The basin sign is preserved (still NEG, |α| ≈ 0.044, consistent with
+Phase 21's d_head=32/64 and Phase 17's plain DN at α=−0.054). The
+mechanism story (multiplicative form + non-softmax aggregation finds
+this basin) is unchanged by the forget gate.
+
+**What this leaves as the explanation for Phase 17's cross-cell
+diminishing lift.** With H1 (state capacity) and H2 (forget-gate
+redundancy) both rejected, the most likely remaining hypothesis is
+**H3 — SSM aggregation form**. Mamba2's structured SSM kernel
+aggregates per-token information through a fundamentally different
+update geometry (continuous-time discretization with channel-wise
+diagonal SSM) than DeltaNet's outer-product Householder-style
+update. The basin we identified — multiplicative form +
+non-softmax aggregation, gradient direction `x · scale` — may
+simply not be reachable through Mamba2's update geometry, regardless
+of whether a forget gate is present.
+
+GatedDeltaProduct sits in the middle (still uses outer-product
+Householder updates like DN, but with multiple Householder products
+per step + the forget gate). Its lift of −1.9 % is between DN's
+−3.1 % and Mamba2's −0.27 %, which is consistent with a partial
+geometric incompatibility rather than a clean redundancy effect.
+
+## Updated cross-cell story
+
+| Cell type | Update geometry | Forget gate | FiLM lift |
+|-----------|-----------------|-------------|-----------|
+| Plain DN  | Outer-product, rank-1 erase | None | **−3.1 %** |
+| DN + forget gate | Outer-product, rank-1 erase | Scalar | **−3.2 %** |
+| GatedDeltaProduct | Outer-product, K Householder products | Scalar | −1.9 % |
+| Mamba2 | Structured SSM, diagonal | Per-channel | −0.27 % |
+
+The FiLM lift correlates with **how close the cell's update is to
+a plain rank-1 outer-product**, not with the presence of a forget
+gate. Future blog/paper should frame this as: "sparse-FiLM is a
+mechanism specifically for outer-product-style linear-RNN cells; it
+does not transfer cleanly to structured-SSM aggregation."
+
+## Suggested follow-up
+
+1. **H4 noise floor (~30 min):** repeat Mamba2 + sparse-FiLM at a
+   second seed to bound whether the −0.27 % is real.
+2. **Test on GatedDeltaProduct *without* multiple Householders**
+   (`num_householder=1`, equivalent to plain DN with forget gate +
+   `allow_neg_eigval=True`). If the lift returns to ~−3 %, H3 is
+   strongly supported: the multiple-Householder-product structure
+   is what disrupts the basin's reachability, not the forget gate.
 

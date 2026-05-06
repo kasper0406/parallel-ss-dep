@@ -245,6 +245,47 @@ class GatedDeltaNetAttention(_FlaWrapper):
         ))
 
 
+class DeltaNetForgetGateAttention(_FlaWrapper):
+    """Forget-gate-only DeltaNet (Phase 21b H2 test).
+
+    Plain `DeltaNet` plus a per-token learnable forget gate (via fla's
+    `chunk_gated_delta_rule` kernel: `g = a_proj(x)` modulated through
+    per-head `A_log` and `dt_bias`), but **no output gate**. This is the
+    cleanest isolation of the forget-gate mechanism vs plain DN —
+    instantiated as `GatedDeltaNet(use_gate=False, allow_neg_eigval=False)`.
+
+    Used to test H2 (forget-gate redundancy): if adding the forget gate
+    to plain DN reduces the sparse-FiLM lift toward GDP's −1.9 % range
+    (vs plain DN's −3.1 %), the cross-cell pattern in Phase 17 is driven
+    by forget-gate redundancy with FiLM.
+
+    Note: applies the sm_120 TileLang smem-alignment workaround on import
+    (forget-gate kernel needs it on RTX 5090). See `BUG_sm120_forget_gate.md`.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_head: int):
+        # Apply sm_120 workaround BEFORE the GatedDeltaNet import triggers
+        # any TileLang JIT in the gated-delta-rule backward path.
+        try:
+            import scripts.sm120_tilelang_workaround  # noqa: F401
+        except ImportError:
+            pass  # Non-sm120 hardware doesn't need it.
+        from fla.layers import GatedDeltaNet
+        assert d_model == n_heads * d_head, \
+            f"DeltaNetForgetGate expects d_model == n_heads*d_head; got {d_model} vs {n_heads*d_head}"
+        super().__init__(GatedDeltaNet(
+            hidden_size=d_model,
+            expand_v=1.0,
+            head_dim=d_head,
+            num_heads=n_heads,
+            num_v_heads=n_heads,
+            mode="chunk",
+            use_gate=False,         # NO output gate — forget-gate-only variant
+            use_short_conv=True,
+            allow_neg_eigval=False, # match plain DN baseline
+        ))
+
+
 class GatedDeltaProductAttention(_FlaWrapper):
     """fla GatedDeltaProduct — DeltaNet + K Householder products + gating.
 

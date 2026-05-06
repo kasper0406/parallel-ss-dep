@@ -35,6 +35,19 @@ of sparse-FiLM over DeltaNet is robust** across 217 M → 360 M →
 708 M; the comparative claim against Transformer is scale- and
 optimizer-dependent.
 
+**Inference cost.** The architecture requires a 2-pass forward at
+both training and decode time (pass 1 produces the FiLM input, pass 2
+is the actual model output). A naïve "lagged-cached" inference
+shortcut that reuses pass-2 outputs as the next step's FiLM input is
+**~99 % cheaper but breaks quality** (PPL 36.97, worse than plain DN
+at 35.38) — see [`LATENCY_REPORT.md`](LATENCY_REPORT.md). The honest
+deployment cost of this architecture is **2× decode latency** vs
+plain DN. The deployment-memory advantage is intact: the RNN
+inference state is **74× smaller** than a 360 M Transformer's KV
+cache at 8 K context (9.8 MB vs 720 MB). Self-feeding-trained
+variants that match the cheap inference protocol are an open
+follow-up.
+
 The high-level idea of upper-to-lower-layer feedback in stacked RNNs
 is not new — see *Related work* below — but the **specific minimal
 form, the modern linear-RNN context, and the mechanism analysis are.**

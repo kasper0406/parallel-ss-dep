@@ -1029,6 +1029,44 @@ Gated DeltaNet — same algebraic family as our student). See
 infrastructure notes (vLLM in a separate venv to keep our
 nightly-torch student environment intact).
 
+### Phase 21b — Mechanism: forget-gate redundancy test (H2) (2026-04-30)
+
+Tested whether adding a learnable forget gate to plain DeltaNet
+reduces the sparse-FiLM lift toward GatedDeltaProduct's −1.9 % range
+(Phase 17). New layer `DeltaNetForgetGateAttention` —
+`GatedDeltaNet(use_gate=False)` (forget-gate-only, no output gate).
+Same training config as Phase 17.
+
+| Cell | Baseline | + FiLM | Δ | Final α | Basin |
+|------|---------:|-------:|---:|--------:|-------|
+| Plain DN (Phase 17) | 51.00 | 49.40 | −3.1 % | −0.054 | NEG |
+| **DN + forget gate** | **46.36** | **44.86** | **−3.23 %** | −0.044 | NEG |
+| (GDP, Phase 17 ref.) | 52.80 | 51.81 | −1.9 % | +0.046 | POS |
+
+**H2 is rejected.** Forget-gate alone substantially improves baseline
+(51.00 → 46.36, −9 %), but the FiLM lift on top is virtually identical
+to plain DN's −3.1 %. FiLM and forget-gate are complementary, not
+redundant.
+
+**Updated cross-cell story.** With H1 (state capacity) and H2
+(forget-gate redundancy) both rejected, the leading remaining
+hypothesis is **H3 — SSM aggregation form / update geometry**.
+The FiLM lift correlates with how close the cell's update is to a
+plain rank-1 outer-product update:
+
+| Cell | Update | Forget gate | FiLM lift |
+|------|--------|-------------|-----------|
+| Plain DN | Outer-product, rank-1 erase | None | **−3.1 %** |
+| DN + forget gate | Outer-product, rank-1 erase | Scalar | **−3.2 %** |
+| GatedDeltaProduct | Outer-product, K Householders | Scalar | −1.9 % |
+| Mamba2 | Structured SSM, diagonal | Per-channel | −0.27 % |
+
+Sparse-FiLM is a mechanism specifically for **outer-product-style
+linear-RNN cells**; it does not transfer cleanly to structured-SSM
+aggregation. The blog/paper should frame the cross-cell variation
+honestly as a geometry-of-update effect rather than a state-capacity
+or gating-redundancy effect.
+
 ### Phase 21 — Mechanism: state-capacity hypothesis test (2026-04-30)
 
 To explain the diminishing FiLM lift across linear-RNN cells found in

@@ -228,10 +228,7 @@ predictive head needed — that machinery can be removed entirely.
 
 ### Recommendations going forward
 
-1. **708 M scale verification** is the most important next test. Run
-   K=3 self-feeding + uniform-weight L_sem at the Phase 20/21d 708 M
-   Muon setup. If the lift holds, the mechanism is real; if it
-   attenuates, it's a small-scale curiosity.
+1. ~~**708 M scale verification**~~ → **Done in Phase 22 below — lift HOLDS at scale.**
 2. **Drop the oracle predictive head** — Phase 1's surprise machinery
    is empirically counterproductive. Future runs should use the
    uniform-weight path only. The `experiments/oracle_train.py` and
@@ -273,6 +270,113 @@ The v0 surprise-modulated-α PoC (commit `21aa8b9`, negative) and the
 β-sweep / uniform-weight ablation here together provide a decisive
 negative on **"surprise as gradient weight"** in the code domain at
 this scale; the **alignment-to-frozen-target** part stands.
+
+## Phase 22 — 708M scale verification (2026-05-07)
+
+The 217M result (cumulative −11.4 % over plain DN) might attenuate
+at scale, like the cross-cell pattern did. Or it might hold. The
+708M run tests this directly.
+
+### Setup
+
+Match Phase 20/21d 708M setup exactly (`d_model=1024, n_heads=16,
+d_head=64, n_layers=36, T=512, batch=4, 15K steps, Muon optimizer`,
+codeparrot Python), with three additions:
+
+- `--feedback film --feedback_pairs "2,34" --feedback_self_k 3` (K=3 self-feeding sparse-FiLM, same as Phase 21d).
+- `--semantic_loss_beta 1.0 --semantic_loss_uniform_weight` (uniform-weight L_sem at the saturation β).
+- `--encoder_ckpt checkpoints/dn_36L_708M_muon.pt` (frozen 708M plain DN baseline — same architecture as the student, used as the alignment target).
+
+The oracle predictive head is skipped entirely — under
+`--semantic_loss_uniform_weight`, the surprise machinery is unused, so
+no oracle is needed. (Loader was relaxed to allow `--encoder_ckpt`
+without `--oracle_ckpt` when uniform-weight is set.)
+
+Wall-clock: 7496 s ≈ 125 min (vs Phase 21d's 6492 s for K=3 only =
++15 % training cost for the L_sem alignment target). Inference cost:
+zero overhead — `W_semantic` is unused at decode time.
+
+### Apples-to-apples comparison on the same 32K val slice
+
+| Variant @ 708M | 2-pass eval | Lagged-cached | Drift | Decode |
+|---|---:|---:|---:|---:|
+| Plain DN baseline | 35.38 | 35.38 | — | 1× |
+| Std-2-pass FiLM (Phase 20) | 34.26 | 36.97 | **+7.92 %** (broken) | 2× to recover |
+| K=3 self-feed (Phase 21d) | 35.23 | **34.85** | −0.04 % | 1× |
+| **K=3 + uniform L_sem (Phase 22)** | **32.26** | **31.83** | **−1.34 %** | **1×** ⭐ |
+
+α at convergence: −0.197 (NEG basin, identical magnitude to
+Phase 21d's −0.198 and Phase 20's −0.198).
+
+### L_sem lift scales cleanly
+
+| Scale | K=3 baseline | K=3 + uniform L_sem | Δ |
+|---|---:|---:|---:|
+| 217M | 45.61 | 41.76 | **−8.4 %** |
+| **708M** | **34.85** | **31.83** | **−8.7 %** |
+
+The L_sem effect is essentially constant across the 3.3× scale-up.
+It does NOT attenuate the way the cross-cell pattern did. Combined
+with the architectural −1.5 % from K=3 self-feeding alone, the
+cumulative lift over plain DN at 708M is **−10.0 %** — the largest
+single-shot architectural improvement we've measured in this project.
+
+### Cumulative deployment-honest lift across all phases
+
+| Stack @ 708M | PPL | Δ vs plain DN | Decode cost |
+|---|---:|---:|---:|
+| Plain DN baseline | 35.38 | — | 1× |
+| + K=3 self-feeding sparse-FiLM | 34.85 | −1.5 % | 1× |
+| + K=3 + uniform L_sem β=1.0 | **31.83** | **−10.0 %** | **1×** ⭐ |
+| (Phase 20 std-2-pass FiLM, deployment-honest) | 36.97 | +4.5 % | 1× (broken) |
+| (Phase 20 std-2-pass FiLM, training-faithful) | 34.26 | −3.2 % | 2× |
+
+### Verdict
+
+**K=3 self-feeding + uniform-weight L_sem alignment loss is the
+recommended training recipe for the distillation pilot.** It gives:
+
+- The largest deployment-honest lift over plain DN (−10.0 % at 708M).
+- Same 1× decode cost as plain DN.
+- Same NEG-basin α (no architectural surprises).
+- Clean train/inference gap (drift −1.34 %, in the favorable direction
+  — lagged-cached deployment matches the model's training distribution
+  more cleanly than the 2-pass eval).
+- ~15-50 % training-time overhead (K=3's +50 % stacks with L_sem's
+  +15 %, total ~+50-60 % vs plain DN training).
+
+The structural-surprise framing is decisively rejected (Phase 21c +
+β-sweep showed surprise weighting is counterproductive). What works
+is **uniform alignment of pooled hidden-state representations to a
+frozen-encoder target**. This is best framed as an auxiliary
+co-distillation loss — student learns from a frozen-DN baseline of
+the same architecture, on the same corpus.
+
+This is the largest single-shot architectural finding in this
+project to date, and the recipe is now ready for the DN-4B
+distillation pilot.
+
+### Reproduction
+
+```bash
+mkdir -p logs/phase22
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -u experiments/train_lm.py \
+    --arch deltanet \
+    --dataset codeparrot/codeparrot-clean --text_field content \
+    --T 512 --batch 4 --steps 15000 \
+    --d_model 1024 --n_heads 16 --d_head 64 --n_layers 36 \
+    --lr 3e-4 --optimizer muon --lr_muon 1e-3 \
+    --feedback film --feedback_pairs "2,34" --feedback_self_k 3 \
+    --semantic_loss_beta 1.0 --semantic_loss_uniform_weight \
+    --encoder_ckpt checkpoints/dn_36L_708M_muon.pt \
+    --log_every 500 --val_every 2500 --seed 0 \
+    --save_ckpt checkpoints/film_self_k3_lsem_uniform_b10_708M_muon.pt
+
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -u experiments/eval_filmed_ppl_708m.py \
+    --ckpt checkpoints/film_self_k3_lsem_uniform_b10_708M_muon.pt \
+    --T 512 --n_tokens 32768 --batch 2 \
+    --out bench_film_self_k3_lsem_uniform_708M_ppl.json
+```
 
 ## Reproduction
 

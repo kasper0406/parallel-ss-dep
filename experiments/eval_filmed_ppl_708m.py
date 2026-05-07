@@ -83,6 +83,12 @@ def load_film_ckpt(path: str, device: str = "cuda",
         feedback_mode=cfg.get("feedback_mode", "film"),
         feedback_pairs=cfg.get("feedback_pairs", ()),
         feedback_self_k=self_k,
+        # If the ckpt was trained with L_sem (Phase 22), it carries a
+        # W_semantic projection in the state_dict. Re-instantiate the
+        # layer here so the weights load cleanly. The W is not needed at
+        # inference; it sits unused.
+        semantic_loss_dim=cfg.get("semantic_loss_dim", 0)
+            or (cfg["d_model"] if cfg.get("semantic_loss_beta", 0.0) > 0.0 else 0),
     ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()

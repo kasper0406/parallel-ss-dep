@@ -390,10 +390,13 @@ def main():
 
     use_semantic_loss = (args.semantic_loss_beta > 0.0)
     if use_semantic_loss:
-        if not args.encoder_ckpt or not args.oracle_ckpt:
+        if not args.encoder_ckpt:
             raise SystemExit(
-                "--semantic_loss_beta > 0 requires --encoder_ckpt and "
-                "--oracle_ckpt to be set.")
+                "--semantic_loss_beta > 0 requires --encoder_ckpt.")
+        if not args.semantic_loss_uniform_weight and not args.oracle_ckpt:
+            raise SystemExit(
+                "--semantic_loss_beta > 0 (without --semantic_loss_uniform_weight) "
+                "requires --oracle_ckpt for surprise weighting.")
         from experiments.statement_stream import (
             StatementAwareTokenisedStream, collate_with_statements,
         )
@@ -521,23 +524,29 @@ def main():
     oracle_head = None
     if use_semantic_loss:
         from experiments.eval_statement_ppl import load_model as load_lm_ckpt
-        from experiments.oracle_train import OraclePredictor
         print(f"Loading frozen encoder for L_sem: {args.encoder_ckpt}")
         encoder = load_lm_ckpt(args.encoder_ckpt, device="cuda")
         for q in encoder.parameters():
             q.requires_grad_(False)
         encoder.eval()
-        print(f"Loading oracle predictive head: {args.oracle_ckpt}")
-        oc = torch.load(args.oracle_ckpt, map_location="cuda",
-                        weights_only=False)
-        oracle_head = OraclePredictor(**oc["config"]).to("cuda")
-        oracle_head.load_state_dict(oc["state_dict"])
-        oracle_head.eval()
-        for q in oracle_head.parameters():
-            q.requires_grad_(False)
-        print(f"  encoder: {encoder.num_params()/1e6:.1f}M params, "
-              f"oracle: {sum(p.numel() for p in oracle_head.parameters())/1e6:.2f}M params")
-        print(f"  semantic_loss_beta = {args.semantic_loss_beta}")
+        if args.oracle_ckpt and not args.semantic_loss_uniform_weight:
+            from experiments.oracle_train import OraclePredictor
+            print(f"Loading oracle predictive head: {args.oracle_ckpt}")
+            oc = torch.load(args.oracle_ckpt, map_location="cuda",
+                            weights_only=False)
+            oracle_head = OraclePredictor(**oc["config"]).to("cuda")
+            oracle_head.load_state_dict(oc["state_dict"])
+            oracle_head.eval()
+            for q in oracle_head.parameters():
+                q.requires_grad_(False)
+            oh_params = sum(p.numel() for p in oracle_head.parameters())/1e6
+            oh_str = f", oracle: {oh_params:.2f}M params"
+        else:
+            oracle_head = None
+            oh_str = " (uniform L_sem; oracle skipped)"
+        print(f"  encoder: {encoder.num_params()/1e6:.1f}M params" + oh_str)
+        print(f"  semantic_loss_beta = {args.semantic_loss_beta}"
+              f"{' (uniform-weight)' if args.semantic_loss_uniform_weight else ''}")
 
     # Optimizer construction — single AdamW (default) or Muon + AdamW split.
     if args.optimizer == "adamw":
@@ -640,15 +649,18 @@ def main():
                 # Oracle prediction sequence: P(prefix [0..t-1]) → predict E(s_t).
                 # For statement t, surprise = 1 - cos(preds[t-1], E_seq[t]).
                 # The oracle head expects (B, S, d).
-                preds = oracle_head(E_seq.unsqueeze(0))            # (1, S, d)
-                # Surprise per statement.
-                surp = torch.full((S,), 0.0, device=device,
-                                   dtype=E_seq.dtype)
-                if S > 1:
-                    cos = F.cosine_similarity(
-                        preds[0, :-1], E_seq[1:], dim=-1,
-                    )                                              # (S-1,)
-                    surp[1:] = 1.0 - cos
+                if oracle_head is not None:
+                    preds = oracle_head(E_seq.unsqueeze(0))        # (1, S, d)
+                    surp = torch.full((S,), 0.0, device=device,
+                                       dtype=E_seq.dtype)
+                    if S > 1:
+                        cos = F.cosine_similarity(
+                            preds[0, :-1], E_seq[1:], dim=-1,
+                        )                                           # (S-1,)
+                        surp[1:] = 1.0 - cos
+                else:
+                    # Uniform-weight path discards surp; keep dummy zeros.
+                    surp = torch.zeros((S,), device=device, dtype=E_seq.dtype)
                 # Per-batch z-score normalisation. We z-score across the
                 # whole batch's statements (computed at the end of this
                 # function before applying to L_sem, so we accumulate the

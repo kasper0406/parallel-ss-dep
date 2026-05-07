@@ -42,11 +42,11 @@ def make_chunks_with_bytes(tokenizer, T: int, n_tokens: int,
                             text_field: str = "content",
                             skip: int = 10_000):
     """Build (N, T+1) chunks from the codeparrot val tail, AND track
-    raw UTF-8 byte counts per chunk so we can compute BPB.
+    raw UTF-8 byte counts for the predicted positions 1..T.
 
-    Approach: walk the stream like the existing eval, but accumulate
-    byte_per_token = len(text.encode('utf-8')) / len(token_ids) for
-    each example, accumulate per-chunk byte counts.
+    Tracks byte cost per token in a flat parallel list and slices it
+    the same way tokens are sliced. Same formulation as
+    `eval_distill_4b_ppl.make_codeparrot_chunks`.
     """
     from datasets import load_dataset
     val_stream = (
@@ -59,7 +59,7 @@ def make_chunks_with_bytes(tokenizer, T: int, n_tokens: int,
     chunks: list[list[int]] = []
     chunk_bytes: list[float] = []
     cur_ids: list[int] = []
-    cur_bytes = 0.0
+    cur_byte_costs: list[float] = []
     for example in val_stream:
         text = example[text_field]
         ids = tokenizer.encode(text, add_special_tokens=False)
@@ -67,19 +67,16 @@ def make_chunks_with_bytes(tokenizer, T: int, n_tokens: int,
             continue
         text_bytes = len(text.encode("utf-8"))
         per_tok_bytes = text_bytes / len(ids)
-        for tok_id in ids + [eos]:
+        for tok_id in ids:
             cur_ids.append(int(tok_id))
-            cur_bytes += per_tok_bytes
-            if len(cur_ids) >= T + 1:
-                chunks.append(cur_ids[: T + 1])
-                # The chunk's predicted tokens are positions 1..T (T positions).
-                # The first position has no target; bytes assigned to it
-                # do not contribute to loss. Adjust by T/(T+1).
-                chunk_bytes.append(cur_bytes * T / (T + 1))
-                cur_ids = cur_ids[T + 1:]
-                cur_bytes = 0.0
-                if len(chunks) >= target:
-                    break
+            cur_byte_costs.append(per_tok_bytes)
+        cur_ids.append(eos)
+        cur_byte_costs.append(0.0)
+        while len(cur_ids) >= T + 1 and len(chunks) < target:
+            chunks.append(cur_ids[: T + 1])
+            chunk_bytes.append(sum(cur_byte_costs[1 : T + 1]))
+            cur_ids = cur_ids[T + 1:]
+            cur_byte_costs = cur_byte_costs[T + 1:]
         if len(chunks) >= target:
             break
     out = torch.tensor(chunks, dtype=torch.long)

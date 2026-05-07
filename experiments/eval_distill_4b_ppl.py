@@ -76,7 +76,13 @@ def make_codeparrot_chunks(tokenizer, T: int, n_tokens: int,
 
     Returns:
         chunks: (N, T+1) int64 token tensor
-        byte_counts: (N,) int — UTF-8 bytes corresponding to each chunk
+        byte_counts: (N,) int — UTF-8 bytes corresponding to each chunk's
+                     prediction targets (positions 1..T after the shift).
+
+    Implementation: track byte cost per token in a flat parallel list,
+    then slice it the same way we slice tokens. A chunk's byte count
+    is the sum of bytes for tokens at positions 1..T (the T predicted
+    positions; position 0 has no target).
     """
     from datasets import load_dataset
     val_stream = (
@@ -88,38 +94,27 @@ def make_codeparrot_chunks(tokenizer, T: int, n_tokens: int,
     chunks: list[list[int]] = []
     chunk_bytes: list[int] = []
     cur_ids: list[int] = []
-    cur_text_len = 0
+    cur_byte_costs: list[float] = []
     eos = tokenizer.eos_token_id or 0
     for example in val_stream:
         text = example[text_field]
         ids = tokenizer.encode(text, add_special_tokens=False)
-        # Assign per-token byte cost proportionally so that a chunk's
-        # total byte count is exact. Use a simple approach: each ID gets
-        # its decoded UTF-8 bytes when reverted; but mixing across docs
-        # across the chunk boundary is messy. Simpler: count text bytes
-        # consumed and apportion at the end of each example.
-        text_bytes = len(text.encode("utf-8"))
-        # Track per-sub-batch the bytes so far.
         if not ids:
             continue
-        # Distribute text_bytes across len(ids) tokens equally for simplicity
-        # — only used in BPB summation; small per-token rounding washes out.
-        per_tok_bytes = text_bytes / max(1, len(ids))
-        for tok_id in ids + [eos]:
+        text_bytes = len(text.encode("utf-8"))
+        per_tok_bytes = text_bytes / len(ids)
+        # Append all tokens with their byte cost; eos gets ~0 bytes.
+        for tok_id in ids:
             cur_ids.append(int(tok_id))
-            cur_text_len += per_tok_bytes
-            if len(cur_ids) >= T + 1:
-                chunks.append(cur_ids[: T + 1])
-                # Bytes covered by this chunk's prediction targets are
-                # the bytes for tokens [1..T] (T tokens); we approximate
-                # as the bytes accumulated in the chunk window. Since
-                # we accumulate per_tok_bytes per token, sum the tail T.
-                chunk_bytes.append(int(round(cur_text_len * T / (T + 1))))
-                # Slide to next chunk (no overlap).
-                cur_ids = cur_ids[T + 1:]
-                cur_text_len = 0
-                if len(chunks) >= target:
-                    break
+            cur_byte_costs.append(per_tok_bytes)
+        cur_ids.append(eos)
+        cur_byte_costs.append(0.0)
+        while len(cur_ids) >= T + 1 and len(chunks) < target:
+            chunks.append(cur_ids[: T + 1])
+            # Predicted targets are positions 1..T; sum their bytes.
+            chunk_bytes.append(int(round(sum(cur_byte_costs[1 : T + 1]))))
+            cur_ids = cur_ids[T + 1:]
+            cur_byte_costs = cur_byte_costs[T + 1:]
         if len(chunks) >= target:
             break
     out = torch.tensor(chunks, dtype=torch.long)

@@ -270,6 +270,12 @@ def main():
     p.add_argument("--max_stmts_per_chunk", type=int, default=64,
                    help="Maximum number of statements scored per chunk under "
                         "L_sem (caps padding cost in the collator).")
+    p.add_argument("--semantic_loss_uniform_weight", action="store_true",
+                   help="Ablation: set all L_sem per-statement weights to 1.0 "
+                        "(i.e. ignore the oracle's surprise score). Used to "
+                        "isolate whether structural-surprise weighting "
+                        "contributes anything beyond the alignment loss "
+                        "itself.")
     p.add_argument("--feedback_scratchpad", type=str, default="",
                    help="Surprise-gated scratchpad pairs, semicolon-separated. "
                         "Each is 'target,source' where target attends causally "
@@ -674,9 +680,13 @@ def main():
         # model AWAY from the oracle's representation). Rescaling without
         # centering preserves the design's intent — high-surprise = bigger
         # weight, low-surprise = smaller — while keeping all weights ≥ 0.
-        mean_surp = all_surp.mean().clamp(min=1e-6)
-        weights = all_surp / mean_surp                             # (N,) ≥ 0
-        l_sem_total = (weights * all_dist).mean()
+        if args.semantic_loss_uniform_weight:
+            # Ablation: ignore oracle surprise; treat every statement equally.
+            l_sem_total = all_dist.mean()
+        else:
+            mean_surp = all_surp.mean().clamp(min=1e-6)
+            weights = all_surp / mean_surp                         # (N,) ≥ 0
+            l_sem_total = (weights * all_dist).mean()
         return l_sem_total, n_stmts_total
 
     for step in range(1, args.steps + 1):

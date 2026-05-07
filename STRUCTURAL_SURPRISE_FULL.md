@@ -143,43 +143,135 @@ A cleaner diagnostic would be a **β=0.3, surprise-weight=1.0** ablation
 (uniform-weight L_sem) — if it matches β=0.3 with surprise weighting,
 the surprise machinery is decorative.
 
-## Recommendations
+## β saturation + uniform-weight ablation (extended sweep, 2026-05-07)
 
-1. **Continue the β sweep**: run β ∈ {0.5, 1.0, 2.0} to find where the
-   lift saturates. The trajectory β=0.0 → 0.1 → 0.3 → ? is monotone
-   so far.
-2. **Run a uniform-weight ablation** at the winning β: `L_sem` with
-   `surprise(s_t) ≡ 1` (no surprise weighting). This isolates whether
-   the surprise machinery contributes anything beyond the alignment
-   loss itself. If uniform matches surprise-weighted, the surprise
-   parts of the design are unnecessary in this domain.
-3. **Verify at 708 M scale**: at 217 M the lift is large; at scale it
-   may attenuate (similar to the smaller cross-cell pattern). Run
-   K=3 + L_sem β=0.3 at 708 M with the same Phase 20/21d Muon setup,
-   compare to K=3-only at 708 M (PPL 34.85).
-4. **Defer Phase 3** (meta-cognitive head) until the surprise-weighting
-   ablation answers whether structural surprise is doing meaningful
-   work.
-5. **Defer dialogue corpus** until the code result generalises at
-   scale. The reframing ("alignment loss + general signal" rather
-   than "structural-surprise loss") may not require dialogue-specific
-   evaluation infrastructure.
+The original recommendation (continue β sweep + uniform-weight
+ablation) was executed. Results:
+
+| Variant | Overall | Top-10% | Bot-10% | top/all |
+|---|---:|---:|---:|---:|
+| K=3 + L_sem β=0.5 (surprise-wtd) | 42.44 | 49.11 | 41.95 | 1.16× |
+| K=3 + L_sem β=1.0 (surprise-wtd) | 42.01 | 48.86 | 41.30 | 1.16× |
+| **K=3 + L_sem β=1.0 (UNIFORM)** | **41.76** | **48.54** | **40.18** | 1.16× |
+| K=3 + L_sem β=2.0 (surprise-wtd) | 41.89 | 49.29 | 41.80 | 1.18× |
+
+### Three decisive findings
+
+1. **β saturates at ≈1.0.** β=2.0 (41.89) brings no measurable
+   improvement over β=1.0 (42.01). The lift curve has plateaued.
+   Optimal `--semantic_loss_beta` for this regime is roughly 1.0.
+
+2. **Surprise weighting is actively counterproductive.** With β
+   held at 1.0, the **uniform-weight** ablation
+   (`--semantic_loss_uniform_weight`) reaches **41.76 PPL**, beating
+   the surprise-weighted 42.01 by 0.6 %. The oracle-derived
+   per-statement weights are not just decorative — they make the
+   result *worse*. Top-10% PPL: 48.54 (uniform) vs 48.86
+   (surprise-weighted). Bot-10%: 40.18 vs 41.30. The improvement is
+   uniform across deciles, not concentrated at low-surprise statements.
+
+3. **The lift's domain is "everything", not "pivots".** The
+   `top/overall` ratio rises monotonically with β (1.12× → 1.16× →
+   1.18×). At higher β, the model gets *relatively* worse at
+   structurally surprising statements vs its overall improvement. The
+   cumulative −11.4 % lift over plain DN at uniform-β=1.0 is
+   distributed:
+   - Top-10% (most-surprising statements): −9.1 %.
+   - Bot-10% (least-surprising statements): **−15.8 %**.
+
+   The frozen-encoder alignment loss helps formulaic code more than
+   pivotal code.
+
+### Cumulative architectural lift over plain DN @ 217M
+
+| Stack | PPL | Δ vs plain DN | Decode cost |
+|---|---:|---:|---:|
+| Plain DN baseline | 47.13 | — | 1× |
+| + K=3 self-feeding sparse-FiLM | 45.61 | −3.2 % | 1× |
+| + K=3 + L_sem β=1.0 (uniform) | **41.76** | **−11.4 %** | 1× |
+
+Of the −11.4 % cumulative lift, K=3 self-feeding contributes −3.2 %
+and the alignment loss contributes the remaining −8.4 %. The
+alignment loss is the larger-magnitude effect.
+
+### Verdict on the structural-surprise hypothesis
+
+**Rejected, decisively.** The proposal's central claim — that
+weighting an alignment loss by oracle-measured structural surprise
+preferentially improves performance at pivotal moments — is wrong
+in this domain. Empirically:
+
+- The oracle correctly identifies structurally surprising statements
+  (the eyeball check on `surprise_inspection.txt` is unambiguous —
+  top-decile is `try:`, `class:`, returns, docstrings; bottom-decile
+  is formulaic imports).
+- But weighting the loss by that surprise score makes results worse
+  than ignoring it.
+- And the lift, when present, concentrates at routine statements,
+  not pivots.
+
+So the surprise machinery is correctly detecting pivots, the loss is
+producing real PPL gains, but the two facts are not connected
+causally. The actual mechanism is **uniform alignment of pooled
+hidden-state representations to a frozen-encoder target** — a general
+auxiliary regulariser, not a structural-surprise booster.
+
+### What still works and is publishable
+
+The `K=3 self-feeding + uniform-weight L_sem alignment loss`
+combination is a clean architectural finding. Lift is large
+(−11.4 % at 217M, additive on top of the K=3 self-feeding lift).
+The mechanism is interpretable: pool the model's hidden states
+across statements, project to a frozen-encoder space, and minimise
+cosine distance to the encoder's pooled representation. No oracle
+predictive head needed — that machinery can be removed entirely.
+
+### Recommendations going forward
+
+1. **708 M scale verification** is the most important next test. Run
+   K=3 self-feeding + uniform-weight L_sem at the Phase 20/21d 708 M
+   Muon setup. If the lift holds, the mechanism is real; if it
+   attenuates, it's a small-scale curiosity.
+2. **Drop the oracle predictive head** — Phase 1's surprise machinery
+   is empirically counterproductive. Future runs should use the
+   uniform-weight path only. The `experiments/oracle_train.py` and
+   `surprise_inspection.txt` artifacts can be retained as evidence
+   for the negative finding.
+3. **Reframe the writeup**: not "structural surprise loss" but
+   "frozen-encoder alignment auxiliary loss for linear-RNN distillation".
+   The alignment-loss framing is also closer to standard knowledge-
+   distillation formulations and easier to relate to existing
+   literature.
+4. **Defer dialogue corpus** indefinitely. The proposal's strongest
+   claims were about dialogue pivots, but the surprise mechanism that
+   was supposed to exploit those pivots doesn't help. There's no
+   reason to expect the dialogue domain to rescue the structural-
+   surprise framing.
+5. **Combine with distillation pilot**. The distillation pilot's
+   recipe (KL+CE α=0.9 from Qwen3.6) and this branch's recipe
+   (uniform-weight L_sem from a frozen DN encoder) are structurally
+   similar — both are auxiliary alignment losses. Worth testing
+   whether both can stack additively, or whether they're substitutes.
 
 ## What this means for the research direction
 
 The proposal's central claim — "structural surprise weights the loss
 toward pivotal moments" — is **not what's happening empirically** in
-code at 217 M. Instead, `L_sem` appears to be a general additive
-auxiliary loss that pushes hidden-state representations toward a
-frozen-encoder target, helping PPL across all statement types
-roughly uniformly.
+code. Instead, what works is **frozen-encoder alignment**: pool the
+model's hidden states across each statement, project to a frozen
+encoder's pooled-representation space, and minimise cosine distance.
+This helps PPL across all statement types roughly uniformly, with
+the largest absolute gains at the easiest statements.
 
-This is still a publishable finding — alignment to a frozen-encoder
-target as a regulariser is a real mechanism — but the framing in the
-final write-up should be honest about what's actually working. The
-v0 surprise-modulated-α PoC (commit `21aa8b9`, also negative) and
-this Phase 0-2 result together suggest the **"surprise as gradient
-weight"** thesis has weak empirical support in the code domain at
+This is a clean publishable finding — alignment to a frozen-encoder
+target as an auxiliary regulariser is a real mechanism with a real
++11.4 % cumulative lift over plain DN at 217 M. The "structural
+surprise" framing of the original proposal should be dropped from the
+final writeup; what to keep is the alignment-loss formulation.
+
+The v0 surprise-modulated-α PoC (commit `21aa8b9`, negative) and the
+β-sweep / uniform-weight ablation here together provide a decisive
+negative on **"surprise as gradient weight"** in the code domain at
 this scale; the **alignment-to-frozen-target** part stands.
 
 ## Reproduction

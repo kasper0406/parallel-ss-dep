@@ -356,3 +356,87 @@ CUDA_VISIBLE_DEVICES=1 ./.venv/bin/python -u experiments/eval_filmed_ppl_217m.py
     --out bench_film_self_k3_ppl_8k.json
 ```
 
+
+# Phase 21d — 708M K=3 self-feeding verification (2026-05-06)
+
+**Question.** Does K=3 self-feeding **scale to 708 M**? At 217 M the
+train/inference gap was already small for std-2-pass (drift +0.83 %),
+making Phase 21c's K=3 result inconclusive about whether self-feeding
+helps at the scales where the problem actually manifests. The 708 M
+std-2-pass model showed +7.9 % drift — that's the signal we need K=3
+to fix.
+
+## Setup
+
+Train a 708 M sparse-(2, 34) FiLM model with K=3 self-feeding, matching
+Phase 20's std-2-pass 708 M run **exactly except for the feedback mode**:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python -u experiments/train_lm.py \
+    --arch deltanet \
+    --dataset codeparrot/codeparrot-clean --text_field content \
+    --T 512 --batch 4 --steps 15000 \
+    --d_model 1024 --n_heads 16 --d_head 64 --n_layers 36 \
+    --lr 3e-4 --optimizer muon --lr_muon 1e-3 \
+    --feedback film --feedback_pairs "2,34" --feedback_self_k 3 \
+    --seed 0 \
+    --save_ckpt checkpoints/sparse_2_34_708M_muon_self_k3.pt
+```
+
+Wall-clock: 6492 s ≈ 108 min (1.32× the std-2-pass 708 M run's 4922 s,
+in line with the +50 % expected from K=3's extra forward).
+
+Eval on the same deterministic 32 K-token val slice that produced the
+std-2-pass 708 M's PPL 34.26 / lagged-cached 36.97 (Phase 20.5
+`d2876e3` extended to 32 K).
+
+## Results
+
+| Variant | Train-faithful PPL | Lagged-cached PPL | Drift | Decode cost | α |
+|---------|-------------------:|------------------:|------:|------------:|--:|
+| 708 M plain DN baseline | 35.38 | 35.38 | — | 1× | — |
+| 708 M std-2-pass FiLM | 34.26 | 36.97 | **+7.92 %** | 2× | −0.198 |
+| **708 M K=3 self-feeding FiLM** | 35.23 | **34.85** | **−0.04 %** | **1×** ⭐ | −0.197 |
+
+K=3 training-protocol PPL (its own self-consistent forward): 34.86.
+Self-consistency rel-norm: **0.114** (better than 217 M K=3's 0.153,
+indicating tighter convergence at scale).
+
+## Interpretation
+
+**K=3 self-feeding scales cleanly to 708 M.** The +7.92 % drift that
+broke the std-2-pass deployment story is fully closed (drift now
+−0.04 %, a sub-PPL-point fluctuation). Both K=3 and std-2-pass find
+the same negative-α basin at α ≈ −0.198, confirming the basin is
+the architecturally robust quantity (Phase 21's prior conclusion).
+
+**Architectural lift at deployment** (lagged-cached, 1× decode cost):
+
+- K=3 deployment vs plain DN baseline: **34.85 vs 35.38 = −1.5 %.**
+- K=3 deployment vs std-2-pass deployment: **34.85 vs 36.97 = −5.7 %.**
+- K=3 deployment vs std-2-pass *training-faithful* (the protocol-cheating
+  reference number we previously quoted): 34.85 vs 34.26 = +1.7 %.
+
+The architectural lift shrinks at 708M from std-2-pass's −3.2 %
+training-faithful claim to K=3's −1.5 % deployment-honest claim, but
+the deployment cost drops from 2× to 1×. Wall-clock × quality
+(`decode_ms × PPL`) at 8 K context: K=3 wins decisively
+(`14.5 × 34.85 = 505` vs std-2-pass `28.8 × 34.26 = 987`, ~2× better).
+
+**Verdict.** **Distillation pilot uses K=3 self-feeding.** The trade
+of −1.7 PPL training-faithful → +0.6 PPL lagged-cached deployment is
+more than compensated by halving the decode cost. The story for any
+paper / blog post is now: "−1.5 % lift at 1× decode cost" instead of
+"−3.2 % lift at 2× decode cost" — the deployment-fair claim is the
+honest one.
+
+## Reproduction
+
+```bash
+# Eval (32 K val slice = 64 chunks × T=512):
+CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python -u experiments/eval_filmed_ppl_708m.py \
+    --ckpt checkpoints/sparse_2_34_708M_muon_self_k3.pt \
+    --T 512 --n_tokens 32768 --batch 2 \
+    --out bench_film_self_k3_708M_ppl.json
+```
+

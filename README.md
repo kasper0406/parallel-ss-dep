@@ -35,18 +35,27 @@ of sparse-FiLM over DeltaNet is robust** across 217 M → 360 M →
 708 M; the comparative claim against Transformer is scale- and
 optimizer-dependent.
 
-**Inference cost.** The architecture requires a 2-pass forward at
-both training and decode time (pass 1 produces the FiLM input, pass 2
-is the actual model output). A naïve "lagged-cached" inference
-shortcut that reuses pass-2 outputs as the next step's FiLM input is
-**~99 % cheaper but breaks quality** (PPL 36.97, worse than plain DN
-at 35.38) — see [`LATENCY_REPORT.md`](LATENCY_REPORT.md). The honest
-deployment cost of this architecture is **2× decode latency** vs
-plain DN. The deployment-memory advantage is intact: the RNN
-inference state is **74× smaller** than a 360 M Transformer's KV
-cache at 8 K context (9.8 MB vs 720 MB). Self-feeding-trained
-variants that match the cheap inference protocol are an open
-follow-up.
+**Inference cost.** Originally the architecture required a 2-pass
+forward at both training and decode time (pass 1 produces the FiLM
+input, pass 2 is the actual model output) — and a naïve "lagged-
+cached" inference shortcut breaks quality (PPL 36.97, worse than
+plain DN at 35.38; see [`LATENCY_REPORT.md`](LATENCY_REPORT.md)).
+**Phase 21c–d fixes this**: training with K=3 self-feeding (the
+model's own lagged source-layer output as FiLM input) closes the
+train/inference gap entirely. At 708M, K=3 self-feeding gives PPL
+**34.85 at 1× decode cost** (vs std-2-pass 34.26 at 2× decode cost,
+or std-2-pass lagged-cached 36.97 — broken). The deployment story:
+
+| Variant @ 708M | PPL | Decode cost | vs DN baseline 35.38 |
+|---|---:|---:|---:|
+| Std-2-pass FiLM (2-pass eval) | 34.26 | 2× | −3.2 % |
+| **K=3 self-feeding FiLM (lagged-cached)** | **34.85** | **1×** | **−1.5 %** ⭐ |
+| Std-2-pass FiLM (lagged-cached, broken) | 36.97 | 1× | +4.5 % |
+
+The deployment-memory advantage is intact: the RNN inference state
+is **74× smaller** than a 360M Transformer's KV cache at 8K context
+(9.8 MB vs 720 MB). The honest deployment-fair claim is **−1.5 %
+lift at 1× decode cost** with K=3 self-feeding training.
 
 The high-level idea of upper-to-lower-layer feedback in stacked RNNs
 is not new — see *Related work* below — but the **specific minimal

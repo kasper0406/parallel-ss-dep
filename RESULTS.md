@@ -1029,6 +1029,46 @@ Gated DeltaNet — same algebraic family as our student). See
 infrastructure notes (vLLM in a separate venv to keep our
 nightly-torch student environment intact).
 
+### Phase 21d — 708M K=3 self-feeding verification (2026-05-06)
+
+K=3 self-feeding (Phase 21c) verified at 708M scale. Trained 708M
+sparse-(2,34) FiLM with `--feedback_self_k 3` for 15K Muon steps,
+matching Phase 20's std-2-pass run except for the feedback protocol.
+Compared 2-pass vs lagged-cached PPL on the same 32K val slice that
+diagnosed the std-2-pass model's +7.9% drift.
+
+| Variant | Train-faithful PPL | Lagged-cached PPL | Drift | Decode cost |
+|---------|-------------------:|------------------:|------:|------------:|
+| 708M plain DN baseline | 35.38 | 35.38 | — | 1× |
+| 708M std-2-pass FiLM | 34.26 | 36.97 | **+7.92 %** (broken) | 2× |
+| **708M K=3 self-feeding FiLM** | 35.23 | **34.85** | **−0.04 %** | **1×** ⭐ |
+
+K=3 training-protocol PPL: 34.86. Self-consistency rel-norm: 0.114
+(tighter than 217M K=3's 0.153). α = −0.197 (NEG basin, same as
+std-2-pass's −0.198 — same basin, same architecturally robust |α|).
+
+**K=3 self-feeding fully closes the 708M lagged-cached drift.** The
+deployment story is now clean: 1× decode cost, −1.5% lift over plain
+DN baseline, no train/inference gap. Wall-clock × quality at 8K
+context (`decode_ms × PPL`): K=3 = 505 vs std-2-pass = 987 — K=3
+wins by ~2× on the integrated cost-quality metric.
+
+The architectural lift shrinks at deployment-honest measurement
+(−3.2% std-2-pass training-faithful → −1.5% K=3 lagged-cached), but
+the deployment-fair number is the one to publish. Distillation pilot
+uses K=3 self-feeding. See MECHANISM_REPORT.md Phase 21d for the
+full report.
+
+### Phase 21c — Self-feeding retrain (Option B) (2026-04-30)
+
+K=3 iterative fixed-point training at 217M closes the train/inference
+gap. New `--feedback_self_k` mode in `experiments/model.py`. K=3
+self-feeding lift = −2.18% vs std-2-pass −3.1%, but lagged-cached
+deployment matches training (drift ±0.04%). 217M result was
+inconclusive about scale (the gap is small at 217M anyway); Phase 21d
+verified at 708M. See MECHANISM_REPORT.md Phase 21c for the full
+report.
+
 ### Phase 21b — Mechanism: forget-gate redundancy test (H2) (2026-04-30)
 
 Tested whether adding a learnable forget gate to plain DeltaNet

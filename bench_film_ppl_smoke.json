@@ -1,0 +1,34 @@
+{
+  "ckpt": "checkpoints/sparse_2_34_708M_muon.pt",
+  "T": 512,
+  "n_chunks": 2,
+  "n_eval_tokens": 1024,
+  "config": {
+    "d_model": 1024,
+    "n_layers": 36,
+    "feedback_pairs": [
+      [
+        2,
+        34
+      ]
+    ],
+    "feedback_mode": "film"
+  },
+  "2pass": {
+    "ce": 3.3699700832366943,
+    "ppl": 29.077657135398503,
+    "n_tokens": 1024,
+    "elapsed_s": 0.4231571169802919
+  },
+  "lagged_cached": {
+    "ce": 3.5020270347595215,
+    "ppl": 33.182646210424096,
+    "n_tokens": 1024,
+    "elapsed_s": 15.553646418033168
+  },
+  "gap": {
+    "delta_ce_nats_per_tok": 0.13205695152282715,
+    "delta_ppl_abs": 4.104989075025593,
+    "delta_ppl_rel": 0.14117330897434197
+  }
+}

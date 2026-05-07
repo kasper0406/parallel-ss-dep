@@ -1,0 +1,56 @@
+GPU: NVIDIA GeForce RTX 5090  arch=deltanet
+Loading tokeniser HuggingFaceTB/SmolLM2-135M ...
+  vocab size: 49152
+Loading dataset codeparrot/codeparrot-clean (streaming) ...
+  no val/test split — using shuffled train tail as validation
+  params: 707.8M  aux_dim=0  feedback=film@d=1
+  optimizer split: 290 Muon params (606.7M), 220 AdamW params (101.2M)
+
+  step     tok/s     tloss         lr
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (93413 > 8192). Running this sequence through the model will result in indexing errors
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (45285 > 8192). Running this sequence through the model will result in indexing errors
+   500      4755    6.4325   9.98e-04  α=[2<-34:-0.006]
+  1000      4745    5.0751   9.90e-04  α=[2<-34:-0.017]
+  1500      4750    4.7019   9.78e-04  α=[2<-34:-0.025]
+  2000      4748    4.5983   9.61e-04  α=[2<-34:-0.034]
+  2500      4749    4.4246   9.40e-04  α=[2<-34:-0.043]
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=4.7963  ppl=121.06
+  3000      4676    3.8322   9.14e-04  α=[2<-34:-0.049]
+  3500      4747    4.2261   8.84e-04  α=[2<-34:-0.058]
+  4000      4747    4.0889   8.51e-04  α=[2<-34:-0.067]
+  4500      4746    3.9015   8.15e-04  α=[2<-34:-0.073]
+  5000      4743    3.9007   7.75e-04  α=[2<-34:-0.084]
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=4.3583  ppl=78.12
+  5500      4671    3.6543   7.33e-04  α=[2<-34:-0.092]
+  6000      4744    3.6368   6.89e-04  α=[2<-34:-0.099]
+  6500      4747    3.5027   6.44e-04  α=[2<-34:-0.107]
+  7000      4746    3.5635   5.97e-04  α=[2<-34:-0.118]
+  7500      4747    3.4586   5.50e-04  α=[2<-34:-0.126]
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=4.0081  ppl=55.04
+  8000      4674    3.6428   5.03e-04  α=[2<-34:-0.135]
+  8500      4747    3.0193   4.56e-04  α=[2<-34:-0.143]
+  9000      4748    3.3744   4.11e-04  α=[2<-34:-0.148]
+  9500      4749    3.3835   3.67e-04  α=[2<-34:-0.154]
+ 10000      4747    3.3238   3.25e-04  α=[2<-34:-0.161]
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=3.7804  ppl=43.83
+ 10500      4673    3.2935   2.85e-04  α=[2<-34:-0.165]
+ 11000      4745    3.2497   2.49e-04  α=[2<-34:-0.171]
+ 11500      4746    3.1225   2.16e-04  α=[2<-34:-0.176]
+ 12000      4745    3.2261   1.86e-04  α=[2<-34:-0.179]
+ 12500      4744    3.1593   1.60e-04  α=[2<-34:-0.183]
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=3.6154  ppl=37.17
+ 13000      4672    3.0253   1.39e-04  α=[2<-34:-0.186]
+ 13500      4745    2.8986   1.22e-04  α=[2<-34:-0.189]
+ 14000      4746    2.7549   1.10e-04  α=[2<-34:-0.193]
+ 14500      4747    2.4157   1.02e-04  α=[2<-34:-0.195]
+ 15000      4747    3.0107   1.00e-04  α=[2<-34:-0.197]
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=3.5513  ppl=34.86
+
+Done in 6492s (433 ms/step avg).
+Checkpoint saved to /home/knielsen/ml/parallel-ss-dep/checkpoints/sparse_2_34_708M_muon_self_k3.pt

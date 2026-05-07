@@ -1,0 +1,46 @@
+{
+  "ckpt": "checkpoints/sparse_2_34_708M_muon.pt",
+  "T": 512,
+  "n_chunks": 64,
+  "n_eval_tokens": 32768,
+  "config": {
+    "d_model": 1024,
+    "n_layers": 36,
+    "feedback_pairs": [
+      [
+        2,
+        34
+      ]
+    ],
+    "feedback_mode": "film",
+    "feedback_self_k": 0
+  },
+  "training_protocol": {
+    "ce": 3.5339605659246445,
+    "ppl": 34.2593858274674,
+    "n_tokens": 32768,
+    "elapsed_s": 2.281287868041545
+  },
+  "self_consistency": {
+    "feedback_self_k": 0,
+    "note": "no self-feeding; skipped"
+  },
+  "2pass": {
+    "ce": 3.5339605659246445,
+    "ppl": 34.2593858274674,
+    "n_tokens": 32768,
+    "elapsed_s": 1.947913946933113
+  },
+  "lagged_cached": {
+    "ce": 3.6101953089237213,
+    "ppl": 36.973273319903576,
+    "n_tokens": 32768,
+    "elapsed_s": 497.9397828039946
+  },
+  "gap": {
+    "lc_vs_training_abs": 2.7138874924361787,
+    "lc_vs_training_rel": 0.07921588279788497,
+    "lc_vs_2pass_abs": 2.7138874924361787,
+    "lc_vs_2pass_rel": 0.07921588279788497
+  }
+}

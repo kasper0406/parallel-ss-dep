@@ -250,6 +250,26 @@ def main():
                         "delta of source-state norms (free signal from K=3 "
                         "self-feeding). Adds 3 learnable scalars per FiLM "
                         "target. Requires --feedback_self_k >= 2.")
+    p.add_argument("--semantic_loss_beta", type=float, default=0.0,
+                   help="Weight on the semantic-gradient loss L_sem (Phase 22 "
+                        "full PoC). 0 (default) = off. Non-zero = enable "
+                        "L_sem; --encoder_ckpt and --oracle_ckpt must be "
+                        "provided so per-statement target embeddings + "
+                        "oracle surprises can be computed. The total loss "
+                        "becomes L = L_ce + β · sum_t L_sem(s_t), where "
+                        "L_sem(s_t) = surprise(s_t).detach() · "
+                        "(1 - cos(W·pool(h), E(s_t).detach())).")
+    p.add_argument("--encoder_ckpt", type=str, default=None,
+                   help="Path to the frozen DN-baseline encoder checkpoint, "
+                        "used by L_sem to produce per-statement target "
+                        "embeddings E(s_t).")
+    p.add_argument("--oracle_ckpt", type=str, default=None,
+                   help="Path to the trained oracle predictive head checkpoint, "
+                        "used by L_sem to produce per-statement surprise "
+                        "weights via 1 - cos(P(prefix), E(s_t)).")
+    p.add_argument("--max_stmts_per_chunk", type=int, default=64,
+                   help="Maximum number of statements scored per chunk under "
+                        "L_sem (caps padding cost in the collator).")
     p.add_argument("--feedback_scratchpad", type=str, default="",
                    help="Surprise-gated scratchpad pairs, semicolon-separated. "
                         "Each is 'target,source' where target attends causally "
@@ -362,12 +382,37 @@ def main():
             val_stream = load_dataset(args.dataset, split="train",
                                       **ds_kwargs).shuffle(seed=42).skip(10_000)
 
-    train_ds = TokenisedStream(train_stream, tok, args.T,
-                               text_field=args.text_field)
-    val_ds = TokenisedStream(val_stream, tok, args.T,
-                             text_field=args.text_field)
-    train_loader = DataLoader(train_ds, batch_size=args.batch, num_workers=2)
-    val_loader = DataLoader(val_ds, batch_size=args.batch, num_workers=1)
+    use_semantic_loss = (args.semantic_loss_beta > 0.0)
+    if use_semantic_loss:
+        if not args.encoder_ckpt or not args.oracle_ckpt:
+            raise SystemExit(
+                "--semantic_loss_beta > 0 requires --encoder_ckpt and "
+                "--oracle_ckpt to be set.")
+        from experiments.statement_stream import (
+            StatementAwareTokenisedStream, collate_with_statements,
+        )
+        train_ds = StatementAwareTokenisedStream(
+            train_stream, tok, args.T, text_field=args.text_field,
+            max_stmts_per_chunk=args.max_stmts_per_chunk,
+        )
+        val_ds = StatementAwareTokenisedStream(
+            val_stream, tok, args.T, text_field=args.text_field,
+            max_stmts_per_chunk=args.max_stmts_per_chunk,
+        )
+        from functools import partial
+        collate_fn = partial(collate_with_statements,
+                              pad_to=args.max_stmts_per_chunk, pad_value=-1)
+        train_loader = DataLoader(train_ds, batch_size=args.batch,
+                                   num_workers=2, collate_fn=collate_fn)
+        val_loader = DataLoader(val_ds, batch_size=args.batch,
+                                 num_workers=1, collate_fn=collate_fn)
+    else:
+        train_ds = TokenisedStream(train_stream, tok, args.T,
+                                   text_field=args.text_field)
+        val_ds = TokenisedStream(val_stream, tok, args.T,
+                                 text_field=args.text_field)
+        train_loader = DataLoader(train_ds, batch_size=args.batch, num_workers=2)
+        val_loader = DataLoader(val_ds, batch_size=args.batch, num_workers=1)
 
     # 2. Model.
     if args.layers:
@@ -439,6 +484,7 @@ def main():
         feedback_scratchpad_routing=args.feedback_scratchpad_routing,
         feedback_self_k=args.feedback_self_k,
         feedback_alpha_mode=args.feedback_alpha_mode,
+        semantic_loss_dim=(args.d_model if use_semantic_loss else 0),
         **attn_kw,
     ).to("cuda")
     if args.freeze_alpha and (args.feedback != "none" or fb_xattn_pairs):
@@ -462,6 +508,30 @@ def main():
               f"non-zero count: {(bracket_deltas != 0).sum().item()}")
     else:
         bracket_deltas = None
+
+    # Phase 22 / structural-surprise full PoC: load frozen encoder and
+    # oracle for L_sem.
+    encoder = None
+    oracle_head = None
+    if use_semantic_loss:
+        from experiments.eval_statement_ppl import load_model as load_lm_ckpt
+        from experiments.oracle_train import OraclePredictor
+        print(f"Loading frozen encoder for L_sem: {args.encoder_ckpt}")
+        encoder = load_lm_ckpt(args.encoder_ckpt, device="cuda")
+        for q in encoder.parameters():
+            q.requires_grad_(False)
+        encoder.eval()
+        print(f"Loading oracle predictive head: {args.oracle_ckpt}")
+        oc = torch.load(args.oracle_ckpt, map_location="cuda",
+                        weights_only=False)
+        oracle_head = OraclePredictor(**oc["config"]).to("cuda")
+        oracle_head.load_state_dict(oc["state_dict"])
+        oracle_head.eval()
+        for q in oracle_head.parameters():
+            q.requires_grad_(False)
+        print(f"  encoder: {encoder.num_params()/1e6:.1f}M params, "
+              f"oracle: {sum(p.numel() for p in oracle_head.parameters())/1e6:.2f}M params")
+        print(f"  semantic_loss_beta = {args.semantic_loss_beta}")
 
     # Optimizer construction — single AdamW (default) or Muon + AdamW split.
     if args.optimizer == "adamw":
@@ -506,32 +576,158 @@ def main():
     scheduler = scheds[0]
 
     # 3. Train loop.
-    print(f"\n{'step':>6}  {'tok/s':>8}  {'tloss':>8}  {'lr':>9}")
+    if use_semantic_loss:
+        print(f"\n{'step':>6}  {'tok/s':>8}  {'tloss':>8}  {'ce':>8}  "
+              f"{'lsem':>8}  {'nstmt':>6}  {'lr':>9}")
+    else:
+        print(f"\n{'step':>6}  {'tok/s':>8}  {'tloss':>8}  {'lr':>9}")
     t0 = time.perf_counter()
     train_iter = iter(train_loader)
     last_log = t0
     last_log_step = 0
     losses = []
+    losses_sem_window: list[float] = []
+    losses_ce_window: list[float] = []
+    losses_nstmt_window: list[int] = []
+
+    def compute_semantic_loss(model, x_batch, stmt_starts, stmt_ends,
+                                hidden, encoder, oracle_head, beta):
+        """Compute L_sem(s_t) summed over all valid statements in the batch.
+
+        - hidden: (B, T, d) — model's final-layer hidden (out_norm output).
+        - stmt_starts, stmt_ends: (B, S_max) padded with -1 for unused slots.
+        - encoder: frozen DN baseline.
+        - oracle_head: frozen predictive head.
+        - beta: scalar weight.
+
+        Returns:
+          (l_sem_total: scalar tensor, n_stmts_total: int).
+        """
+        device = hidden.device
+        d_model = hidden.shape[-1]
+        # 1. Frozen encoder forward to get target embeddings.
+        with torch.no_grad():
+            _, enc_hidden = encoder(x_batch, return_hidden=True)
+        B = x_batch.shape[0]
+        # 2. Pool encoder hidden per statement → get target embedding seq E(s_t) per row.
+        # 3. Pool model hidden per statement → get h_t. Project via W.
+        # 4. Run oracle head on E sequence to get predicted next-statement embedding.
+        #    Surprise(t) = 1 - cos(P(prefix), E(s_t)).
+        # We process row-by-row to handle variable S per row cleanly.
+        l_sem_terms: list[torch.Tensor] = []
+        n_stmts_total = 0
+        for b in range(B):
+            ss = stmt_starts[b]
+            se = stmt_ends[b]
+            valid_mask = (ss >= 0)
+            if not valid_mask.any():
+                continue
+            ss_v = ss[valid_mask].tolist()
+            se_v = se[valid_mask].tolist()
+            S = len(ss_v)
+            # Pool encoder hidden → E(s_t) for each statement.
+            with torch.no_grad():
+                enc_pool = []
+                for st, en in zip(ss_v, se_v):
+                    enc_pool.append(enc_hidden[b, st:en].mean(dim=0))
+                E_seq = torch.stack(enc_pool, dim=0)            # (S, d)
+                # Oracle prediction sequence: P(prefix [0..t-1]) → predict E(s_t).
+                # For statement t, surprise = 1 - cos(preds[t-1], E_seq[t]).
+                # The oracle head expects (B, S, d).
+                preds = oracle_head(E_seq.unsqueeze(0))            # (1, S, d)
+                # Surprise per statement.
+                surp = torch.full((S,), 0.0, device=device,
+                                   dtype=E_seq.dtype)
+                if S > 1:
+                    cos = F.cosine_similarity(
+                        preds[0, :-1], E_seq[1:], dim=-1,
+                    )                                              # (S-1,)
+                    surp[1:] = 1.0 - cos
+                # Per-batch z-score normalisation. We z-score across the
+                # whole batch's statements (computed at the end of this
+                # function before applying to L_sem, so we accumulate the
+                # raw surprise here and z-score later).
+            # Pool model hidden over statement → h_t. With grad.
+            mod_pool = []
+            for st, en in zip(ss_v, se_v):
+                mod_pool.append(hidden[b, st:en].mean(dim=0))
+            h_t = torch.stack(mod_pool, dim=0)                    # (S, d_model)
+            h_tilde = model.W_semantic(h_t)                       # (S, d_oracle)
+            # Cosine sim against E_seq (frozen).
+            cos_h = F.cosine_similarity(h_tilde, E_seq.detach(), dim=-1)  # (S,)
+            # L_sem per statement: surp * (1 - cos_h). Surp is detached.
+            # We handle z-scoring per BATCH (across all rows) — accumulate
+            # raw surprise + per-stmt loss tensors and combine outside the loop.
+            l_sem_terms.append((surp.detach(), 1.0 - cos_h, S))
+            n_stmts_total += S
+        if n_stmts_total == 0:
+            return torch.zeros((), device=device), 0
+        # Concatenate all rows' (surp, loss_per_stmt) arrays.
+        all_surp = torch.cat([t[0] for t in l_sem_terms])         # (N,)
+        all_dist = torch.cat([t[1] for t in l_sem_terms])         # (N,)
+        # Per-batch normalisation so β has portable meaning across batches.
+        # We rescale raw surprise (already in [0, 2] from cosine distance) so
+        # the batch mean of the weight is 1.0 — i.e., β controls the average
+        # relative weight of L_sem vs L_ce. We do NOT center: a centered
+        # z-score would produce negative weights for low-surprise statements,
+        # which would invert the loss direction at routine code (push the
+        # model AWAY from the oracle's representation). Rescaling without
+        # centering preserves the design's intent — high-surprise = bigger
+        # weight, low-surprise = smaller — while keeping all weights ≥ 0.
+        mean_surp = all_surp.mean().clamp(min=1e-6)
+        weights = all_surp / mean_surp                             # (N,) ≥ 0
+        l_sem_total = (weights * all_dist).mean()
+        return l_sem_total, n_stmts_total
+
     for step in range(1, args.steps + 1):
         try:
-            x, y = next(train_iter)
+            batch = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
-            x, y = next(train_iter)
-        x, y = x.to("cuda"), y.to("cuda")
-        want_surprise = (args.feedback == "predictive" and args.surprise_weight > 0)
-        if args.aux_brackets and want_surprise:
-            logits, aux_logits, surprise = model(x, return_aux=True, return_surprise=True)
-        elif args.aux_brackets:
-            logits, aux_logits = model(x, return_aux=True)
-            surprise = torch.zeros((), device="cuda")
-        elif want_surprise:
-            logits, surprise = model(x, return_surprise=True)
-            aux_logits = None
+            batch = next(train_iter)
+        if use_semantic_loss:
+            x, y, stmt_starts, stmt_ends = batch
+            x, y = x.to("cuda"), y.to("cuda")
+            stmt_starts = stmt_starts.to("cuda")
+            stmt_ends = stmt_ends.to("cuda")
         else:
-            logits = model(x)
-            aux_logits = None
-            surprise = torch.zeros((), device="cuda")
+            x, y = batch
+            x, y = x.to("cuda"), y.to("cuda")
+        want_surprise = (args.feedback == "predictive" and args.surprise_weight > 0)
+        if use_semantic_loss:
+            # Need hidden for L_sem.
+            if args.aux_brackets and want_surprise:
+                logits, aux_logits, surprise, hidden = model(
+                    x, return_aux=True, return_surprise=True, return_hidden=True
+                )
+            elif args.aux_brackets:
+                logits, aux_logits, hidden = model(
+                    x, return_aux=True, return_hidden=True
+                )
+                surprise = torch.zeros((), device="cuda")
+            elif want_surprise:
+                logits, surprise, hidden = model(
+                    x, return_surprise=True, return_hidden=True
+                )
+                aux_logits = None
+            else:
+                logits, hidden = model(x, return_hidden=True)
+                aux_logits = None
+                surprise = torch.zeros((), device="cuda")
+        else:
+            if args.aux_brackets and want_surprise:
+                logits, aux_logits, surprise = model(x, return_aux=True, return_surprise=True)
+            elif args.aux_brackets:
+                logits, aux_logits = model(x, return_aux=True)
+                surprise = torch.zeros((), device="cuda")
+            elif want_surprise:
+                logits, surprise = model(x, return_surprise=True)
+                aux_logits = None
+            else:
+                logits = model(x)
+                aux_logits = None
+                surprise = torch.zeros((), device="cuda")
+            hidden = None
         if args.aux_brackets:
             depth = bracket_depth(x, bracket_deltas).clamp(0, args.aux_max_depth)
             aux_loss = F.cross_entropy(
@@ -543,7 +739,18 @@ def main():
         lm_loss = F.cross_entropy(
             logits.reshape(-1, tok.vocab_size), y.reshape(-1),
         )
-        loss = lm_loss + args.aux_weight * aux_loss + args.surprise_weight * surprise
+        if use_semantic_loss:
+            l_sem, n_stmts = compute_semantic_loss(
+                model, x, stmt_starts, stmt_ends, hidden,
+                encoder, oracle_head, args.semantic_loss_beta,
+            )
+        else:
+            l_sem = torch.zeros((), device="cuda")
+            n_stmts = 0
+        loss = (lm_loss
+                + args.aux_weight * aux_loss
+                + args.surprise_weight * surprise
+                + args.semantic_loss_beta * l_sem)
         for o in opts:
             o.zero_grad(set_to_none=True)
         loss.backward()
@@ -553,13 +760,27 @@ def main():
         for s in scheds:
             s.step()
         losses.append(lm_loss.item())  # track LM loss alone for comparison
+        if use_semantic_loss:
+            losses_sem_window.append(float(l_sem.item()))
+            losses_ce_window.append(float(lm_loss.item()))
+            losses_nstmt_window.append(int(n_stmts))
 
         if step % args.log_every == 0 or step == args.steps:
             now = time.perf_counter()
             tok_per_sec = (step - last_log_step) * args.batch * args.T / (now - last_log)
-            line = (f"{step:>6d}  {tok_per_sec:>8.0f}  "
-                    f"{sum(losses[-args.log_every:]) / max(1, len(losses[-args.log_every:])):>8.4f}  "
-                    f"{scheduler.get_last_lr()[0]:>9.2e}")
+            tloss_avg = sum(losses[-args.log_every:]) / max(1, len(losses[-args.log_every:]))
+            if use_semantic_loss:
+                ce_avg = sum(losses_ce_window[-args.log_every:]) / max(1, len(losses_ce_window[-args.log_every:]))
+                lsem_avg = sum(losses_sem_window[-args.log_every:]) / max(1, len(losses_sem_window[-args.log_every:]))
+                nstmt_avg = sum(losses_nstmt_window[-args.log_every:]) / max(1, len(losses_nstmt_window[-args.log_every:]))
+                line = (f"{step:>6d}  {tok_per_sec:>8.0f}  "
+                        f"{tloss_avg:>8.4f}  {ce_avg:>8.4f}  "
+                        f"{lsem_avg:>8.4f}  {nstmt_avg:>6.1f}  "
+                        f"{scheduler.get_last_lr()[0]:>9.2e}")
+            else:
+                line = (f"{step:>6d}  {tok_per_sec:>8.0f}  "
+                        f"{tloss_avg:>8.4f}  "
+                        f"{scheduler.get_last_lr()[0]:>9.2e}")
             if args.feedback != "none" or fb_xattn_pairs:
                 alphas = model.feedback_alphas()
                 if not alphas:
@@ -593,7 +814,11 @@ def main():
             val_loss = 0.0
             n_val = 0
             with torch.no_grad():
-                for vx, vy in val_loader:
+                for vbatch in val_loader:
+                    if use_semantic_loss:
+                        vx, vy, *_ = vbatch
+                    else:
+                        vx, vy = vbatch
                     vx, vy = vx.to("cuda"), vy.to("cuda")
                     vlogits = model(vx)
                     vloss = F.cross_entropy(
@@ -626,6 +851,10 @@ def main():
                 "feedback_xattn_form": args.feedback_xattn_form,
                 "feedback_self_k": args.feedback_self_k,
                 "feedback_alpha_mode": args.feedback_alpha_mode,
+                "semantic_loss_dim": (args.d_model if use_semantic_loss else 0),
+                "semantic_loss_beta": args.semantic_loss_beta,
+                "encoder_ckpt": args.encoder_ckpt,
+                "oracle_ckpt": args.oracle_ckpt,
                 "arch": args.arch, "layers_spec": args.layers,
                 "n_symbols": args.n_symbols,
                 "tokenizer": args.tokenizer,

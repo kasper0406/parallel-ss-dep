@@ -1,0 +1,32 @@
+GPU: NVIDIA GeForce RTX 5090
+Loading checkpoint: /home/knielsen/ml/parallel-ss-dep/checkpoints/dn_baseline_30L_217M_for_oracle.pt
+  config: {'d_model': 576, 'n_layers': 30, 'feedback_pairs': [], 'feedback_self_k': 0, 'feedback_alpha_mode': 'scalar'}
+
+Building val-tail file chunks at T=512, n_eval_tokens=32768 ...
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (15558 > 8192). Running this sequence through the model will result in indexing errors
+<unknown>:37: SyntaxWarning: invalid escape sequence '\s'
+<unknown>:80: SyntaxWarning: invalid escape sequence '\>'
+<unknown>:87: SyntaxWarning: invalid escape sequence '\!'
+<unknown>:60: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:64: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:65: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:701: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:889: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:1244: SyntaxWarning: invalid escape sequence '\d'
+<unknown>:1337: SyntaxWarning: invalid escape sequence '\('
+<unknown>:2392: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:2443: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:2587: SyntaxWarning: invalid escape sequence '\_'
+  67 files, 33013 real tokens, 1604 statements
+
+--- Per-statement metrics (overall PPL) ---
+/home/knielsen/ml/parallel-ss-dep/.venv/lib/python3.12/site-packages/triton/language/core.py:2284: UserWarning: tl.make_block_ptr is deprecated. Use TensorDescriptor or tl.make_tensor_descriptor instead.
+  warn("tl.make_block_ptr is deprecated. Use TensorDescriptor or tl.make_tensor_descriptor instead.")
+  overall CE  = 3.8529
+  overall PPL = 47.1277
+  (22047 stmt-internal tokens, 2.5s)
+
+--- Decile-binned metrics ---
+  Overall:        n_stmts=1604, n_tokens=22047, PPL=47.1277
+
+Results written to /home/knielsen/ml/parallel-ss-dep/bench_stmt_ppl_dn_baseline.json

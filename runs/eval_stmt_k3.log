@@ -1,0 +1,30 @@
+GPU: NVIDIA GeForce RTX 5090
+Loading checkpoint: /home/knielsen/ml/parallel-ss-dep/checkpoints/film_self_k3_2_28_30L_217M.pt
+  config: {'d_model': 576, 'n_layers': 30, 'feedback_pairs': [(2, 28)], 'feedback_self_k': 3, 'feedback_alpha_mode': 'scalar'}
+
+Building val-tail file chunks at T=512, n_eval_tokens=32768 ...
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (15558 > 8192). Running this sequence through the model will result in indexing errors
+<unknown>:37: SyntaxWarning: invalid escape sequence '\s'
+<unknown>:80: SyntaxWarning: invalid escape sequence '\>'
+<unknown>:87: SyntaxWarning: invalid escape sequence '\!'
+<unknown>:60: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:64: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:65: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:701: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:889: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:1244: SyntaxWarning: invalid escape sequence '\d'
+<unknown>:1337: SyntaxWarning: invalid escape sequence '\('
+<unknown>:2392: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:2443: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:2587: SyntaxWarning: invalid escape sequence '\_'
+  67 files, 33013 real tokens, 1604 statements
+
+--- Per-statement metrics (overall PPL) ---
+  overall CE  = 3.8202
+  overall PPL = 45.6133
+  (22047 stmt-internal tokens, 1.7s)
+
+--- Decile-binned metrics ---
+  Overall:        n_stmts=1604, n_tokens=22047, PPL=45.6133
+
+Results written to /home/knielsen/ml/parallel-ss-dep/bench_stmt_ppl_k3.json

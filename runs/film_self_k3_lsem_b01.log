@@ -1,0 +1,16 @@
+GPU: NVIDIA GeForce RTX 5090  arch=deltanet
+Loading tokeniser HuggingFaceTB/SmolLM2-135M ...
+  vocab size: 49152
+Loading dataset codeparrot/codeparrot-clean (streaming) ...
+  no val/test split — using shuffled train tail as validation
+  params: 217.3M  aux_dim=0  feedback=film@d=1
+Loading frozen encoder for L_sem: /home/knielsen/ml/parallel-ss-dep/checkpoints/dn_baseline_30L_217M_for_oracle.pt
+Loading oracle predictive head: /home/knielsen/ml/parallel-ss-dep/checkpoints/oracle_predictive_head_217M.pt
+  encoder: 216.3M params, oracle: 8.13M params
+  semantic_loss_beta = 0.1
+
+  step     tok/s     tloss        ce      lsem   nstmt         lr
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (93413 > 8192). Running this sequence through the model will result in indexing errors
+<unknown>:119: SyntaxWarning: invalid escape sequence '\.'
+<unknown>:281: SyntaxWarning: invalid escape sequence '\d'
+<unknown>:292: SyntaxWarning: invalid escape sequence '\d'

@@ -972,6 +972,16 @@ class TinyLM(nn.Module):
                                               # Adds 3 learnable scalars per
                                               # FiLM target. Requires
                                               # feedback_self_k >= 2.
+        semantic_loss_dim: int = 0,           # Phase 22 / structural-surprise
+                                              # full PoC: dimensionality of the
+                                              # oracle's embedding space (0 =
+                                              # off; non-zero = construct a
+                                              # learnable W: d_model -> dim
+                                              # projection used by the trainer
+                                              # to align pooled hidden states
+                                              # to the frozen oracle's E(s_t).
+                                              # Saved with the checkpoint so
+                                              # eval can reuse the W.
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1154,6 +1164,22 @@ class TinyLM(nn.Module):
                 for _ in range(n_layers)
             ])
 
+        # Phase 22 / structural-surprise full PoC: linear projection
+        # W: R^{d_model} -> R^{semantic_loss_dim}, used by the trainer to
+        # align pooled hidden states to the frozen oracle's E(s_t).
+        self.semantic_loss_dim = int(semantic_loss_dim)
+        if self.semantic_loss_dim > 0:
+            # Identity-like init when the dims match (576 -> 576). Helps
+            # the projection start near the encoder's representation space.
+            self.W_semantic = nn.Linear(d_model, self.semantic_loss_dim,
+                                         bias=False)
+            if self.semantic_loss_dim == d_model:
+                with torch.no_grad():
+                    self.W_semantic.weight.copy_(torch.eye(d_model))
+            else:
+                nn.init.normal_(self.W_semantic.weight,
+                                std=1.0 / math.sqrt(d_model))
+
     def _sparse_pass_collect_sources(self,
                                       x: torch.Tensor,
                                       source_layers: set,
@@ -1198,7 +1224,8 @@ class TinyLM(nn.Module):
 
     def forward(self, input_ids: torch.Tensor,
                 return_aux: bool = False,
-                return_surprise: bool = False
+                return_surprise: bool = False,
+                return_hidden: bool = False,
                 ) -> torch.Tensor | tuple:
         x = self.embed(input_ids)
         if self.max_T > 0:
@@ -1213,9 +1240,12 @@ class TinyLM(nn.Module):
                 x = blk(x, input_ids=input_ids)
             h = self.out_norm(x)
             lm_logits = self.lm_head(h)
+            outs = (lm_logits,)
             if return_aux and self.aux_dim > 0:
-                return lm_logits, self.aux_head(h)
-            return lm_logits
+                outs = outs + (self.aux_head(h),)
+            if return_hidden:
+                outs = outs + (h,)
+            return outs[0] if len(outs) == 1 else outs
 
         # Surprise-gated scratchpad feedback. Pass 1 vanilla, pass 1 logits to
         # compute per-position surprise (stop-grad), pass 2 applies the
@@ -1431,9 +1461,12 @@ class TinyLM(nn.Module):
                 else:
                     self._last_surprise_per_target = {}
                     self._last_alpha_t_per_target = {}
+                outs = (lm_logits,)
                 if return_aux and self.aux_dim > 0:
-                    return lm_logits, self.aux_head(h_norm)
-                return lm_logits
+                    outs = outs + (self.aux_head(h_norm),)
+                if return_hidden:
+                    outs = outs + (h_norm,)
+                return outs[0] if len(outs) == 1 else outs
             # ----------------------------------------------------------------
             # Standard 2-pass sparse FiLM (existing path).
             # ----------------------------------------------------------------
@@ -1462,9 +1495,12 @@ class TinyLM(nn.Module):
                     h = self.sparse_feedback[str(L)](h, state_above_lagged)
             h = self.out_norm(h)
             lm_logits = self.lm_head(h)
+            outs = (lm_logits,)
             if return_aux and self.aux_dim > 0:
-                return lm_logits, self.aux_head(h)
-            return lm_logits
+                outs = outs + (self.aux_head(h),)
+            if return_hidden:
+                outs = outs + (h,)
+            return outs[0] if len(outs) == 1 else outs
 
         # 2-pass forward with cross-layer feedback.
         # Pass 1: vanilla forward, collect each layer's output.

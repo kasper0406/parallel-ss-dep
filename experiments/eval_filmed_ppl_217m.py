@@ -96,6 +96,7 @@ def load_film_217m(path: str, device: str = "cuda",
         feedback_pairs=cfg.get("feedback_pairs", ()),
         feedback_self_k=self_k,
         feedback_alpha_mode=alpha_mode,
+        semantic_loss_dim=cfg.get("semantic_loss_dim", 0),
     ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()

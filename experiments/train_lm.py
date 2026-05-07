@@ -239,6 +239,17 @@ def main():
                         "self-consistent under lagged-cached deployment, "
                         "closing the train/inference gap. Requires "
                         "--feedback_pairs to be set.")
+    p.add_argument("--feedback_alpha_mode", type=str, default="scalar",
+                   choices=["scalar", "surprise_modulated"],
+                   help="α form for sparse-FiLM feedback. "
+                        "'scalar' (default, matches Phase 21c) = single "
+                        "learnable α per (target,source) pair. "
+                        "'surprise_modulated' (Phase 22 / structural-surprise "
+                        "PoC) = per-token α(t) = α₀·σ(scale·s_z(t)+bias) "
+                        "where s_z(t) is the per-batch z-scored inter-iter "
+                        "delta of source-state norms (free signal from K=3 "
+                        "self-feeding). Adds 3 learnable scalars per FiLM "
+                        "target. Requires --feedback_self_k >= 2.")
     p.add_argument("--feedback_scratchpad", type=str, default="",
                    help="Surprise-gated scratchpad pairs, semicolon-separated. "
                         "Each is 'target,source' where target attends causally "
@@ -427,6 +438,7 @@ def main():
         feedback_scratchpad_heads=args.feedback_scratchpad_heads,
         feedback_scratchpad_routing=args.feedback_scratchpad_routing,
         feedback_self_k=args.feedback_self_k,
+        feedback_alpha_mode=args.feedback_alpha_mode,
         **attn_kw,
     ).to("cuda")
     if args.freeze_alpha and (args.feedback != "none" or fb_xattn_pairs):
@@ -613,6 +625,7 @@ def main():
                 "feedback_xattn_heads": args.feedback_xattn_heads,
                 "feedback_xattn_form": args.feedback_xattn_form,
                 "feedback_self_k": args.feedback_self_k,
+                "feedback_alpha_mode": args.feedback_alpha_mode,
                 "arch": args.arch, "layers_spec": args.layers,
                 "n_symbols": args.n_symbols,
                 "tokenizer": args.tokenizer,

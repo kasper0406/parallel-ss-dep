@@ -111,13 +111,33 @@ class FeedbackProjection(nn.Module):
     Input: state_above_lagged (B, T, d) — pass-1 output of layer L+1,
            shifted right by 1.
     Output: feedback contribution to layer L's residual input.
+
+    Alpha modes (`alpha_mode`):
+      - 'scalar' (default):  one learnable α (or per-channel d_model
+        learnable αs when `per_channel_alpha` is True). FiLM:
+            x * (1 + α · scale) + α · shift
+      - 'surprise_modulated' (Phase 22 / structural-surprise PoC):
+        per-token α(t) = α₀ · σ(scale · surprise_z(t) + bias) where
+        α₀, scale, bias are three learnable scalars. The surprise tensor
+        is supplied at forward time (B, T) — the caller computes it from
+        inter-iter source-state deltas in K=3 self-feeding. Internal
+        normalization: per-batch z-score over (B, T) before the sigmoid,
+        so the inputs to σ are roughly unit-variance regardless of the
+        absolute scale of the surprise signal.
     """
 
     def __init__(self, d_model: int, mode: str,
-                 per_channel_alpha: bool = False):
+                 per_channel_alpha: bool = False,
+                 alpha_mode: str = "scalar"):
         super().__init__()
         self.mode = mode
         self.per_channel_alpha = per_channel_alpha
+        if alpha_mode not in ("scalar", "surprise_modulated"):
+            raise ValueError(
+                f"alpha_mode must be 'scalar' or 'surprise_modulated' "
+                f"(got {alpha_mode!r})"
+            )
+        self.alpha_mode = alpha_mode
         # IMPORTANT: keep W_fb / W_scale / W_shift at *normal* init so the
         # gradient on α is non-zero from the first step. Earlier bug: with
         # both α=0 AND W_*=0, gradient on α is zero and α never moves.
@@ -133,25 +153,89 @@ class FeedbackProjection(nn.Module):
             nn.init.normal_(self.W_shift.weight, std=1.0 / math.sqrt(d_model))
         elif mode != "none":
             raise ValueError(f"unknown feedback mode: {mode}")
-        # Per-layer learnable feedback strength α_L. Init zero so the model
-        # starts as a pure feedforward stack and has to *earn* feedback use,
-        # but the gradient on α is non-zero (because W_* are non-zero) so
-        # the optimizer can move it.
-        # Scalar (1,) by default; per-channel (d_model,) when requested.
-        alpha_shape = (d_model,) if per_channel_alpha else (1,)
-        self.alpha = nn.Parameter(torch.zeros(alpha_shape))
+        if alpha_mode == "scalar":
+            # Per-layer learnable feedback strength α_L. Init zero so the
+            # model starts as a pure feedforward stack and has to *earn*
+            # feedback use, but the gradient on α is non-zero (because
+            # W_* are non-zero) so the optimizer can move it.
+            # Scalar (1,) by default; per-channel (d_model,) when requested.
+            alpha_shape = (d_model,) if per_channel_alpha else (1,)
+            self.alpha = nn.Parameter(torch.zeros(alpha_shape))
+        else:
+            # alpha_mode == 'surprise_modulated'.
+            # α(t) = alpha_zero · σ(surprise_scale · surprise_z(t) + surprise_bias).
+            # Init: α_zero = 0 so model starts as a pure feedforward stack
+            # (matches scalar-α init), surprise_scale = 1 (unit slope),
+            # surprise_bias = 0 (σ(0)=0.5 baseline, symmetric around mean
+            # surprise).  Three scalars total (extra params are negligible).
+            # NOTE: per_channel_alpha is ignored in this mode — α(t) is
+            # always per-token-scalar (broadcast across channels). A future
+            # extension could add a per-channel α₀ tensor if needed.
+            self.alpha_zero = nn.Parameter(torch.zeros(1))
+            self.surprise_scale = nn.Parameter(torch.ones(1))
+            self.surprise_bias = nn.Parameter(torch.zeros(1))
         # Diagnostic: freeze α at 0 (ablation — film with feedback machinery
         # but no actual feedback application). Tests whether "dead weights"
         # alone hurt PPL.
         self.freeze_alpha = False
 
     def get_alpha(self) -> torch.Tensor:
-        return torch.zeros_like(self.alpha) if self.freeze_alpha else self.alpha
+        # For backwards-compat with external callers that summarise the
+        # learned strength. In scalar mode this is the per-layer (or
+        # per-channel) α; in surprise_modulated mode this is α_zero
+        # (the unmodulated maximum strength).
+        if self.alpha_mode == "scalar":
+            return torch.zeros_like(self.alpha) if self.freeze_alpha else self.alpha
+        return torch.zeros_like(self.alpha_zero) if self.freeze_alpha else self.alpha_zero
 
-    def forward(self, x: torch.Tensor, state_above_lagged: torch.Tensor) -> torch.Tensor:
+    def get_per_token_alpha(self, surprise: torch.Tensor) -> torch.Tensor:
+        """Compute α(t) for surprise-modulated mode.
+
+        Args:
+          surprise: (B, T) non-negative tensor of per-token L2 deltas
+                    between consecutive iterations' source states.
+        Returns:
+          α(t): (B, T, 1) tensor — broadcasts across channels in the
+                FiLM modulation.
+        """
+        assert self.alpha_mode == "surprise_modulated"
+        if self.freeze_alpha:
+            return torch.zeros(*surprise.shape, 1,
+                                device=surprise.device, dtype=surprise.dtype)
+        # Per-batch z-score: (s - mean) / (std + eps). Computed over the
+        # whole (B, T) flat for stability — per-batch normalisation, not
+        # per-position. This makes the surprise scale invariant to the
+        # absolute layer-output magnitude.
+        s = surprise.detach()                  # surprise is a measurement,
+                                                # not a learnable signal — block
+                                                # gradient flow through it.
+        mu = s.mean()
+        sd = s.std().clamp(min=1e-6)
+        s_z = (s - mu) / sd
+        # σ(scale · z + bias) ∈ (0, 1). Multiply by α_zero.
+        gate = torch.sigmoid(self.surprise_scale * s_z + self.surprise_bias)
+        a_t = self.alpha_zero * gate           # (B, T)
+        return a_t.unsqueeze(-1)               # (B, T, 1)
+
+    def forward(self, x: torch.Tensor, state_above_lagged: torch.Tensor,
+                surprise: torch.Tensor | None = None) -> torch.Tensor:
         if self.mode == "none" or state_above_lagged is None:
             return x
-        a = self.get_alpha()
+        if self.alpha_mode == "scalar":
+            a = self.get_alpha()
+        else:
+            # surprise_modulated. surprise must be provided by caller.
+            if surprise is None:
+                # Fallback for callers (e.g. cold-start lagged-cached eval)
+                # that lack a surprise signal: use σ(bias) as the gate so
+                # the model degrades to a fixed-α form rather than
+                # crashing. This is the deployment-without-surprise mode.
+                if self.freeze_alpha:
+                    a = torch.zeros_like(self.alpha_zero)
+                else:
+                    a = self.alpha_zero * torch.sigmoid(self.surprise_bias)
+            else:
+                a = self.get_per_token_alpha(surprise)   # (B, T, 1)
         if self.mode in ("additive", "predictive"):
             fb = self.W_fb(state_above_lagged)
             return x + a * fb
@@ -876,6 +960,18 @@ class TinyLM(nn.Module):
                                               # closes the train/inference gap
                                               # for the lagged-cached deploy
                                               # protocol.
+        feedback_alpha_mode: str = "scalar",  # 'scalar' = single learnable α
+                                              # per (target,source) pair (the
+                                              # default, matches Phase 21c).
+                                              # 'surprise_modulated' = per-token
+                                              # α(t) = α₀·σ(scale·s_z(t)+bias)
+                                              # where s_z(t) is the per-batch
+                                              # z-scored inter-iter delta of
+                                              # source-state norms (free
+                                              # signal from K=3 self-feeding).
+                                              # Adds 3 learnable scalars per
+                                              # FiLM target. Requires
+                                              # feedback_self_k >= 2.
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -944,6 +1040,20 @@ class TinyLM(nn.Module):
         if self.feedback_self_k > 0 and not feedback_pairs:
             raise ValueError(
                 "feedback_self_k requires sparse feedback_pairs to be non-empty"
+            )
+        if feedback_alpha_mode not in ("scalar", "surprise_modulated"):
+            raise ValueError(
+                f"feedback_alpha_mode must be 'scalar' or "
+                f"'surprise_modulated' (got {feedback_alpha_mode!r})"
+            )
+        self.feedback_alpha_mode = feedback_alpha_mode
+        if (feedback_alpha_mode == "surprise_modulated"
+                and self.feedback_self_k < 2):
+            raise ValueError(
+                "feedback_alpha_mode='surprise_modulated' requires "
+                "feedback_self_k >= 2 (we need at least 2 no-grad "
+                "iterations to compute the inter-iter delta surprise "
+                "signal before the loss-bearing pass)."
             )
         self.feedback_xattn_pairs = tuple(
             (int(t), tuple(int(s) for s in srcs)) for t, srcs in feedback_xattn_pairs
@@ -1029,6 +1139,7 @@ class TinyLM(nn.Module):
                 str(t): FeedbackProjection(
                     d_model, mode=feedback_mode,
                     per_channel_alpha=feedback_per_channel_alpha,
+                    alpha_mode=feedback_alpha_mode,
                 )
                 for t, _ in self.feedback_pairs
             })
@@ -1048,6 +1159,7 @@ class TinyLM(nn.Module):
                                       source_layers: set,
                                       film_sources_lagged: dict | None,
                                       input_ids: torch.Tensor | None,
+                                      surprise: torch.Tensor | None = None,
                                       ) -> dict:
         """One sparse-FiLM forward pass — collect source-layer outputs for
         use as next iteration's FiLM input.
@@ -1056,6 +1168,9 @@ class TinyLM(nn.Module):
         - film_sources_lagged: dict[source_L -> (B, T, d)] — lagged source
           states to feed at FiLM target layers. If None, no FiLM (cold-start
           iteration 0).
+        - surprise: optional (B, T) tensor — passed to FeedbackProjection in
+          surprise-modulated mode to compute per-token α(t). For scalar α
+          mode, ignored.
 
         Returns dict[source_L -> (B, T, d)] of THIS pass's source-layer
         outputs (un-lagged; the caller is responsible for applying the lag
@@ -1068,13 +1183,15 @@ class TinyLM(nn.Module):
                     and L in self.sparse_target_to_source
                     and self.feedback_position == "pre"):
                 src = self.sparse_target_to_source[L]
-                h = self.sparse_feedback[str(L)](h, film_sources_lagged[src])
+                h = self.sparse_feedback[str(L)](h, film_sources_lagged[src],
+                                                  surprise=surprise)
             h = blk(h, input_ids=input_ids)
             if (film_sources_lagged is not None
                     and L in self.sparse_target_to_source
                     and self.feedback_position == "post"):
                 src = self.sparse_target_to_source[L]
-                h = self.sparse_feedback[str(L)](h, film_sources_lagged[src])
+                h = self.sparse_feedback[str(L)](h, film_sources_lagged[src],
+                                                  surprise=surprise)
             if L in source_layers:
                 out_src[L] = h
         return out_src
@@ -1216,10 +1333,26 @@ class TinyLM(nn.Module):
                     )
                 # Iterations 1 .. K-2 (if K>2): self-feed. Detached so backward
                 # never reaches them.
+                # In surprise_modulated mode we also need the source state
+                # from the SECOND-TO-LAST no_grad iteration (so we can compute
+                # the inter-iter delta surprise = ||iter_{K-1} - iter_{K-2}||
+                # before the loss-bearing pass starts). Track it explicitly.
+                #
+                # Iter naming (1-indexed in comments to match design doc):
+                #   K=2: pass 1 (cold, no_grad), pass 2 (loss-bearing).
+                #        Cannot compute inter-iter delta surprise (only one
+                #        no_grad pass). [validated above by feedback_self_k>=2
+                #        gating + the K=2 case relies on `prev_src_states`
+                #        being a zero-init "previous" stand-in.]
+                #   K=3: pass 1 (cold, no_grad), pass 2 (no_grad self-feed),
+                #        pass 3 (loss-bearing). Surprise = ||pass2.src - pass1.src||,
+                #        normalised then sigmoid'd → α(t) for pass 3's FiLM.
+                prev_src_states = None     # iter k-2 source states (for delta)
                 for _ in range(K - 2):
                     with torch.no_grad():
                         film_in = {s: _shift_right_by_k(v, self.feedback_lag)
                                     for s, v in src_states.items()}
+                        prev_src_states = src_states   # save iter K-2 (= prev)
                         src_states = self._sparse_pass_collect_sources(
                             x, source_layers, film_sources_lagged=film_in,
                             input_ids=input_ids,
@@ -1230,17 +1363,48 @@ class TinyLM(nn.Module):
                 # produced), shifted right by feedback_lag.
                 film_in = {s: _shift_right_by_k(v, self.feedback_lag)
                             for s, v in src_states.items()}
+
+                # Compute the per-token surprise signal for surprise_modulated
+                # FiLM. We use the inter-iter delta between the two most-recent
+                # no_grad iterations: ||src_states[s] - prev_src_states[s]||₂
+                # at each (B, T) position, summed/averaged across the source
+                # layers in self.sparse_target_to_source. The signal is a
+                # MEASUREMENT of how much the model's own source-layer
+                # representation shifted between the two no_grad iterations,
+                # so it's already a self-surprise proxy without needing a
+                # separate predictive head.
+                surprise_per_target: dict = {}
+                if self.feedback_alpha_mode == "surprise_modulated":
+                    if prev_src_states is None:
+                        # K=2 fallback (no two no_grad iterations available).
+                        # Use a zero-surprise tensor so α(t) = α₀·σ(bias) —
+                        # equivalent to a fixed-α form for the entire batch.
+                        # Caller is warned by the constructor's K>=2 check; in
+                        # practice we expect K=3 for surprise_modulated.
+                        for t, s in self.feedback_pairs:
+                            surprise_per_target[t] = x.new_zeros(x.shape[:2])
+                    else:
+                        for t, s in self.feedback_pairs:
+                            # L2-norm across channels at each (B, T) position.
+                            delta = src_states[s] - prev_src_states[s]
+                            surprise_per_target[t] = (
+                                delta.float().norm(dim=-1)        # (B, T)
+                                .to(x.dtype)
+                                .detach()                          # measurement
+                            )
                 # Run the final forward end-to-end with grad enabled.
                 final_src_states: dict = {}
                 h = x
                 for L, blk in enumerate(self.blocks):
                     if L in self.sparse_target_to_source and self.feedback_position == "pre":
                         src = self.sparse_target_to_source[L]
-                        h = self.sparse_feedback[str(L)](h, film_in[src])
+                        sup = surprise_per_target.get(L) if surprise_per_target else None
+                        h = self.sparse_feedback[str(L)](h, film_in[src], surprise=sup)
                     h = blk(h, input_ids=input_ids)
                     if L in self.sparse_target_to_source and self.feedback_position == "post":
                         src = self.sparse_target_to_source[L]
-                        h = self.sparse_feedback[str(L)](h, film_in[src])
+                        sup = surprise_per_target.get(L) if surprise_per_target else None
+                        h = self.sparse_feedback[str(L)](h, film_in[src], surprise=sup)
                     if L in source_layers:
                         final_src_states[L] = h
                 h_norm = self.out_norm(h)
@@ -1253,6 +1417,20 @@ class TinyLM(nn.Module):
                 self._last_self_feed_prev_src = {
                     s: v.detach() for s, v in src_states.items()
                 }
+                # Cache surprise + per-token α(t) for diagnostic/eval use.
+                # Only meaningful in surprise_modulated mode.
+                if surprise_per_target:
+                    self._last_surprise_per_target = {
+                        t: s.detach() for t, s in surprise_per_target.items()
+                    }
+                    self._last_alpha_t_per_target = {
+                        t: self.sparse_feedback[str(t)]
+                            .get_per_token_alpha(s).detach()
+                        for t, s in surprise_per_target.items()
+                    }
+                else:
+                    self._last_surprise_per_target = {}
+                    self._last_alpha_t_per_target = {}
                 if return_aux and self.aux_dim > 0:
                     return lm_logits, self.aux_head(h_norm)
                 return lm_logits
@@ -1365,6 +1543,17 @@ class TinyLM(nn.Module):
         if self.feedback_mode == "none":
             return []
         if self.feedback_pairs:
+            if self.feedback_alpha_mode == "surprise_modulated":
+                # Report (target, source, α₀_zero); the per-token α(t) is
+                # logged separately via _last_alpha_t_per_target. The
+                # `_alpha_zero` magnitude is the analogue of the scalar α
+                # in the unmodulated baseline (max α achievable when σ→1).
+                return [
+                    (t, s,
+                     float(self.sparse_feedback[str(t)]
+                           .alpha_zero.detach().mean().item()))
+                    for t, s in self.feedback_pairs
+                ]
             return [(t, s, float(self.sparse_feedback[str(t)].alpha.detach().mean().item()))
                     for t, s in self.feedback_pairs]
         if len(self.feedback_distances) == 1:

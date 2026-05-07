@@ -1,0 +1,87 @@
+GPU: NVIDIA GeForce RTX 5090
+Loading checkpoint: checkpoints/film_self_k3_surprise_2_28_30L_217M.pt
+  config: {'d_model': 576, 'n_layers': 30, 'feedback_pairs': [(2, 28)], 'feedback_mode': 'film', 'feedback_self_k': 3, 'feedback_alpha_mode': 'surprise_modulated'}
+Loading codeparrot val tail (skip=10_000) at T=512 ...
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+  16 chunks × T=512 = 8192 eval tokens
+
+--- Training-protocol PPL (model's K-iter self-feeding forward) ---
+  CE  = 3.8341
+  PPL = 46.2516
+  (8192 tokens, 0.6s)
+
+--- Self-consistency norms (prev_iter vs final_iter source state) ---
+  {'feedback_self_k': 3, 'n_batches': 4, 'abs_norm_mean': 1884.6643676757812, 'final_norm_mean': 11219.736083984375, 'rel_norm_mean': 0.16827342732112782}
+  (0.2s)
+
+--- surprise(t) and α(t) distributions ---
+  Target layer 2:
+    surprise(t): mean=103.1288  std=31.9436  min=0.0000  max=317.1245  p50=98.3434  p95=160.8971
+    α(t):        mean=0.0458  std=0.0076  min=0.0180  max=0.0786  p50=0.0448  p95=0.0598
+  surprise(t) histogram (n=8192, min=0.0000, max=317.1245):
+      0.0000 –  15.8562 |     17 
+     15.8562 –  31.7124 |     19 
+     31.7124 –  47.5687 |     84 █
+     47.5687 –  63.4249 |    398 ████████
+     63.4249 –  79.2811 |   1204 ████████████████████████
+     79.2811 –  95.1373 |   1968 ████████████████████████████████████████
+     95.1373 – 110.9936 |   1745 ███████████████████████████████████
+    110.9936 – 126.8498 |   1178 ███████████████████████
+    126.8498 – 142.7060 |    732 ██████████████
+    142.7060 – 158.5622 |    384 ███████
+    158.5622 – 174.4185 |    222 ████
+    174.4185 – 190.2747 |    118 ██
+    190.2747 – 206.1309 |     55 █
+    206.1309 – 221.9871 |     33 
+    221.9871 – 237.8434 |     13 
+    237.8434 – 253.6996 |      7 
+    253.6996 – 269.5558 |      9 
+    269.5558 – 285.4120 |      0 
+    285.4120 – 301.2683 |      2 
+    301.2683 – 317.1245 |      4 
+  α(t) histogram (n=8192, min=0.0180, max=0.0786):
+      0.0180 –   0.0210 |      8 
+      0.0210 –   0.0240 |      9 
+      0.0240 –   0.0271 |      9 
+      0.0271 –   0.0301 |     33 
+      0.0301 –   0.0331 |    100 ██
+      0.0331 –   0.0361 |    371 █████████
+      0.0361 –   0.0392 |    927 ████████████████████████
+      0.0392 –   0.0422 |   1353 ███████████████████████████████████
+      0.0422 –   0.0452 |   1511 ████████████████████████████████████████
+      0.0452 –   0.0483 |   1212 ████████████████████████████████
+      0.0483 –   0.0513 |    917 ████████████████████████
+      0.0513 –   0.0543 |    649 █████████████████
+      0.0543 –   0.0574 |    418 ███████████
+      0.0574 –   0.0604 |    306 ████████
+      0.0604 –   0.0634 |    170 ████
+      0.0634 –   0.0664 |    101 ██
+      0.0664 –   0.0695 |     58 █
+      0.0695 –   0.0725 |     22 
+      0.0725 –   0.0755 |     13 
+      0.0755 –   0.0786 |      5 
+  (0.2s)
+
+--- 2-pass PPL (gold reference, training-faithful 2-pass) ---
+  [info] surprise_modulated checkpoint: ignoring override_self_k=0, using trained K=3.
+  CE  = 3.8341
+  PPL = 46.2516
+  (8192 tokens, 0.2s)
+
+--- Lagged-cached deployment PPL (1× decode cost protocol) ---
+  [  5/16]  partial CE=3.6333  PPL=37.84  (78 tok/s, ETA 72s)
+  [ 10/16]  partial CE=3.8118  PPL=45.23  (78 tok/s, ETA 40s)
+  [ 15/16]  partial CE=3.8307  PPL=46.10  (77 tok/s, ETA 7s)
+  [ 16/16]  partial CE=3.8327  PPL=46.19  (77 tok/s, ETA 0s)
+  CE  = 3.8327
+  PPL = 46.1867
+  (8192 tokens, 106.4s)
+
+--- Comparison ---
+  PPL (training-protocol K=3)  = 46.2516
+  PPL (2-pass gold)               = 46.2516
+  PPL (lagged-cached deployment)  = 46.1867
+  ΔPPL lagged vs training-protocol: -0.0649 (-0.14 %)
+  ΔPPL lagged vs 2-pass:            -0.0649 (-0.14 %)
+
+Results written to bench_film_self_k3_surprise_ppl_8k.json

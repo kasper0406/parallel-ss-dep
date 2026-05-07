@@ -67,11 +67,25 @@ from experiments.decode_bench import _block_with_cache
 def load_film_217m(path: str, device: str = "cuda",
                     override_self_k: int | None = None) -> TinyLM:
     """Load a TinyLM 217M sparse-FiLM checkpoint, optionally overriding the
-    self-feeding K (e.g. set to 0 for plain 2-pass eval)."""
+    self-feeding K (e.g. set to 0 for plain 2-pass eval).
+
+    For surprise_modulated checkpoints, override_self_k is *ignored* — we
+    always use the trained K because the surprise signal depends on having
+    multiple no-grad iterations to compute the inter-iter delta. The
+    fallback case (when no surprise tensor is provided, e.g. lagged-cached
+    deploy) uses α₀·σ(bias) inside the FeedbackProjection forward.
+    """
     ckpt = torch.load(path, map_location=device, weights_only=False)
     cfg = ckpt["config"]
-    self_k = (override_self_k if override_self_k is not None
-              else cfg.get("feedback_self_k", 0))
+    alpha_mode = cfg.get("feedback_alpha_mode", "scalar")
+    self_k_ckpt = cfg.get("feedback_self_k", 0)
+    if override_self_k is not None and alpha_mode == "surprise_modulated":
+        print(f"  [info] surprise_modulated checkpoint: ignoring "
+              f"override_self_k={override_self_k}, using trained K={self_k_ckpt}.")
+        self_k = self_k_ckpt
+    else:
+        self_k = (override_self_k if override_self_k is not None
+                  else self_k_ckpt)
     model = TinyLM(
         vocab_size=cfg["vocab_size"],
         d_model=cfg["d_model"], n_layers=cfg["n_layers"],
@@ -81,6 +95,7 @@ def load_film_217m(path: str, device: str = "cuda",
         feedback_mode=cfg.get("feedback_mode", "film"),
         feedback_pairs=cfg.get("feedback_pairs", ()),
         feedback_self_k=self_k,
+        feedback_alpha_mode=alpha_mode,
     ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
@@ -266,6 +281,81 @@ def eval_self_consistency(model, chunks: torch.Tensor,
     }
 
 
+@torch.no_grad()
+def collect_surprise_alpha_distribution(model, chunks: torch.Tensor,
+                                          batch: int = 4) -> dict:
+    """For surprise_modulated checkpoints, collect surprise(t) and α(t)
+    distributions over the val slice.
+
+    Returns a dict with per-target histograms (numpy lists), summary
+    stats (mean/std/min/max/p5/p50/p95), and ASCII plots for quick eyeballing.
+    Only meaningful when model.feedback_alpha_mode == 'surprise_modulated'.
+    Returns an empty dict for scalar α models.
+    """
+    if getattr(model, "feedback_alpha_mode", "scalar") != "surprise_modulated":
+        return {"feedback_alpha_mode": "scalar",
+                "note": "scalar α; no per-token distribution to collect"}
+    if model.feedback_self_k == 0:
+        return {"feedback_self_k": 0,
+                "note": "no self-feeding; cannot compute surprise"}
+    import numpy as np
+    device = next(model.parameters()).device
+    surprise_acc: dict = {}
+    alpha_t_acc: dict = {}
+    N = chunks.shape[0]
+    for i in range(0, N, batch):
+        batch_chunks = chunks[i : i + batch].to(device)
+        x = batch_chunks[:, :-1]
+        _ = model(x)
+        for t, sup in model._last_surprise_per_target.items():
+            surprise_acc.setdefault(t, []).append(sup.float().reshape(-1).cpu().numpy())
+        for t, at in model._last_alpha_t_per_target.items():
+            alpha_t_acc.setdefault(t, []).append(at.float().reshape(-1).cpu().numpy())
+    out: dict = {"feedback_alpha_mode": "surprise_modulated", "per_target": {}}
+    for t in surprise_acc:
+        sup_all = np.concatenate(surprise_acc[t])
+        at_all = np.concatenate(alpha_t_acc[t])
+
+        def _summary(a):
+            qs = np.quantile(a.astype(np.float64),
+                              [0.05, 0.25, 0.5, 0.75, 0.95]).tolist()
+            return {
+                "mean": float(a.mean()),
+                "std": float(a.std()),
+                "min": float(a.min()),
+                "max": float(a.max()),
+                "p5": qs[0], "p25": qs[1], "p50": qs[2],
+                "p75": qs[3], "p95": qs[4],
+                "n": int(a.size),
+            }
+
+        def _ascii_hist(a, n_bins=20, width=40, label=""):
+            counts, edges = np.histogram(a.astype(np.float64), bins=n_bins)
+            mx = max(counts.max(), 1)
+            lines = [f"  {label} histogram (n={a.size}, "
+                     f"min={a.min():.4f}, max={a.max():.4f}):"]
+            for c, lo, hi in zip(counts, edges[:-1], edges[1:]):
+                bar = "█" * int(width * c / mx) if mx > 0 else ""
+                lines.append(f"    {lo:8.4f} – {hi:8.4f} | {c:6d} {bar}")
+            return "\n".join(lines)
+
+        out["per_target"][int(t)] = {
+            "surprise": _summary(sup_all),
+            "alpha_t": _summary(at_all),
+            "surprise_hist_ascii": _ascii_hist(sup_all, label="surprise(t)"),
+            "alpha_t_hist_ascii": _ascii_hist(at_all, label="α(t)"),
+            "surprise_hist": np.histogram(
+                sup_all.astype(np.float64), bins=40)[0].tolist(),
+            "surprise_hist_edges": np.histogram(
+                sup_all.astype(np.float64), bins=40)[1].tolist(),
+            "alpha_t_hist": np.histogram(
+                at_all.astype(np.float64), bins=40)[0].tolist(),
+            "alpha_t_hist_edges": np.histogram(
+                at_all.astype(np.float64), bins=40)[1].tolist(),
+        }
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Main.
 # ---------------------------------------------------------------------------
@@ -296,6 +386,7 @@ def main():
         "feedback_pairs": list(model_self.feedback_pairs),
         "feedback_mode": model_self.feedback_mode,
         "feedback_self_k": model_self.feedback_self_k,
+        "feedback_alpha_mode": getattr(model_self, "feedback_alpha_mode", "scalar"),
     }
     print(f"  config: {cfg_d}")
 
@@ -336,6 +427,36 @@ def main():
     print(f"  {sc}")
     print(f"  ({elapsed_sc:.1f}s)")
     results["self_consistency"] = sc
+
+    # 2b. surprise(t) and α(t) distributions for surprise_modulated
+    # checkpoints. Empty dict for scalar-α checkpoints.
+    if getattr(model_self, "feedback_alpha_mode", "scalar") == "surprise_modulated":
+        print("\n--- surprise(t) and α(t) distributions ---")
+        t0 = time.perf_counter()
+        dist = collect_surprise_alpha_distribution(model_self, chunks,
+                                                     batch=args.batch)
+        elapsed_d = time.perf_counter() - t0
+        # Print ASCII histograms for quick eyeballing.
+        for t, target_d in dist.get("per_target", {}).items():
+            print(f"  Target layer {t}:")
+            print(f"    surprise(t): "
+                  f"mean={target_d['surprise']['mean']:.4f}  "
+                  f"std={target_d['surprise']['std']:.4f}  "
+                  f"min={target_d['surprise']['min']:.4f}  "
+                  f"max={target_d['surprise']['max']:.4f}  "
+                  f"p50={target_d['surprise']['p50']:.4f}  "
+                  f"p95={target_d['surprise']['p95']:.4f}")
+            print(f"    α(t):        "
+                  f"mean={target_d['alpha_t']['mean']:.4f}  "
+                  f"std={target_d['alpha_t']['std']:.4f}  "
+                  f"min={target_d['alpha_t']['min']:.4f}  "
+                  f"max={target_d['alpha_t']['max']:.4f}  "
+                  f"p50={target_d['alpha_t']['p50']:.4f}  "
+                  f"p95={target_d['alpha_t']['p95']:.4f}")
+            print(target_d["surprise_hist_ascii"])
+            print(target_d["alpha_t_hist_ascii"])
+        print(f"  ({elapsed_d:.1f}s)")
+        results["surprise_alpha_distribution"] = dist
 
     # 3. 2-pass PPL — same model weights, but with feedback_self_k=0 (standard
     # 2-pass forward). Sanity-checks that self-feeding-trained weights still

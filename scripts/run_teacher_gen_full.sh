@@ -46,4 +46,4 @@ nohup /home/knielsen/ml/parallel-ss-dep/.venv-vllm/bin/python -u \
 
 PID=$!
 echo "PID $PID logging to $LOG"
-echo $PID > logs/distill_pilot_full/teacher_gen_50M.pid
+echo $PID > logs/distill_pilot_full/teacher_gen_30M.pid

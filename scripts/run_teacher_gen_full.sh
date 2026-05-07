@@ -15,9 +15,12 @@ cd /home/knielsen/ml/parallel-ss-dep-distill
 mkdir -p logs/distill_pilot_full
 mkdir -p data
 
-TOTAL_TOKENS="${TOTAL_TOKENS:-50000000}"
-OUT_DIR="${OUT_DIR:-data/distill_pilot_50M}"
-LOG="${LOG:-logs/distill_pilot_full/teacher_gen_50M.log}"
+# Default: 30M tokens. Per the brief, fallback from 50M is acceptable
+# at 20-30M; 30M leaves comfortable headroom in the 2-day budget.
+# Override via env: TOTAL_TOKENS=50000000 OUT_DIR=... LOG=...
+TOTAL_TOKENS="${TOTAL_TOKENS:-30000000}"
+OUT_DIR="${OUT_DIR:-data/distill_pilot_30M}"
+LOG="${LOG:-logs/distill_pilot_full/teacher_gen_30M.log}"
 SEED="${SEED:-42}"
 
 export CUDA_VISIBLE_DEVICES=0

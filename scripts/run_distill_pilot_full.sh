@@ -17,7 +17,7 @@ mkdir -p logs/distill_pilot_full
 mkdir -p checkpoints
 
 # Defaults (the brief). Can be overridden via env.
-SHARDS="${SHARDS:-data/distill_pilot_50M}"
+SHARDS="${SHARDS:-data/distill_pilot_30M}"
 STEPS="${STEPS:-30000}"
 ALPHA="${ALPHA:-0.9}"
 TOP_K="${TOP_K:-20}"

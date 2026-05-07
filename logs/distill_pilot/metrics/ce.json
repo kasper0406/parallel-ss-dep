@@ -1,0 +1,73 @@
+{
+  "mode": "ce",
+  "alpha": 0.5,
+  "kl_weight": 0.0,
+  "ce_weight": 1.0,
+  "top_k": 20,
+  "steps": 1000,
+  "batch": 4,
+  "lr": 0.0003,
+  "seed": 0,
+  "d_model": 1280,
+  "n_heads": 20,
+  "d_head": 64,
+  "n_layers": 24,
+  "tie_embeddings": true,
+  "vocab_size": 248128,
+  "T": 512,
+  "params_M": 947.796736,
+  "shards": "/home/knielsen/ml/parallel-ss-dep-distill/data/distill_pilot_1M",
+  "teacher": "QuantTrio/Qwen3.6-35B-A3B-AWQ",
+  "dataset": "qwen_self_generated_code",
+  "wallclock_s": 167.9938063621521,
+  "final_val": {
+    "step": 1000,
+    "val_loss": 1.79208954423666,
+    "val_ce": 1.79208954423666,
+    "val_kl": 0.0,
+    "val_ppl": 6.001980776936128,
+    "n": 64
+  },
+  "val_history": [
+    {
+      "step": 0,
+      "val_loss": 12.910398960113525,
+      "val_ce": 12.910398960113525,
+      "val_kl": 0.0,
+      "val_ppl": 404496.74161710835,
+      "n": 64
+    },
+    {
+      "step": 250,
+      "val_loss": 2.9795658886432648,
+      "val_ce": 2.9795658886432648,
+      "val_kl": 0.0,
+      "val_ppl": 19.67927179480998,
+      "n": 64
+    },
+    {
+      "step": 500,
+      "val_loss": 2.281551957130432,
+      "val_ce": 2.281551957130432,
+      "val_kl": 0.0,
+      "val_ppl": 9.7918651784098,
+      "n": 64
+    },
+    {
+      "step": 750,
+      "val_loss": 1.9502897337079048,
+      "val_ce": 1.9502897337079048,
+      "val_kl": 0.0,
+      "val_ppl": 7.030724323345989,
+      "n": 64
+    },
+    {
+      "step": 1000,
+      "val_loss": 1.79208954423666,
+      "val_ce": 1.79208954423666,
+      "val_kl": 0.0,
+      "val_ppl": 6.001980776936128,
+      "n": 64
+    }
+  ]
+}

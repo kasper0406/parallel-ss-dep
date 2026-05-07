@@ -1,0 +1,73 @@
+{
+  "mode": "kl_ce",
+  "alpha": 0.5,
+  "kl_weight": 0.5,
+  "ce_weight": 0.5,
+  "top_k": 20,
+  "steps": 1000,
+  "batch": 4,
+  "lr": 0.0003,
+  "seed": 0,
+  "d_model": 1280,
+  "n_heads": 20,
+  "d_head": 64,
+  "n_layers": 24,
+  "tie_embeddings": true,
+  "vocab_size": 248128,
+  "T": 512,
+  "params_M": 947.796736,
+  "shards": "/home/knielsen/ml/parallel-ss-dep-distill/data/distill_pilot_1M",
+  "teacher": "QuantTrio/Qwen3.6-35B-A3B-AWQ",
+  "dataset": "qwen_self_generated_code",
+  "wallclock_s": 170.49640417099,
+  "final_val": {
+    "step": 1000,
+    "val_loss": 1.467502623796463,
+    "val_ce": 1.9333013966679573,
+    "val_kl": 1.0017038434743881,
+    "val_ppl": 6.912292834231735,
+    "n": 64
+  },
+  "val_history": [
+    {
+      "step": 0,
+      "val_loss": 7.954097479581833,
+      "val_ce": 12.910398960113525,
+      "val_kl": 2.9977959394454956,
+      "val_ppl": 404496.74161710835,
+      "n": 64
+    },
+    {
+      "step": 250,
+      "val_loss": 2.5010078996419907,
+      "val_ce": 3.3260242491960526,
+      "val_kl": 1.6759915202856064,
+      "val_ppl": 27.827486331436138,
+      "n": 64
+    },
+    {
+      "step": 500,
+      "val_loss": 1.8805871531367302,
+      "val_ce": 2.48486690223217,
+      "val_kl": 1.276307374238968,
+      "val_ppl": 11.999523038809121,
+      "n": 64
+    },
+    {
+      "step": 750,
+      "val_loss": 1.592326432466507,
+      "val_ce": 2.0980692356824875,
+      "val_kl": 1.086583647876978,
+      "val_ppl": 8.150418174430031,
+      "n": 64
+    },
+    {
+      "step": 1000,
+      "val_loss": 1.467502623796463,
+      "val_ce": 1.9333013966679573,
+      "val_kl": 1.0017038434743881,
+      "val_ppl": 6.912292834231735,
+      "n": 64
+    }
+  ]
+}

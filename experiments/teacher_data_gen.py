@@ -46,6 +46,16 @@ _DEFAULT_PROMPT_TEMPLATES = [
     "import {mod}\n\n\ndef {name}({args}):\n    ",
     "# Implement a function that {task}.\n\ndef {name}({args}):\n    ",
     "from typing import List\n\n\ndef {name}({args}) -> {ret}:\n    \"\"\"{doc}.\"\"\"\n    ",
+    "# {task}.\nimport {mod}\n\n\ndef {name}({args}) -> {ret}:\n    ",
+    "@dataclass\nclass {cls}:\n    \"\"\"{doc}.\"\"\"\n    ",
+    "def {name}({args}):\n    # {task}.\n    ",
+    "async def {name}({args}):\n    \"\"\"{doc}.\"\"\"\n    ",
+    "from {mod} import *\n\n\nclass {cls}:\n    def {name}(self{args2}) -> {ret}:\n        \"\"\"{doc}.\"\"\"\n        ",
+    "def test_{name}():\n    \"\"\"Test that {task}.\"\"\"\n    ",
+    "# Pure-Python implementation of {task}.\ndef {name}({args}):\n    ",
+    "from typing import Optional, Iterable\n\n\ndef {name}({args}) -> Optional[{ret}]:\n    \"\"\"{doc}.\"\"\"\n    ",
+    "class {cls}(Exception):\n    \"\"\"{doc}.\"\"\"\n    pass\n\n\ndef {name}({args}):\n    ",
+    "# Solution: {task}.\n\ndef {name}({args}):\n    ",
 ]
 
 _FUNC_NAMES = [
@@ -54,11 +64,33 @@ _FUNC_NAMES = [
     "extract", "count", "sort", "search", "convert", "normalise",
     "tokenize", "chunk", "flatten", "group", "rotate", "sample", "score",
     "train", "predict", "evaluate", "rank",
+    # Round 2 expansions for the full pilot:
+    "fold", "reduce", "zip", "unzip", "split", "join", "balance", "rebalance",
+    "iterate", "enumerate", "diff", "patch", "apply", "compose", "map",
+    "scan", "fuse", "unify", "match", "lookup", "shard", "merge_sort",
+    "dedupe", "expand", "shrink", "trim", "pad", "wrap", "unwrap",
+    "lift", "lower", "promote", "compile", "interpret", "render", "ingest",
+    "broadcast", "collapse", "reshape", "permute", "argsort", "argmax",
+    "softmax", "logsumexp", "rolling_mean", "ema", "stft", "fft", "rfft",
+    "rotate_left", "rotate_right", "reverse", "shuffle", "permutation",
+    "bin", "histogram", "interpolate", "extrapolate", "clip", "saturate",
 ]
 _ARG_LISTS = [
     "data", "x", "items, key=None", "a, b", "n: int", "s: str",
     "values: list", "obj, default=None", "lo, hi", "x, y, z=0",
     "tokens, vocab", "graph, src", "matrix, k=3", "model, batch",
+    # Round 2:
+    "items: list[int]", "items: list[str]", "values: dict",
+    "graph: dict[int, list[int]]", "tree: TreeNode | None",
+    "buf: bytes, offset: int = 0", "tokens: list[int]",
+    "left: float, right: float, eps: float = 1e-9",
+    "head: ListNode | None", "matrix: list[list[float]]",
+    "config: dict[str, int]", "src, dst, weight=1",
+    "items, *, reverse=False", "stream, chunk_size=4096",
+    "x: float, y: float, z: float = 0.0",
+    "a: int = 0, b: int = 0, c: int = 0",
+    "name: str, **kwargs", "*args, **kwargs",
+    "values, threshold=0.5", "axis: int = -1, keepdim: bool = False",
 ]
 _DOCS = [
     "return the result of the operation",
@@ -69,6 +101,22 @@ _DOCS = [
     "scan the input and emit any matching elements",
     "produce a normalised view",
     "validate the inputs and raise on error",
+    # Round 2:
+    "iterate over the input and yield processed values",
+    "merge two sources, deduplicating by key",
+    "build an index for fast lookup",
+    "stream the underlying buffer and yield decoded items",
+    "compute statistics suitable for downstream analysis",
+    "rebalance the data structure for amortized constant lookup",
+    "compose two callables, returning the wrapped function",
+    "evaluate the predicate and return the matching subset",
+    "encode the payload using the configured serialiser",
+    "decode the bytes and return a parsed object",
+    "translate the abstract representation into IR",
+    "execute the plan and return the result",
+    "checkpoint the state for later recovery",
+    "validate the schema and raise on constraint violation",
+    "sort the items by a custom key, stable",
 ]
 _TASKS = [
     "computes the running mean of a list",
@@ -86,12 +134,66 @@ _TASKS = [
     "parses an ISO-8601 timestamp string",
     "rotates a 2D matrix in place by 90 degrees",
     "computes the Levenshtein edit distance",
+    # Round 2:
+    "computes the n-th Fibonacci number iteratively",
+    "implements topological sort over a DAG",
+    "computes the convex hull of a set of 2D points",
+    "checks whether two strings are anagrams",
+    "implements run-length encoding of a string",
+    "implements run-length decoding of a string",
+    "removes duplicates while preserving order",
+    "flattens a nested list of arbitrary depth",
+    "computes the product of all elements except self",
+    "implements Kadane's algorithm for max subarray",
+    "encrypts a message using a one-time pad",
+    "implements a min-heap from scratch",
+    "implements memoization via a decorator",
+    "computes the GCD using the Euclidean algorithm",
+    "computes the LCM of two integers",
+    "performs Gaussian elimination on a matrix",
+    "implements quickselect for the n-th order statistic",
+    "applies a moving-average filter over a 1D signal",
+    "implements the Aho-Corasick string matcher",
+    "implements depth-first traversal with cycle detection",
+    "computes a sliding-window minimum in linear time",
+    "implements the union-find data structure with path compression",
+    "validates that brackets in a string are balanced",
+    "implements a priority queue with custom comparator",
+    "computes the determinant of a square matrix",
+    "implements a stable merge sort",
+    "computes the Damerau-Levenshtein edit distance",
+    "implements a Bloom filter with k hash functions",
+    "checks whether a graph is bipartite",
+    "computes the strongly connected components of a digraph",
 ]
 _CLASSES = ["Cache", "Buffer", "Worker", "Tokeniser", "Parser", "Stream",
-            "Pipeline", "Index", "Heap", "Queue", "Tree", "Graph"]
+            "Pipeline", "Index", "Heap", "Queue", "Tree", "Graph",
+            # Round 2:
+            "MinHeap", "MaxHeap", "Trie", "BloomFilter", "RingBuffer",
+            "PriorityQueue", "Deque", "Stack", "LinkedList", "DoublyLinkedList",
+            "Skiplist", "BTree", "RedBlackTree", "AVLTree", "SegmentTree",
+            "FenwickTree", "DSU", "UnionFind", "DAG", "FSM", "StateMachine",
+            "Counter", "MultiSet", "OrderedDict", "DefaultDict",
+            "AsyncWorker", "AsyncQueue", "RateLimiter", "TokenBucket",
+            "Connection", "Pool", "Cursor", "Iterator", "Generator",
+            "Coroutine", "Channel", "Mailbox", "Actor", "Scheduler",
+            "EventLoop", "Selector", "Reactor"]
 _MODULES = ["math", "json", "re", "os", "collections", "itertools",
-            "functools", "heapq", "bisect", "hashlib"]
-_RETURNS = ["int", "float", "str", "list", "dict", "bool", "tuple"]
+            "functools", "heapq", "bisect", "hashlib",
+            # Round 2:
+            "logging", "threading", "asyncio", "multiprocessing", "queue",
+            "csv", "io", "struct", "pickle", "base64",
+            "uuid", "time", "datetime", "calendar", "decimal",
+            "fractions", "statistics", "random", "secrets", "string",
+            "operator", "copy", "weakref", "contextlib", "dataclasses",
+            "typing", "abc", "warnings", "traceback"]
+_RETURNS = ["int", "float", "str", "list", "dict", "bool", "tuple",
+            # Round 2:
+            "bytes", "bytearray", "set", "frozenset", "complex",
+            "Iterator[int]", "Iterable[str]", "list[int]", "list[str]",
+            "dict[str, int]", "dict[int, list[int]]", "set[str]",
+            "tuple[int, ...]", "tuple[str, int]",
+            "Optional[int]", "Optional[str]", "None"]
 
 
 def make_prompts(n: int, rng: random.Random) -> list[str]:

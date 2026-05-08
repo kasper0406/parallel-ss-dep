@@ -373,6 +373,16 @@ def main():
                    help="Batch size for non-streaming evals.")
     p.add_argument("--out", type=str, default="bench_film_self_ppl.json")
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--dataset", type=str, default="codeparrot/codeparrot-clean",
+                   help="HF dataset for the val tail. "
+                        "Default codeparrot/codeparrot-clean.")
+    p.add_argument("--text_field", type=str, default="content",
+                   help="Text field in the dataset (default 'content' for "
+                        "codeparrot, use 'text' for TinyStories).")
+    p.add_argument("--skip_lagged_cached", action="store_true",
+                   help="Skip the slow token-by-token lagged-cached eval. "
+                        "Useful for plain-DN baselines that don't have "
+                        "feedback_pairs.")
     args = p.parse_args()
 
     print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -391,10 +401,12 @@ def main():
     }
     print(f"  config: {cfg_d}")
 
-    print(f"Loading codeparrot val tail (skip=10_000) at T={args.T} ...")
+    print(f"Loading {args.dataset} val tail (skip=10_000) at T={args.T} ...")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
     chunks = make_val_chunks(tok, T=args.T, n_tokens=args.n_tokens,
+                              dataset=args.dataset,
+                              text_field=args.text_field,
                               skip=10_000)
     n_chunks, _ = chunks.shape
     target_tokens = n_chunks * args.T
@@ -459,56 +471,62 @@ def main():
         print(f"  ({elapsed_d:.1f}s)")
         results["surprise_alpha_distribution"] = dist
 
-    # 3. 2-pass PPL — same model weights, but with feedback_self_k=0 (standard
-    # 2-pass forward). Sanity-checks that self-feeding-trained weights still
-    # produce a coherent PPL when run in 2-pass mode.
-    print("\n--- 2-pass PPL (gold reference, training-faithful 2-pass) ---")
-    del model_self
-    torch.cuda.empty_cache()
-    model_2pass = load_film_217m(args.ckpt, device=args.device, override_self_k=0)
-    t0 = time.perf_counter()
-    ce_2p, n_2p, ppl_2p = eval_model_forward_ppl(model_2pass, chunks, batch=args.batch)
-    elapsed_2p = time.perf_counter() - t0
-    print(f"  CE  = {ce_2p:.4f}")
-    print(f"  PPL = {ppl_2p:.4f}")
-    print(f"  ({n_2p} tokens, {elapsed_2p:.1f}s)")
-    results["2pass"] = {
-        "ce": ce_2p, "ppl": ppl_2p, "n_tokens": n_2p, "elapsed_s": elapsed_2p,
-    }
+    if args.skip_lagged_cached or not cfg_d["feedback_pairs"]:
+        # No FiLM pairs (plain DN baseline) or explicit skip — only the
+        # training-protocol PPL is meaningful. Do not run 2-pass /
+        # lagged-cached.
+        print("\n--- (Skipping 2-pass and lagged-cached — no FiLM pair) ---")
+    else:
+        # 3. 2-pass PPL — same model weights, but with feedback_self_k=0 (standard
+        # 2-pass forward). Sanity-checks that self-feeding-trained weights still
+        # produce a coherent PPL when run in 2-pass mode.
+        print("\n--- 2-pass PPL (gold reference, training-faithful 2-pass) ---")
+        del model_self
+        torch.cuda.empty_cache()
+        model_2pass = load_film_217m(args.ckpt, device=args.device, override_self_k=0)
+        t0 = time.perf_counter()
+        ce_2p, n_2p, ppl_2p = eval_model_forward_ppl(model_2pass, chunks, batch=args.batch)
+        elapsed_2p = time.perf_counter() - t0
+        print(f"  CE  = {ce_2p:.4f}")
+        print(f"  PPL = {ppl_2p:.4f}")
+        print(f"  ({n_2p} tokens, {elapsed_2p:.1f}s)")
+        results["2pass"] = {
+            "ce": ce_2p, "ppl": ppl_2p, "n_tokens": n_2p, "elapsed_s": elapsed_2p,
+        }
 
-    # 4. Lagged-cached PPL — token-by-token streaming with previous-step
-    # pass-2 source as the lagged FiLM input. Reuses the same model_2pass
-    # (the cell forward is identical; the FiLM module is the same params).
-    print("\n--- Lagged-cached deployment PPL (1× decode cost protocol) ---")
-    t0 = time.perf_counter()
-    ce_lc, n_lc, ppl_lc = eval_lagged_cached_ppl(model_2pass, chunks)
-    elapsed_lc = time.perf_counter() - t0
-    print(f"  CE  = {ce_lc:.4f}")
-    print(f"  PPL = {ppl_lc:.4f}")
-    print(f"  ({n_lc} tokens, {elapsed_lc:.1f}s)")
-    results["lagged_cached"] = {
-        "ce": ce_lc, "ppl": ppl_lc, "n_tokens": n_lc, "elapsed_s": elapsed_lc,
-    }
+        # 4. Lagged-cached PPL — token-by-token streaming with previous-step
+        # pass-2 source as the lagged FiLM input. Reuses the same model_2pass
+        # (the cell forward is identical; the FiLM module is the same params).
+        print("\n--- Lagged-cached deployment PPL (1× decode cost protocol) ---")
+        t0 = time.perf_counter()
+        ce_lc, n_lc, ppl_lc = eval_lagged_cached_ppl(model_2pass, chunks)
+        elapsed_lc = time.perf_counter() - t0
+        print(f"  CE  = {ce_lc:.4f}")
+        print(f"  PPL = {ppl_lc:.4f}")
+        print(f"  ({n_lc} tokens, {elapsed_lc:.1f}s)")
+        results["lagged_cached"] = {
+            "ce": ce_lc, "ppl": ppl_lc, "n_tokens": n_lc, "elapsed_s": elapsed_lc,
+        }
 
-    # 5. Comparisons.
-    gap_lc_vs_train_abs = ppl_lc - ppl
-    gap_lc_vs_train_rel = gap_lc_vs_train_abs / ppl
-    gap_lc_vs_2p_abs = ppl_lc - ppl_2p
-    gap_lc_vs_2p_rel = gap_lc_vs_2p_abs / ppl_2p
-    print("\n--- Comparison ---")
-    print(f"  PPL (training-protocol K={cfg_d['feedback_self_k']})  = {ppl:.4f}")
-    print(f"  PPL (2-pass gold)               = {ppl_2p:.4f}")
-    print(f"  PPL (lagged-cached deployment)  = {ppl_lc:.4f}")
-    print(f"  ΔPPL lagged vs training-protocol: {gap_lc_vs_train_abs:+.4f} "
-          f"({gap_lc_vs_train_rel*100:+.2f} %)")
-    print(f"  ΔPPL lagged vs 2-pass:            {gap_lc_vs_2p_abs:+.4f} "
-          f"({gap_lc_vs_2p_rel*100:+.2f} %)")
-    results["gap"] = {
-        "lc_vs_training_abs": gap_lc_vs_train_abs,
-        "lc_vs_training_rel": gap_lc_vs_train_rel,
-        "lc_vs_2pass_abs": gap_lc_vs_2p_abs,
-        "lc_vs_2pass_rel": gap_lc_vs_2p_rel,
-    }
+        # 5. Comparisons.
+        gap_lc_vs_train_abs = ppl_lc - ppl
+        gap_lc_vs_train_rel = gap_lc_vs_train_abs / ppl
+        gap_lc_vs_2p_abs = ppl_lc - ppl_2p
+        gap_lc_vs_2p_rel = gap_lc_vs_2p_abs / ppl_2p
+        print("\n--- Comparison ---")
+        print(f"  PPL (training-protocol K={cfg_d['feedback_self_k']})  = {ppl:.4f}")
+        print(f"  PPL (2-pass gold)               = {ppl_2p:.4f}")
+        print(f"  PPL (lagged-cached deployment)  = {ppl_lc:.4f}")
+        print(f"  ΔPPL lagged vs training-protocol: {gap_lc_vs_train_abs:+.4f} "
+              f"({gap_lc_vs_train_rel*100:+.2f} %)")
+        print(f"  ΔPPL lagged vs 2-pass:            {gap_lc_vs_2p_abs:+.4f} "
+              f"({gap_lc_vs_2p_rel*100:+.2f} %)")
+        results["gap"] = {
+            "lc_vs_training_abs": gap_lc_vs_train_abs,
+            "lc_vs_training_rel": gap_lc_vs_train_rel,
+            "lc_vs_2pass_abs": gap_lc_vs_2p_abs,
+            "lc_vs_2pass_rel": gap_lc_vs_2p_rel,
+        }
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

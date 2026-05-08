@@ -1,0 +1,24 @@
+GPU: NVIDIA GeForce RTX 5090  arch=deltanet
+Loading tokeniser HuggingFaceTB/SmolLM2-135M ...
+  vocab size: 49152
+Loading dataset codeparrot/codeparrot-clean (streaming) ...
+  no val/test split — using shuffled train tail as validation
+  params: 216.9M  aux_dim=0  feedback=film@d=1
+Loading frozen encoder: checkpoints/dn_baseline_30L_217M_for_oracle.pt
+  encoder: 216.3M params (no oracle: uniform/per-token/KL mode)
+  logit_kl_beta = 1.0 (temperature T = 2.0)
+
+  step     tok/s     tloss        ce       lkl         lr
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (93413 > 8192). Running this sequence through the model will result in indexing errors
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (45285 > 8192). Running this sequence through the model will result in indexing errors
+   500     15209    5.5015    5.5015    0.8490   2.93e-04  α=[2<-28:+0.050]
+  1000     15203    4.5360    4.5360    0.4084   2.74e-04  α=[2<-28:+0.063]
+  1500     15205    4.0670    4.0670    0.3087   2.44e-04  α=[2<-28:+0.062]
+  2000     15219    4.0584    4.0584    0.2391   2.07e-04  α=[2<-28:+0.059]
+  2500     15252    3.8267    3.8267    0.2023   1.65e-04  α=[2<-28:+0.056]
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=4.1453  ppl=63.14
+  3000     15070    3.6311    3.6311    0.1687   1.23e-04  α=[2<-28:+0.053]
+  3500     15215    3.4879    3.4879    0.1532   8.56e-05  α=[2<-28:+0.051]
+  4000     15184    3.5766    3.5766    0.1259   5.58e-05  α=[2<-28:+0.048]
+  4500     15201    3.3818    3.3818    0.1212   3.66e-05  α=[2<-28:+0.046]

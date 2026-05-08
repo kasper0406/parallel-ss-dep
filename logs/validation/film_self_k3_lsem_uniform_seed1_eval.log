@@ -1,0 +1,49 @@
+GPU: NVIDIA GeForce RTX 5090
+Loading checkpoint: checkpoints/film_self_k3_lsem_uniform_b10_30L_217M_seed1.pt
+  config: {'d_model': 576, 'n_layers': 30, 'feedback_pairs': [(2, 28)], 'feedback_self_k': 3, 'feedback_alpha_mode': 'scalar'}
+
+Building val-tail file chunks at T=512, n_eval_tokens=32768 ...
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (15558 > 8192). Running this sequence through the model will result in indexing errors
+<unknown>:37: SyntaxWarning: invalid escape sequence '\s'
+<unknown>:80: SyntaxWarning: invalid escape sequence '\>'
+<unknown>:87: SyntaxWarning: invalid escape sequence '\!'
+<unknown>:60: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:64: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:65: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:701: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:889: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:1244: SyntaxWarning: invalid escape sequence '\d'
+<unknown>:1337: SyntaxWarning: invalid escape sequence '\('
+<unknown>:2392: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:2443: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:2587: SyntaxWarning: invalid escape sequence '\_'
+  67 files, 33013 real tokens, 1604 statements
+
+--- Per-statement metrics (overall PPL) ---
+  overall CE  = 3.7772
+  overall PPL = 43.6943
+  (22047 stmt-internal tokens, 1.4s)
+
+Loading frozen encoder from checkpoints/dn_baseline_30L_217M_for_oracle.pt ...
+Loading oracle head from checkpoints/oracle_predictive_head_217M.pt ...
+
+--- Computing oracle surprise per statement ---
+  (0.6s)
+
+--- Decile-binned metrics ---
+  Overall:        n_stmts=1604, n_tokens=22047, PPL=43.6943
+  Top decile:     n_stmts=153, n_tokens=2054, PPL=49.6587, surprise_range=[0.5489,0.9441]
+  Bottom decile:  n_stmts=153, n_tokens=2104, PPL=43.5971, surprise_range=[0.0361,0.1144]
+  Per-decile PPL (low to high surprise):
+    D0: n_stmts=153, n_toks=2104, PPL=43.5971, surp=[0.0361,0.1144]
+    D1: n_stmts=154, n_toks=1770, PPL=31.1197, surp=[0.1144,0.1581]
+    D2: n_stmts=154, n_toks=1693, PPL=27.6944, surp=[0.1583,0.1902]
+    D3: n_stmts=153, n_toks=1768, PPL=43.1852, surp=[0.1906,0.2237]
+    D4: n_stmts=154, n_toks=2068, PPL=30.3772, surp=[0.2240,0.2619]
+    D5: n_stmts=154, n_toks=1918, PPL=46.1590, surp=[0.2625,0.3039]
+    D6: n_stmts=153, n_toks=2391, PPL=49.6445, surp=[0.3040,0.3594]
+    D7: n_stmts=154, n_toks=2132, PPL=45.5225, surp=[0.3598,0.4306]
+    D8: n_stmts=154, n_toks=2477, PPL=48.0403, surp=[0.4327,0.5478]
+    D9: n_stmts=154, n_toks=2063, PPL=49.1429, surp=[0.5488,0.9441]
+
+Results written to bench_stmt_ppl_lsem_uniform_seed1.json

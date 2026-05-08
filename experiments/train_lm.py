@@ -276,6 +276,25 @@ def main():
                         "isolate whether structural-surprise weighting "
                         "contributes anything beyond the alignment loss "
                         "itself.")
+    p.add_argument("--semantic_loss_granularity", type=str, default="statement",
+                   choices=["statement", "token"],
+                   help="Phase 22b ablation 2: granularity of L_sem alignment. "
+                        "'statement' (default) = mean-pool model+encoder hidden "
+                        "across each AST statement, align with cosine. 'token' "
+                        "= per-token cosine alignment (no AST infrastructure, "
+                        "uses standard TokenisedStream loader). Used to test "
+                        "whether AST-statement segmentation does real work or "
+                        "if pure per-token alignment matches it.")
+    p.add_argument("--logit_kl_beta", type=float, default=0.0,
+                   help="Phase 22b ablation 3: weight on a textbook KL-on-logits "
+                        "distillation loss. >0 = enable; replaces L_sem "
+                        "entirely. Encoder forward provides the teacher logits "
+                        "(temperature `--logit_kl_temp`). Loss adds "
+                        "β · T² · KL(softmax(student/T) || softmax(teacher/T)) "
+                        "averaged over (B*T) positions. Requires --encoder_ckpt.")
+    p.add_argument("--logit_kl_temp", type=float, default=2.0,
+                   help="Temperature for the KL-on-logits ablation (default 2.0, "
+                        "textbook KD).")
     p.add_argument("--feedback_scratchpad", type=str, default="",
                    help="Surprise-gated scratchpad pairs, semicolon-separated. "
                         "Each is 'target,source' where target attends causally "
@@ -388,15 +407,32 @@ def main():
             val_stream = load_dataset(args.dataset, split="train",
                                       **ds_kwargs).shuffle(seed=42).skip(10_000)
 
+    # Three "alignment loss" modes that can use a frozen encoder:
+    #   (a) statement-pooled L_sem  (Phase 22 default; needs AST loader)
+    #   (b) per-token L_sem          (Phase 22b ablation 2; standard loader)
+    #   (c) logit-level KL           (Phase 22b ablation 3; standard loader)
+    # Modes (b) and (c) do NOT require AST-aware data; mode (a) does.
     use_semantic_loss = (args.semantic_loss_beta > 0.0)
-    if use_semantic_loss:
-        if not args.encoder_ckpt:
-            raise SystemExit(
-                "--semantic_loss_beta > 0 requires --encoder_ckpt.")
-        if not args.semantic_loss_uniform_weight and not args.oracle_ckpt:
-            raise SystemExit(
-                "--semantic_loss_beta > 0 (without --semantic_loss_uniform_weight) "
-                "requires --oracle_ckpt for surprise weighting.")
+    use_logit_kl = (args.logit_kl_beta > 0.0)
+    use_per_token_lsem = (use_semantic_loss
+                          and args.semantic_loss_granularity == "token")
+    use_stmt_lsem = (use_semantic_loss
+                     and args.semantic_loss_granularity == "statement")
+    needs_encoder = use_semantic_loss or use_logit_kl
+    needs_ast = use_stmt_lsem
+    if needs_encoder and not args.encoder_ckpt:
+        raise SystemExit(
+            "Alignment-loss modes (--semantic_loss_beta or --logit_kl_beta) "
+            "require --encoder_ckpt.")
+    if (use_stmt_lsem and not args.semantic_loss_uniform_weight
+            and not args.oracle_ckpt):
+        raise SystemExit(
+            "Statement-granularity surprise-weighted L_sem requires "
+            "--oracle_ckpt (or pass --semantic_loss_uniform_weight).")
+    if use_semantic_loss and use_logit_kl:
+        raise SystemExit(
+            "Pick at most one of --semantic_loss_beta or --logit_kl_beta.")
+    if needs_ast:
         from experiments.statement_stream import (
             StatementAwareTokenisedStream, collate_with_statements,
         )
@@ -493,7 +529,8 @@ def main():
         feedback_scratchpad_routing=args.feedback_scratchpad_routing,
         feedback_self_k=args.feedback_self_k,
         feedback_alpha_mode=args.feedback_alpha_mode,
-        semantic_loss_dim=(args.d_model if use_semantic_loss else 0),
+        semantic_loss_dim=(args.d_model
+                           if (use_semantic_loss) else 0),
         **attn_kw,
     ).to("cuda")
     if args.freeze_alpha and (args.feedback != "none" or fb_xattn_pairs):
@@ -519,17 +556,18 @@ def main():
         bracket_deltas = None
 
     # Phase 22 / structural-surprise full PoC: load frozen encoder and
-    # oracle for L_sem.
+    # oracle for L_sem (and Phase 22b ablations: KL-on-logits / per-token L_sem).
     encoder = None
     oracle_head = None
-    if use_semantic_loss:
+    if needs_encoder:
         from experiments.eval_statement_ppl import load_model as load_lm_ckpt
-        print(f"Loading frozen encoder for L_sem: {args.encoder_ckpt}")
+        print(f"Loading frozen encoder: {args.encoder_ckpt}")
         encoder = load_lm_ckpt(args.encoder_ckpt, device="cuda")
         for q in encoder.parameters():
             q.requires_grad_(False)
         encoder.eval()
-        if args.oracle_ckpt and not args.semantic_loss_uniform_weight:
+        if (use_stmt_lsem and args.oracle_ckpt
+                and not args.semantic_loss_uniform_weight):
             from experiments.oracle_train import OraclePredictor
             print(f"Loading oracle predictive head: {args.oracle_ckpt}")
             oc = torch.load(args.oracle_ckpt, map_location="cuda",
@@ -543,10 +581,18 @@ def main():
             oh_str = f", oracle: {oh_params:.2f}M params"
         else:
             oracle_head = None
-            oh_str = " (uniform L_sem; oracle skipped)"
+            oh_str = " (no oracle: uniform/per-token/KL mode)"
         print(f"  encoder: {encoder.num_params()/1e6:.1f}M params" + oh_str)
-        print(f"  semantic_loss_beta = {args.semantic_loss_beta}"
-              f"{' (uniform-weight)' if args.semantic_loss_uniform_weight else ''}")
+        if use_stmt_lsem:
+            print(f"  semantic_loss_beta = {args.semantic_loss_beta} "
+                  f"(statement-granularity"
+                  f"{', uniform-weight' if args.semantic_loss_uniform_weight else ', surprise-weighted'})")
+        elif use_per_token_lsem:
+            print(f"  semantic_loss_beta = {args.semantic_loss_beta} "
+                  f"(token-granularity per-position cosine alignment)")
+        elif use_logit_kl:
+            print(f"  logit_kl_beta = {args.logit_kl_beta} "
+                  f"(temperature T = {args.logit_kl_temp})")
 
     # Optimizer construction — single AdamW (default) or Muon + AdamW split.
     if args.optimizer == "adamw":
@@ -592,8 +638,12 @@ def main():
 
     # 3. Train loop.
     if use_semantic_loss:
+        unit = "nstmt" if use_stmt_lsem else "ntok"
         print(f"\n{'step':>6}  {'tok/s':>8}  {'tloss':>8}  {'ce':>8}  "
-              f"{'lsem':>8}  {'nstmt':>6}  {'lr':>9}")
+              f"{'lsem':>8}  {unit:>6}  {'lr':>9}")
+    elif use_logit_kl:
+        print(f"\n{'step':>6}  {'tok/s':>8}  {'tloss':>8}  {'ce':>8}  "
+              f"{'lkl':>8}  {'lr':>9}")
     else:
         print(f"\n{'step':>6}  {'tok/s':>8}  {'tloss':>8}  {'lr':>9}")
     t0 = time.perf_counter()
@@ -701,13 +751,16 @@ def main():
             l_sem_total = (weights * all_dist).mean()
         return l_sem_total, n_stmts_total
 
+    needs_hidden = use_semantic_loss              # both stmt + token L_sem need hidden
+    needs_encoder_hidden = use_semantic_loss      # we pool encoder's hidden for cosine target
+    needs_encoder_logits = use_logit_kl           # KL ablation needs encoder logits
     for step in range(1, args.steps + 1):
         try:
             batch = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
             batch = next(train_iter)
-        if use_semantic_loss:
+        if needs_ast:
             x, y, stmt_starts, stmt_ends = batch
             x, y = x.to("cuda"), y.to("cuda")
             stmt_starts = stmt_starts.to("cuda")
@@ -715,9 +768,11 @@ def main():
         else:
             x, y = batch
             x, y = x.to("cuda"), y.to("cuda")
+            stmt_starts = None
+            stmt_ends = None
         want_surprise = (args.feedback == "predictive" and args.surprise_weight > 0)
-        if use_semantic_loss:
-            # Need hidden for L_sem.
+        if needs_hidden:
+            # Need hidden for L_sem (statement or token granularity).
             if args.aux_brackets and want_surprise:
                 logits, aux_logits, surprise, hidden = model(
                     x, return_aux=True, return_surprise=True, return_hidden=True
@@ -761,18 +816,49 @@ def main():
         lm_loss = F.cross_entropy(
             logits.reshape(-1, tok.vocab_size), y.reshape(-1),
         )
-        if use_semantic_loss:
+        # Compute the alignment-loss term (one of three modes).
+        l_sem = torch.zeros((), device="cuda")
+        l_kl = torch.zeros((), device="cuda")
+        n_stmts = 0
+        n_tokens_aligned = 0
+        if use_stmt_lsem:
             l_sem, n_stmts = compute_semantic_loss(
                 model, x, stmt_starts, stmt_ends, hidden,
                 encoder, oracle_head, args.semantic_loss_beta,
             )
-        else:
-            l_sem = torch.zeros((), device="cuda")
-            n_stmts = 0
+        elif use_per_token_lsem:
+            # Phase 22b ablation 2: per-token cosine alignment.
+            with torch.no_grad():
+                _, enc_hidden = encoder(x, return_hidden=True)
+            h_tilde = model.W_semantic(hidden)                       # (B, T, d)
+            cos_h = F.cosine_similarity(
+                h_tilde, enc_hidden.detach(), dim=-1,
+            )                                                          # (B, T)
+            l_sem = (1.0 - cos_h).mean()
+            n_tokens_aligned = int(cos_h.numel())
+        elif use_logit_kl:
+            # Phase 22b ablation 3: KL divergence on logits between student
+            # and frozen-encoder teacher. Both detached on the teacher side.
+            with torch.no_grad():
+                enc_logits = encoder(x)                                # (B, T, V)
+            T = float(args.logit_kl_temp)
+            log_p = F.log_softmax(logits / T, dim=-1)                  # student
+            log_q = F.log_softmax(enc_logits.detach() / T, dim=-1)     # teacher
+            # KL(student || teacher) per textbook KD: mean over (B*T).
+            # We use F.kl_div with `log_target=True`, which expects:
+            #   input  = log_p (student), target = log_q (teacher).
+            # The sign convention there is KL(target || input), so feed
+            # teacher as `target` and student as `input` — KL(teacher || student),
+            # the canonical Hinton-KD form.
+            kl_pp = F.kl_div(log_p, log_q, log_target=True,
+                              reduction="none").sum(dim=-1)           # (B, T)
+            l_kl = (T * T) * kl_pp.mean()
+            n_tokens_aligned = int(kl_pp.numel())
         loss = (lm_loss
                 + args.aux_weight * aux_loss
                 + args.surprise_weight * surprise
-                + args.semantic_loss_beta * l_sem)
+                + args.semantic_loss_beta * l_sem
+                + args.logit_kl_beta * l_kl)
         for o in opts:
             o.zero_grad(set_to_none=True)
         loss.backward()
@@ -785,7 +871,11 @@ def main():
         if use_semantic_loss:
             losses_sem_window.append(float(l_sem.item()))
             losses_ce_window.append(float(lm_loss.item()))
-            losses_nstmt_window.append(int(n_stmts))
+            losses_nstmt_window.append(int(n_stmts) if use_stmt_lsem
+                                        else int(n_tokens_aligned))
+        elif use_logit_kl:
+            losses_sem_window.append(float(l_kl.item()))
+            losses_ce_window.append(float(lm_loss.item()))
 
         if step % args.log_every == 0 or step == args.steps:
             now = time.perf_counter()
@@ -798,6 +888,13 @@ def main():
                 line = (f"{step:>6d}  {tok_per_sec:>8.0f}  "
                         f"{tloss_avg:>8.4f}  {ce_avg:>8.4f}  "
                         f"{lsem_avg:>8.4f}  {nstmt_avg:>6.1f}  "
+                        f"{scheduler.get_last_lr()[0]:>9.2e}")
+            elif use_logit_kl:
+                ce_avg = sum(losses_ce_window[-args.log_every:]) / max(1, len(losses_ce_window[-args.log_every:]))
+                lkl_avg = sum(losses_sem_window[-args.log_every:]) / max(1, len(losses_sem_window[-args.log_every:]))
+                line = (f"{step:>6d}  {tok_per_sec:>8.0f}  "
+                        f"{tloss_avg:>8.4f}  {ce_avg:>8.4f}  "
+                        f"{lkl_avg:>8.4f}  "
                         f"{scheduler.get_last_lr()[0]:>9.2e}")
             else:
                 line = (f"{step:>6d}  {tok_per_sec:>8.0f}  "
@@ -837,7 +934,7 @@ def main():
             n_val = 0
             with torch.no_grad():
                 for vbatch in val_loader:
-                    if use_semantic_loss:
+                    if needs_ast:
                         vx, vy, *_ = vbatch
                     else:
                         vx, vy = vbatch
@@ -873,8 +970,14 @@ def main():
                 "feedback_xattn_form": args.feedback_xattn_form,
                 "feedback_self_k": args.feedback_self_k,
                 "feedback_alpha_mode": args.feedback_alpha_mode,
-                "semantic_loss_dim": (args.d_model if use_semantic_loss else 0),
+                "semantic_loss_dim": (args.d_model
+                                       if use_semantic_loss else 0),
                 "semantic_loss_beta": args.semantic_loss_beta,
+                "semantic_loss_uniform_weight":
+                    bool(args.semantic_loss_uniform_weight),
+                "semantic_loss_granularity": args.semantic_loss_granularity,
+                "logit_kl_beta": args.logit_kl_beta,
+                "logit_kl_temp": args.logit_kl_temp,
                 "encoder_ckpt": args.encoder_ckpt,
                 "oracle_ckpt": args.oracle_ckpt,
                 "arch": args.arch, "layers_spec": args.layers,

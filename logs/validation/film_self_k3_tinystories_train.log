@@ -1,0 +1,22 @@
+GPU: NVIDIA GeForce RTX 5090  arch=deltanet
+Loading tokeniser HuggingFaceTB/SmolLM2-135M ...
+  vocab size: 49152
+Loading dataset roneneldan/TinyStories (streaming) ...
+  params: 216.9M  aux_dim=0  feedback=film@d=1
+
+  step     tok/s     tloss         lr
+   500     19083    3.8410   2.93e-04  α=[2<-28:-0.060]
+  1000     19321    2.8296   2.74e-04  α=[2<-28:-0.067]
+  1500     19282    2.4744   2.44e-04  α=[2<-28:-0.067]
+  2000     19311    2.4650   2.07e-04  α=[2<-28:-0.066]
+  2500     19301    2.2919   1.65e-04  α=[2<-28:-0.066]
+        VAL  loss=1.9649  ppl=7.13
+  3000     19051    2.1875   1.23e-04  α=[2<-28:-0.065]
+  3500     19295    2.1217   8.56e-05  α=[2<-28:-0.064]
+  4000     19326    2.0497   5.58e-05  α=[2<-28:-0.064]
+  4500     19325    1.9818   3.66e-05  α=[2<-28:-0.063]
+  5000     19305    2.0577   3.00e-05  α=[2<-28:-0.063]
+        VAL  loss=1.7160  ppl=5.56
+
+Done in 1065s (213 ms/step avg).
+Checkpoint saved to checkpoints/film_self_k3_30L_217M_tinystories_seed0.pt

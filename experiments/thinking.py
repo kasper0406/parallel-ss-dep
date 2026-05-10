@@ -1,0 +1,232 @@
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+from typing import Iterable
+
+import torch
+import torch.nn.functional as F
+
+
+@dataclass
+class ThinkContinuation:
+    context_ids: list[int]
+    target_id: int
+    depth: int = 0
+    accum_nll: float = 0.0
+    accum_cost: float = 0.0
+    origin_step: int = 0
+    decision_context_ids: list[int] | None = None
+    immediate_nll: float = 0.0
+
+
+@dataclass
+class ThinkReplay:
+    context_ids: list[int]
+    target_id: int
+    target_is_thinking: bool
+
+
+class ThinkContinuationQueue:
+    def __init__(self, max_len: int):
+        if max_len <= 0:
+            raise ValueError(f"max_len must be positive, got {max_len}")
+        self.max_len = int(max_len)
+        self._items: deque[ThinkContinuation] = deque()
+        self.dropped = 0
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def enqueue(self, item: ThinkContinuation) -> None:
+        if len(self._items) >= self.max_len:
+            raise OverflowError(
+                "thinking continuation queue is full; refusing to drop an "
+                "unresolved target obligation"
+            )
+        self._items.append(item)
+
+    def extend(self, items: Iterable[ThinkContinuation]) -> None:
+        for item in items:
+            self.enqueue(item)
+
+    def pop_batch(self, n: int) -> list[ThinkContinuation]:
+        out: list[ThinkContinuation] = []
+        for _ in range(min(int(n), len(self._items))):
+            out.append(self._items.popleft())
+        return out
+
+    def mean_depth(self) -> float:
+        if not self._items:
+            return 0.0
+        return sum(item.depth for item in self._items) / len(self._items)
+
+    def max_depth(self) -> int:
+        if not self._items:
+            return 0
+        return max(item.depth for item in self._items)
+
+
+class ThinkReplayQueue:
+    def __init__(self, max_len: int):
+        if max_len <= 0:
+            raise ValueError(f"max_len must be positive, got {max_len}")
+        self.max_len = int(max_len)
+        self._items: deque[ThinkReplay] = deque()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def enqueue(self, item: ThinkReplay) -> None:
+        if len(self._items) >= self.max_len:
+            self._items.popleft()
+        self._items.append(item)
+
+    def pop_batch(self, n: int) -> list[ThinkReplay]:
+        out: list[ThinkReplay] = []
+        for _ in range(min(int(n), len(self._items))):
+            out.append(self._items.popleft())
+        return out
+
+
+def mask_token_logit(logits: torch.Tensor, token_id: int) -> torch.Tensor:
+    masked = logits.clone()
+    masked[..., int(token_id)] = -torch.inf
+    return masked
+
+
+def cross_entropy_masking_token(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    token_id: int,
+    reduction: str = "none",
+) -> torch.Tensor:
+    return F.cross_entropy(
+        mask_token_logit(logits, token_id),
+        targets,
+        reduction=reduction,
+    )
+
+
+def choose_think_actions(
+    logits: torch.Tensor,
+    thinking_token_id: int,
+    policy: str,
+    threshold: float,
+    temperature: float,
+    allow_think: torch.Tensor | bool = True,
+) -> torch.Tensor:
+    """Return a boolean mask of examples whose on-policy action is THINKING."""
+    if policy == "greedy":
+        think = logits.argmax(dim=-1) == thinking_token_id
+    elif policy == "threshold":
+        probs = torch.softmax(logits, dim=-1)
+        think = probs[..., thinking_token_id] >= threshold
+    elif policy == "sample":
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
+        sample = torch.distributions.Categorical(logits=logits / temperature).sample()
+        think = sample == thinking_token_id
+    else:
+        raise ValueError(f"unknown thinking policy: {policy!r}")
+
+    if isinstance(allow_think, bool):
+        return think if allow_think else torch.zeros_like(think, dtype=torch.bool)
+    return think & allow_think.to(device=think.device, dtype=torch.bool)
+
+
+def choose_explore_actions(
+    scores: torch.Tensor,
+    probability: float,
+    mode: str = "uniform",
+    top_frac: float = 1.0,
+    min_score: float = 0.0,
+    allow: torch.Tensor | bool = True,
+) -> torch.Tensor:
+    """Sample exploratory THINKING actions, optionally biased to high-score sites."""
+    if probability <= 0.0:
+        return torch.zeros_like(scores, dtype=torch.bool)
+    if not (0.0 <= probability <= 1.0):
+        raise ValueError(f"probability must be in [0, 1], got {probability}")
+    if not (0.0 < top_frac <= 1.0):
+        raise ValueError(f"top_frac must be in (0, 1], got {top_frac}")
+
+    if isinstance(allow, bool):
+        eligible = torch.ones_like(scores, dtype=torch.bool) if allow else torch.zeros_like(scores, dtype=torch.bool)
+    else:
+        eligible = allow.to(device=scores.device, dtype=torch.bool).clone()
+    eligible &= scores >= min_score
+
+    if mode == "uniform":
+        candidate = eligible
+    elif mode == "high_ce":
+        candidate = torch.zeros_like(eligible)
+        idx = eligible.reshape(-1).nonzero(as_tuple=False).flatten()
+        if idx.numel() > 0:
+            k = max(1, int(idx.numel() * top_frac))
+            flat_scores = scores.reshape(-1)
+            top_idx = idx[torch.topk(flat_scores[idx], k=k).indices]
+            candidate.reshape(-1)[top_idx] = True
+    else:
+        raise ValueError(f"unknown exploration mode: {mode!r}")
+
+    return (torch.rand_like(scores.float()) < probability) & candidate
+
+
+def build_continuation_batch(
+    items: list[ThinkContinuation],
+    block_size: int,
+    pad_token_id: int,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Right-pad/crop continuation contexts and return (ids, targets, last_pos)."""
+    if not items:
+        raise ValueError("cannot build an empty continuation batch")
+    ctx_rows: list[list[int]] = []
+    last_positions: list[int] = []
+    targets: list[int] = []
+    for item in items:
+        ctx = item.context_ids[-block_size:]
+        if not ctx:
+            raise ValueError("continuation context_ids must be non-empty")
+        last_positions.append(len(ctx) - 1)
+        targets.append(int(item.target_id))
+        if len(ctx) < block_size:
+            ctx = ctx + [int(pad_token_id)] * (block_size - len(ctx))
+        ctx_rows.append(ctx)
+    return (
+        torch.tensor(ctx_rows, dtype=torch.long, device=device),
+        torch.tensor(targets, dtype=torch.long, device=device),
+        torch.tensor(last_positions, dtype=torch.long, device=device),
+    )
+
+
+def build_replay_batch(
+    items: list[ThinkReplay],
+    block_size: int,
+    pad_token_id: int,
+    thinking_token_id: int,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not items:
+        raise ValueError("cannot build an empty replay batch")
+    ctx_rows: list[list[int]] = []
+    last_positions: list[int] = []
+    targets: list[int] = []
+    target_is_thinking: list[bool] = []
+    for item in items:
+        ctx = item.context_ids[-block_size:]
+        if not ctx:
+            raise ValueError("replay context_ids must be non-empty")
+        last_positions.append(len(ctx) - 1)
+        targets.append(int(thinking_token_id if item.target_is_thinking else item.target_id))
+        target_is_thinking.append(bool(item.target_is_thinking))
+        if len(ctx) < block_size:
+            ctx = ctx + [int(pad_token_id)] * (block_size - len(ctx))
+        ctx_rows.append(ctx)
+    return (
+        torch.tensor(ctx_rows, dtype=torch.long, device=device),
+        torch.tensor(targets, dtype=torch.long, device=device),
+        torch.tensor(last_positions, dtype=torch.long, device=device),
+        torch.tensor(target_is_thinking, dtype=torch.bool, device=device),
+    )

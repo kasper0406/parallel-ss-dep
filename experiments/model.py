@@ -982,6 +982,16 @@ class TinyLM(nn.Module):
                                               # to the frozen oracle's E(s_t).
                                               # Saved with the checkpoint so
                                               # eval can reuse the W.
+        output_gate: bool = False,            # Learned per-position output gate.
+                                              # When True, adds a gate_head
+                                              # (d_model → 1) whose sigmoid
+                                              # output g_t ∈ [0,1] controls
+                                              # the emit/think tradeoff.
+                                              # The caller uses g to compute:
+                                              # L = mean(g*CE + (1-g)*λ).
+                                              # Init: zero weight, bias=+2.0
+                                              # (g ≈ 0.88 at start so training
+                                              # starts near standard LM).
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1180,6 +1190,16 @@ class TinyLM(nn.Module):
                 nn.init.normal_(self.W_semantic.weight,
                                 std=1.0 / math.sqrt(d_model))
 
+        # Output gate (emit/think per-position gate, Phase 23).
+        # gate_head: d_model → 1; sigmoid gives g_t ∈ (0, 1).
+        # Bias = +2.0 → sigmoid(2) ≈ 0.88 so all positions start near
+        # "always emit", making early training identical to a standard LM.
+        self.output_gate = bool(output_gate)
+        if self.output_gate:
+            self.gate_head = nn.Linear(d_model, 1, bias=True)
+            nn.init.zeros_(self.gate_head.weight)
+            nn.init.constant_(self.gate_head.bias, 2.0)
+
     def _sparse_pass_collect_sources(self,
                                       x: torch.Tensor,
                                       source_layers: set,
@@ -1226,12 +1246,23 @@ class TinyLM(nn.Module):
                 return_aux: bool = False,
                 return_surprise: bool = False,
                 return_hidden: bool = False,
+                return_gate: bool = False,
                 ) -> torch.Tensor | tuple:
         x = self.embed(input_ids)
         if self.max_T > 0:
             T = input_ids.shape[1]
             pos = torch.arange(T, device=input_ids.device)
             x = x + self.pos_embed(pos)
+
+        def _maybe_gate(h_normed: torch.Tensor) -> torch.Tensor | None:
+            """Compute gate (B, T) from normed hidden, store as _last_gate."""
+            if not self.output_gate:
+                return None
+            gate_logits = self.gate_head(h_normed).squeeze(-1)
+            g = torch.sigmoid(gate_logits)
+            self._last_gate_logits = gate_logits
+            self._last_gate = g  # side-effect: accessible after forward()
+            return g
 
         if (self.feedback_mode == "none"
                 and not self.feedback_xattn_pairs
@@ -1245,6 +1276,10 @@ class TinyLM(nn.Module):
                 outs = outs + (self.aux_head(h),)
             if return_hidden:
                 outs = outs + (h,)
+            if return_gate:
+                outs = outs + (_maybe_gate(h),)
+            else:
+                _maybe_gate(h)   # still populate _last_gate as side effect
             return outs[0] if len(outs) == 1 else outs
 
         # Surprise-gated scratchpad feedback. Pass 1 vanilla, pass 1 logits to
@@ -1290,12 +1325,14 @@ class TinyLM(nn.Module):
                 h = blk(h, input_ids=input_ids)
             h = self.out_norm(h)
             lm_logits = self.lm_head(h)
+            outs = (lm_logits,)
             if return_aux and self.aux_dim > 0:
-                return lm_logits, self.aux_head(h)
-            return lm_logits
-
-        # Cross-layer attention feedback (Idea 1 / Idea 2). Target layers attend
-        # over the t-1 lagged pass-1 outputs of multiple source layers.
+                outs = outs + (self.aux_head(h),)
+            if return_gate:
+                outs = outs + (_maybe_gate(h),)
+            else:
+                _maybe_gate(h)
+            return outs[0] if len(outs) == 1 else outs
         if self.feedback_xattn_pairs:
             # Pass 1: vanilla. Collect outputs at every layer that any target
             # references as a source (union across all targets).
@@ -1327,12 +1364,14 @@ class TinyLM(nn.Module):
                 h = blk(h, input_ids=input_ids)
             h = self.out_norm(h)
             lm_logits = self.lm_head(h)
+            outs = (lm_logits,)
             if return_aux and self.aux_dim > 0:
-                return lm_logits, self.aux_head(h)
-            return lm_logits
-
-        # Sparse-pair feedback: only specific target layers receive feedback
-        # from specific source layers. Avoids compounding divergence.
+                outs = outs + (self.aux_head(h),)
+            if return_gate:
+                outs = outs + (_maybe_gate(h),)
+            else:
+                _maybe_gate(h)
+            return outs[0] if len(outs) == 1 else outs
         if self.feedback_pairs:
             source_layers = set(s for _, s in self.feedback_pairs)
 
@@ -1466,6 +1505,10 @@ class TinyLM(nn.Module):
                     outs = outs + (self.aux_head(h_norm),)
                 if return_hidden:
                     outs = outs + (h_norm,)
+                if return_gate:
+                    outs = outs + (_maybe_gate(h_norm),)
+                else:
+                    _maybe_gate(h_norm)
                 return outs[0] if len(outs) == 1 else outs
             # ----------------------------------------------------------------
             # Standard 2-pass sparse FiLM (existing path).
@@ -1500,9 +1543,11 @@ class TinyLM(nn.Module):
                 outs = outs + (self.aux_head(h),)
             if return_hidden:
                 outs = outs + (h,)
+            if return_gate:
+                outs = outs + (_maybe_gate(h),)
+            else:
+                _maybe_gate(h)
             return outs[0] if len(outs) == 1 else outs
-
-        # 2-pass forward with cross-layer feedback.
         # Pass 1: vanilla forward, collect each layer's output.
         pass1_outs: list[torch.Tensor] = []
         h = x
@@ -1553,6 +1598,10 @@ class TinyLM(nn.Module):
             outs = outs + (self.aux_head(h),)
         if return_surprise:
             outs = outs + (surprise_loss,)
+        if return_gate:
+            outs = outs + (_maybe_gate(h),)
+        else:
+            _maybe_gate(h)
         return outs[0] if len(outs) == 1 else outs
 
     def num_params(self) -> int:

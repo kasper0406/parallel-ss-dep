@@ -36,6 +36,18 @@ from experiments.layers import (
 )
 from experiments.model import TinyLM
 from experiments.aux_brackets import compute_bracket_deltas, bracket_depth
+from experiments.thinking import (
+    ThinkContinuation,
+    ThinkContinuationQueue,
+    ThinkReplay,
+    ThinkReplayQueue,
+    build_continuation_batch,
+    build_replay_batch,
+    choose_explore_actions,
+    choose_think_actions,
+    cross_entropy_masking_token,
+    mask_token_logit,
+)
 
 
 _NAME_TO_CLS = {
@@ -313,6 +325,137 @@ def main():
                         "(tests pure content retrieval); "
                         "'uniform_surprise' = surprise only, content IGNORED "
                         "(tests pure saliency-based retrieval).")
+    p.add_argument("--output_gate", action="store_true",
+                   help="Enable learned per-position output gate (Phase 23). "
+                        "Adds a gate_head (d_model → 1) whose sigmoid output "
+                        "g_t ∈ (0,1) weights the loss: "
+                        "L = mean(g_t * CE_t + (1 - g_t) * gate_lambda). "
+                        "When g_t → 0 the model 'thinks' (pays λ); when "
+                        "g_t → 1 it emits (pays CE). Self-regulating: the "
+                        "model pauses when CE > λ and emits when CE < λ.")
+    p.add_argument("--gate_lambda", type=float, default=2.0,
+                   help="Pause cost λ for the output gate (default 2.0). "
+                        "Set relative to the model's expected CE: λ < avg_CE "
+                        "→ some pausing; λ ≈ avg_CE → ~50%% pause rate; "
+                        "λ > avg_CE → rarely pauses (degenerates to standard LM). "
+                        "Recommended sweep: {1.0, 2.0, 3.0, 4.0} for a "
+                        "codeparrot model with CE ≈ 3-4 nats.")
+    p.add_argument("--gate_warmup_steps", type=int, default=2000,
+                   help="Number of warmup steps over which the gate floor "
+                        "linearly decays from 1.0 (always emit) to 0.0 (free "
+                        "gate). Prevents early gate collapse when initial CE >> λ. "
+                        "Set to 0 to disable (raw self-regulating gate). "
+                        "Default: 2000 (≈25%% of a typical 8k-step run).")
+    p.add_argument("--enable_thinking_token", action="store_true",
+                   help="Enable discrete [THINKING] token training with an "
+                        "on-policy continuation queue. A THINKING action pays "
+                        "--think_lambda and requeues the original target instead "
+                        "of masking it out.")
+    p.add_argument("--thinking_token", type=str, default="[THINKING]",
+                   help="Special token string used for internal thinking steps.")
+    p.add_argument("--think_lambda", type=float, default=0.1,
+                   help="Fixed ponder cost added for every emitted THINKING token.")
+    p.add_argument("--think_warmup_steps", type=int, default=0,
+                   help="Number of initial steps where THINKING actions are "
+                        "disallowed and the model trains as a standard LM.")
+    p.add_argument("--think_curriculum_steps", type=int, default=0,
+                   help="After --think_warmup_steps, linearly ramp scheduled "
+                        "THINKING knobs over this many optimizer steps. 0 keeps "
+                        "the old fixed behavior.")
+    p.add_argument("--think_explore_start_prob", type=float, default=0.0,
+                   help="Exploration probability at the start of the THINKING "
+                        "curriculum. It ramps to --think_explore_prob.")
+    p.add_argument("--think_lambda_start", type=float, default=None,
+                   help="Optional ponder cost at the start of the curriculum; "
+                        "ramps to --think_lambda. If omitted, λ is constant.")
+    p.add_argument("--think_policy", type=str, default="greedy",
+                   choices=["greedy", "threshold", "sample"],
+                   help="On-policy rule for deciding whether the model emitted "
+                        "the THINKING token.")
+    p.add_argument("--think_decision", type=str, default="token",
+                   choices=["token", "gate"],
+                   help="Decision surface for THINKING. token uses the "
+                        "vocabulary [THINKING] logit; gate uses a separate "
+                        "binary emit/think head and inserts [THINKING] only "
+                        "into queued contexts.")
+    p.add_argument("--think_gate_threshold", type=float, default=0.5,
+                   help="For --think_decision gate, emit probabilities below "
+                        "this threshold are treated as THINK actions.")
+    p.add_argument("--think_gate_threshold_start", type=float, default=None,
+                   help="Optional gate threshold at the start of the curriculum; "
+                        "ramps to --think_gate_threshold. Lower values bias "
+                        "against THINK early, higher final values allow more "
+                        "THINK later.")
+    p.add_argument("--think_threshold", type=float, default=0.5,
+                   help="p([THINKING]) threshold used by --think_policy threshold.")
+    p.add_argument("--think_temperature", type=float, default=1.0,
+                   help="Sampling temperature used by --think_policy sample.")
+    p.add_argument("--think_explore_prob", type=float, default=0.0,
+                    help="Optional epsilon exploration probability that forces "
+                         "eligible positions to take a THINKING action. Useful "
+                         "early because a freshly-added special token may never "
+                         "win greedy/threshold selection. Default 0 keeps the "
+                         "policy purely model-driven.")
+    p.add_argument("--think_explore_mode", type=str, default="uniform",
+                   choices=["uniform", "high_ce"],
+                   help="Exploration distribution. uniform samples every "
+                        "eligible token equally; high_ce restricts samples to "
+                        "the highest conventional-CE positions in the batch.")
+    p.add_argument("--think_explore_top_frac", type=float, default=1.0,
+                   help="For --think_explore_mode high_ce, only sample from "
+                        "this top fraction of eligible positions by answer CE.")
+    p.add_argument("--think_explore_min_ce", type=float, default=0.0,
+                   help="Minimum conventional answer CE required for an "
+                        "exploration candidate.")
+    p.add_argument("--think_queue_max", type=int, default=262144,
+                   help="Maximum number of unresolved THINKING continuations. "
+                        "The queue lives in CPU memory as token-id lists; GPU "
+                        "memory is controlled by --think_queue_batch.")
+    p.add_argument("--think_queue_batch", type=int, default=0,
+                   help="Number of queued continuations to mix into each step. "
+                   "0 = one continuation microbatch (lowest peak memory).")
+    p.add_argument("--think_prioritize_queue", action="store_true",
+                   help="When enabled, process queued continuation obligations "
+                        "first, then replay rows, and use fresh dataloader rows "
+                        "only with leftover batch capacity.")
+    p.add_argument("--think_max_new_per_step", type=int, default=0,
+                   help="Maximum new THINKING continuations created from fresh "
+                        "tokens per optimizer step. 0 disables the cap; this "
+                        "is only a safety/debug backpressure knob, not part of "
+                        "the model policy.")
+    p.add_argument("--think_safety_max_depth", type=int, default=0,
+                   help="Optional runaway safety cap. 0 disables. When a queued "
+                        "item reaches this depth, THINKING is masked and an "
+                        "answer is forced; frequent firing means λ/policy is "
+                        "miscalibrated.")
+    p.add_argument("--think_safety_max_depth_start", type=int, default=None,
+                   help="Optional starting safety depth for the THINKING "
+                        "curriculum; linearly ramps to "
+                        "--think_safety_max_depth. Use e.g. 1 -> 5 to allow "
+                        "deeper thinking only after the LM signal improves.")
+    p.add_argument("--think_queue_ttl", type=int, default=0,
+                   help="Optional max age in optimizer steps for queued items. "
+                        "0 disables. Expired items force an answer attempt.")
+    p.add_argument("--think_advantage_margin", type=float, default=0.0,
+                   help="Only replay/train THINK when the resolved trajectory "
+                        "beats immediate answer CE by at least this margin.")
+    p.add_argument("--think_replay_batch", type=int, default=0,
+                   help="Number of resolved advantage replay rows packed into "
+                        "each batch. 0 = match --think_queue_batch.")
+    p.add_argument("--think_replay_weight", type=float, default=1.0,
+                   help="Multiplier for resolved advantage replay loss. This "
+                        "lets sparse THINK supervision compete with dense "
+                        "next-token LM loss without changing conventional CE.")
+    p.add_argument("--think_gate_emit_weight", type=float, default=0.0,
+                   help="For --think_decision gate, optional dense BCE weight "
+                        "that trains fresh non-THINK positions to EMIT. This "
+                        "keeps the binary gate calibrated while replay rows "
+                        "teach the sparse THINK cases.")
+    p.add_argument("--think_min_fresh_rows", type=int, default=0,
+                   help="Reserve at least this many rows in each packed batch "
+                        "for fresh dataloader examples. Default 0 lets "
+                        "--think_prioritize_queue fully drain queued work "
+                        "before adding more fresh data.")
     p.add_argument("--feedback_xattn_form", type=str, default="attn",
                    choices=["attn", "film_sum", "film_sum_mlp", "film_sum_glu",
                             "film_target_gated",
@@ -373,7 +516,65 @@ def main():
                    help="Field in the dataset that contains the text "
                         "('text' for TinyStories, 'content' for codeparrot/the-stack)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--tb_dir", type=str, default=None,
+                   help="Directory for TensorBoard SummaryWriter logs. "
+                        "If omitted, TensorBoard logging is disabled. "
+                        "Pass e.g. 'runs/exp_name' and run "
+                        "'tensorboard --logdir runs' to visualize. "
+                        "Scalars logged: train/loss, train/ppl, train/lr, "
+                        "train/tok_per_sec, val/loss, val/ppl, "
+                        "gate/think_frac, gate/mean_gate, gate/raw_ce "
+                        "(gate/* only when --output_gate is set), "
+                        "and alpha/* for FiLM feedback coefficients.")
     args = p.parse_args()
+    if args.enable_thinking_token and args.output_gate:
+        raise SystemExit(
+            "--enable_thinking_token and --output_gate are mutually exclusive. "
+            "Use --think_decision gate to train the discrete THINKING path "
+            "with a binary gate head."
+        )
+    if args.enable_thinking_token and args.think_lambda < 0:
+        raise SystemExit("--think_lambda must be non-negative.")
+    if (args.enable_thinking_token and args.think_lambda_start is not None
+            and args.think_lambda_start < 0):
+        raise SystemExit("--think_lambda_start must be non-negative.")
+    if args.enable_thinking_token and args.think_curriculum_steps < 0:
+        raise SystemExit("--think_curriculum_steps must be non-negative.")
+    if args.enable_thinking_token and args.think_queue_max <= 0:
+        raise SystemExit("--think_queue_max must be positive.")
+    if args.enable_thinking_token and not (0.0 <= args.think_explore_prob <= 1.0):
+        raise SystemExit("--think_explore_prob must be in [0, 1].")
+    if args.enable_thinking_token and not (0.0 <= args.think_explore_start_prob <= 1.0):
+        raise SystemExit("--think_explore_start_prob must be in [0, 1].")
+    if args.enable_thinking_token and args.think_min_fresh_rows < 0:
+        raise SystemExit("--think_min_fresh_rows must be non-negative.")
+    if args.enable_thinking_token and not (0.0 < args.think_gate_threshold < 1.0):
+        raise SystemExit("--think_gate_threshold must be in (0, 1).")
+    if (args.enable_thinking_token and args.think_gate_threshold_start is not None
+            and not (0.0 < args.think_gate_threshold_start < 1.0)):
+        raise SystemExit("--think_gate_threshold_start must be in (0, 1).")
+    if args.enable_thinking_token and args.think_max_new_per_step < 0:
+        raise SystemExit("--think_max_new_per_step must be non-negative.")
+    if args.enable_thinking_token and args.think_safety_max_depth < 0:
+        raise SystemExit("--think_safety_max_depth must be non-negative.")
+    if (args.enable_thinking_token and args.think_safety_max_depth_start is not None
+            and args.think_safety_max_depth_start < 0):
+        raise SystemExit("--think_safety_max_depth_start must be non-negative.")
+    if args.enable_thinking_token and args.think_replay_weight < 0:
+        raise SystemExit("--think_replay_weight must be non-negative.")
+    if args.enable_thinking_token and args.think_gate_emit_weight < 0:
+        raise SystemExit("--think_gate_emit_weight must be non-negative.")
+    if args.enable_thinking_token and args.logit_kl_beta > 0:
+        raise SystemExit(
+            "--enable_thinking_token is not compatible with --logit_kl_beta yet "
+            "because the frozen teacher checkpoint lacks the added token."
+        )
+    if args.enable_thinking_token and (
+            args.aux_brackets or args.semantic_loss_beta > 0.0):
+        raise SystemExit(
+            "--enable_thinking_token currently supports the standard LM loss "
+            "path only; disable aux/semantic losses for thinking experiments."
+        )
 
     torch.manual_seed(args.seed)
     arch_label = args.arch if args.arch else f"layers={args.layers}"
@@ -384,7 +585,20 @@ def main():
     from datasets import load_dataset
     print(f"Loading tokeniser {args.tokenizer} ...")
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
-    print(f"  vocab size: {tok.vocab_size}")
+    thinking_token_id = None
+    added_thinking_tokens = 0
+    if args.enable_thinking_token:
+        added_thinking_tokens = tok.add_special_tokens(
+            {"additional_special_tokens": [args.thinking_token]}
+        )
+        thinking_token_id = tok.convert_tokens_to_ids(args.thinking_token)
+        if thinking_token_id is None or thinking_token_id < 0:
+            raise SystemExit(
+                f"failed to add/resolve thinking token {args.thinking_token!r}"
+            )
+    model_vocab_size = len(tok)
+    print(f"  vocab size: base={tok.vocab_size}, model={model_vocab_size}"
+          f"{f', thinking_id={thinking_token_id}, added={added_thinking_tokens}' if args.enable_thinking_token else ''}")
 
     print(f"Loading dataset {args.dataset} (streaming) ...")
     ds_kwargs = dict(streaming=True)
@@ -468,7 +682,7 @@ def main():
         if args.arch is None:
             raise SystemExit("specify --arch or --layers")
         attn_kw = build_arch(args.arch, args.n_layers,
-                             vocab_size=tok.vocab_size, n_symbols=args.n_symbols)
+                             vocab_size=model_vocab_size, n_symbols=args.n_symbols)
         n_layers_actual = args.n_layers
     aux_dim = (args.aux_max_depth + 1) if args.aux_brackets else 0
     fb_distances = tuple(int(d) for d in args.feedback_distances.split(",") if d)
@@ -513,7 +727,7 @@ def main():
                 tmp.append((tgt, srcs))
             fb_xattn_pairs = tuple(tmp)
     model = TinyLM(
-        vocab_size=tok.vocab_size, d_model=args.d_model, n_layers=n_layers_actual,
+        vocab_size=model_vocab_size, d_model=args.d_model, n_layers=n_layers_actual,
         n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim,
         max_T=args.max_T,
         feedback_mode=args.feedback, feedback_distances=fb_distances,
@@ -531,6 +745,9 @@ def main():
         feedback_alpha_mode=args.feedback_alpha_mode,
         semantic_loss_dim=(args.d_model
                            if (use_semantic_loss) else 0),
+        output_gate=(args.output_gate
+                     or (args.enable_thinking_token
+                         and args.think_decision == "gate")),
         **attn_kw,
     ).to("cuda")
     if args.freeze_alpha and (args.feedback != "none" or fb_xattn_pairs):
@@ -654,6 +871,31 @@ def main():
     losses_sem_window: list[float] = []
     losses_ce_window: list[float] = []
     losses_nstmt_window: list[int] = []
+    losses_gate_window: list[tuple] = []  # (mean_g, emit_frac, raw_ce) per step
+    think_queue = (ThinkContinuationQueue(args.think_queue_max)
+                   if args.enable_thinking_token else None)
+    think_replay_queue = (ThinkReplayQueue(args.think_queue_max)
+                          if args.enable_thinking_token else None)
+    think_stats_window: list[dict[str, float]] = []
+    think_closed_traj_window: list[float] = []
+    think_queue_batch = args.think_queue_batch or 1
+    think_replay_batch = args.think_replay_batch or think_queue_batch
+    if args.enable_thinking_token:
+        print(f"  THINKING queue: max={args.think_queue_max:,} CPU records, "
+              f"packed_cont={think_queue_batch}, packed_replay={think_replay_batch}, "
+              f"decision={args.think_decision}, "
+              f"priority={'on' if args.think_prioritize_queue else 'off'}")
+    pad_token_id = tok.eos_token_id
+    if pad_token_id is None:
+        pad_token_id = tok.bos_token_id if tok.bos_token_id is not None else 0
+
+    # TensorBoard writer — no-op context when --tb_dir is not set.
+    if args.tb_dir:
+        from torch.utils.tensorboard import SummaryWriter
+        tb = SummaryWriter(log_dir=args.tb_dir)
+        print(f"TensorBoard logging → {args.tb_dir}")
+    else:
+        tb = None
 
     def compute_semantic_loss(model, x_batch, stmt_starts, stmt_ends,
                                 hidden, encoder, oracle_head, beta):
@@ -751,6 +993,73 @@ def main():
             l_sem_total = (weights * all_dist).mean()
         return l_sem_total, n_stmts_total
 
+    def process_thinking_continuations(step: int) -> tuple[torch.Tensor, int, dict[str, float]]:
+        if not args.enable_thinking_token or think_queue is None or len(think_queue) == 0:
+            return torch.zeros((), device="cuda"), 0, {}
+        items = think_queue.pop_batch(think_queue_batch)
+        ctx, targets, last_pos = build_continuation_batch(
+            items, block_size=args.T, pad_token_id=pad_token_id, device="cuda"
+        )
+        logits_cont = model(ctx)
+        row = torch.arange(ctx.shape[0], device=ctx.device)
+        logits_last = logits_cont[row, last_pos]                    # (Bq, V)
+        forced = torch.zeros(ctx.shape[0], dtype=torch.bool, device=ctx.device)
+        if args.think_safety_max_depth > 0:
+            forced |= torch.tensor(
+                [item.depth >= args.think_safety_max_depth for item in items],
+                dtype=torch.bool, device=ctx.device,
+            )
+        if args.think_queue_ttl > 0:
+            forced |= torch.tensor(
+                [step - item.origin_step >= args.think_queue_ttl for item in items],
+                dtype=torch.bool, device=ctx.device,
+            )
+        think_mask = choose_think_actions(
+            logits_last.detach(), thinking_token_id, args.think_policy,
+            args.think_threshold, args.think_temperature, allow_think=~forced,
+        )
+        explore_mask = torch.zeros_like(think_mask)
+        if args.think_explore_prob > 0.0:
+            explore_mask = (
+                torch.rand_like(think_mask.float()) < args.think_explore_prob
+            ) & ~forced
+            think_mask = think_mask | explore_mask
+        think_targets = torch.full_like(targets, int(thinking_token_id))
+        think_nll = F.cross_entropy(logits_last, think_targets, reduction="none")
+        answer_nll = cross_entropy_masking_token(
+            logits_last, targets, int(thinking_token_id), reduction="none"
+        )
+        per_item_loss = torch.where(
+            think_mask, think_nll + args.think_lambda, answer_nll
+        )
+        closed_traj: list[float] = []
+        for i, item in enumerate(items):
+            if bool(think_mask[i].item()):
+                next_ctx = (item.context_ids + [int(thinking_token_id)])[-args.T:]
+                think_queue.enqueue(ThinkContinuation(
+                    context_ids=next_ctx,
+                    target_id=item.target_id,
+                    depth=item.depth + 1,
+                    accum_nll=item.accum_nll + float(think_nll[i].detach().item()),
+                    accum_cost=item.accum_cost + float(args.think_lambda),
+                    origin_step=item.origin_step,
+                ))
+            else:
+                closed_traj.append(
+                    item.accum_nll + item.accum_cost
+                    + float(answer_nll[i].detach().item())
+                )
+        if closed_traj:
+            think_closed_traj_window.extend(closed_traj)
+        stats = {
+            "cont_items": float(len(items)),
+            "cont_think": float(think_mask.float().sum().item()),
+            "cont_explore": float(explore_mask.float().sum().item()),
+            "forced_emit": float(forced.float().sum().item()),
+            "closed": float(len(closed_traj)),
+        }
+        return per_item_loss.sum(), len(items), stats
+
     needs_hidden = use_semantic_loss              # both stmt + token L_sem need hidden
     needs_encoder_hidden = use_semantic_loss      # we pool encoder's hidden for cosine target
     needs_encoder_logits = use_logit_kl           # KL ablation needs encoder logits
@@ -770,6 +1079,51 @@ def main():
             x, y = x.to("cuda"), y.to("cuda")
             stmt_starts = None
             stmt_ends = None
+        packed_cont_items: list[ThinkContinuation] = []
+        packed_replay_items: list[ThinkReplay] = []
+        packed_cont_last = packed_cont_targets = None
+        packed_replay_last = packed_replay_targets = packed_replay_is_think = None
+        fresh_offset = 0
+        fresh_n = x.shape[0]
+        if args.enable_thinking_token:
+            assert think_queue is not None and think_replay_queue is not None
+            if args.think_prioritize_queue:
+                queue_capacity = max(0, x.shape[0] - args.think_min_fresh_rows)
+                n_cont = min(len(think_queue), queue_capacity)
+                n_replay = min(len(think_replay_queue), queue_capacity - n_cont)
+            else:
+                max_aux_rows = max(0, x.shape[0] - args.think_min_fresh_rows)
+                n_cont = min(think_queue_batch, len(think_queue), max_aux_rows)
+                n_replay = min(think_replay_batch, len(think_replay_queue),
+                               max_aux_rows - n_cont)
+            packed_cont_items = think_queue.pop_batch(n_cont)
+            packed_replay_items = think_replay_queue.pop_batch(n_replay)
+            fresh_n = x.shape[0] - n_cont - n_replay
+            packed_rows = []
+            packed_targets = []
+            if packed_cont_items:
+                cont_x, packed_cont_targets, packed_cont_last = build_continuation_batch(
+                    packed_cont_items, block_size=args.T,
+                    pad_token_id=pad_token_id, device=x.device,
+                )
+                packed_rows.append(cont_x)
+                packed_targets.append(torch.zeros_like(cont_x))
+            if packed_replay_items:
+                replay_x, packed_replay_targets, packed_replay_last, packed_replay_is_think = build_replay_batch(
+                    packed_replay_items, block_size=args.T,
+                    pad_token_id=pad_token_id,
+                    thinking_token_id=int(thinking_token_id),
+                    device=x.device,
+                )
+                packed_rows.append(replay_x)
+                packed_targets.append(torch.zeros_like(replay_x))
+            if fresh_n > 0:
+                packed_rows.append(x[:fresh_n])
+                packed_targets.append(y[:fresh_n])
+            if packed_rows:
+                x = torch.cat(packed_rows, dim=0)
+                y = torch.cat(packed_targets, dim=0)
+            fresh_offset = n_cont + n_replay
         want_surprise = (args.feedback == "predictive" and args.surprise_weight > 0)
         if needs_hidden:
             # Need hidden for L_sem (statement or token granularity).
@@ -813,9 +1167,350 @@ def main():
             )
         else:
             aux_loss = torch.zeros((), device="cuda")
-        lm_loss = F.cross_entropy(
-            logits.reshape(-1, tok.vocab_size), y.reshape(-1),
-        )
+        # Gated loss (Phase 23): L = mean(g_t * CE_t + (1-g_t) * λ).
+        # g_t is stored in model._last_gate by the forward pass (side effect).
+        # When output_gate is off, fall back to standard mean CE.
+        V = logits.shape[-1]
+        ce_per_token = F.cross_entropy(
+            logits.reshape(-1, V), y.reshape(-1),
+            reduction="none",
+        ).reshape(y.shape)                                               # (B, T)
+        if args.enable_thinking_token:
+            if step <= args.think_warmup_steps:
+                think_curriculum = 0.0
+            elif args.think_curriculum_steps > 0:
+                think_curriculum = min(
+                    1.0,
+                    (step - args.think_warmup_steps)
+                    / float(args.think_curriculum_steps),
+                )
+            else:
+                think_curriculum = 1.0
+            think_explore_prob_eff = (
+                args.think_explore_start_prob
+                + think_curriculum
+                * (args.think_explore_prob - args.think_explore_start_prob)
+            )
+            lambda_start = (
+                args.think_lambda if args.think_lambda_start is None
+                else args.think_lambda_start
+            )
+            think_lambda_eff = (
+                lambda_start
+                + think_curriculum * (args.think_lambda - lambda_start)
+            )
+            gate_threshold_start = (
+                args.think_gate_threshold
+                if args.think_gate_threshold_start is None
+                else args.think_gate_threshold_start
+            )
+            think_gate_threshold_eff = (
+                gate_threshold_start
+                + think_curriculum
+                * (args.think_gate_threshold - gate_threshold_start)
+            )
+            depth_start = (
+                args.think_safety_max_depth
+                if args.think_safety_max_depth_start is None
+                else args.think_safety_max_depth_start
+            )
+            if args.think_safety_max_depth <= 0 and depth_start <= 0:
+                think_safety_max_depth_eff = 0
+            else:
+                depth_eff_float = (
+                    depth_start
+                    + think_curriculum
+                    * (args.think_safety_max_depth - depth_start)
+                )
+                think_safety_max_depth_eff = max(1, int(round(depth_eff_float)))
+            cont_loss_terms: list[torch.Tensor] = []
+            replay_loss_terms: list[torch.Tensor] = []
+            cont_stats = {
+                "cont_items": float(len(packed_cont_items)),
+                "cont_think": 0.0,
+                "cont_explore": 0.0,
+                "forced_emit": 0.0,
+                "closed": 0.0,
+                "replay_items": float(len(packed_replay_items)),
+                "replay_think": 0.0,
+                "curriculum": float(think_curriculum),
+                "explore_prob": float(think_explore_prob_eff),
+                "lambda": float(think_lambda_eff),
+                "gate_threshold": float(think_gate_threshold_eff),
+                "safety_max_depth": float(think_safety_max_depth_eff),
+            }
+            if packed_cont_items:
+                row = torch.arange(len(packed_cont_items), device=logits.device)
+                cont_logits = logits[row, packed_cont_last]
+                forced = torch.zeros(len(packed_cont_items), dtype=torch.bool,
+                                     device=logits.device)
+                if think_safety_max_depth_eff > 0:
+                    forced |= torch.tensor(
+                        [item.depth >= think_safety_max_depth_eff
+                         for item in packed_cont_items],
+                        dtype=torch.bool, device=logits.device,
+                    )
+                if args.think_queue_ttl > 0:
+                    forced |= torch.tensor(
+                        [step - item.origin_step >= args.think_queue_ttl
+                         for item in packed_cont_items],
+                        dtype=torch.bool, device=logits.device,
+                )
+                if args.think_decision == "gate":
+                    cont_gate = model._last_gate[row, packed_cont_last].detach()
+                    cont_think = (cont_gate < think_gate_threshold_eff) & ~forced
+                else:
+                    cont_think = choose_think_actions(
+                        cont_logits.detach(), int(thinking_token_id),
+                        args.think_policy, args.think_threshold,
+                        args.think_temperature, allow_think=~forced,
+                    )
+                cont_explore = torch.zeros_like(cont_think)
+                if think_explore_prob_eff > 0.0:
+                    cont_explore = (
+                        torch.rand_like(cont_think.float()) < think_explore_prob_eff
+                    ) & ~forced
+                    cont_think = cont_think | cont_explore
+                think_targets = torch.full_like(packed_cont_targets,
+                                                int(thinking_token_id))
+                if args.think_decision == "gate":
+                    cont_gate_logits = model._last_gate_logits[row, packed_cont_last]
+                    cont_think_nll = F.binary_cross_entropy_with_logits(
+                        cont_gate_logits,
+                        torch.zeros_like(cont_gate_logits),
+                        reduction="none",
+                    )
+                else:
+                    cont_think_nll = F.cross_entropy(
+                        cont_logits, think_targets, reduction="none"
+                    )
+                cont_answer_nll = cross_entropy_masking_token(
+                    cont_logits, packed_cont_targets, int(thinking_token_id),
+                    reduction="none",
+                )
+                closed_traj: list[float] = []
+                for i, item in enumerate(packed_cont_items):
+                    if bool(cont_think[i].item()):
+                        next_ctx = (item.context_ids + [int(thinking_token_id)])[-args.T:]
+                        think_queue.enqueue(ThinkContinuation(
+                            context_ids=next_ctx,
+                            target_id=item.target_id,
+                            depth=item.depth + 1,
+                            accum_nll=(item.accum_nll
+                                       + float(cont_think_nll[i].detach().item())),
+                            accum_cost=item.accum_cost + float(think_lambda_eff),
+                            origin_step=item.origin_step,
+                            decision_context_ids=(item.decision_context_ids
+                                                  or item.context_ids),
+                            immediate_nll=item.immediate_nll,
+                        ))
+                    else:
+                        answer_after_think = float(cont_answer_nll[i].detach().item())
+                        traj = item.accum_nll + item.accum_cost + answer_after_think
+                        closed_traj.append(traj)
+                        comparable_traj = item.accum_cost + answer_after_think
+                        beneficial = (
+                            comparable_traj + args.think_advantage_margin
+                            < float(item.immediate_nll)
+                        )
+                        think_replay_queue.enqueue(ThinkReplay(
+                            context_ids=(item.decision_context_ids
+                                         or item.context_ids),
+                            target_id=item.target_id,
+                            target_is_thinking=beneficial,
+                        ))
+                        cont_loss_terms.append(cont_answer_nll[i])
+                if closed_traj:
+                    think_closed_traj_window.extend(closed_traj)
+                cont_stats.update({
+                    "cont_think": float(cont_think.float().sum().item()),
+                    "cont_explore": float(cont_explore.float().sum().item()),
+                    "forced_emit": float(forced.float().sum().item()),
+                    "closed": float(len(closed_traj)),
+                })
+            if packed_replay_items:
+                start = len(packed_cont_items)
+                row = torch.arange(start, start + len(packed_replay_items),
+                                   device=logits.device)
+                replay_logits = logits[row, packed_replay_last]
+                if args.think_decision == "gate":
+                    replay_gate_logits = model._last_gate_logits[row, packed_replay_last]
+                    emit_targets = (~packed_replay_is_think).float()
+                    gate_ce = F.binary_cross_entropy_with_logits(
+                        replay_gate_logits, emit_targets, reduction="none"
+                    )
+                    replay_answer_ce = cross_entropy_masking_token(
+                        replay_logits, packed_replay_targets,
+                        int(thinking_token_id), reduction="none",
+                    )
+                    replay_ce = torch.where(
+                        packed_replay_is_think,
+                        gate_ce + think_lambda_eff,
+                        gate_ce + replay_answer_ce,
+                    )
+                else:
+                    replay_ce = F.cross_entropy(
+                        replay_logits, packed_replay_targets, reduction="none"
+                    )
+                    replay_ce = (
+                        replay_ce
+                        + think_lambda_eff * packed_replay_is_think.float()
+                    )
+                replay_loss_terms.append(args.think_replay_weight * replay_ce)
+                cont_stats["replay_think"] = float(
+                    packed_replay_is_think.float().sum().item()
+                )
+            allow_think = step > args.think_warmup_steps
+            fresh_logits = logits[fresh_offset:]
+            fresh_y = y[fresh_offset:]
+            if fresh_n > 0:
+                if args.think_decision == "gate":
+                    fresh_gate = model._last_gate[fresh_offset:].detach()
+                    think_mask = fresh_gate < think_gate_threshold_eff
+                    if not allow_think:
+                        think_mask = torch.zeros_like(think_mask)
+                else:
+                    think_mask = choose_think_actions(
+                        fresh_logits.detach(), int(thinking_token_id),
+                        args.think_policy, args.think_threshold,
+                        args.think_temperature, allow_think=allow_think,
+                    )
+            else:
+                think_mask = torch.zeros((0, args.T), dtype=torch.bool,
+                                         device=logits.device)
+            explore_mask = torch.zeros_like(think_mask)
+            free_slots = think_queue.max_len - len(think_queue)
+            if fresh_n > 0:
+                answer_ce_all = cross_entropy_masking_token(
+                    fresh_logits.reshape(-1, V), fresh_y.reshape(-1),
+                    int(thinking_token_id), reduction="none",
+                ).reshape(fresh_y.shape)
+                if allow_think and think_explore_prob_eff > 0.0:
+                    explore_mask = choose_explore_actions(
+                        answer_ce_all.detach(),
+                        probability=think_explore_prob_eff,
+                        mode=args.think_explore_mode,
+                        top_frac=args.think_explore_top_frac,
+                        min_score=args.think_explore_min_ce,
+                    )
+                    think_mask = think_mask | explore_mask
+                fresh_loss_sum = answer_ce_all.sum()
+            else:
+                answer_ce_all = torch.zeros((0, args.T), device=logits.device)
+                fresh_loss_sum = torch.zeros((), device=logits.device)
+            if free_slots <= 0:
+                think_mask = torch.zeros_like(think_mask)
+                explore_mask = torch.zeros_like(explore_mask)
+            else:
+                think_flat = think_mask.reshape(-1)
+                max_new = free_slots
+                if args.think_max_new_per_step > 0:
+                    max_new = min(max_new, int(args.think_max_new_per_step))
+                n_think = int(think_flat.sum().item())
+                if n_think > max_new:
+                    idx = think_flat.nonzero(as_tuple=False).flatten()
+                    if answer_ce_all.numel():
+                        scores = answer_ce_all.detach().reshape(-1)[idx]
+                        keep_idx = idx[torch.topk(scores, k=max_new).indices]
+                    else:
+                        keep_idx = idx[:max_new]
+                    limited = torch.zeros_like(think_flat)
+                    limited[keep_idx] = True
+                    think_mask = limited.reshape_as(think_mask)
+                    explore_mask = explore_mask & think_mask
+            extra_loss_sum = torch.zeros((), device=logits.device)
+            extra_count = 0
+            if cont_loss_terms:
+                extra_loss_sum = extra_loss_sum + torch.stack(cont_loss_terms).sum()
+                extra_count += len(cont_loss_terms)
+            if replay_loss_terms:
+                extra_loss_sum = extra_loss_sum + torch.cat(replay_loss_terms).sum()
+                extra_count += int(sum(t.numel() for t in replay_loss_terms))
+            gate_emit_items = 0.0
+            if (args.think_decision == "gate" and args.think_gate_emit_weight > 0
+                    and fresh_n > 0 and think_mask.numel() > 0):
+                emit_mask = ~think_mask.detach()
+                gate_logits_fresh = model._last_gate_logits[fresh_offset:]
+                if emit_mask.any():
+                    emit_ce = F.binary_cross_entropy_with_logits(
+                        gate_logits_fresh[emit_mask],
+                        torch.ones_like(gate_logits_fresh[emit_mask]),
+                        reduction="sum",
+                    )
+                    extra_loss_sum = (
+                        extra_loss_sum
+                        + args.think_gate_emit_weight * emit_ce
+                    )
+                    weighted_emit_count = (
+                        args.think_gate_emit_weight
+                        * float(emit_mask.float().sum().item())
+                    )
+                    extra_count += weighted_emit_count
+                    gate_emit_items = float(emit_mask.float().sum().item())
+            denom = fresh_y.numel() + extra_count
+            lm_loss = (fresh_loss_sum + extra_loss_sum) / max(1, denom)
+            think_coords = think_mask.detach().nonzero(as_tuple=False).cpu().tolist()
+            x_cpu = x[fresh_offset:].detach().cpu()
+            y_cpu = fresh_y.detach().cpu()
+            answer_ce_cpu = answer_ce_all.detach().cpu()
+            fresh_logits_cpu = fresh_logits.detach().cpu()
+            fresh_gate_logits_cpu = (
+                model._last_gate_logits[fresh_offset:].detach().cpu()
+                if args.think_decision == "gate" else None
+            )
+            for b, t_idx in think_coords:
+                ctx_ids = x_cpu[b, :t_idx + 1].tolist() + [int(thinking_token_id)]
+                decision_ctx = x_cpu[b, :t_idx + 1].tolist()
+                if args.think_decision == "gate":
+                    assert fresh_gate_logits_cpu is not None
+                    think_nll = F.binary_cross_entropy_with_logits(
+                        fresh_gate_logits_cpu[b, t_idx].unsqueeze(0),
+                        torch.zeros(1),
+                        reduction="none",
+                    )[0].item()
+                else:
+                    think_nll = F.cross_entropy(
+                        fresh_logits_cpu[b, t_idx].unsqueeze(0),
+                        torch.tensor([int(thinking_token_id)]),
+                        reduction="none",
+                    )[0].item()
+                think_queue.enqueue(ThinkContinuation(
+                    context_ids=ctx_ids[-args.T:],
+                    target_id=int(y_cpu[b, t_idx].item()),
+                    depth=1,
+                    accum_nll=float(think_nll),
+                    accum_cost=float(think_lambda_eff),
+                    origin_step=step,
+                    decision_context_ids=decision_ctx[-args.T:],
+                    immediate_nll=float(answer_ce_cpu[b, t_idx].item()),
+                ))
+            think_stats = {
+                "normal_items": float(fresh_y.numel()),
+                "normal_think": float(think_mask.float().sum().item()),
+                "normal_explore": float(explore_mask.float().sum().item()),
+                "answer_ce": (float(answer_ce_all.mean().detach().item())
+                              if answer_ce_all.numel() else 0.0),
+                "queue_len": float(len(think_queue)),
+                "queue_mean_depth": float(think_queue.mean_depth()),
+                "queue_max_depth": float(think_queue.max_depth()),
+                "queue_dropped": float(think_queue.dropped),
+                "replay_queue_len": float(len(think_replay_queue)),
+                "gate_emit_items": gate_emit_items,
+                **cont_stats,
+            }
+            think_stats_window.append(think_stats)
+        elif args.output_gate:
+            g = model._last_gate                                         # (B, T)
+            # Warmup floor: clamp gate from below, decaying 1→0 over
+            # gate_warmup_steps. Prevents early collapse when initial CE >> λ.
+            if args.gate_warmup_steps > 0:
+                gate_floor = max(0.0, 1.0 - step / args.gate_warmup_steps)
+                g_eff = g.clamp(min=gate_floor)
+            else:
+                g_eff = g
+            lm_loss = (g_eff * ce_per_token + (1.0 - g_eff) * args.gate_lambda).mean()
+        else:
+            lm_loss = ce_per_token.mean()
         # Compute the alignment-loss term (one of three modes).
         l_sem = torch.zeros((), device="cuda")
         l_kl = torch.zeros((), device="cuda")
@@ -868,6 +1563,19 @@ def main():
         for s in scheds:
             s.step()
         losses.append(lm_loss.item())  # track LM loss alone for comparison
+        if args.output_gate:
+            g_detached = model._last_gate.detach()
+            ce_detached = ce_per_token.detach()
+            emit_mask = g_detached > 0.5
+            # CE averaged only over emitted positions — the fair comparison metric.
+            emit_ce = (ce_detached[emit_mask].mean().item()
+                       if emit_mask.any() else float("nan"))
+            losses_gate_window.append((
+                float(g_detached.mean().item()),
+                float(emit_mask.float().mean().item()),
+                float(ce_detached.mean().item()),
+                emit_ce,
+            ))
         if use_semantic_loss:
             losses_sem_window.append(float(l_sem.item()))
             losses_ce_window.append(float(lm_loss.item()))
@@ -924,7 +1632,107 @@ def main():
                     line += f"  max|α|=[{','.join(f'{a:.3f}' for a in summary)}]"
                 else:
                     line += f"  α=[{','.join(f'{a:+.3f}' for a in alphas)}]"
+            if args.output_gate and losses_gate_window:
+                recent = losses_gate_window[-args.log_every:]
+                mean_g = sum(r[0] for r in recent) / len(recent)
+                emit_frac = sum(r[1] for r in recent) / len(recent)
+                raw_ce = sum(r[2] for r in recent) / len(recent)
+                valid_emit = [r[3] for r in recent if r[3] == r[3]]  # drop NaN
+                emit_ce = sum(valid_emit) / len(valid_emit) if valid_emit else float("nan")
+                gf = (f",floor={max(0.0, 1.0 - step/args.gate_warmup_steps):.2f}"
+                      if args.gate_warmup_steps > 0 else "")
+                ece_str = f"{emit_ce:.4f}" if emit_ce == emit_ce else "nan"
+                line += (f"  gate(g={mean_g:.3f},emit={emit_frac:.2f},"
+                         f"emit_ce={ece_str},ce={raw_ce:.4f}{gf})")
+            if args.enable_thinking_token and think_stats_window:
+                recent = think_stats_window[-args.log_every:]
+                normal_items = sum(r.get("normal_items", 0.0) for r in recent)
+                normal_think = sum(r.get("normal_think", 0.0) for r in recent)
+                normal_explore = sum(r.get("normal_explore", 0.0) for r in recent)
+                cont_items = sum(r.get("cont_items", 0.0) for r in recent)
+                cont_think = sum(r.get("cont_think", 0.0) for r in recent)
+                cont_explore = sum(r.get("cont_explore", 0.0) for r in recent)
+                replay_items = sum(r.get("replay_items", 0.0) for r in recent)
+                replay_think = sum(r.get("replay_think", 0.0) for r in recent)
+                gate_emit_items = sum(r.get("gate_emit_items", 0.0) for r in recent)
+                forced_emit = sum(r.get("forced_emit", 0.0) for r in recent)
+                answer_ce = sum(r.get("answer_ce", 0.0) for r in recent) / len(recent)
+                think_rate = ((normal_think + cont_think)
+                              / max(1.0, normal_items + cont_items))
+                explore_rate = ((normal_explore + cont_explore)
+                                / max(1.0, normal_items + cont_items))
+                forced_rate = forced_emit / max(1.0, cont_items)
+                queue_len = recent[-1].get("queue_len", 0.0)
+                q_mean_depth = recent[-1].get("queue_mean_depth", 0.0)
+                q_max_depth = recent[-1].get("queue_max_depth", 0.0)
+                q_dropped = recent[-1].get("queue_dropped", 0.0)
+                replay_rate = replay_think / max(1.0, replay_items)
+                curr = recent[-1].get("curriculum", 1.0)
+                explore_prob = recent[-1].get("explore_prob", args.think_explore_prob)
+                lambda_eff = recent[-1].get("lambda", args.think_lambda)
+                gate_thr = recent[-1].get("gate_threshold", args.think_gate_threshold)
+                depth_cap = recent[-1].get("safety_max_depth", args.think_safety_max_depth)
+                traj_recent = think_closed_traj_window[-args.log_every:]
+                traj_nll = (sum(traj_recent) / len(traj_recent)
+                            if traj_recent else float("nan"))
+                traj_str = f"{traj_nll:.4f}" if traj_nll == traj_nll else "nan"
+                line += (f"  think(rate={think_rate:.3f},ans_ce={answer_ce:.4f},"
+                          f"traj={traj_str},q={queue_len:.0f},"
+                          f"depth={q_mean_depth:.2f}/{q_max_depth:.0f},"
+                          f"forced={forced_rate:.3f},explore={explore_rate:.3f},"
+                          f"replay_think={replay_rate:.3f},"
+                          f"gate_emit={gate_emit_items:.0f},"
+                          f"curr={curr:.2f},eps={explore_prob:.3f},"
+                          f"lam={lambda_eff:.3f},thr={gate_thr:.3f},"
+                          f"cap={depth_cap:.0f},"
+                          f"drop={q_dropped:.0f})")
             print(line)
+            if tb is not None:
+                tb.add_scalar("train/loss", tloss_avg, step)
+                tb.add_scalar("train/ppl", float(torch.tensor(tloss_avg).exp()), step)
+                tb.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
+                tb.add_scalar("train/tok_per_sec", tok_per_sec, step)
+                if use_semantic_loss:
+                    tb.add_scalar("train/ce", ce_avg, step)
+                    tb.add_scalar("train/l_sem", lsem_avg, step)
+                elif use_logit_kl:
+                    tb.add_scalar("train/ce", ce_avg, step)
+                    tb.add_scalar("train/l_kl", lkl_avg, step)
+                if args.output_gate and losses_gate_window:
+                    tb.add_scalar("gate/think_frac", 1.0 - emit_frac, step)
+                    tb.add_scalar("gate/mean_gate", mean_g, step)
+                    tb.add_scalar("gate/raw_ce", raw_ce, step)
+                    if emit_ce == emit_ce:  # not NaN
+                        tb.add_scalar("gate/emit_ce", emit_ce, step)
+                    if args.gate_warmup_steps > 0:
+                        gate_floor = max(0.0, 1.0 - step / args.gate_warmup_steps)
+                        tb.add_scalar("gate/floor", gate_floor, step)
+                if args.enable_thinking_token and think_stats_window:
+                    tb.add_scalar("think/rate", think_rate, step)
+                    tb.add_scalar("think/explore_rate", explore_rate, step)
+                    tb.add_scalar("think/explore_prob", explore_prob, step)
+                    tb.add_scalar("think/curriculum", curr, step)
+                    tb.add_scalar("think/lambda", lambda_eff, step)
+                    tb.add_scalar("think/gate_threshold", gate_thr, step)
+                    tb.add_scalar("think/safety_max_depth", depth_cap, step)
+                    tb.add_scalar("think/replay_think_rate", replay_rate, step)
+                    tb.add_scalar("think/answer_ce", answer_ce, step)
+                    if traj_nll == traj_nll:
+                        tb.add_scalar("think/trajectory_nll", traj_nll, step)
+                    tb.add_scalar("think/queue_len", queue_len, step)
+                    tb.add_scalar("think/queue_mean_depth", q_mean_depth, step)
+                    tb.add_scalar("think/queue_max_depth", q_max_depth, step)
+                    tb.add_scalar("think/forced_emit_rate", forced_rate, step)
+                    tb.add_scalar("think/queue_dropped", q_dropped, step)
+                # FiLM α values.
+                if args.feedback != "none" or fb_xattn_pairs:
+                    for entry in model.feedback_alphas():
+                        if isinstance(entry, tuple) and len(entry) == 3:
+                            t_idx, s_idx, alpha = entry
+                            label = (f"alpha/t{t_idx}"
+                                     if isinstance(s_idx, tuple)
+                                     else f"alpha/t{t_idx}_s{s_idx}")
+                            tb.add_scalar(label, alpha, step)
             last_log = now
             last_log_step = step
 
@@ -940,9 +1748,16 @@ def main():
                         vx, vy = vbatch
                     vx, vy = vx.to("cuda"), vy.to("cuda")
                     vlogits = model(vx)
-                    vloss = F.cross_entropy(
-                        vlogits.reshape(-1, tok.vocab_size), vy.reshape(-1),
-                    )
+                    if args.enable_thinking_token:
+                        vloss = cross_entropy_masking_token(
+                            vlogits.reshape(-1, vlogits.shape[-1]), vy.reshape(-1),
+                            int(thinking_token_id),
+                            reduction="mean",
+                        )
+                    else:
+                        vloss = F.cross_entropy(
+                            vlogits.reshape(-1, vlogits.shape[-1]), vy.reshape(-1),
+                        )
                     val_loss += vloss.item() * vx.numel()
                     n_val += vx.numel()
                     if n_val >= 64 * args.T:                # cap val
@@ -950,16 +1765,22 @@ def main():
             val_loss /= n_val
             ppl = float(torch.tensor(val_loss).exp())
             print(f"        VAL  loss={val_loss:.4f}  ppl={ppl:.2f}")
+            if tb is not None:
+                tb.add_scalar("val/loss", val_loss, step)
+                tb.add_scalar("val/ppl", ppl, step)
             model.train()
 
     secs = time.perf_counter() - t0
     print(f"\nDone in {secs:.0f}s ({secs/args.steps*1000:.0f} ms/step avg).")
+    if tb is not None:
+        tb.close()
 
     if args.save_ckpt:
         ckpt = {
             "state_dict": model.state_dict(),
             "config": {
-                "vocab_size": tok.vocab_size,
+                "vocab_size": model_vocab_size,
+                "tokenizer_base_vocab_size": tok.vocab_size,
                 "d_model": args.d_model, "n_heads": args.n_heads,
                 "d_head": args.d_head, "n_layers": n_layers_actual,
                 "max_T": args.T, "feedback_mode": args.feedback,
@@ -983,6 +1804,20 @@ def main():
                 "arch": args.arch, "layers_spec": args.layers,
                 "n_symbols": args.n_symbols,
                 "tokenizer": args.tokenizer,
+                "enable_thinking_token": bool(args.enable_thinking_token),
+                "thinking_token": args.thinking_token,
+                "thinking_token_id": thinking_token_id,
+                "think_lambda": args.think_lambda,
+                "think_lambda_start": args.think_lambda_start,
+                "think_curriculum_steps": args.think_curriculum_steps,
+                "think_policy": args.think_policy,
+                "think_decision": args.think_decision,
+                "think_gate_threshold": args.think_gate_threshold,
+                "think_gate_threshold_start": args.think_gate_threshold_start,
+                "think_explore_prob": args.think_explore_prob,
+                "think_explore_start_prob": args.think_explore_start_prob,
+                "think_safety_max_depth": args.think_safety_max_depth,
+                "think_safety_max_depth_start": args.think_safety_max_depth_start,
             },
         }
         pathlib.Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)

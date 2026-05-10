@@ -44,6 +44,7 @@ import torch.nn.functional as F
 from experiments.layers import DeltaNetAttention
 from experiments.model import TinyLM
 from experiments.statement_segmentation import parse_file_statements, Statement
+from experiments.thinking import mask_token_logit
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +81,7 @@ def load_model(path: str, device: str = "cuda",
         semantic_loss_dim=cfg.get("semantic_loss_dim", 0),
     ).to(device)
     model.load_state_dict(ckpt["state_dict"])
+    model.thinking_token_id = cfg.get("thinking_token_id")
     model.eval()
     for L, blk in enumerate(model.blocks):
         blk.attn.layer.layer_idx = L
@@ -324,6 +326,9 @@ def compute_per_statement_metrics(
         # Per-token CE on shifted labels (predict t+1 from h_t).
         # logits: (B, T, V); targets shift left by 1, so loss at pos t is
         # CE(logits[:, t], x[:, t+1]).
+        thinking_token_id = getattr(model, "thinking_token_id", None)
+        if thinking_token_id is not None:
+            logits = mask_token_logit(logits, int(thinking_token_id))
         log_probs = F.log_softmax(logits.float(), dim=-1)
         for b, fc in enumerate(batch_chunks):
             for s in fc.statements:

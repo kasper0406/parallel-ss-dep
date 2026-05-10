@@ -448,6 +448,16 @@ def main():
                         "before each fresh dataloader batch. 0 keeps the old "
                         "row-packing behavior. Values >0 increase queue "
                         "processing capacity without reducing fresh LM rows.")
+    p.add_argument("--think_aux_normalize", type=str, default="fresh_tokens",
+                   choices=["fresh_tokens", "aux_items"],
+                   help="Normalization for queued continuation/replay "
+                        "microbatches processed by --think_queue_accum_steps. "
+                        "fresh_tokens preserves the original behavior by "
+                        "dividing each aux microbatch by batch*T; aux_items "
+                        "divides by the number of queued loss items.")
+    p.add_argument("--think_aux_loss_scale", type=float, default=1.0,
+                   help="Multiplier applied to queued continuation/replay "
+                        "microbatch losses after --think_aux_normalize.")
     p.add_argument("--think_queue_accum_max_steps", type=int, default=0,
                    help="Maximum queued microbatches per optimizer step when "
                         "--think_queue_drain_target is active. 0 means use "
@@ -597,6 +607,8 @@ def main():
         raise SystemExit("--think_safety_max_depth_start must be non-negative.")
     if args.enable_thinking_token and args.think_replay_weight < 0:
         raise SystemExit("--think_replay_weight must be non-negative.")
+    if args.enable_thinking_token and args.think_aux_loss_scale < 0:
+        raise SystemExit("--think_aux_loss_scale must be non-negative.")
     if args.enable_thinking_token and args.think_queue_accum_steps < 0:
         raise SystemExit("--think_queue_accum_steps must be non-negative.")
     if args.enable_thinking_token and args.think_queue_accum_max_steps < 0:
@@ -1385,7 +1397,13 @@ def main():
                     )
                     merge_thinking_stats(pre_think_stats, aux_stats)
                     if aux_count > 0:
-                        (aux_loss_sum / fresh_token_budget).backward()
+                        aux_denom = (
+                            aux_count
+                            if args.think_aux_normalize == "aux_items"
+                            else fresh_token_budget
+                        )
+                        (args.think_aux_loss_scale
+                         * aux_loss_sum / max(1.0, aux_denom)).backward()
                     accum_step += 1
         packed_cont_items: list[ThinkContinuation] = []
         packed_replay_items: list[ThinkReplay] = []
@@ -2084,6 +2102,8 @@ def main():
                 "think_explore_start_prob": args.think_explore_start_prob,
                 "think_safety_max_depth": args.think_safety_max_depth,
                 "think_safety_max_depth_start": args.think_safety_max_depth_start,
+                "think_aux_normalize": args.think_aux_normalize,
+                "think_aux_loss_scale": args.think_aux_loss_scale,
                 "think_queue_accum_steps": args.think_queue_accum_steps,
                 "think_queue_accum_max_steps": args.think_queue_accum_max_steps,
                 "think_queue_drain_target": args.think_queue_drain_target,

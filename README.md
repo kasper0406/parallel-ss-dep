@@ -121,21 +121,24 @@ Chinchilla-scale or frontier-finetune follow-up*.
                                          pass-2 input
 ```
 
-## Current Frontier: Continuous RAG & The Thinking Head
+## Current Frontier: Reinforcement Learning (GRPO) & Deep Thinking
 
-We are currently extending the architecture with a **discrete Thinking Head**
-that enables Adaptive Computation Time (ACT) without sequence expansion.
+We are currently transitioning the architecture from supervised BPTT to **Reinforcement Learning (GRPO)**.
 
-- **The Problem:** Traditional "Pause Tokens" in Transformers bloat the KV cache.
-- **The Solution:** Because our backbone is a **Linear RNN (DeltaNet)**, the
-  state is fixed-size. A "thinking" step is simply a recurrent update to the
-  $c_t$ state matrix in-place.
-- **The Roadmap:** This mechanism sets the foundation for **Continuous RAG**,
-  where thinking steps trigger external vector-database retrievals that project
-  facts directly into the model's persistent recurrent state.
+### Phase 23 Findings: The "Maladaptive Thinking" Trap
+Recent experiments (May 2026) with supervised auxiliary losses revealed a critical failure mode:
+- **Result:** We successfully increased the thinking rate to ~6% by normalizing auxiliary losses by actual items (`aux_items`).
+- **Failure:** However, this thinking was **negatively correlated** with model quality (PPL collapsed from 81 to 156+).
+- **Diagnosis:** The supervised proxy (matching "thought" states to targets) taught the model to "daydream"—spending compute on internal state alignment that didn't help, or even hindered, next-token prediction.
 
-See [`THINKING_RAG_DIRECTION.md`](THINKING_RAG_DIRECTION.md) for the full
-mechanistic rationale.
+See [`AUX_LOSS_SWEEP_REPORT.md`](AUX_LOSS_SWEEP_REPORT.md) for the full breakdown.
+
+### The RL Pivot
+To scale deep thinking beyond depth 20 and escape the supervised trap, we are migrating to **GRPO**:
+- **Reward Signal:** The model is only rewarded if a thinking trajectory reduces the final Negative Log-Likelihood (NLL) of the correct token.
+- **Continuous RAG:** Thinking steps trigger external retrievals that are rewarded only when the retrieved facts contribute to generation accuracy.
+
+See [`RL_RAG_ROADMAP.md`](RL_RAG_ROADMAP.md) for the technical integration plan.
 
 ## Validation matrix
 

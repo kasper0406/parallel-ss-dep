@@ -101,23 +101,21 @@ matrices is unipotent) and inherit `Monoid` / `Group` structure from
 mathlib's `Matrix`. Focus on U_4 concretely, with gestures toward
 general n.
 
-## Current Primary Research Pivot: Continuous RAG & The Thinking Head
+## Current Primary Research Pivot: Reinforcement Learning (GRPO)
 
-While algebraic monoid discovery continues in Lean, the empirical focus has
-shifted to the **Thinking Head** architecture:
+Supervised auxiliary losses for the Thinking Head failed in Phase 23 (Maladaptive
+Thinking Trap). The focus has now moved to **Reinforcement Learning**:
 
-- **Thinking Head:** A discrete gate that triggers recurrent in-place state
-  updates to the DeltaNet matrix ($c_t$), enabling Adaptive Computation Time
-  (ACT) without KV-cache bloat.
-- **Continuous RAG:** Integration of external vector retrievals during "thought"
-  passes, projecting facts directly into the persistent RNN state.
-- **Immediate Task:** Sweep auxiliary loss normalization (`aux_items` vs
-  `fresh_tokens`) to stabilize the thinking curriculum.
+- **Active Task:** Transition the Thinking Head to **GRPO-based training**.
+- **Mechanism:** Use detached trajectories (no-grad) to sample thinking depths
+  and reward based on final-token NLL reduction.
+- **RAG Integration:** Design the rollout loop to trigger vector DB lookups during
+  thinking actions.
+- **Immediate Milestone:** Implement `experiments/thinking.py` trajectory
+  sampling for RL.
 
 ## After these are done
 
-- **RL Transition:** Migrate the Thinking Head to GRPO-based training to scale
-  recurrent depth beyond BPTT limits.
 - **Continuous RAG:** Wire the Thinking Head actions to external vector DBs.
 - Wire imports into `StateDep.lean`, single `lake build` to confirm
   everything still compiles.

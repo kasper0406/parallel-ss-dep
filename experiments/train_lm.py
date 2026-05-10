@@ -442,6 +442,22 @@ def main():
     p.add_argument("--think_replay_batch", type=int, default=0,
                    help="Number of resolved advantage replay rows packed into "
                         "each batch. 0 = match --think_queue_batch.")
+    p.add_argument("--think_queue_accum_steps", type=int, default=0,
+                   help="Number of extra queued continuation/replay "
+                        "microbatches to process with gradient accumulation "
+                        "before each fresh dataloader batch. 0 keeps the old "
+                        "row-packing behavior. Values >0 increase queue "
+                        "processing capacity without reducing fresh LM rows.")
+    p.add_argument("--think_queue_accum_max_steps", type=int, default=0,
+                   help="Maximum queued microbatches per optimizer step when "
+                        "--think_queue_drain_target is active. 0 means use "
+                        "--think_queue_accum_steps as the fixed maximum.")
+    p.add_argument("--think_queue_drain_target", type=int, default=-1,
+                   help="Adaptive queue drain target. When >=0, continue "
+                        "processing queued microbatches until both continuation "
+                        "and replay queues are at or below this many records, "
+                        "bounded by --think_queue_accum_max_steps. -1 disables "
+                        "adaptive draining.")
     p.add_argument("--think_replay_weight", type=float, default=1.0,
                    help="Multiplier for resolved advantage replay loss. This "
                         "lets sparse THINK supervision compete with dense "
@@ -562,6 +578,17 @@ def main():
         raise SystemExit("--think_safety_max_depth_start must be non-negative.")
     if args.enable_thinking_token and args.think_replay_weight < 0:
         raise SystemExit("--think_replay_weight must be non-negative.")
+    if args.enable_thinking_token and args.think_queue_accum_steps < 0:
+        raise SystemExit("--think_queue_accum_steps must be non-negative.")
+    if args.enable_thinking_token and args.think_queue_accum_max_steps < 0:
+        raise SystemExit("--think_queue_accum_max_steps must be non-negative.")
+    if (args.enable_thinking_token and args.think_queue_accum_max_steps > 0
+            and args.think_queue_accum_max_steps < args.think_queue_accum_steps):
+        raise SystemExit(
+            "--think_queue_accum_max_steps must be >= --think_queue_accum_steps."
+        )
+    if args.enable_thinking_token and args.think_queue_drain_target < -1:
+        raise SystemExit("--think_queue_drain_target must be >= -1.")
     if args.enable_thinking_token and args.think_gate_emit_weight < 0:
         raise SystemExit("--think_gate_emit_weight must be non-negative.")
     if args.enable_thinking_token and args.logit_kl_beta > 0:
@@ -883,6 +910,9 @@ def main():
     if args.enable_thinking_token:
         print(f"  THINKING queue: max={args.think_queue_max:,} CPU records, "
               f"packed_cont={think_queue_batch}, packed_replay={think_replay_batch}, "
+              f"accum_steps={args.think_queue_accum_steps}, "
+              f"accum_max={args.think_queue_accum_max_steps or args.think_queue_accum_steps}, "
+              f"drain_target={args.think_queue_drain_target}, "
               f"decision={args.think_decision}, "
               f"priority={'on' if args.think_prioritize_queue else 'off'}")
     pad_token_id = tok.eos_token_id
@@ -993,72 +1023,239 @@ def main():
             l_sem_total = (weights * all_dist).mean()
         return l_sem_total, n_stmts_total
 
-    def process_thinking_continuations(step: int) -> tuple[torch.Tensor, int, dict[str, float]]:
-        if not args.enable_thinking_token or think_queue is None or len(think_queue) == 0:
-            return torch.zeros((), device="cuda"), 0, {}
-        items = think_queue.pop_batch(think_queue_batch)
-        ctx, targets, last_pos = build_continuation_batch(
-            items, block_size=args.T, pad_token_id=pad_token_id, device="cuda"
-        )
-        logits_cont = model(ctx)
-        row = torch.arange(ctx.shape[0], device=ctx.device)
-        logits_last = logits_cont[row, last_pos]                    # (Bq, V)
-        forced = torch.zeros(ctx.shape[0], dtype=torch.bool, device=ctx.device)
-        if args.think_safety_max_depth > 0:
-            forced |= torch.tensor(
-                [item.depth >= args.think_safety_max_depth for item in items],
-                dtype=torch.bool, device=ctx.device,
+    def thinking_schedule(step: int) -> dict[str, float]:
+        if step <= args.think_warmup_steps:
+            curriculum = 0.0
+        elif args.think_curriculum_steps > 0:
+            curriculum = min(
+                1.0,
+                (step - args.think_warmup_steps)
+                / float(args.think_curriculum_steps),
             )
-        if args.think_queue_ttl > 0:
-            forced |= torch.tensor(
-                [step - item.origin_step >= args.think_queue_ttl for item in items],
-                dtype=torch.bool, device=ctx.device,
+        else:
+            curriculum = 1.0
+        explore_prob = (
+            args.think_explore_start_prob
+            + curriculum
+            * (args.think_explore_prob - args.think_explore_start_prob)
+        )
+        lambda_start = (
+            args.think_lambda if args.think_lambda_start is None
+            else args.think_lambda_start
+        )
+        lambda_eff = lambda_start + curriculum * (args.think_lambda - lambda_start)
+        gate_threshold_start = (
+            args.think_gate_threshold
+            if args.think_gate_threshold_start is None
+            else args.think_gate_threshold_start
+        )
+        gate_threshold = (
+            gate_threshold_start
+            + curriculum * (args.think_gate_threshold - gate_threshold_start)
+        )
+        depth_start = (
+            args.think_safety_max_depth
+            if args.think_safety_max_depth_start is None
+            else args.think_safety_max_depth_start
+        )
+        if args.think_safety_max_depth <= 0 and depth_start <= 0:
+            safety_max_depth = 0
+        else:
+            depth_eff_float = (
+                depth_start
+                + curriculum * (args.think_safety_max_depth - depth_start)
             )
-        think_mask = choose_think_actions(
-            logits_last.detach(), thinking_token_id, args.think_policy,
-            args.think_threshold, args.think_temperature, allow_think=~forced,
-        )
-        explore_mask = torch.zeros_like(think_mask)
-        if args.think_explore_prob > 0.0:
-            explore_mask = (
-                torch.rand_like(think_mask.float()) < args.think_explore_prob
-            ) & ~forced
-            think_mask = think_mask | explore_mask
-        think_targets = torch.full_like(targets, int(thinking_token_id))
-        think_nll = F.cross_entropy(logits_last, think_targets, reduction="none")
-        answer_nll = cross_entropy_masking_token(
-            logits_last, targets, int(thinking_token_id), reduction="none"
-        )
-        per_item_loss = torch.where(
-            think_mask, think_nll + args.think_lambda, answer_nll
-        )
-        closed_traj: list[float] = []
-        for i, item in enumerate(items):
-            if bool(think_mask[i].item()):
-                next_ctx = (item.context_ids + [int(thinking_token_id)])[-args.T:]
-                think_queue.enqueue(ThinkContinuation(
-                    context_ids=next_ctx,
-                    target_id=item.target_id,
-                    depth=item.depth + 1,
-                    accum_nll=item.accum_nll + float(think_nll[i].detach().item()),
-                    accum_cost=item.accum_cost + float(args.think_lambda),
-                    origin_step=item.origin_step,
-                ))
-            else:
-                closed_traj.append(
-                    item.accum_nll + item.accum_cost
-                    + float(answer_nll[i].detach().item())
-                )
-        if closed_traj:
-            think_closed_traj_window.extend(closed_traj)
-        stats = {
-            "cont_items": float(len(items)),
-            "cont_think": float(think_mask.float().sum().item()),
-            "cont_explore": float(explore_mask.float().sum().item()),
-            "forced_emit": float(forced.float().sum().item()),
-            "closed": float(len(closed_traj)),
+            safety_max_depth = max(1, int(round(depth_eff_float)))
+        return {
+            "curriculum": float(curriculum),
+            "explore_prob": float(explore_prob),
+            "lambda": float(lambda_eff),
+            "gate_threshold": float(gate_threshold),
+            "safety_max_depth": float(safety_max_depth),
         }
-        return per_item_loss.sum(), len(items), stats
+
+    def new_thinking_stats(schedule: dict[str, float]) -> dict[str, float]:
+        return {
+            "cont_items": 0.0,
+            "cont_think": 0.0,
+            "cont_explore": 0.0,
+            "forced_emit": 0.0,
+            "closed": 0.0,
+            "replay_items": 0.0,
+            "replay_think": 0.0,
+            **schedule,
+        }
+
+    def merge_thinking_stats(dst: dict[str, float], src: dict[str, float]) -> None:
+        summed = {
+            "cont_items", "cont_think", "cont_explore", "forced_emit",
+            "closed", "replay_items", "replay_think",
+        }
+        for key, value in src.items():
+            if key in summed:
+                dst[key] = dst.get(key, 0.0) + float(value)
+            else:
+                dst[key] = float(value)
+
+    def process_thinking_aux_batch(
+        step: int,
+        cont_items: list[ThinkContinuation],
+        replay_items: list[ThinkReplay],
+        schedule: dict[str, float],
+    ) -> tuple[torch.Tensor, float, dict[str, float]]:
+        if not cont_items and not replay_items:
+            return torch.zeros((), device="cuda"), 0.0, new_thinking_stats(schedule)
+        assert think_queue is not None and think_replay_queue is not None
+        rows = []
+        cont_targets = cont_last = None
+        replay_targets = replay_last = replay_is_think = None
+        if cont_items:
+            cont_x, cont_targets, cont_last = build_continuation_batch(
+                cont_items, block_size=args.T, pad_token_id=pad_token_id,
+                device="cuda",
+            )
+            rows.append(cont_x)
+        if replay_items:
+            replay_x, replay_targets, replay_last, replay_is_think = build_replay_batch(
+                replay_items, block_size=args.T, pad_token_id=pad_token_id,
+                thinking_token_id=int(thinking_token_id), device="cuda",
+            )
+            rows.append(replay_x)
+        aux_x = torch.cat(rows, dim=0)
+        aux_logits = model(aux_x)
+        loss_terms: list[torch.Tensor] = []
+        stats = new_thinking_stats(schedule)
+        lambda_eff = float(schedule["lambda"])
+        gate_threshold = float(schedule["gate_threshold"])
+        safety_max_depth = int(schedule["safety_max_depth"])
+        explore_prob = float(schedule["explore_prob"])
+
+        if cont_items:
+            assert cont_targets is not None and cont_last is not None
+            row = torch.arange(len(cont_items), device=aux_logits.device)
+            cont_logits = aux_logits[row, cont_last]
+            forced = torch.zeros(len(cont_items), dtype=torch.bool,
+                                 device=aux_logits.device)
+            if safety_max_depth > 0:
+                forced |= torch.tensor(
+                    [item.depth >= safety_max_depth for item in cont_items],
+                    dtype=torch.bool, device=aux_logits.device,
+                )
+            if args.think_queue_ttl > 0:
+                forced |= torch.tensor(
+                    [step - item.origin_step >= args.think_queue_ttl
+                     for item in cont_items],
+                    dtype=torch.bool, device=aux_logits.device,
+                )
+            if args.think_decision == "gate":
+                cont_gate = model._last_gate[row, cont_last].detach()
+                cont_think = (cont_gate < gate_threshold) & ~forced
+                cont_gate_logits = model._last_gate_logits[row, cont_last]
+                cont_think_nll = F.binary_cross_entropy_with_logits(
+                    cont_gate_logits,
+                    torch.zeros_like(cont_gate_logits),
+                    reduction="none",
+                )
+            else:
+                cont_think = choose_think_actions(
+                    cont_logits.detach(), int(thinking_token_id),
+                    args.think_policy, args.think_threshold,
+                    args.think_temperature, allow_think=~forced,
+                )
+                think_targets = torch.full_like(cont_targets, int(thinking_token_id))
+                cont_think_nll = F.cross_entropy(
+                    cont_logits, think_targets, reduction="none",
+                )
+            cont_explore = torch.zeros_like(cont_think)
+            if explore_prob > 0.0:
+                cont_explore = (
+                    torch.rand_like(cont_think.float()) < explore_prob
+                ) & ~forced
+                cont_think = cont_think | cont_explore
+            cont_answer_nll = cross_entropy_masking_token(
+                cont_logits, cont_targets, int(thinking_token_id),
+                reduction="none",
+            )
+            closed_traj: list[float] = []
+            for i, item in enumerate(cont_items):
+                if bool(cont_think[i].item()):
+                    next_ctx = (item.context_ids + [int(thinking_token_id)])[-args.T:]
+                    think_queue.enqueue(ThinkContinuation(
+                        context_ids=next_ctx,
+                        target_id=item.target_id,
+                        depth=item.depth + 1,
+                        accum_nll=(
+                            item.accum_nll
+                            + float(cont_think_nll[i].detach().item())
+                        ),
+                        accum_cost=item.accum_cost + lambda_eff,
+                        origin_step=item.origin_step,
+                        decision_context_ids=(
+                            item.decision_context_ids or item.context_ids
+                        ),
+                        immediate_nll=item.immediate_nll,
+                    ))
+                else:
+                    answer_after_think = float(cont_answer_nll[i].detach().item())
+                    traj = item.accum_nll + item.accum_cost + answer_after_think
+                    closed_traj.append(traj)
+                    comparable_traj = item.accum_cost + answer_after_think
+                    beneficial = (
+                        comparable_traj + args.think_advantage_margin
+                        < float(item.immediate_nll)
+                    )
+                    think_replay_queue.enqueue(ThinkReplay(
+                        context_ids=item.decision_context_ids or item.context_ids,
+                        target_id=item.target_id,
+                        target_is_thinking=beneficial,
+                    ))
+                    loss_terms.append(cont_answer_nll[i])
+            if closed_traj:
+                think_closed_traj_window.extend(closed_traj)
+            stats.update({
+                "cont_items": float(len(cont_items)),
+                "cont_think": float(cont_think.float().sum().item()),
+                "cont_explore": float(cont_explore.float().sum().item()),
+                "forced_emit": float(forced.float().sum().item()),
+                "closed": float(len(closed_traj)),
+            })
+
+        if replay_items:
+            assert replay_targets is not None
+            assert replay_last is not None and replay_is_think is not None
+            start = len(cont_items)
+            row = torch.arange(start, start + len(replay_items),
+                               device=aux_logits.device)
+            replay_logits = aux_logits[row, replay_last]
+            if args.think_decision == "gate":
+                replay_gate_logits = model._last_gate_logits[row, replay_last]
+                emit_targets = (~replay_is_think).float()
+                gate_ce = F.binary_cross_entropy_with_logits(
+                    replay_gate_logits, emit_targets, reduction="none",
+                )
+                replay_answer_ce = cross_entropy_masking_token(
+                    replay_logits, replay_targets, int(thinking_token_id),
+                    reduction="none",
+                )
+                replay_ce = torch.where(
+                    replay_is_think,
+                    gate_ce + lambda_eff,
+                    gate_ce + replay_answer_ce,
+                )
+            else:
+                replay_ce = F.cross_entropy(
+                    replay_logits, replay_targets, reduction="none",
+                )
+                replay_ce = replay_ce + lambda_eff * replay_is_think.float()
+            loss_terms.append(args.think_replay_weight * replay_ce)
+            stats["replay_items"] = float(len(replay_items))
+            stats["replay_think"] = float(replay_is_think.float().sum().item())
+
+        if not loss_terms:
+            return torch.zeros((), device=aux_logits.device), 0.0, stats
+        loss_sum = torch.stack([term.sum() for term in loss_terms]).sum()
+        count = float(sum(term.numel() for term in loss_terms))
+        return loss_sum, count, stats
 
     needs_hidden = use_semantic_loss              # both stmt + token L_sem need hidden
     needs_encoder_hidden = use_semantic_loss      # we pool encoder's hidden for cosine target
@@ -1079,6 +1276,44 @@ def main():
             x, y = x.to("cuda"), y.to("cuda")
             stmt_starts = None
             stmt_ends = None
+        for o in opts:
+            o.zero_grad(set_to_none=True)
+        pre_think_stats: dict[str, float] | None = None
+        if args.enable_thinking_token:
+            schedule = thinking_schedule(step)
+            pre_think_stats = new_thinking_stats(schedule)
+            if args.think_queue_accum_steps > 0:
+                assert think_queue is not None and think_replay_queue is not None
+                fresh_token_budget = max(1, x.numel())
+                accum_max_steps = (
+                    args.think_queue_accum_max_steps
+                    or args.think_queue_accum_steps
+                )
+                accum_step = 0
+                while accum_step < accum_max_steps:
+                    must_do_minimum = accum_step < args.think_queue_accum_steps
+                    should_drain = (
+                        args.think_queue_drain_target >= 0
+                        and (
+                            len(think_queue) > args.think_queue_drain_target
+                            or len(think_replay_queue) > args.think_queue_drain_target
+                        )
+                    )
+                    if not must_do_minimum and not should_drain:
+                        break
+                    cont_n = min(think_queue_batch, len(think_queue))
+                    replay_n = min(think_replay_batch, len(think_replay_queue))
+                    if cont_n == 0 and replay_n == 0:
+                        break
+                    cont_items = think_queue.pop_batch(cont_n)
+                    replay_items = think_replay_queue.pop_batch(replay_n)
+                    aux_loss_sum, aux_count, aux_stats = process_thinking_aux_batch(
+                        step, cont_items, replay_items, schedule,
+                    )
+                    merge_thinking_stats(pre_think_stats, aux_stats)
+                    if aux_count > 0:
+                        (aux_loss_sum / fresh_token_budget).backward()
+                    accum_step += 1
         packed_cont_items: list[ThinkContinuation] = []
         packed_replay_items: list[ThinkReplay] = []
         packed_cont_last = packed_cont_targets = None
@@ -1087,7 +1322,10 @@ def main():
         fresh_n = x.shape[0]
         if args.enable_thinking_token:
             assert think_queue is not None and think_replay_queue is not None
-            if args.think_prioritize_queue:
+            if args.think_queue_accum_steps > 0:
+                n_cont = 0
+                n_replay = 0
+            elif args.think_prioritize_queue:
                 queue_capacity = max(0, x.shape[0] - args.think_min_fresh_rows)
                 n_cont = min(len(think_queue), queue_capacity)
                 n_replay = min(len(think_replay_queue), queue_capacity - n_cont)
@@ -1176,69 +1414,17 @@ def main():
             reduction="none",
         ).reshape(y.shape)                                               # (B, T)
         if args.enable_thinking_token:
-            if step <= args.think_warmup_steps:
-                think_curriculum = 0.0
-            elif args.think_curriculum_steps > 0:
-                think_curriculum = min(
-                    1.0,
-                    (step - args.think_warmup_steps)
-                    / float(args.think_curriculum_steps),
-                )
-            else:
-                think_curriculum = 1.0
-            think_explore_prob_eff = (
-                args.think_explore_start_prob
-                + think_curriculum
-                * (args.think_explore_prob - args.think_explore_start_prob)
-            )
-            lambda_start = (
-                args.think_lambda if args.think_lambda_start is None
-                else args.think_lambda_start
-            )
-            think_lambda_eff = (
-                lambda_start
-                + think_curriculum * (args.think_lambda - lambda_start)
-            )
-            gate_threshold_start = (
-                args.think_gate_threshold
-                if args.think_gate_threshold_start is None
-                else args.think_gate_threshold_start
-            )
-            think_gate_threshold_eff = (
-                gate_threshold_start
-                + think_curriculum
-                * (args.think_gate_threshold - gate_threshold_start)
-            )
-            depth_start = (
-                args.think_safety_max_depth
-                if args.think_safety_max_depth_start is None
-                else args.think_safety_max_depth_start
-            )
-            if args.think_safety_max_depth <= 0 and depth_start <= 0:
-                think_safety_max_depth_eff = 0
-            else:
-                depth_eff_float = (
-                    depth_start
-                    + think_curriculum
-                    * (args.think_safety_max_depth - depth_start)
-                )
-                think_safety_max_depth_eff = max(1, int(round(depth_eff_float)))
+            schedule = thinking_schedule(step)
+            think_curriculum = schedule["curriculum"]
+            think_explore_prob_eff = schedule["explore_prob"]
+            think_lambda_eff = schedule["lambda"]
+            think_gate_threshold_eff = schedule["gate_threshold"]
+            think_safety_max_depth_eff = int(schedule["safety_max_depth"])
             cont_loss_terms: list[torch.Tensor] = []
             replay_loss_terms: list[torch.Tensor] = []
-            cont_stats = {
-                "cont_items": float(len(packed_cont_items)),
-                "cont_think": 0.0,
-                "cont_explore": 0.0,
-                "forced_emit": 0.0,
-                "closed": 0.0,
-                "replay_items": float(len(packed_replay_items)),
-                "replay_think": 0.0,
-                "curriculum": float(think_curriculum),
-                "explore_prob": float(think_explore_prob_eff),
-                "lambda": float(think_lambda_eff),
-                "gate_threshold": float(think_gate_threshold_eff),
-                "safety_max_depth": float(think_safety_max_depth_eff),
-            }
+            cont_stats = new_thinking_stats(schedule)
+            cont_stats["cont_items"] = float(len(packed_cont_items))
+            cont_stats["replay_items"] = float(len(packed_replay_items))
             if packed_cont_items:
                 row = torch.arange(len(packed_cont_items), device=logits.device)
                 cont_logits = logits[row, packed_cont_last]
@@ -1498,6 +1684,9 @@ def main():
                 "gate_emit_items": gate_emit_items,
                 **cont_stats,
             }
+            if pre_think_stats is not None:
+                merge_thinking_stats(pre_think_stats, think_stats)
+                think_stats = pre_think_stats
             think_stats_window.append(think_stats)
         elif args.output_gate:
             g = model._last_gate                                         # (B, T)
@@ -1554,8 +1743,6 @@ def main():
                 + args.surprise_weight * surprise
                 + args.semantic_loss_beta * l_sem
                 + args.logit_kl_beta * l_kl)
-        for o in opts:
-            o.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         for o in opts:
@@ -1679,6 +1866,7 @@ def main():
                 line += (f"  think(rate={think_rate:.3f},ans_ce={answer_ce:.4f},"
                           f"traj={traj_str},q={queue_len:.0f},"
                           f"depth={q_mean_depth:.2f}/{q_max_depth:.0f},"
+                          f"work={cont_items:.0f}/{replay_items:.0f},"
                           f"forced={forced_rate:.3f},explore={explore_rate:.3f},"
                           f"replay_think={replay_rate:.3f},"
                           f"gate_emit={gate_emit_items:.0f},"
@@ -1724,6 +1912,8 @@ def main():
                     tb.add_scalar("think/queue_max_depth", q_max_depth, step)
                     tb.add_scalar("think/forced_emit_rate", forced_rate, step)
                     tb.add_scalar("think/queue_dropped", q_dropped, step)
+                    tb.add_scalar("think/cont_items", cont_items, step)
+                    tb.add_scalar("think/replay_items", replay_items, step)
                 # FiLM α values.
                 if args.feedback != "none" or fb_xattn_pairs:
                     for entry in model.feedback_alphas():
@@ -1818,6 +2008,9 @@ def main():
                 "think_explore_start_prob": args.think_explore_start_prob,
                 "think_safety_max_depth": args.think_safety_max_depth,
                 "think_safety_max_depth_start": args.think_safety_max_depth_start,
+                "think_queue_accum_steps": args.think_queue_accum_steps,
+                "think_queue_accum_max_steps": args.think_queue_accum_max_steps,
+                "think_queue_drain_target": args.think_queue_drain_target,
             },
         }
         pathlib.Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)

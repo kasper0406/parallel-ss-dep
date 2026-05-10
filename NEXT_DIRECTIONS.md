@@ -1,6 +1,41 @@
 # NEXT_DIRECTIONS.md
 
-## Current focus (2026-04-27): scaling sparse far-distance feedback
+## Current Focus (2026-05-10): Continuous RAG & The Thinking Head
+
+While the sparse far-distance feedback (Finding 9) remains a core architectural
+win, the project has pivoted to the **Thinking Head** as the primary path to
+frontier scaling and **Continuous RAG**.
+
+### 1. The Thinking Head (Active)
+We have implemented a discrete gated path that enables Linear RNNs (DeltaNet) to
+perform **Adaptive Computation Time (ACT)** without increasing context length or
+KV-cache size.
+
+- **Current Status:** Sweep on auxiliary loss normalization/scaling is active.
+- **Key Insight:** Moving from `fresh_tokens` to `aux_items` normalization
+  stabilizes the curriculum by decoupling the learning signal from the frequency
+  of thinking steps.
+- **Verification:** Monitor `runs/think_sweep_*.log`.
+
+### 2. The Roadmap to Continuous RAG
+The thinking mechanism provides the necessary temporal hooks for **External Retrieval**.
+
+- **Mechanism:** Thinking steps will be extended to trigger vector-database
+  lookups. The retrieved facts will be projected directly into the DeltaNet
+  recurrent state matrix.
+- **Impact:** Eliminates the need for massive prompt prefixing in RAG; the model
+  loads facts into memory dynamically.
+
+### 3. Scaling & Distillation (Next)
+Once the thinking curriculum is stabilized at the 217M scale, we will return to
+the distillation track:
+- Distill from **Qwen2.5-Coder** (or Qwen3.6) using the Thinking-DeltaNet backbone.
+- Evaluate on **HumanEval** and **MBPP** to measure the reasoning lift from the
+  extra "thought" passes.
+
+---
+
+## Previous focus (2026-04-27): scaling sparse far-distance feedback
 
 After the architectural exploration logged in
 [`SESSION_FINDINGS.md`](SESSION_FINDINGS.md) and

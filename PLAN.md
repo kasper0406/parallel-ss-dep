@@ -101,7 +101,20 @@ matrices is unipotent) and inherit `Monoid` / `Group` structure from
 mathlib's `Matrix`. Focus on U_4 concretely, with gestures toward
 general n.
 
-## After (3) are done
+## Current Primary Research Pivot: Continuous RAG & The Thinking Head
+
+While algebraic monoid discovery continues in Lean, the empirical focus has
+shifted to the **Thinking Head** architecture:
+
+- **Thinking Head:** A discrete gate that triggers recurrent in-place state
+  updates to the DeltaNet matrix ($c_t$), enabling Adaptive Computation Time
+  (ACT) without KV-cache bloat.
+- **Continuous RAG:** Integration of external vector retrievals during "thought"
+  passes, projecting facts directly into the persistent RNN state.
+- **Immediate Task:** Sweep auxiliary loss normalization (`aux_items` vs
+  `fresh_tokens`) to stabilize the thinking curriculum.
+
+## After these are done
 
 - Wire imports into `StateDep.lean`, single `lake build` to confirm
   everything still compiles.

@@ -121,6 +121,22 @@ Chinchilla-scale or frontier-finetune follow-up*.
                                          pass-2 input
 ```
 
+## Current Frontier: Continuous RAG & The Thinking Head
+
+We are currently extending the architecture with a **discrete Thinking Head**
+that enables Adaptive Computation Time (ACT) without sequence expansion.
+
+- **The Problem:** Traditional "Pause Tokens" in Transformers bloat the KV cache.
+- **The Solution:** Because our backbone is a **Linear RNN (DeltaNet)**, the
+  state is fixed-size. A "thinking" step is simply a recurrent update to the
+  $c_t$ state matrix in-place.
+- **The Roadmap:** This mechanism sets the foundation for **Continuous RAG**,
+  where thinking steps trigger external vector-database retrievals that project
+  facts directly into the model's persistent recurrent state.
+
+See [`THINKING_RAG_DIRECTION.md`](THINKING_RAG_DIRECTION.md) for the full
+mechanistic rationale.
+
 ## Validation matrix
 
 | Metric | Result | Reference |

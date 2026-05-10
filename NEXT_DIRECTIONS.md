@@ -16,6 +16,9 @@ KV-cache size.
   stabilizes the curriculum by decoupling the learning signal from the frequency
   of thinking steps.
 - **Verification:** Monitor `runs/think_sweep_*.log`.
+- **Scaling Path:** Transition to Reinforcement Learning (**GRPO**) to support
+  deep thinking chains (depth 50+) and Continuous RAG. See
+  [`RL_RAG_ROADMAP.md`](RL_RAG_ROADMAP.md).
 
 ### 2. The Roadmap to Continuous RAG
 The thinking mechanism provides the necessary temporal hooks for **External Retrieval**.

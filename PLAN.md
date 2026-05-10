@@ -116,6 +116,9 @@ shifted to the **Thinking Head** architecture:
 
 ## After these are done
 
+- **RL Transition:** Migrate the Thinking Head to GRPO-based training to scale
+  recurrent depth beyond BPTT limits.
+- **Continuous RAG:** Wire the Thinking Head actions to external vector DBs.
 - Wire imports into `StateDep.lean`, single `lake build` to confirm
   everything still compiles.
 - Reflect on what was easy vs. hard in each, and pick **one** to carry

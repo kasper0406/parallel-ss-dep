@@ -13,7 +13,9 @@ The project has pivoted toward the **Thinking Head** architecture:
 - **Sparse Feedback:** Maintain the **sparse (2, 28) FiLM feedback** connection as it is a proven architectural win for routing high-level context.
 - **Training Loops:** Use the **asynchronous `ThinkContinuationQueue`** for training thinking passes to ensure GPU saturation.
 - **Normalization:** Use **`aux_items`** (actual item count) rather than `fresh_tokens` (batch size × T) for normalizing auxiliary losses in the thinking head to stabilize curriculum learning.
-- **Memory Management:** For "thinking" experiments with `safety_max_depth > 2`, always enable **`--think_checkpointing`**. This uses activation checkpointing for continuation passes, which is essential to prevent OOM errors during the deep-recurrence phases of the curriculum.
+- **Memory Management:** For "thinking" experiments with `safety_max_depth > 2`, always enable **`--think_checkpointing`**. 
+- **RL Alignment:** Prefer **GRPO** (Group Relative Policy Optimization) for scaling thought depth beyond depth 15. This bypasses the BPTT memory wall and aligns thinking directly with generation accuracy.
+- **Evaluation:** Always validate RL agents on **HumanEval** and **mechanistic tasks** to ensure "thinking" translates to reasoning, not just token-level over-optimization.
 
 ## Documentation Index
 - `README.md`: High-level overview and headline findings.

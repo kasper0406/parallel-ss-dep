@@ -113,6 +113,8 @@ Thinking Trap). The focus has now moved to **Reinforcement Learning**:
   thinking actions.
 - **Immediate Milestone:** Implement `experiments/thinking.py` trajectory
   sampling for RL.
+- **Evaluation Phase (Active):** Run RL-trained checkpoints on existing benchmarks
+  (HumanEval, Mechanistic Tasks) to verify the reasoning lift.
 
 ## After these are done
 

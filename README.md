@@ -125,18 +125,15 @@ Chinchilla-scale or frontier-finetune follow-up*.
 
 We are currently transitioning the architecture from supervised BPTT to **Reinforcement Learning (GRPO)**.
 
-### Phase 23 Findings: The "Maladaptive Thinking" Trap
-Recent experiments (May 2026) with supervised auxiliary losses revealed a critical failure mode:
-- **Result:** We successfully increased the thinking rate to ~6% by normalizing auxiliary losses by actual items (`aux_items`).
-- **Failure:** However, this thinking was **negatively correlated** with model quality (PPL collapsed from 81 to 156+).
-- **Diagnosis:** The supervised proxy (matching "thought" states to targets) taught the model to "daydream"—spending compute on internal state alignment that didn't help, or even hindered, next-token prediction.
+### Phase 24 Discovery: Autonomous Thinking "From Scratch"
+Recent experiments (May 2026) have established that:
+- **RL > Supervised:** Transitioning to GRPO has solved the "Maladaptive Thinking" trap. Models are now rewarded only when thinking directly improves next-token prediction.
+- **Autonomous Discovery:** We successfully trained a thinking model **from scratch** (starting from a non-thinking DN baseline). The model autonomously discovered the utility of the [THINKING] token, reaching a ~12% thought rate through pure RL exploration.
+- **Scaling Depth:** The "From SFT" model has already scaled to an average depth of 1.25 (max 10) while maintaining control over perplexity.
 
-See [`AUX_LOSS_SWEEP_REPORT.md`](AUX_LOSS_SWEEP_REPORT.md) for the full breakdown.
-
-### The RL Pivot
-To scale deep thinking beyond depth 20 and escape the supervised trap, we are migrating to **GRPO**:
-- **Reward Signal:** The model is only rewarded if a thinking trajectory reduces the final Negative Log-Likelihood (NLL) of the correct token.
-- **Continuous RAG:** Thinking steps trigger external retrievals that are rewarded only when the retrieved facts contribute to generation accuracy.
+### Next Steps: Benchmark & RAG
+1.  **Evaluation:** We are now running the RL-trained agents on existing benchmarks (**HumanEval**, **MBPP**, and mechanistic tasks) to quantify the reasoning lift from extra "thought" passes.
+2.  **Continuous RAG:** Integrating the external vector database to give the model a concrete source of information to "think about."
 
 See [`RL_RAG_ROADMAP.md`](RL_RAG_ROADMAP.md) for the technical integration plan.
 

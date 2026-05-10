@@ -442,6 +442,10 @@ def main():
     p.add_argument("--think_replay_batch", type=int, default=0,
                    help="Number of resolved advantage replay rows packed into "
                         "each batch. 0 = match --think_queue_batch.")
+    p.add_argument("--think_checkpointing", action="store_true",
+                   help="Use gradient checkpointing for the thinking continuation "
+                        "passes to massively reduce memory at the cost of "
+                        "extra compute.")
     p.add_argument("--think_queue_accum_steps", type=int, default=0,
                    help="Number of extra queued continuation/replay "
                         "microbatches to process with gradient accumulation "
@@ -1205,7 +1209,13 @@ def main():
             )
             rows.append(replay_x)
         aux_x = torch.cat(rows, dim=0)
-        aux_logits = model(aux_x)
+        if args.think_checkpointing:
+            from torch.utils.checkpoint import checkpoint
+            # model is a nn.Module, which checkpoint can wrap.
+            # We use use_reentrant=False for modern compatibility.
+            aux_logits = checkpoint(model, aux_x, use_reentrant=False)
+        else:
+            aux_logits = model(aux_x)
         loss_terms: list[torch.Tensor] = []
         stats = new_thinking_stats(schedule)
         lambda_eff = float(schedule["lambda"])

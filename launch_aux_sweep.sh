@@ -10,7 +10,7 @@ COMMON_ARGS=(
     --T 512 --batch 4 --steps 4000 --lr 3e-4 --seed 0
     --dataset codeparrot/codeparrot-clean --text_field content
     --log_every 200 --val_every 1000
-    --enable_thinking_token
+    --enable_thinking_token --think_checkpointing
     --think_decision gate
     --think_prioritize_queue
     --think_queue_batch 4

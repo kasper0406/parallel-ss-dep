@@ -458,6 +458,25 @@ def main():
                         "and replay queues are at or below this many records, "
                         "bounded by --think_queue_accum_max_steps. -1 disables "
                         "adaptive draining.")
+    p.add_argument("--think_backpressure_target", type=int, default=-1,
+                   help="Queue length target for dynamic THINK backpressure. "
+                        "-1 reuses --think_queue_drain_target when available; "
+                        "otherwise backpressure is disabled.")
+    p.add_argument("--think_backpressure_max", type=float, default=4.0,
+                   help="Maximum normalized queue pressure applied to dynamic "
+                        "THINK backpressure.")
+    p.add_argument("--think_backpressure_lambda", type=float, default=0.0,
+                   help="Additional ponder cost per unit queue pressure. This "
+                        "makes new/repeated THINK actions less attractive when "
+                        "the continuation or replay queue is above target.")
+    p.add_argument("--think_backpressure_threshold", type=float, default=0.0,
+                   help="For --think_decision gate, divide the effective THINK "
+                        "gate threshold by (1 + this * queue_pressure), biasing "
+                        "the gate toward EMIT when backlog is high.")
+    p.add_argument("--think_backpressure_explore", type=float, default=0.0,
+                   help="Divide exploration probability by "
+                        "(1 + this * queue_pressure), reducing artificial THINK "
+                        "inflow when backlog is high.")
     p.add_argument("--think_replay_weight", type=float, default=1.0,
                    help="Multiplier for resolved advantage replay loss. This "
                         "lets sparse THINK supervision compete with dense "
@@ -589,6 +608,16 @@ def main():
         )
     if args.enable_thinking_token and args.think_queue_drain_target < -1:
         raise SystemExit("--think_queue_drain_target must be >= -1.")
+    if args.enable_thinking_token and args.think_backpressure_target < -1:
+        raise SystemExit("--think_backpressure_target must be >= -1.")
+    if args.enable_thinking_token and args.think_backpressure_max < 0:
+        raise SystemExit("--think_backpressure_max must be non-negative.")
+    if args.enable_thinking_token and args.think_backpressure_lambda < 0:
+        raise SystemExit("--think_backpressure_lambda must be non-negative.")
+    if args.enable_thinking_token and args.think_backpressure_threshold < 0:
+        raise SystemExit("--think_backpressure_threshold must be non-negative.")
+    if args.enable_thinking_token and args.think_backpressure_explore < 0:
+        raise SystemExit("--think_backpressure_explore must be non-negative.")
     if args.enable_thinking_token and args.think_gate_emit_weight < 0:
         raise SystemExit("--think_gate_emit_weight must be non-negative.")
     if args.enable_thinking_token and args.logit_kl_beta > 0:
@@ -1072,7 +1101,49 @@ def main():
             "lambda": float(lambda_eff),
             "gate_threshold": float(gate_threshold),
             "safety_max_depth": float(safety_max_depth),
+            "queue_pressure": 0.0,
+            "backpressure_target": 0.0,
         }
+
+    def apply_queue_backpressure(schedule: dict[str, float]) -> dict[str, float]:
+        if think_queue is None or think_replay_queue is None:
+            return schedule
+        target = args.think_backpressure_target
+        if target < 0:
+            target = args.think_queue_drain_target
+        uses_backpressure = (
+            target >= 0
+            and (
+                args.think_backpressure_lambda > 0.0
+                or args.think_backpressure_threshold > 0.0
+                or args.think_backpressure_explore > 0.0
+            )
+        )
+        if not uses_backpressure:
+            schedule["backpressure_target"] = float(max(0, target))
+            return schedule
+        target = max(1, target)
+        backlog = max(len(think_queue), len(think_replay_queue))
+        pressure = max(0.0, (backlog - target) / float(target))
+        if args.think_backpressure_max > 0.0:
+            pressure = min(pressure, args.think_backpressure_max)
+        schedule = dict(schedule)
+        schedule["queue_pressure"] = float(pressure)
+        schedule["backpressure_target"] = float(target)
+        if pressure <= 0.0:
+            return schedule
+        schedule["lambda"] = float(
+            schedule["lambda"] + args.think_backpressure_lambda * pressure
+        )
+        if args.think_backpressure_threshold > 0.0:
+            divisor = 1.0 + args.think_backpressure_threshold * pressure
+            schedule["gate_threshold"] = float(
+                max(1e-4, min(0.9999, schedule["gate_threshold"] / divisor))
+            )
+        if args.think_backpressure_explore > 0.0:
+            divisor = 1.0 + args.think_backpressure_explore * pressure
+            schedule["explore_prob"] = float(schedule["explore_prob"] / divisor)
+        return schedule
 
     def new_thinking_stats(schedule: dict[str, float]) -> dict[str, float]:
         return {
@@ -1280,7 +1351,8 @@ def main():
             o.zero_grad(set_to_none=True)
         pre_think_stats: dict[str, float] | None = None
         if args.enable_thinking_token:
-            schedule = thinking_schedule(step)
+            base_schedule = thinking_schedule(step)
+            schedule = apply_queue_backpressure(base_schedule)
             pre_think_stats = new_thinking_stats(schedule)
             if args.think_queue_accum_steps > 0:
                 assert think_queue is not None and think_replay_queue is not None
@@ -1307,8 +1379,9 @@ def main():
                         break
                     cont_items = think_queue.pop_batch(cont_n)
                     replay_items = think_replay_queue.pop_batch(replay_n)
+                    aux_schedule = apply_queue_backpressure(base_schedule)
                     aux_loss_sum, aux_count, aux_stats = process_thinking_aux_batch(
-                        step, cont_items, replay_items, schedule,
+                        step, cont_items, replay_items, aux_schedule,
                     )
                     merge_thinking_stats(pre_think_stats, aux_stats)
                     if aux_count > 0:
@@ -1414,7 +1487,7 @@ def main():
             reduction="none",
         ).reshape(y.shape)                                               # (B, T)
         if args.enable_thinking_token:
-            schedule = thinking_schedule(step)
+            schedule = apply_queue_backpressure(thinking_schedule(step))
             think_curriculum = schedule["curriculum"]
             think_explore_prob_eff = schedule["explore_prob"]
             think_lambda_eff = schedule["lambda"]
@@ -1858,6 +1931,7 @@ def main():
                 explore_prob = recent[-1].get("explore_prob", args.think_explore_prob)
                 lambda_eff = recent[-1].get("lambda", args.think_lambda)
                 gate_thr = recent[-1].get("gate_threshold", args.think_gate_threshold)
+                q_pressure = recent[-1].get("queue_pressure", 0.0)
                 depth_cap = recent[-1].get("safety_max_depth", args.think_safety_max_depth)
                 traj_recent = think_closed_traj_window[-args.log_every:]
                 traj_nll = (sum(traj_recent) / len(traj_recent)
@@ -1872,6 +1946,7 @@ def main():
                           f"gate_emit={gate_emit_items:.0f},"
                           f"curr={curr:.2f},eps={explore_prob:.3f},"
                           f"lam={lambda_eff:.3f},thr={gate_thr:.3f},"
+                          f"bp={q_pressure:.2f},"
                           f"cap={depth_cap:.0f},"
                           f"drop={q_dropped:.0f})")
             print(line)
@@ -1902,6 +1977,7 @@ def main():
                     tb.add_scalar("think/curriculum", curr, step)
                     tb.add_scalar("think/lambda", lambda_eff, step)
                     tb.add_scalar("think/gate_threshold", gate_thr, step)
+                    tb.add_scalar("think/queue_pressure", q_pressure, step)
                     tb.add_scalar("think/safety_max_depth", depth_cap, step)
                     tb.add_scalar("think/replay_think_rate", replay_rate, step)
                     tb.add_scalar("think/answer_ce", answer_ce, step)
@@ -2011,6 +2087,11 @@ def main():
                 "think_queue_accum_steps": args.think_queue_accum_steps,
                 "think_queue_accum_max_steps": args.think_queue_accum_max_steps,
                 "think_queue_drain_target": args.think_queue_drain_target,
+                "think_backpressure_target": args.think_backpressure_target,
+                "think_backpressure_max": args.think_backpressure_max,
+                "think_backpressure_lambda": args.think_backpressure_lambda,
+                "think_backpressure_threshold": args.think_backpressure_threshold,
+                "think_backpressure_explore": args.think_backpressure_explore,
             },
         }
         pathlib.Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)

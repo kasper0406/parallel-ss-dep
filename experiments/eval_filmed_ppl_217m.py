@@ -98,8 +98,10 @@ def load_film_217m(path: str, device: str = "cuda",
         feedback_self_k=self_k,
         feedback_alpha_mode=alpha_mode,
         semantic_loss_dim=cfg.get("semantic_loss_dim", 0),
+        output_gate=cfg.get("output_gate", False) or "gate_head.weight" in ckpt["state_dict"],
     ).to(device)
-    model.load_state_dict(ckpt["state_dict"])
+    model.load_state_dict(ckpt["state_dict"], strict=False)
+
     model.thinking_token_id = cfg.get("thinking_token_id")
     model.eval()
     # Set layer_idx on every fla DeltaNet layer for cache plumbing.

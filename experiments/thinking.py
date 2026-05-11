@@ -27,6 +27,155 @@ class ThinkReplay:
     target_is_thinking: bool
 
 
+@dataclass
+class ThoughtTrajectory:
+    """A single sampled thinking trajectory for RL."""
+    initial_context: list[int]
+    target_id: int
+    actions: list[int]  # 1 for Think, 0 for Emit
+    action_logprobs: list[float]
+    final_logits: torch.Tensor | None = None
+    depth: int = 0
+    rag_history: list[int] | None = None # Indices of retrieved facts
+
+
+@torch.no_grad()
+def generate_thought_trajectories(
+    model: torch.nn.Module,
+    initial_contexts: list[list[int]],
+    target_ids: list[int],
+    n_group: int,
+    max_depth: int,
+    thinking_token_id: int,
+    block_size: int,
+    temperature: float = 1.0,
+    device: str = "cuda",
+    rag_keys: torch.Tensor | None = None,
+) -> list[list[ThoughtTrajectory]]:
+    """Sample n_group trajectories per (context, target) pair."""
+    B = len(initial_contexts)
+    N = n_group
+    
+    # Initialize trajectories: [B][N]
+    trajectories: list[list[ThoughtTrajectory]] = [
+        [ThoughtTrajectory(initial_context=ctx, target_id=tid, actions=[], action_logprobs=[], rag_history=[])
+         for _ in range(N)]
+        for ctx, tid in zip(initial_contexts, target_ids)
+    ]
+    
+    # Active trajectories: flat list of (B*N)
+    active_trajs: list[ThoughtTrajectory] = [t for group in trajectories for t in group]
+    finished_mask = torch.zeros(B * N, dtype=torch.bool, device=device)
+    
+    # Track the embedding to inject in the NEXT pass for each trajectory
+    # Shape: (BN, d_model)
+    d_model = model.d_model if hasattr(model, "d_model") else 576
+    next_injection = torch.zeros((B * N, d_model), device=device)
+    
+    for d in range(max_depth + 1):
+        if finished_mask.all():
+            break
+            
+        ctx_list = []
+        for i, t in enumerate(active_trajs):
+            ctx = (t.initial_context + ([thinking_token_id] * t.depth))[-block_size:]
+            ctx_list.append(ctx)
+            
+        # Pad contexts for batching
+        max_len = max(len(c) for c in ctx_list)
+        input_ids = torch.full((B * N, max_len), 0, dtype=torch.long, device=device)
+        for i, c in enumerate(ctx_list):
+            input_ids[i, -len(c):] = torch.tensor(c, dtype=torch.long, device=device)
+        
+        # Build rag_hidden: inject at the last position only
+        rag_hidden = torch.zeros((B * N, max_len, d_model), device=device)
+        rag_hidden[:, -1, :] = next_injection
+        
+        # Forward pass
+        logits, gate = model(input_ids, return_gate=True, rag_hidden=rag_hidden)
+        
+        # We only care about the last position
+        last_logits = logits[:, -1]
+        last_gate = gate[:, -1]
+        
+        # Perform retrieval for the NEXT step
+        if rag_keys is not None:
+            # Query is the hidden state at the last position
+            _, hidden = model(input_ids, return_hidden=True, rag_hidden=rag_hidden)
+            query = hidden[:, -1, :]
+            query = F.normalize(query, p=2, dim=1)
+            
+            # Simple MatMul search
+            scores = torch.matmul(query, rag_keys.T) # (BN, N_chunks)
+            best_idx = scores.argmax(dim=-1)
+            next_injection = rag_keys[best_idx]
+            
+            # Record history
+            for i, t in enumerate(active_trajs):
+                if not finished_mask[i]:
+                    t.rag_history.append(int(best_idx[i].item()))
+        
+        # Action probability: gate = prob(Emit)
+        # So prob(Think) = 1 - gate
+        probs = torch.stack([1 - last_gate, last_gate], dim=-1) # [BN, 2]
+        
+        dist = torch.distributions.Categorical(probs=probs)
+        actions = dist.sample() # 0: Think, 1: Emit
+        log_probs = dist.log_prob(actions)
+        
+        for i, t in enumerate(active_trajs):
+            if finished_mask[i]:
+                continue
+            
+            action = int(actions[i].item())
+            t.actions.append(1 - action) # Store 1 for Think, 0 for Emit
+            t.action_logprobs.append(float(log_probs[i].item()))
+            
+            if action == 1 or d == max_depth: # Emit or reached max depth
+                finished_mask[i] = True
+                # Mask thinking token from logits before storing
+                t.final_logits = mask_token_logit(last_logits[i], thinking_token_id).cpu()
+                t.depth = d
+            else:
+                t.depth += 1
+                
+    return trajectories
+
+
+def compute_grpo_advantages(
+    trajectory_groups: list[list[ThoughtTrajectory]],
+    ponder_cost: float,
+) -> torch.Tensor:
+    """Calculate GRPO advantages normalized within each group.
+    
+    Returns a tensor of shape [B, N].
+    """
+    B = len(trajectory_groups)
+    N = len(trajectory_groups[0])
+    rewards = torch.zeros((B, N))
+    
+    for i, group in enumerate(trajectory_groups):
+        for j, t in enumerate(group):
+            # Task Reward: -CE(logits, target)
+            # final_logits shape: [V]
+            target = torch.tensor(t.target_id)
+            logits = t.final_logits.unsqueeze(0) # [1, V]
+            ce = F.cross_entropy(logits, target.unsqueeze(0))
+            task_reward = -ce.item()
+            
+            # Ponder Penalty
+            ponder_reward = -ponder_cost * t.depth
+            
+            rewards[i, j] = task_reward + ponder_reward
+            
+    # Normalize within each group
+    group_means = rewards.mean(dim=1, keepdim=True)
+    group_stds = rewards.std(dim=1, keepdim=True) + 1e-8
+    advantages = (rewards - group_means) / group_stds
+    
+    return advantages
+
+
 class ThinkContinuationQueue:
     def __init__(self, max_len: int):
         if max_len <= 0:

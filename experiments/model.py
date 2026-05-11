@@ -1199,6 +1199,10 @@ class TinyLM(nn.Module):
             self.gate_head = nn.Linear(d_model, 1, bias=True)
             nn.init.zeros_(self.gate_head.weight)
             nn.init.constant_(self.gate_head.bias, 2.0)
+            
+        self.rag_projection = nn.Linear(d_model, d_model)
+        nn.init.zeros_(self.rag_projection.weight)
+        nn.init.zeros_(self.rag_projection.bias)
 
     def _sparse_pass_collect_sources(self,
                                       x: torch.Tensor,
@@ -1247,8 +1251,12 @@ class TinyLM(nn.Module):
                 return_surprise: bool = False,
                 return_hidden: bool = False,
                 return_gate: bool = False,
+                rag_hidden: torch.Tensor | None = None,
                 ) -> torch.Tensor | tuple:
         x = self.embed(input_ids)
+        if rag_hidden is not None:
+            x = x + self.rag_projection(rag_hidden)
+            
         if self.max_T > 0:
             T = input_ids.shape[1]
             pos = torch.arange(T, device=input_ids.device)

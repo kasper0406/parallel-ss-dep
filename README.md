@@ -12,6 +12,8 @@ Stack as of 2026-05-12:
 
 Open work: cross-task validation of the memory module (induction, dyck, var-binding), boundary sweep of the saturation threshold, then a real pretrain on enough code tokens to make HumanEval comparison meaningful (the current SFT base scores 0 / 20).
 
+Full architectural write-up: [`WORKING_MEMORY_FINDINGS.md`](WORKING_MEMORY_FINDINGS.md).
+
 ---
 
 ## Architecture-research background

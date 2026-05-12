@@ -931,3 +931,47 @@ Recommended next steps for proper-LLM integration:
 3. Test on TinyStories to see if win is code-specific or general
 4. If all positive: distillation experiment from Qwen2.5-Coder using sparse-feedback backbone
 5. Or scale up directly: 350-500M / 10-20B tokens / 1-2 weeks on 2× 5090
+
+---
+
+# Session 2026-05-12 — Bounded Working Memory for DeltaNet
+
+**Full write-up:** [`WORKING_MEMORY_FINDINGS.md`](WORKING_MEMORY_FINDINGS.md).
+
+**Headline:** added `WorkingMemory` to TinyLM — bounded write-gated buffer
+of past hidden states with soft-attention reads at chosen positions, cost
+O(T·K·d). On MQAR at the saturation regime, +10–11 pp recall over DN
+baseline; at T=1024/K=128 the baseline never escapes uniform prior in
+16,000 steps while DN+memory reaches 0.310. At T=2048 the envelope closes
+again — memory extends working-T ~2× at fixed model size.
+
+**Cross-task ablation** establishes a **read-event-density threshold**:
+many reads/seq → memory helps (MQAR, dyck); one read/seq → memory hurts
+(induction, −28 pp gradient starvation).
+
+**Killed predecessor:** the old "Continuous RAG" path had `rag_projection.weight`
+zero-initialised AND was never passed into the loss-bearing forward, so its
+gradient was structurally zero. Two RL runs with vs without `--enable_rag`
+produced bit-identical TB scalars — diagnostic preserved in `CLAUDE.md`.
+
+**Distillation + SFT pipeline:** wired end-to-end (Qwen3.6-35B-A3B-AWQ
+teacher → student via KL on top-20 logprobs → SFT on MBPP+CodeAlpaca).
+Val PPL 81 → 41 → SFT loss ~2 but HumanEval pass@1 stays at 0/50 at
+this data scale. Bottleneck is data, not architecture.
+
+**Files added this session:**
+- `experiments/model.py::WorkingMemory` + `mem_read_mask` threading.
+- `experiments/code_grader.py` (HumanEval + MBPP unit-test grader).
+- `experiments/probe_thinking.py` (gate/memory ckpt diagnostics).
+- `experiments/sft_code.py` (supervised instruction-tune from a distilled ckpt).
+- `scripts/aggregate_mqar_sweep.py`, `scripts/aggregate_longctx_recall.py`.
+- `launch_mqar_boundary.sh`, `launch_longctx_recall.sh`, `launch_longctx_d256.sh`.
+
+**Memory notes** (in `/home/knielsen/.claude/projects/.../memory/`):
+- `project_super_coder_vision.md`
+- `project_working_memory_win.md`
+- `project_memory_read_density.md`
+- `project_base_ckpt_undertrained.md`
+- `project_distillation_run_2026_05_12.md`
+- `project_sft_run_2026_05_12.md`
+- `project_longctx_recall_2026_05_12.md`

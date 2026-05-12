@@ -575,6 +575,33 @@ def main():
                         "gate/think_frac, gate/mean_gate, gate/raw_ce "
                         "(gate/* only when --output_gate is set), "
                         "and alpha/* for FiLM feedback coefficients.")
+    # ---- Mixed-corpus pretrain (super-coder) flags ----
+    p.add_argument("--data_mix", type=str, default=None,
+                   help="Path to a YAML config describing weighted multi-source "
+                        "streaming. If set, overrides --dataset / --dataset_config "
+                        "/ --text_field. See configs/pretrain_mix_v1.yaml.")
+    p.add_argument("--use_memory", action="store_true",
+                   help="Enable WorkingMemory module. Requires a thinking-token "
+                        "id; auto-set when --data_mix is used.")
+    p.add_argument("--mem_size", type=int, default=1024)
+    p.add_argument("--mem_dim", type=int, default=0,
+                   help="Memory projection dim. 0 = match d_model.")
+    p.add_argument("--think_burst_prob", type=float, default=0.5,
+                   help="Per-chunk probability of inserting random think-token "
+                        "bursts during mixed-corpus pretrain (gives memory + "
+                        "gate-head dense gradient from step 0).")
+    p.add_argument("--think_max_bursts", type=int, default=2)
+    p.add_argument("--think_max_burst_depth", type=int, default=6)
+    p.add_argument("--mid_eval_every_tokens", type=int, default=0,
+                   help="Run a HumanEval pass every N tokens of training. "
+                        "0 disables. Suggested: 500_000_000.")
+    p.add_argument("--mid_eval_n_problems", type=int, default=50)
+    p.add_argument("--mid_eval_max_gen", type=int, default=192)
+    p.add_argument("--auto_stop", action="store_true",
+                   help="Stop training when HumanEval pass-rate is flat over "
+                        "two consecutive mid-eval intervals (< 1pp gain each).")
+    p.add_argument("--auto_stop_threshold", type=float, default=0.01)
+    p.add_argument("--auto_stop_k", type=int, default=2)
     args = p.parse_args()
     if args.enable_thinking_token and args.output_gate:
         raise SystemExit(
@@ -668,36 +695,19 @@ def main():
             raise SystemExit(
                 f"failed to add/resolve thinking token {args.thinking_token!r}"
             )
-    model_vocab_size = len(tok)
+    if args.data_mix:
+        # Mixed-corpus pretrain. Reserve one slot above the base tokenizer
+        # vocab for the think token; round model vocab up to multiple-of-64
+        # so embedding / lm_head dims are GPU-friendly.
+        thinking_token_id = int(tok.vocab_size)
+        model_vocab_size = ((int(tok.vocab_size) + 1 + 63) // 64) * 64
+    else:
+        model_vocab_size = len(tok)
     print(f"  vocab size: base={tok.vocab_size}, model={model_vocab_size}"
-          f"{f', thinking_id={thinking_token_id}, added={added_thinking_tokens}' if args.enable_thinking_token else ''}")
+          f"{f', thinking_id={thinking_token_id}' if thinking_token_id is not None else ''}")
 
-    print(f"Loading dataset {args.dataset} (streaming) ...")
-    ds_kwargs = dict(streaming=True)
-    if args.dataset_config:
-        ds_kwargs["name"] = args.dataset_config
-    try:
-        train_stream = load_dataset(args.dataset, split="train", **ds_kwargs)
-    except ValueError:
-        # Some datasets only have "train".
-        train_stream = load_dataset(args.dataset, **ds_kwargs)["train"]
-    try:
-        val_stream = load_dataset(args.dataset, split="validation", **ds_kwargs)
-    except (ValueError, KeyError):
-        # No validation split — split off a slice of train as held-out.
-        # We just take a separate streaming pass with a different seed-shuffle.
-        try:
-            val_stream = load_dataset(args.dataset, split="test", **ds_kwargs)
-        except (ValueError, KeyError):
-            print("  no val/test split — using shuffled train tail as validation")
-            val_stream = load_dataset(args.dataset, split="train",
-                                      **ds_kwargs).shuffle(seed=42).skip(10_000)
-
-    # Three "alignment loss" modes that can use a frozen encoder:
-    #   (a) statement-pooled L_sem  (Phase 22 default; needs AST loader)
-    #   (b) per-token L_sem          (Phase 22b ablation 2; standard loader)
-    #   (c) logit-level KL           (Phase 22b ablation 3; standard loader)
-    # Modes (b) and (c) do NOT require AST-aware data; mode (a) does.
+    # Bind alignment-loss booleans up-front (used by both data paths and the
+    # model-construction block below).
     use_semantic_loss = (args.semantic_loss_beta > 0.0)
     use_logit_kl = (args.logit_kl_beta > 0.0)
     use_per_token_lsem = (use_semantic_loss
@@ -706,44 +716,99 @@ def main():
                      and args.semantic_loss_granularity == "statement")
     needs_encoder = use_semantic_loss or use_logit_kl
     needs_ast = use_stmt_lsem
-    if needs_encoder and not args.encoder_ckpt:
-        raise SystemExit(
-            "Alignment-loss modes (--semantic_loss_beta or --logit_kl_beta) "
-            "require --encoder_ckpt.")
-    if (use_stmt_lsem and not args.semantic_loss_uniform_weight
-            and not args.oracle_ckpt):
-        raise SystemExit(
-            "Statement-granularity surprise-weighted L_sem requires "
-            "--oracle_ckpt (or pass --semantic_loss_uniform_weight).")
-    if use_semantic_loss and use_logit_kl:
-        raise SystemExit(
-            "Pick at most one of --semantic_loss_beta or --logit_kl_beta.")
-    if needs_ast:
-        from experiments.statement_stream import (
-            StatementAwareTokenisedStream, collate_with_statements,
+
+    if args.data_mix:
+        print(f"Loading data mix from {args.data_mix} (streaming) ...")
+        if needs_encoder or needs_ast:
+            raise SystemExit(
+                "--data_mix is incompatible with alignment-loss modes "
+                "(semantic_loss / logit_kl / statement granularity).")
+        from experiments.data_mix import (
+            MixedSourceStream, load_sources_from_yaml,
         )
-        train_ds = StatementAwareTokenisedStream(
-            train_stream, tok, args.T, text_field=args.text_field,
-            max_stmts_per_chunk=args.max_stmts_per_chunk,
+        sources = load_sources_from_yaml(args.data_mix)
+        print(f"  {len(sources)} sources:")
+        for s in sources:
+            print(f"    - {s.name:30s} weight={s.weight:.3f}  id={s.dataset_id}")
+        train_ds = MixedSourceStream(
+            sources=sources, tokenizer=tok, block_size=args.T,
+            thinking_token_id=thinking_token_id,
+            think_burst_prob=args.think_burst_prob,
+            think_max_bursts=args.think_max_bursts,
+            think_max_burst_depth=args.think_max_burst_depth,
+            base_seed=args.seed,
         )
-        val_ds = StatementAwareTokenisedStream(
-            val_stream, tok, args.T, text_field=args.text_field,
-            max_stmts_per_chunk=args.max_stmts_per_chunk,
+        # Val: same sources, different seed, burst injection off so val PPL
+        # reflects the clean data distribution.
+        val_ds = MixedSourceStream(
+            sources=sources, tokenizer=tok, block_size=args.T,
+            thinking_token_id=thinking_token_id,
+            think_burst_prob=0.0,
+            base_seed=args.seed + 999_983,
         )
-        from functools import partial
-        collate_fn = partial(collate_with_statements,
-                              pad_to=args.max_stmts_per_chunk, pad_value=-1)
-        train_loader = DataLoader(train_ds, batch_size=args.batch,
-                                   num_workers=2, collate_fn=collate_fn)
-        val_loader = DataLoader(val_ds, batch_size=args.batch,
-                                 num_workers=1, collate_fn=collate_fn)
-    else:
-        train_ds = TokenisedStream(train_stream, tok, args.T,
-                                   text_field=args.text_field)
-        val_ds = TokenisedStream(val_stream, tok, args.T,
-                                 text_field=args.text_field)
         train_loader = DataLoader(train_ds, batch_size=args.batch, num_workers=2)
         val_loader = DataLoader(val_ds, batch_size=args.batch, num_workers=1)
+    else:
+        print(f"Loading dataset {args.dataset} (streaming) ...")
+        ds_kwargs = dict(streaming=True)
+        if args.dataset_config:
+            ds_kwargs["name"] = args.dataset_config
+        try:
+            train_stream = load_dataset(args.dataset, split="train", **ds_kwargs)
+        except ValueError:
+            # Some datasets only have "train".
+            train_stream = load_dataset(args.dataset, **ds_kwargs)["train"]
+        try:
+            val_stream = load_dataset(args.dataset, split="validation",
+                                       **ds_kwargs)
+        except (ValueError, KeyError):
+            # No validation split — split off a slice of train as held-out.
+            try:
+                val_stream = load_dataset(args.dataset, split="test", **ds_kwargs)
+            except (ValueError, KeyError):
+                print("  no val/test split — using shuffled train tail as validation")
+                val_stream = load_dataset(args.dataset, split="train",
+                                          **ds_kwargs).shuffle(seed=42).skip(10_000)
+
+        if needs_encoder and not args.encoder_ckpt:
+            raise SystemExit(
+                "Alignment-loss modes (--semantic_loss_beta or --logit_kl_beta) "
+                "require --encoder_ckpt.")
+        if (use_stmt_lsem and not args.semantic_loss_uniform_weight
+                and not args.oracle_ckpt):
+            raise SystemExit(
+                "Statement-granularity surprise-weighted L_sem requires "
+                "--oracle_ckpt (or pass --semantic_loss_uniform_weight).")
+        if use_semantic_loss and use_logit_kl:
+            raise SystemExit(
+                "Pick at most one of --semantic_loss_beta or --logit_kl_beta.")
+        if needs_ast:
+            from experiments.statement_stream import (
+                StatementAwareTokenisedStream, collate_with_statements,
+            )
+            train_ds = StatementAwareTokenisedStream(
+                train_stream, tok, args.T, text_field=args.text_field,
+                max_stmts_per_chunk=args.max_stmts_per_chunk,
+            )
+            val_ds = StatementAwareTokenisedStream(
+                val_stream, tok, args.T, text_field=args.text_field,
+                max_stmts_per_chunk=args.max_stmts_per_chunk,
+            )
+            from functools import partial
+            collate_fn = partial(collate_with_statements,
+                                  pad_to=args.max_stmts_per_chunk, pad_value=-1)
+            train_loader = DataLoader(train_ds, batch_size=args.batch,
+                                       num_workers=2, collate_fn=collate_fn)
+            val_loader = DataLoader(val_ds, batch_size=args.batch,
+                                     num_workers=1, collate_fn=collate_fn)
+        else:
+            train_ds = TokenisedStream(train_stream, tok, args.T,
+                                       text_field=args.text_field)
+            val_ds = TokenisedStream(val_stream, tok, args.T,
+                                     text_field=args.text_field)
+            train_loader = DataLoader(train_ds, batch_size=args.batch,
+                                       num_workers=2)
+            val_loader = DataLoader(val_ds, batch_size=args.batch, num_workers=1)
 
     # 2. Model.
     if args.layers:
@@ -798,6 +863,18 @@ def main():
                 srcs = tuple(int(s) for s in src_str.split(",") if s.strip())
                 tmp.append((tgt, srcs))
             fb_xattn_pairs = tuple(tmp)
+    mem_kwargs = {}
+    if args.use_memory:
+        if thinking_token_id is None:
+            raise SystemExit(
+                "--use_memory requires a thinking token. Set --data_mix "
+                "(auto-assigns one) or --enable_thinking_token.")
+        mem_kwargs = dict(
+            use_memory=True,
+            mem_size=int(args.mem_size),
+            mem_dim=int(args.mem_dim) if args.mem_dim > 0 else int(args.d_model),
+            thinking_token_id=int(thinking_token_id),
+        )
     model = TinyLM(
         vocab_size=model_vocab_size, d_model=args.d_model, n_layers=n_layers_actual,
         n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim,
@@ -820,6 +897,7 @@ def main():
         output_gate=(args.output_gate
                      or (args.enable_thinking_token
                          and args.think_decision == "gate")),
+        **mem_kwargs,
         **attn_kw,
     ).to("cuda")
     if args.freeze_alpha and (args.feedback != "none" or fb_xattn_pairs):
@@ -940,6 +1018,22 @@ def main():
     last_log = t0
     last_log_step = 0
     losses = []
+    # Mid-training eval state.
+    mid_eval_controller = None
+    tokens_seen = 0
+    next_eval_at = 0
+    if args.mid_eval_every_tokens > 0:
+        from experiments.eval_callback import EvalStopController, run_eval
+        mid_eval_controller = EvalStopController(
+            stop_threshold=args.auto_stop_threshold,
+            k_consecutive_flat=args.auto_stop_k,
+        )
+        next_eval_at = int(args.mid_eval_every_tokens)
+        print(f"\nMid-training eval enabled: HumanEval @ "
+              f"{args.mid_eval_n_problems} problems every "
+              f"{args.mid_eval_every_tokens:,} tokens. "
+              f"auto_stop={args.auto_stop} (Δ<{args.auto_stop_threshold:.3f} "
+              f"for {args.auto_stop_k} consecutive intervals).")
     losses_sem_window: list[float] = []
     losses_ce_window: list[float] = []
     losses_nstmt_window: list[int] = []
@@ -1798,9 +1892,17 @@ def main():
                 g_eff = g.clamp(min=gate_floor)
             else:
                 g_eff = g
-            lm_loss = (g_eff * ce_per_token + (1.0 - g_eff) * args.gate_lambda).mean()
+            gate_terms = g_eff * ce_per_token + (1.0 - g_eff) * args.gate_lambda
+            # Mask positions where the target is -100 (e.g. positions where
+            # the model is predicting a think token under mixed-corpus burst
+            # injection — no loss should accrue there).
+            valid = (y != -100).float()
+            denom = valid.sum().clamp(min=1.0)
+            lm_loss = (gate_terms * valid).sum() / denom
         else:
-            lm_loss = ce_per_token.mean()
+            valid = (y != -100).float()
+            denom = valid.sum().clamp(min=1.0)
+            lm_loss = (ce_per_token * valid).sum() / denom
         # Compute the alignment-loss term (one of three modes).
         l_sem = torch.zeros((), device="cuda")
         l_kl = torch.zeros((), device="cuda")
@@ -2064,6 +2166,73 @@ def main():
                 tb.add_scalar("val/ppl", ppl, step)
             model.train()
 
+        # ---- Mid-training HumanEval hook (auto_stop). ----
+        # tokens_seen is the rough count of tokens consumed by the train
+        # loop so far. At every `mid_eval_every_tokens` boundary, save a
+        # ckpt, shell out to eval_humaneval.py, log pass-rate to TB,
+        # append to controller, optionally stop.
+        tokens_seen = step * args.batch * args.T
+        if (mid_eval_controller is not None
+                and tokens_seen >= next_eval_at):
+            # Snapshot to a numbered ckpt — kept for the curve plot.
+            stem = pathlib.Path(args.save_ckpt or "checkpoints/pretrain.pt").stem
+            mid_path = pathlib.Path("checkpoints") / (
+                f"{stem}_step{step}_tok{tokens_seen}.pt")
+            mid_path.parent.mkdir(parents=True, exist_ok=True)
+            _save_cfg = dict(
+                vocab_size=model_vocab_size,
+                tokenizer_base_vocab_size=tok.vocab_size,
+                d_model=args.d_model, n_heads=args.n_heads,
+                d_head=args.d_head, n_layers=n_layers_actual,
+                max_T=args.max_T, feedback_mode=args.feedback,
+                feedback_distances=fb_distances,
+                feedback_pairs=fb_pairs,
+                feedback_self_k=args.feedback_self_k,
+                feedback_alpha_mode=args.feedback_alpha_mode,
+                arch=args.arch, layers_spec=args.layers,
+                tokenizer=args.tokenizer,
+                thinking_token_id=thinking_token_id,
+                use_memory=bool(args.use_memory),
+                mem_size=int(args.mem_size) if args.use_memory else 0,
+                mem_dim=(int(args.mem_dim) if args.mem_dim > 0
+                          else int(args.d_model)) if args.use_memory else 0,
+                output_gate=bool(args.output_gate
+                                  or (args.enable_thinking_token
+                                      and args.think_decision == "gate")),
+            )
+            torch.save({"state_dict": model.state_dict(), "step": step,
+                        "config": _save_cfg}, str(mid_path))
+            print(f"\n[mid-eval] saved ckpt at step={step} tokens={tokens_seen:,}"
+                  f" → {mid_path}")
+            print(f"[mid-eval] running HumanEval (max_problems="
+                  f"{args.mid_eval_n_problems}) ...")
+            model.eval()
+            res = run_eval(
+                str(mid_path), tokens_seen=tokens_seen, step=step,
+                n_problems=args.mid_eval_n_problems,
+                max_gen=args.mid_eval_max_gen,
+                use_thinking=bool(args.use_memory),
+                emit_threshold=0.5,
+            )
+            model.train()
+            mid_eval_controller.append(res)
+            print(f"[mid-eval] {mid_eval_controller.summary_line()}")
+            if tb is not None:
+                tb.add_scalar("eval/humaneval", res.humaneval_pass_rate, step)
+                tb.add_scalar("eval/humaneval_vs_tokens",
+                              res.humaneval_pass_rate, tokens_seen // 1_000_000)
+            # Advance the next-eval threshold to the next interval; if we
+            # blew past several intervals (e.g. small batch * long step),
+            # snap forward by multiples.
+            while next_eval_at <= tokens_seen:
+                next_eval_at += int(args.mid_eval_every_tokens)
+            if args.auto_stop and mid_eval_controller.should_stop():
+                print(f"[mid-eval] AUTO STOP — pass-rate plateaued. "
+                      f"Last {args.auto_stop_k} intervals each gained "
+                      f"<{args.auto_stop_threshold:.3f}. Stopping at "
+                      f"step={step} tokens={tokens_seen:,}.")
+                break
+
     secs = time.perf_counter() - t0
     print(f"\nDone in {secs:.0f}s ({secs/args.steps*1000:.0f} ms/step avg).")
     if tb is not None:
@@ -2072,9 +2241,18 @@ def main():
     if args.save_ckpt:
         ckpt = {
             "state_dict": model.state_dict(),
+            "step": locals().get("step", 0),
             "config": {
                 "vocab_size": model_vocab_size,
                 "tokenizer_base_vocab_size": tok.vocab_size,
+                "use_memory": bool(args.use_memory),
+                "mem_size": (int(args.mem_size) if args.use_memory else 0),
+                "mem_dim": ((int(args.mem_dim) if args.mem_dim > 0
+                             else int(args.d_model)) if args.use_memory else 0),
+                "data_mix": args.data_mix,
+                "think_burst_prob": args.think_burst_prob,
+                "think_max_bursts": args.think_max_bursts,
+                "think_max_burst_depth": args.think_max_burst_depth,
                 "d_model": args.d_model, "n_heads": args.n_heads,
                 "d_head": args.d_head, "n_layers": n_layers_actual,
                 "max_T": args.T, "feedback_mode": args.feedback,

@@ -1,3 +1,124 @@
+# Handoff — 2026-05-12 (thinking + memory + RL)
+
+## TL;DR
+
+The thinking-token + bounded-working-memory architecture is **fully validated
+end-to-end under RL on a real LM substrate** for the first time. Five
+bootstrap fixes had to land in sequence; details below. **HumanEval pass@1
+remains 0/50** at the training-data scale available this session (10 M
+distill + 10 k SFT pairs) — that's the data limit, not the architecture.
+
+Full architectural write-up: [`WORKING_MEMORY_FINDINGS.md`](WORKING_MEMORY_FINDINGS.md).
+
+## What's empirically settled
+
+- **`WorkingMemory`** (in `experiments/model.py`): bounded write-gated buffer,
+  soft-attention reads at think positions, cost O(T·K·d).
+  - +10–11 pp recall on saturated MQAR (T=512 / K=64, 128).
+  - **Enables learning at T=1024/K=128** where the baseline never escapes
+    uniform prior for 16 k steps.
+  - Has a **read-event-density threshold**: single-decision tasks
+    (induction) *regress* by −28 pp because the read-side weights starve.
+- **The RL pipeline works.** With v5's full set of fixes, mem-on RL keeps
+  thinking ON (~6 % of decisions, position-dependent gate) and beats mem-off
+  RL by ~25 % PPL on the optimised tokens.
+
+## What's open
+
+- **HumanEval still 0/50** on every Qwen-distilled ckpt we have. This is
+  the training-data scale, not the architecture. To move it: ≥100 M distill
+  tokens + ≥100 k instruction-format SFT pairs (estimated minimum).
+- **Inference-time thinking is not wired.** `experiments/eval_humaneval.py`'s
+  `generate()` does plain autoregressive sampling — it never triggers the
+  gate or feeds think tokens through the model. So even an RL-trained "uses
+  thinking on hard positions" model can't actually use it at eval time.
+  This is the next obvious gap.
+- **Scaling-law evidence** for memory (d=128 → d=256 → d=512) is partial: the
+  d=256 sweep didn't extend cleanly under the same recipe (lr-tuning issue,
+  not architectural). One clean point exists at d=128.
+
+## Canonical recipe — keep these flags wired together
+
+```
+1. Qwen3.6-35B teacher → 10M codeparrot logprobs
+     experiments/extract_teacher_logprobs.py
+2. Distill (no memory, no gate — keep this clean)
+     experiments/train_distill.py --feedback_self_k 3 --feedback_pairs "2,28"
+3. SFT-with-thinking (THIS step trains memory + think-embedding)
+     experiments/sft_code.py --with_thinking --mem_size 512
+4. RL with full credit assignment + hard-example sampling
+     experiments/train_rl.py --use_memory --hard_pos_sampling
+                              --grpo_kl_beta 0.02 --grpo_ponder_cost 0.01
+                              --max_depth 16 --tokenizer <teacher_tokenizer>
+5. Eval via experiments/code_grader.py (HumanEval / MBPP unit tests)
+```
+
+Skipping any one of these — distillation, SFT-with-thinking,
+hard-example sampling, full-trajectory GRPO, KL anchor — re-introduces a
+specific bootstrap failure. See section 7 of `WORKING_MEMORY_FINDINGS.md`.
+
+## The five bootstrap fixes (in order discovered)
+
+1. **`WorkingMemory` only fires at think positions.** Pretrain/SFT data
+   doesn't contain think tokens → memory was inert. Fix: only enable memory
+   in RL or in code that explicitly passes `mem_read_mask`.
+2. **GRPO loss only updated the last gate decision per trajectory.** The
+   policy could drift on the unattributed early decisions. Fix: sum log P
+   over all decision positions in the trajectory.
+3. **No KL anchor** = no gravity holding the policy near a competent base.
+   Fix: `--grpo_kl_beta 0.02` keeps a frozen ref model.
+4. **`gate_head.weight` initialised to zero** → gate logit was identically
+   2 at every position → no input dependence → RL couldn't differentiate
+   hard from easy tokens. Fix: `nn.init.normal_(W, std=0.02)`.
+5. **Memory + think-embedding random at RL start** → "think" was a
+   noise-injection action → RL collapsed to never-think → those weights
+   never got gradient → bootstrap catch-22. Fix: `sft_code.py --with_thinking`
+   inserts random think bursts during SFT so all three (memory weights,
+   think-embedding row, trunk tolerance) train with dense supervised
+   gradient before RL ever evaluates the gate.
+
+## Where to find what
+
+- `experiments/model.py::WorkingMemory` — the module.
+- `experiments/model.py::TinyLM.forward` — `mem_read_mask` threaded through
+  all 6 forward branches.
+- `experiments/train_distill.py` — Qwen3.6 KL distillation.
+- `experiments/sft_code.py` (with `--with_thinking`) — supervised pretraining
+  of memory + think-embedding.
+- `experiments/train_rl.py` — GRPO with `--use_memory --hard_pos_sampling`,
+  full-trajectory loss, KL anchor.
+- `experiments/code_grader.py` — HumanEval + MBPP unit-test grader, gold-check verified.
+- `experiments/probe_thinking.py` — checkpoint diagnostic (Spearman ρ(gate, CE), memory norms, write-gate stats).
+- `experiments/tasks/{mqar,induction,dyck}.py` + their trainers — synthetic recall ablations.
+- `WORKING_MEMORY_FINDINGS.md` — full write-up.
+- `/home/knielsen/.claude/projects/.../memory/` — 9 project memory notes.
+
+## Suggested next steps (priority order)
+
+1. **Wire inference-time thinking into the generation loop.** Without this
+   the RL-trained gate never fires at eval time, so we cannot test whether
+   thinking helps end-task performance even if the architecture is sound.
+   Concrete: extend `eval_humaneval.py::generate` to consult the gate at
+   each step, optionally appending a thinking token (bounded by some max
+   depth) when the gate says "think", and only sample the next emit token
+   after the thinking budget completes or the gate flips back. ~half a
+   day. Lets us re-eval all v5 ckpts on a "can thinking actually help at
+   eval time" footing.
+2. **Scale data 10–20× and rerun the canonical recipe.** ~100 M distill
+   tokens + ~100 k SFT pairs is the realistic budget for the architecture
+   to land non-zero HumanEval. ~24–48 hr of vLLM extraction + ~2–4 hr of
+   student training. The infrastructure is ready; this is just compute.
+3. **Scaling-law evidence at d=256 / d=512 on MQAR.** Tune the recipe
+   (lr=1e-3 with warmup is the obvious starting point) and confirm the
+   "memory extends the working-T envelope at any model size" claim
+   cleanly. Paper-quality follow-up to MQAR T=1024 break-through.
+4. **Pivot to a recall-incentivising reward**: math-word problems (GSM8K,
+   MATH) with answer-extraction verification, or long-context NIAH-style
+   evals. These tasks reward the architecture in ways single-token CE on
+   codeparrot does not.
+
+---
+
 # Handoff — state of the project at session reset (2026-05-08)
 
 This doc is the single-page brief for the next agent picking up. It

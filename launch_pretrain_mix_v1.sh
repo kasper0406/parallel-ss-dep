@@ -22,7 +22,7 @@ export PYTHONPATH=$PYTHONPATH:.
 mkdir -p runs checkpoints
 
 CUDA_VISIBLE_DEVICES=${GPU:-0} nohup .venv/bin/python -u experiments/train_lm.py \
-    --arch gated_deltanet \
+    --arch deltanet \
     --d_model 576 --n_layers 30 --d_head 64 --n_heads 9 \
     --feedback film --feedback_pairs "2,28" --feedback_self_k 3 \
     --output_gate \

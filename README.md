@@ -1,5 +1,21 @@
 # state-dep-parallel
 
+## Current direction — "Small super-coder"
+
+The active goal of this repo is to build a **small, efficient code model that competes with much larger models on coding benchmarks** under tight compute (2× RTX 5090). The architectural research below feeds into that target.
+
+Stack as of 2026-05-12:
+- **Gated DeltaNet** backbone — bounded-state linear RNN, no KV-cache cost.
+- **Sparse FiLM feedback (2, 28)** + K=3 self-feeding — −3 % to −5 % PPL at 217 M / 360 M / 708 M, single forward at deploy.
+- **Bounded working memory** ([`experiments/model.py::WorkingMemory`](experiments/model.py)) — write-gated buffer of past hidden states, read via soft attention at "think" / query positions. **+11.1 pp recall** on saturated MQAR (T=512, K=128) vs DeltaNet alone, no O(T²) attention cost. Validated 2026-05-12 — see [SESSION_FINDINGS](SESSION_FINDINGS.md).
+- **Thinking gate** — per-position σ head choosing emit vs think. Allows extra recurrent passes at hard positions and triggers memory reads.
+
+Open work: cross-task validation of the memory module (induction, dyck, var-binding), boundary sweep of the saturation threshold, then a real pretrain on enough code tokens to make HumanEval comparison meaningful (the current SFT base scores 0 / 20).
+
+---
+
+## Architecture-research background
+
 Mapping the design space of **state-dependent, parallelizable RNN cells**
 — with a specific finding: in a DeltaNet stack, a *single*
 sparse late-to-early FiLM connection (a minimal-form descendant of

@@ -1,6 +1,38 @@
 # NEXT_DIRECTIONS.md
 
-## Current Focus (2026-05-10): Continuous RAG & The Thinking Head
+## Current Focus (2026-05-12): Small Super-Coder
+
+The top-level goal is now a small DeltaNet-backbone code model that competes
+with larger Transformer code models on HumanEval/MBPP under tight compute.
+The thinking head + memory architecture below is in service of that target.
+
+### What changed since 2026-05-10
+
+- **Bounded working memory** (`experiments/model.py::WorkingMemory`) supersedes
+  the old "Continuous RAG" (`rag_projection`) idea — the latter was structurally
+  dead (gradient = 0 throughout RL training; runs were bit-identical with vs
+  without). The new module is in-sequence, bounded at `mem_size` (default 1024)
+  with write-gated soft-attention reads at think / query positions. Cost
+  O(T·K·d), no quadratic attention. Validated on MQAR: **+10–11 pp recall** at
+  the saturation regime.
+- **Cross-task validation** shows the architecture has a *read-event-density*
+  threshold: helps on tasks with many reads per sequence (MQAR, dyck) and hurts
+  on sparse-decision tasks (induction, single read site).
+- **Distillation pipeline** from Qwen3.6-35B-A3B-AWQ is wired and runs end-to-end:
+  PPL 81 → 41 on 10 M tokens. Subsequent SFT on MBPP+CodeAlpaca drops loss further
+  but HumanEval pass@1 remains 0/50 — bottleneck is data scale (we're at ~10 M
+  distill + 10 k SFT tokens vs typical small-coder budgets of 100 M-1 B+).
+- **Code grader** (`experiments/code_grader.py`) wired against HumanEval and
+  MBPP, gold-check verified. Drop-in reward function for the eventual RL push.
+
+### Active next steps
+1. Scale the distillation extract (more Qwen3.6 tokens, broader prompt mix).
+2. Generate or curate ≥100 k HumanEval-format (signature + docstring → body)
+   SFT pairs — the current SFT format mismatch is a known issue.
+3. Once HumanEval pass@1 is nonzero, the existing GRPO infra +
+   `code_grader.grade` is the natural follow-up.
+
+### Historical context (original 2026-05-10 framing below)
 
 While the sparse far-distance feedback (Finding 9) remains a core architectural
 win, the project has pivoted to the **Thinking Head** as the primary path to

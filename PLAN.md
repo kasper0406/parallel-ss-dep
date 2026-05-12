@@ -1,6 +1,44 @@
 # state-dep-parallel — research plan
 
-## Goal
+## Current direction (as of 2026-05-12) — small super-coder
+
+**Top-level goal:** a DeltaNet-backbone code model that competes with
+much larger Transformer code models on coding benchmarks under tight
+compute (2× RTX 5090). All architectural research below now feeds this
+target.
+
+### Validated this round
+- **Bounded working memory** (`experiments/model.py::WorkingMemory`):
+  write-gated buffer of past hidden states, read at think / query
+  positions via soft attention. **+10–11 pp recall** on saturated
+  MQAR (T=512 / K=64, 128). Cost O(T·K·d), no quadratic attention.
+- **Read-event-density threshold**: induction (1 read/seq) **−28 pp**;
+  dyck (per-position) tied but ~2× faster; MQAR (~256+ reads) +10 pp.
+  Memory only helps when reads happen frequently.
+- **Distillation pipeline end-to-end** with Qwen3.6-35B-A3B-AWQ
+  teacher: 10 M tokens → val PPL 81 → 41. SFT on MBPP + CodeAlpaca
+  pushes loss to ~2; HumanEval pass@1 stays at 0/50 — at this data
+  scale the model is code-shaped but not problem-solving. Bottleneck
+  is data, not architecture.
+
+### Ruled out
+- Corpus-RAG (the old `rag_projection`) — structurally dead. Replaced
+  by `WorkingMemory`.
+- Natural-text RL on the 8.2 M-token SFT base (HumanEval 0/20).
+- 10 M-token Qwen-distill + 10 k-pair SFT — same scale → same outcome.
+
+### Next round
+- Scale data ≥10×: more Qwen-distill tokens AND ≥100 k HumanEval-format SFT pairs.
+- Or tighten claim to "competitive at 10× smaller training budget".
+- The eval harness (`experiments/code_grader.py`) is ready for either.
+
+The formalisation work below is still the *backbone* of why we use
+DeltaNet; the active research is now applying that backbone to the
+super-coder target.
+
+---
+
+## Original goal (formalisation arm)
 
 Find algebraic structures that let state-transition RNN cells be
 **state-dependent** (the step operator depends on input / prior state)

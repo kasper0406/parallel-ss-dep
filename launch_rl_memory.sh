@@ -18,6 +18,9 @@ SHARED=(
     --max_depth 16
     --T 512 --max_T 0 --min_decision_pos 16
     --think_checkpointing
+    --hard_pos_sampling            # sample decision positions from the
+    --hard_ce_min 1.5              # [moderate, hard] CE band where thinking
+    --hard_ce_max 6.0              # can actually help
     --tokenizer QuantTrio/Qwen3.6-35B-A3B-AWQ
     --load_ckpt checkpoints/sft_dn217_nomem.pt
 )

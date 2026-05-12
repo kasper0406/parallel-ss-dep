@@ -27,10 +27,18 @@ target.
 - Natural-text RL on the 8.2 M-token SFT base (HumanEval 0/20).
 - 10 M-token Qwen-distill + 10 k-pair SFT — same scale → same outcome.
 
-### Next round
-- Scale data ≥10×: more Qwen-distill tokens AND ≥100 k HumanEval-format SFT pairs.
-- Or tighten claim to "competitive at 10× smaller training budget".
-- The eval harness (`experiments/code_grader.py`) is ready for either.
+### Next round (active)
+- **Run the actual RL+memory experiment.** Architecture and pipeline are
+  validated independently, but a real RL run with memory enabled and
+  extended thinking depth (≥16) on the SFT base has not been measured
+  end-to-end. Headline metrics to track: `grpo/avg_depth`,
+  `grpo/think_rate`, `mem/proj_norm`, `mem/write_gate_mean`,
+  `grpo/depth_ce_d{i}` (does deeper thinking lower CE?), and
+  HumanEval/MBPP pass@1 before/after. Memory was only ever trained on
+  the synthetic ablations; RL is its first real-data test.
+- Scale data ≥10× (deferred until the RL run tells us whether the
+  architecture is moving the needle on real text).
+- The eval harness (`experiments/code_grader.py`) is ready.
 
 The formalisation work below is still the *backbone* of why we use
 DeltaNet; the active research is now applying that backbone to the

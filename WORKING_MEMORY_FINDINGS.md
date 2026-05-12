@@ -195,7 +195,37 @@ Validation losses behave correctly. Generation inspection shows the post-SFT mod
 
 ---
 
-## 7. What This Result Is — and Isn't
+## 7. The Pivotal Untested Claim — RL with Deep Thinking
+
+Everything above is **architecture in isolation**: synthetic recall benchmarks,
+or a pipeline that wires memory in but never trains the memory weights (the
+distillation/SFT inertness in section 5).
+
+**The intended deployment claim — "RL training with memory + a learned
+thinking gate improves a code model" — has not yet been measured end-to-end.**
+
+What we still need to run:
+1. From the SFT base (which produces code-shaped text but 0/50 HumanEval),
+   add `--use_memory` and increase `--max_depth` (≥ 16) so the model can take
+   more recurrent passes per token. Use a small ponder cost (≈ 0.005–0.01 per
+   think step) so the model self-regulates how deep it goes.
+2. Watch the TB trajectories:
+   - `grpo/avg_depth` — does the model actually use the extra depth?
+   - `grpo/think_rate` — is thinking sparse or frequent?
+   - `mem/proj_norm`, `mem/write_norm`, `mem/write_gate_mean` — do memory
+     weights move under the real RL gradient? (At max_depth=16 the rollout
+     has ≥ 16 read events per trajectory — favourable per the read-density
+     threshold in section 3.)
+   - `grpo/depth_ce_d{i}` — does deeper thinking correlate with lower CE on
+     the optimized token? (The architectural payoff.)
+3. Probe + HumanEval before vs after, comparing mem-on against a mem-off
+   control run from the same SFT base.
+
+Until those numbers are in, the "small super-coder via thinking + memory"
+story is *plausible from the architectural ablations* but **not directly
+demonstrated**. The next session's headline test is this RL run.
+
+## 8. What This Result Is — and Isn't
 
 **It is:**
 - A clean architectural finding on a synthetic recall benchmark (MQAR), validated at multiple model sizes and context lengths.
@@ -209,7 +239,7 @@ Validation losses behave correctly. Generation inspection shows the post-SFT mod
 
 ---
 
-## 8. Next-Round Candidates
+## 9. Next-Round Candidates
 
 In priority order, given limited compute:
 

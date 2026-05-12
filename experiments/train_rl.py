@@ -70,6 +70,16 @@ def main():
                    help="Minimum context length when sampling the decision "
                         "position. ≥2 avoids fla's decode/step path; ≥16 keeps "
                         "DeltaNet's chunked kernels engaged.")
+    p.add_argument("--hard_pos_sampling", action="store_true",
+                   help="Pre-pass the input through the model to compute "
+                        "per-position CE, then sample the decision position "
+                        "from the [hard_ce_min, hard_ce_max] band. Eliminates "
+                        "trivial-easy and pathological-extreme positions which "
+                        "give RL no useful signal.")
+    p.add_argument("--hard_ce_min", type=float, default=1.5,
+                   help="Lower bound on per-position CE for hard sampling.")
+    p.add_argument("--hard_ce_max", type=float, default=6.0,
+                   help="Upper bound on per-position CE for hard sampling.")
     
     # Shared from train_lm
     p.add_argument("--feedback", type=str, default="film")
@@ -243,6 +253,49 @@ def main():
         span = (upper - lower).clamp(min=1)
         offset = (torch.rand(B, device=upper.device) * span.float()).long()
         pos = (lower + offset).clamp(min=min_pos, max=T - 1)
+
+        # Hard-example sampling: pre-pass the model to compute per-position CE,
+        # then resample `pos` from the [hard_ce_min, hard_ce_max] band (per
+        # row). Falls back to the random pos above when no positions fall in
+        # the band. Eliminates trivial tokens (which the model already nails
+        # and where thinking is wasted) and pathological tokens (which are
+        # fundamentally unguessable and where thinking cannot help either).
+        if args.hard_pos_sampling:
+            with torch.no_grad():
+                logits_pre = model(input_ids)            # (B, T, V)
+                # CE at position p predicts input_ids[:, p+1]. Per-position CE
+                # for positions 0..T-2; position T-1 has no target.
+                shift_logits = logits_pre[:, :-1].float()
+                shift_targets = input_ids[:, 1:]
+                ce_per_pos = F.cross_entropy(
+                    shift_logits.reshape(-1, shift_logits.size(-1)),
+                    shift_targets.reshape(-1),
+                    reduction="none",
+                ).reshape(B, T - 1)
+                # Eligibility mask: position is in [min_pos-1, first_pad-2]
+                # (we predict the *next* token, so the decision is at p-1 and
+                # the target is at p; map back: decision pos = p means we
+                # predict input_ids[:, p+1], so we need ce_per_pos[:, p] where
+                # p ∈ [min_pos-1, first_pad-2]).
+                eligible = torch.zeros_like(ce_per_pos, dtype=torch.bool)
+                pos_idx = torch.arange(T - 1, device=ce_per_pos.device).unsqueeze(0)
+                # ce_per_pos[b, p] corresponds to predicting input_ids[b, p+1].
+                # We want decision_pos (where the model emits) such that
+                # min_pos ≤ decision_pos < first_pad. decision_pos = p means
+                # we predict input_ids[b, decision_pos] = input_ids[b, p+1]
+                # for input_ids index p+1. So decision_pos = p + 1; range
+                # min_pos ≤ p + 1 ≤ first_pad - 1, i.e. p ∈ [min_pos-1, first_pad-2].
+                lower_p = (torch.full_like(first_pad, min_pos) - 1).unsqueeze(1)
+                upper_p = (first_pad - 2).unsqueeze(1)
+                eligible = (pos_idx >= lower_p) & (pos_idx <= upper_p)
+                in_band = (ce_per_pos >= args.hard_ce_min) & (ce_per_pos <= args.hard_ce_max)
+                hard = eligible & in_band                  # (B, T-1)
+                for b in range(B):
+                    cands = hard[b].nonzero(as_tuple=False).flatten()
+                    if cands.numel() > 0:
+                        pick = cands[torch.randint(0, cands.numel(), (1,))]
+                        # decision_pos = chosen p + 1 (predicting next token)
+                        pos[b] = int(pick.item()) + 1
         pos_list = pos.tolist()
 
         initial_contexts = [input_ids[i, :pos_list[i]].tolist() for i in range(B)]

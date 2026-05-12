@@ -107,6 +107,58 @@ def build_example(prompt: str, solution: str, tokenizer,
     return full, labels
 
 
+def insert_think_bursts(
+    input_ids: list[int], labels: list[int],
+    thinking_token_id: int, max_len: int,
+    max_bursts: int = 3, max_burst_depth: int = 8,
+    rng: torch.Generator | None = None,
+) -> tuple[list[int], list[int]]:
+    """Insert random-depth thinking-token bursts into a (input_ids, labels) pair.
+
+    Each burst is a run of `depth` think tokens; depth ~ U[1, max_burst_depth].
+    Labels at inserted think positions are set to -100 (no loss). The result
+    is truncated to `max_len` if too long.
+
+    Purpose: give the think-token embedding, the gate head, and the working-
+    memory module dense supervised gradient *before* RL ever sees them. The
+    SFT loss is still next-token CE on real tokens (think positions don't
+    contribute), but every real-token prediction that follows a think burst
+    requires the model to have processed those think tokens gracefully, so
+    the think-embedding and memory weights have to learn to be useful.
+    """
+    if rng is None:
+        rng = torch.Generator().manual_seed(0)
+    if max_bursts <= 0:
+        return input_ids, labels
+    n = len(input_ids)
+    if n < 4:
+        return input_ids, labels
+    n_bursts = int(torch.randint(0, max_bursts + 1, (1,), generator=rng).item())
+    if n_bursts == 0:
+        return input_ids, labels
+    burst_positions = sorted(
+        torch.randperm(n, generator=rng)[:n_bursts].tolist()
+    )
+    new_ids: list[int] = []
+    new_labels: list[int] = []
+    last = 0
+    for p in burst_positions:
+        new_ids.extend(input_ids[last:p])
+        new_labels.extend(labels[last:p])
+        depth = int(
+            torch.randint(1, max_burst_depth + 1, (1,), generator=rng).item()
+        )
+        new_ids.extend([int(thinking_token_id)] * depth)
+        new_labels.extend([-100] * depth)
+        last = p
+    new_ids.extend(input_ids[last:])
+    new_labels.extend(labels[last:])
+    if len(new_ids) > max_len:
+        new_ids = new_ids[:max_len]
+        new_labels = new_labels[:max_len]
+    return new_ids, new_labels
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--load_ckpt", type=str, required=True)
@@ -119,32 +171,90 @@ def main() -> int:
     p.add_argument("--max_codealpaca", type=int, default=10000,
                    help="Cap on CodeAlpaca samples (full set is 20k).")
     p.add_argument("--seed", type=int, default=0)
+    # --- Thinking-during-SFT: forces the model to handle think tokens ---
+    p.add_argument("--with_thinking", action="store_true",
+                   help="Enable working memory + output gate + random think "
+                        "burst insertion during SFT. This trains the "
+                        "think-embedding, memory weights, and trunk to handle "
+                        "think tokens gracefully BEFORE RL evaluates the "
+                        "gate's emit/think decision. Without this, RL has to "
+                        "bootstrap thinking from random init — which it "
+                        "rationally refuses (see WORKING_MEMORY_FINDINGS.md).")
+    p.add_argument("--think_max_bursts", type=int, default=3,
+                   help="Max think-token bursts inserted per example.")
+    p.add_argument("--think_max_depth", type=int, default=8,
+                   help="Max depth per inserted burst.")
+    p.add_argument("--mem_size", type=int, default=1024)
+    p.add_argument("--mem_dim", type=int, default=0)
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
     device = "cuda"
 
     # --- 1. Build model from ckpt ----------------------------------------
-    # NOTE: Loading via build_model_from_ckpt auto-detects memory.* keys in
-    # the state dict and re-enables WorkingMemory. That's *fine* for eval,
-    # but SFT here does not pass `mem_read_mask`, so the memory module
-    # would inject only at thinking_token_id positions — which never appear
-    # in MBPP/CodeAlpaca text. The module's gradient would therefore be
-    # zero (same failure mode as the old corpus-RAG). Make this explicit:
-    # if the loaded ckpt has memory weights, we still build the model with
-    # memory ON (so state_dict matches), but the caller should be aware
-    # that those weights are not being trained here.
     print(f"loading checkpoint: {args.load_ckpt}")
-    from experiments.eval_bracket_structure import build_model_from_ckpt
-    model, cfg = build_model_from_ckpt(args.load_ckpt)
+    if args.with_thinking:
+        # Build the model directly with thinking + memory ON, then load the
+        # ckpt state with strict=False so memory + gate heads stay
+        # freshly-initialised (the loaded ckpt has neither). The think-token
+        # embedding gets fresh init at the new last vocab slot (later
+        # over-written to embed-mean inside TinyLM.__init__ when
+        # use_memory=True).
+        import torch as _t
+        from experiments.model import TinyLM
+        from experiments.layers import DeltaNetAttention
+        raw_ckpt = _t.load(args.load_ckpt, map_location="cpu", weights_only=False)
+        cfg = dict(raw_ckpt["config"])  # copy
+        sd = raw_ckpt["state_dict"]
+        base_vocab = int(cfg["vocab_size"])
+        new_vocab = base_vocab + 1
+        thinking_token_id = base_vocab
+        # Expand embed + lm_head rows if needed (ckpt had output_gate=False,
+        # so no extra slot was reserved).
+        for key in ("embed.weight", "lm_head.weight"):
+            if key in sd and sd[key].shape[0] < new_vocab:
+                old = sd[key]
+                pad = _t.zeros(new_vocab - old.shape[0], old.shape[1], dtype=old.dtype)
+                sd[key] = _t.cat([old, pad], dim=0)
+        fb_pairs = tuple(tuple(p) for p in cfg.get("feedback_pairs", ()) or ())
+        model = TinyLM(
+            vocab_size=new_vocab,
+            d_model=int(cfg["d_model"]),
+            n_layers=int(cfg["n_layers"]),
+            n_heads=int(cfg["n_heads"]),
+            d_head=int(cfg["d_head"]),
+            max_T=int(cfg.get("max_T", 0)),
+            feedback_mode=str(cfg.get("feedback_mode", "none")),
+            feedback_pairs=fb_pairs,
+            feedback_self_k=int(cfg.get("feedback_self_k", 0)),
+            tie_embeddings=bool(cfg.get("tie_embeddings", True)),
+            output_gate=True,
+            use_memory=True,
+            mem_size=int(args.mem_size),
+            mem_dim=int(args.mem_dim) if args.mem_dim > 0 else int(cfg["d_model"]),
+            thinking_token_id=thinking_token_id,
+            attention_cls=DeltaNetAttention,
+        ).cuda()
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        print(f"  with-thinking build: +1 vocab slot for think token "
+              f"({thinking_token_id=}), missing={len(missing)} unexpected={len(unexpected)}")
+        cfg["use_memory"] = True
+        cfg["output_gate"] = True
+        cfg["thinking_token_id"] = thinking_token_id
+        cfg["vocab_size"] = new_vocab
+        cfg["mem_size"] = int(args.mem_size)
+        cfg["mem_dim"] = int(args.mem_dim) if args.mem_dim > 0 else int(cfg["d_model"])
+        cfg["sft_with_thinking"] = True
+    else:
+        # Original path: load whatever was saved, leave memory inert if present.
+        from experiments.eval_bracket_structure import build_model_from_ckpt
+        model, cfg = build_model_from_ckpt(args.load_ckpt)
+        thinking_token_id = cfg.get("thinking_token_id")
     model.train()
-    mem_in_ckpt = bool(cfg.get("use_memory", False)) or hasattr(model, "memory")
+    base_vocab_for_loss = int(cfg["vocab_size"]) - (1 if args.with_thinking else 0)
     print(f"  model: {cfg['n_layers']}L  d_model={cfg['d_model']}  "
-          f"params={model.num_params() / 1e6:.1f}M")
-    if mem_in_ckpt:
-        print("  ⚠️  ckpt has WorkingMemory weights. SFT does NOT pass "
-              "mem_read_mask, so memory.* weights will receive zero gradient "
-              "during this run (inert path). Use RL for memory training.")
+          f"params={model.num_params() / 1e6:.1f}M  "
+          f"with_thinking={args.with_thinking}")
 
     # --- 2. Tokenizer ------------------------------------------------------
     from transformers import AutoTokenizer
@@ -198,13 +308,30 @@ def main() -> int:
         idx = torch.randperm(len(encoded), generator=rng).tolist()
         for i in range(0, len(encoded) - args.batch + 1, args.batch):
             rows = [encoded[idx[j]] for j in range(i, i + args.batch)]
+            if args.with_thinking and thinking_token_id is not None:
+                # Inject random think bursts per row. Each row independently
+                # samples 0..K bursts; depth ∈ [1, max_burst_depth] per burst.
+                rows = [
+                    insert_think_bursts(ids, lbls, int(thinking_token_id),
+                                          args.max_len,
+                                          args.think_max_bursts,
+                                          args.think_max_depth, rng)
+                    for ids, lbls in rows
+                ]
             x, y = make_batch(rows)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = model(x)
+                # Slice off the +1 thinking-token slot before CE so the
+                # think token is never a valid target (label space ==
+                # base_vocab_for_loss). The slice is a no-op when not
+                # in with_thinking mode (sizes match).
+                if args.with_thinking:
+                    logits = logits[..., :base_vocab_for_loss]
                 # Standard causal-LM shift: logits[:, :-1] predict y[:, 1:].
                 shift_logits = logits[:, :-1].contiguous()
                 shift_labels = y[:, 1:].contiguous()
-                # ignore_index=-100 masks the comment tokens.
+                # ignore_index=-100 masks the comment tokens AND the
+                # inserted think tokens.
                 loss = F.cross_entropy(
                     shift_logits.reshape(-1, shift_logits.size(-1)),
                     shift_labels.reshape(-1),

@@ -1,5 +1,23 @@
 # Phase C RL: prediction-as-RL-signal for code generation
 
+> **Ponder-cost shaping (Phase-C-prep, landed pre-pretrain-finish):**
+> `experiments/thinking.py::compute_grpo_advantages` now supports
+> `ponder_shape ∈ {linear, quadratic}`, `counterfactual=True`
+> (clamps task component at the depth-0 baseline so thinking can never
+> make the task reward worse than not thinking, then always charges
+> the depth cost — encourages exploration of thinking while still
+> minimising depth), and `separate_ponder_norm=True` (z-score task
+> reward within the GRPO group, then subtract absolute ponder cost
+> — prevents the group z-score from squashing small ponder values
+> into noise). `experiments/train_rl.py` exposes
+> `--grpo_ponder_shape`, `--grpo_ponder_counterfactual`,
+> `--grpo_separate_ponder_norm`, and `--grpo_ponder_warmup_steps`
+> (curriculum). Defaults are backward-compatible. **Recommended config
+> for the next RL run:** `--grpo_ponder_shape quadratic
+> --grpo_ponder_counterfactual --grpo_ponder_warmup_steps 300`. See
+> the function docstring for the exact reward formula per mode.
+
+
 The proposal: train the model to write code **and** predict the
 behaviour of that code before execution, then use the gap between
 predicted and actual behaviour as part of the RL reward. Code that

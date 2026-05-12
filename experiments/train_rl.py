@@ -43,7 +43,29 @@ def main():
     p.add_argument("--grpo_kl_beta", type=float, default=0.01,
                    help="Weight for KL penalty against reference model.")
     p.add_argument("--grpo_ponder_cost", type=float, default=0.01,
-                   help="Penalty per thinking step.")
+                   help="Penalty per thinking step (full value; see "
+                        "--grpo_ponder_warmup_steps for curriculum).")
+    p.add_argument("--grpo_ponder_shape", type=str, default="linear",
+                   choices=["linear", "quadratic"],
+                   help="'linear' = cost * depth; 'quadratic' = cost * depth^2. "
+                        "Quadratic makes shallow thinking cheap while deep "
+                        "thinking has to clearly pay for itself.")
+    p.add_argument("--grpo_ponder_counterfactual", action="store_true",
+                   help="Reward thinking only when CE actually drops vs the "
+                        "depth-0 baseline. Wasted thinking pays its ponder "
+                        "cost but doesn't lower the floor reward.")
+    p.add_argument("--grpo_separate_ponder_norm", action="store_true",
+                   help="Z-score task reward within the GRPO group, then "
+                        "subtract the absolute ponder cost — prevents the "
+                        "group normalisation from squashing the (small) "
+                        "ponder magnitude into noise. Ignored when "
+                        "--grpo_ponder_counterfactual is set.")
+    p.add_argument("--grpo_ponder_warmup_steps", type=int, default=0,
+                   help="Curriculum: ramp ponder_cost from 0 to its full "
+                        "value linearly over this many steps. 0 disables "
+                        "(full cost from step 1). Suggested ~200-500 for "
+                        "cold-start runs to give the gate + memory time to "
+                        "discover what thinking buys before being penalised.")
     p.add_argument("--max_depth", type=int, default=10)
     
     # Working memory (in-sequence, bounded, write-gated). Reads only at
@@ -312,8 +334,22 @@ def main():
             pad_token_id=pad_token_id,
         )
 
-        # Phase 2: Advantages
-        advantages = compute_grpo_advantages(trajectory_groups, args.grpo_ponder_cost).to("cuda")
+        # Phase 2: Advantages.
+        # Curriculum: ramp ponder_cost linearly from 0 to its full value over
+        # `grpo_ponder_warmup_steps`. Avoids the cold-start trap where the
+        # gate + memory haven't yet discovered what thinking buys and the
+        # ponder cost prunes thinking before it can demonstrate value.
+        if args.grpo_ponder_warmup_steps > 0:
+            ramp = min(1.0, step / float(args.grpo_ponder_warmup_steps))
+        else:
+            ramp = 1.0
+        ponder_cost_eff = args.grpo_ponder_cost * ramp
+        advantages = compute_grpo_advantages(
+            trajectory_groups, ponder_cost_eff,
+            ponder_shape=args.grpo_ponder_shape,
+            counterfactual=args.grpo_ponder_counterfactual,
+            separate_ponder_norm=args.grpo_separate_ponder_norm,
+        ).to("cuda")
 
         # Pure-task rewards (for logging) — exclude the ponder term so the
         # reported PPL is true perplexity of the optimised token. Also bucket

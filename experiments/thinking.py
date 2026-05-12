@@ -36,6 +36,11 @@ class ThoughtTrajectory:
     action_logprobs: list[float]
     final_logits: torch.Tensor | None = None
     depth: int = 0
+    # Counterfactual baseline: the logits the model would have emitted at
+    # depth=0 (immediate emit, no thinking). Captured once at the start of
+    # every rollout so reward shaping can ask "did thinking pay off vs.
+    # not thinking at all?" without re-running the forward.
+    immediate_logits: torch.Tensor | None = None
 
 
 # fla's short_conv routes seq_len==1 through a decode/step path that requires
@@ -121,6 +126,14 @@ def generate_thought_trajectories(
             if finished_mask[i]:
                 continue
 
+            # Capture the depth-0 (immediate-emit) baseline before any
+            # think tokens are appended — used by counterfactual reward
+            # shaping in `compute_grpo_advantages`.
+            if d == 0:
+                t.immediate_logits = mask_token_logit(
+                    last_logits[i], thinking_token_id
+                ).cpu()
+
             action = int(actions[i].item())
             t.actions.append(1 - action)  # Store 1 for Think, 0 for Emit
             t.action_logprobs.append(float(log_probs[i].item()))
@@ -138,35 +151,97 @@ def generate_thought_trajectories(
 def compute_grpo_advantages(
     trajectory_groups: list[list[ThoughtTrajectory]],
     ponder_cost: float,
+    *,
+    ponder_shape: str = "linear",
+    counterfactual: bool = False,
+    separate_ponder_norm: bool = False,
 ) -> torch.Tensor:
-    """Calculate GRPO advantages normalized within each group.
-    
-    Returns a tensor of shape [B, N].
+    """Compute GRPO advantages with configurable ponder-cost shaping.
+
+    Reward shapes (selected by the kwargs):
+
+    - **Default (backward-compat)** — `linear` shape, no counterfactual,
+      ponder bundled into the GRPO normalization:
+      ``reward = -CE(d) - cost * d``, then z-score within group.
+      This is the original formula and stays default.
+
+    - ``ponder_shape='quadratic'`` — uses ``cost * d^2`` instead of
+      ``cost * d``. Marginal cost grows with depth, matching the
+      diminishing value of deeper thinking.
+
+    - ``counterfactual=True`` — clamps the task component at the
+      depth-0 baseline so thinking can never make the task reward
+      worse than not thinking, but *always* charges the depth cost:
+      ``reward = max(-CE(d), -CE(0)) - cost * f(d)``.
+      Encourages exploration of thinking (no task-side punishment for
+      trying) while still pushing toward *minimum* depth via the cost
+      term — matches "if thinking solves the task, it pays off; if
+      not, it costs but doesn't catastrophise".
+
+    - ``separate_ponder_norm=True`` (only meaningful when
+      ``counterfactual=False``): z-score task reward within group,
+      then subtract the absolute ponder term *after* normalization.
+      Prevents the group-z-score from squashing the (typically much
+      smaller) ponder magnitude into noise.
+
+    Returns a `(B, N)` advantage tensor.
     """
+    if ponder_shape not in ("linear", "quadratic"):
+        raise ValueError(f"unknown ponder_shape: {ponder_shape!r}")
     B = len(trajectory_groups)
     N = len(trajectory_groups[0])
-    rewards = torch.zeros((B, N))
-    
+
+    # Compute per-trajectory task rewards at chosen depth and at depth 0,
+    # plus the depth itself, in a single pass.
+    task_rewards_d = torch.zeros((B, N))
+    task_rewards_0 = torch.zeros((B, N))
+    depths = torch.zeros((B, N))
     for i, group in enumerate(trajectory_groups):
         for j, t in enumerate(group):
-            # Task Reward: -CE(logits, target)
-            # final_logits shape: [V]
             target = torch.tensor(t.target_id)
-            logits = t.final_logits.unsqueeze(0) # [1, V]
-            ce = F.cross_entropy(logits, target.unsqueeze(0))
-            task_reward = -ce.item()
-            
-            # Ponder Penalty
-            ponder_reward = -ponder_cost * t.depth
-            
-            rewards[i, j] = task_reward + ponder_reward
-            
-    # Normalize within each group
-    group_means = rewards.mean(dim=1, keepdim=True)
-    group_stds = rewards.std(dim=1, keepdim=True) + 1e-8
-    advantages = (rewards - group_means) / group_stds
-    
-    return advantages
+            ce_d = F.cross_entropy(t.final_logits.unsqueeze(0),
+                                    target.unsqueeze(0))
+            task_rewards_d[i, j] = -float(ce_d.item())
+            if t.immediate_logits is not None:
+                ce_0 = F.cross_entropy(t.immediate_logits.unsqueeze(0),
+                                        target.unsqueeze(0))
+                task_rewards_0[i, j] = -float(ce_0.item())
+            else:
+                # Fallback when an older rollout didn't capture the baseline.
+                task_rewards_0[i, j] = task_rewards_d[i, j]
+            depths[i, j] = float(t.depth)
+
+    # Depth cost: shape-dependent.
+    if ponder_shape == "linear":
+        depth_cost = ponder_cost * depths
+    else:  # quadratic
+        depth_cost = ponder_cost * (depths ** 2)
+
+    if counterfactual:
+        # Clamp the task component at the depth-0 baseline ("thinking
+        # never makes the task reward worse than not thinking") and
+        # then always charge the depth cost. Encourages exploration of
+        # thinking while still pushing the policy toward minimum depth.
+        task_component = torch.maximum(task_rewards_d, task_rewards_0)
+        rewards = task_component - depth_cost
+        means = rewards.mean(dim=1, keepdim=True)
+        stds = rewards.std(dim=1, keepdim=True) + 1e-8
+        return (rewards - means) / stds
+
+    if separate_ponder_norm:
+        # Z-score task only; ponder stays in absolute units so the
+        # group-relative comparison doesn't squash its (typically small)
+        # magnitude into noise.
+        task_means = task_rewards_d.mean(dim=1, keepdim=True)
+        task_stds = task_rewards_d.std(dim=1, keepdim=True) + 1e-8
+        return (task_rewards_d - task_means) / task_stds - depth_cost
+
+    # Original behavior (backward-compatible): ponder bundled into reward,
+    # full reward z-scored within group.
+    rewards = task_rewards_d - depth_cost
+    means = rewards.mean(dim=1, keepdim=True)
+    stds = rewards.std(dim=1, keepdim=True) + 1e-8
+    return (rewards - means) / stds
 
 
 class ThinkContinuationQueue:

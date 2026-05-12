@@ -79,6 +79,11 @@ The high-level idea of upper-to-lower-layer feedback in stacked RNNs
 is not new — see *Related work* below — but the **specific minimal
 form, the modern linear-RNN context, and the mechanism analysis are.**
 
+- [`THESIS.md`](THESIS.md) — project framing: why methodology-stacking
+  at small scale is the bet, what the claim is and isn't
+- [`PHASE_C_RL.md`](PHASE_C_RL.md) — prediction-as-RL-signal proposal:
+  reward code that's both correct *and* whose behaviour the model
+  predicted; the RL plan for after Phase A pretrain + Phase B SFT
 - [`RESULTS.md`](RESULTS.md) — full empirical writeup, Phases 1-16
 - [`NEXT_DIRECTIONS.md`](NEXT_DIRECTIONS.md) — current research plan
 - [`HISTORY.md`](HISTORY.md) — earlier hybrid + Lean + Triton-kernel

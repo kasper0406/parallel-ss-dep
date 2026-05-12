@@ -125,13 +125,26 @@ def main() -> int:
     device = "cuda"
 
     # --- 1. Build model from ckpt ----------------------------------------
+    # NOTE: Loading via build_model_from_ckpt auto-detects memory.* keys in
+    # the state dict and re-enables WorkingMemory. That's *fine* for eval,
+    # but SFT here does not pass `mem_read_mask`, so the memory module
+    # would inject only at thinking_token_id positions — which never appear
+    # in MBPP/CodeAlpaca text. The module's gradient would therefore be
+    # zero (same failure mode as the old corpus-RAG). Make this explicit:
+    # if the loaded ckpt has memory weights, we still build the model with
+    # memory ON (so state_dict matches), but the caller should be aware
+    # that those weights are not being trained here.
     print(f"loading checkpoint: {args.load_ckpt}")
     from experiments.eval_bracket_structure import build_model_from_ckpt
     model, cfg = build_model_from_ckpt(args.load_ckpt)
     model.train()
+    mem_in_ckpt = bool(cfg.get("use_memory", False)) or hasattr(model, "memory")
     print(f"  model: {cfg['n_layers']}L  d_model={cfg['d_model']}  "
-          f"use_memory={cfg.get('use_memory', False)}  "
           f"params={model.num_params() / 1e6:.1f}M")
+    if mem_in_ckpt:
+        print("  ⚠️  ckpt has WorkingMemory weights. SFT does NOT pass "
+              "mem_read_mask, so memory.* weights will receive zero gradient "
+              "during this run (inert path). Use RL for memory training.")
 
     # --- 2. Tokenizer ------------------------------------------------------
     from transformers import AutoTokenizer

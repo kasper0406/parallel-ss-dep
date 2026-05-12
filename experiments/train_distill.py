@@ -122,13 +122,13 @@ def main():
                    help="Enable per-position emit/think gate. Optional during "
                         "distillation; useful if a downstream RL pass will use "
                         "the gate.")
-    p.add_argument("--use_memory", action="store_true",
-                   help="Enable bounded working memory. Reads happen at every "
-                        "position during distillation (every token is a target "
-                        "→ many read events → favourable regime).")
-    p.add_argument("--mem_size", type=int, default=1024)
-    p.add_argument("--mem_dim", type=int, default=0,
-                   help="0 = use d_model.")
+    # NOTE: --use_memory intentionally removed from this trainer (2026-05-12).
+    # WorkingMemory injects only at positions matching `thinking_token_id`,
+    # which never appears in teacher token streams. We previously enabled it
+    # during distillation; gradient through the memory path was structurally
+    # zero (same failure mode as the old corpus-RAG) so the runs were a no-op.
+    # Memory belongs in RL (or in any setting that explicitly passes
+    # mem_read_mask, e.g. the synthetic recall ablations).
     p.add_argument("--teacher_tokenizer", type=str,
                    default="QuantTrio/Qwen3.6-35B-A3B-AWQ",
                    help="Saved to ckpt config so eval scripts pick the right tokenizer.")
@@ -184,12 +184,11 @@ def main():
         tuple(int(x) for x in pair.split(","))
         for pair in args.feedback_pairs.split(";") if pair
     )
-    # Reserve a single extra vocab slot for the thinking-token id when memory
-    # or output_gate is enabled. The slot doesn't appear in the teacher's
-    # token_ids stream, so we just slice student logits to teacher_vocab for
-    # KL/CE losses. (Same pattern as MQAR / Induction / Dyck wiring.)
+    # Reserve a single extra vocab slot for the thinking-token id only when
+    # the output gate is on (the gate may be useful downstream even though
+    # memory is intentionally NOT enabled here — see the use_memory note above).
     teacher_vocab = vocab_size
-    needs_think_slot = args.use_memory or args.output_gate
+    needs_think_slot = bool(args.output_gate)
     if needs_think_slot:
         vocab_size = teacher_vocab + 1
         thinking_token_id = teacher_vocab  # the new last id
@@ -199,7 +198,7 @@ def main():
           f"{' (+1 think slot)' if needs_think_slot else ''}  "
           f"d_model={args.d_model} n_layers={args.n_layers} sparse={fb_pairs} "
           f"self_k={args.feedback_self_k} gate={args.output_gate} "
-          f"memory={args.use_memory} tie_emb={args.tie_embeddings}")
+          f"tie_emb={args.tie_embeddings}")
     model = TinyLM(
         vocab_size=vocab_size, d_model=args.d_model, n_heads=args.n_heads,
         d_head=args.d_head, n_layers=args.n_layers,
@@ -207,9 +206,6 @@ def main():
         feedback_mode=args.feedback_mode, feedback_pairs=fb_pairs,
         feedback_self_k=int(args.feedback_self_k),
         output_gate=bool(args.output_gate),
-        use_memory=bool(args.use_memory),
-        mem_size=int(args.mem_size),
-        mem_dim=int(args.mem_dim) if args.mem_dim > 0 else args.d_model,
         thinking_token_id=thinking_token_id,
         tie_embeddings=args.tie_embeddings,
     ).cuda()
@@ -319,9 +315,6 @@ def main():
                 "feedback_self_k": int(args.feedback_self_k),
                 "tie_embeddings": args.tie_embeddings,
                 "output_gate": bool(args.output_gate),
-                "use_memory": bool(args.use_memory),
-                "mem_size": int(args.mem_size),
-                "mem_dim": int(args.mem_dim) if args.mem_dim > 0 else args.d_model,
                 "thinking_token_id": thinking_token_id,
                 "teacher_model": teacher_model,
                 "tokenizer": args.teacher_tokenizer,

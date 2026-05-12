@@ -134,26 +134,39 @@ This whole layer is now removed; `WorkingMemory` replaces it. The lesson — **d
 
 ## 5. End-to-End Pipeline
 
-The full pipeline now compiles end-to-end on a single 5090:
+The full pipeline compiles end-to-end on a single 5090:
 
 ```
 Qwen3.6-35B teacher → 10M-token NPZ shards (experiments/extract_teacher_logprobs.py)
    ↓
-experiments/train_distill.py  (--use_memory --feedback_self_k 3 --feedback_pairs 2,28)
-   → checkpoints/distill_qwen36_dn217_mem.pt  (PPL 81 → 41)
+experiments/train_distill.py  (--feedback_self_k 3 --feedback_pairs 2,28)
+   → checkpoints/distill_qwen36_dn217.pt       (PPL 81 → 41)
    ↓
 experiments/sft_code.py       (MBPP train + CodeAlpaca-20k Python-filtered, ~10k pairs)
-   → checkpoints/sft_dn217_mem.pt              (loss 5 → 2)
+   → checkpoints/sft_dn217.pt                   (loss 5 → 2)
+   ↓
+experiments/train_rl.py       (--use_memory  ← MEMORY ENTERS HERE, not before)
+   → RL ckpt with trained gate + memory
    ↓
 experiments/eval_humaneval.py + experiments/code_grader.py
-   → HumanEval pass@1 = 0 / 50
+   → HumanEval pass@1 = 0 / 50  (at the data scales we've run so far)
 ```
 
-Validation losses behave correctly at every stage. Generation inspection shows the post-SFT model produces syntactic Python (proper indentation, `return`, function structure) but no working programs — degenerate repetition loops on greedy decoding, no recoverable problem-solving with temperature sampling at pass@3.
+### Where memory belongs (and where it does not)
+
+**Critical**: `WorkingMemory` injects only at positions matching `thinking_token_id` (or wherever the caller passes a `mem_read_mask`). In pretraining and SFT the input data has no thinking tokens at all, so the default mask is everywhere-False — the memory module's gradient is **structurally zero**. This is exactly the failure mode that killed the old corpus-RAG.
+
+We discovered this mid-session. The earlier "memory vs no-memory" distillation comparison (val PPL 40.73 vs 40.80) was meaningless — the memory path never fired and the 0.07 gap was RNG drift from the extra vocab slot. Same for the post-SFT comparison.
+
+**The cleanup:** `train_distill.py` no longer accepts `--use_memory`. `sft_code.py` warns if the loaded ckpt has memory weights (they won't train). Memory is only meaningful in `train_rl.py` (where the rollout naturally produces think tokens) or in synthetic ablations that explicitly pass `mem_read_mask`.
+
+### Why HumanEval is still 0
+
+Validation losses behave correctly. Generation inspection shows the post-SFT model produces syntactic Python (proper indentation, `return`, function structure) but no working programs — degenerate repetition loops on greedy decoding, no recoverable problem-solving with temperature sampling at pass@3.
 
 **The bottleneck is data scale.** Qwen2.5-Coder-0.5B (5× our parameter count) was trained on hundreds of billions of tokens to reach ~30% pass@1. Our 217 M model has seen 10 M distill tokens + 10 k SFT pairs — orders of magnitude short of any fair comparison.
 
-**The architecture is not at fault.** We have independent recall benchmarks where memory's lift is clean and measurable; the HumanEval gap reflects training-token budget, not whether the bounded buffer works.
+**The architecture is not at fault.** Independent recall benchmarks (MQAR) show memory's lift cleanly; the HumanEval gap reflects training-token budget, not whether the bounded buffer works. And the previous "mem-on vs mem-off" results on the LM pipeline don't count for or against the architecture — they were both running the same (no-memory) trunk.
 
 ---
 

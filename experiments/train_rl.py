@@ -46,14 +46,27 @@ def main():
                    help="Penalty per thinking step.")
     p.add_argument("--max_depth", type=int, default=10)
     
-    # RAG Config
-    p.add_argument("--enable_rag", action="store_true")
-    p.add_argument("--rag_n_chunks", type=int, default=2000)
-    p.add_argument("--rag_dataset", type=str, default="codeparrot/codeparrot-clean")
-    
+    # Working memory (in-sequence, bounded, write-gated). Reads only at
+    # think positions; writes at every real token, gated. Replaces the
+    # corpus-RAG approach that previously sat behind --enable_rag.
+    p.add_argument("--use_memory", action="store_true",
+                   help="Enable bounded working memory inside the model.")
+    p.add_argument("--mem_size", type=int, default=1024,
+                   help="Max number of write-gated entries kept in the buffer.")
+    p.add_argument("--mem_dim", type=int, default=0,
+                   help="Memory key/value dim. 0 = use d_model.")
+
     p.add_argument("--save_ckpt", type=str, default="checkpoints/think_rl.pt")
     p.add_argument("--load_ckpt", type=str, help="Load a pre-trained BPTT checkpoint.")
     p.add_argument("--tb_dir", type=str, help="TensorBoard log directory.")
+    p.add_argument("--think_checkpointing", action="store_true",
+                   help="Wrap the policy forward in torch.utils.checkpoint to cut "
+                        "activation memory for the loss-bearing pass. Mandated for "
+                        "max_depth > 2 per GEMINI.md.")
+    p.add_argument("--min_decision_pos", type=int, default=16,
+                   help="Minimum context length when sampling the decision "
+                        "position. ≥2 avoids fla's decode/step path; ≥16 keeps "
+                        "DeltaNet's chunked kernels engaged.")
     
     # Shared from train_lm
     p.add_argument("--feedback", type=str, default="film")
@@ -76,26 +89,37 @@ def main():
             t, s = map(int, p_str.split(","))
             fb_pairs.append((t, s))
             
+    pad_token_id_int = int(tok.eos_token_id) if tok.eos_token_id is not None else 0
     model_config = dict(
         vocab_size=model_vocab_size, d_model=args.d_model, n_layers=args.n_layers,
         n_heads=args.n_heads, d_head=args.d_head, max_T=args.max_T,
         feedback_mode=args.feedback, feedback_pairs=tuple(fb_pairs),
         feedback_self_k=args.feedback_self_k,
         output_gate=True,
+        use_memory=bool(args.use_memory),
+        mem_size=int(args.mem_size),
+        mem_dim=int(args.mem_dim) if args.mem_dim > 0 else args.d_model,
+        thinking_token_id=int(thinking_token_id),
+        pad_token_id=int(pad_token_id_int),
         attention_cls=DeltaNetAttention
     )
     
     model = TinyLM(**model_config).to("cuda")
-    ref_model = TinyLM(**model_config).to("cuda")
-    ref_model.eval()
-    for p_param in ref_model.parameters():
-        p_param.requires_grad_(False)
-        
+    # Only materialise the reference model if a KL penalty is actually used —
+    # it's a full 217M-param copy that otherwise just wastes GPU memory.
+    if args.grpo_kl_beta > 0:
+        ref_model = TinyLM(**model_config).to("cuda")
+        ref_model.eval()
+        for p_param in ref_model.parameters():
+            p_param.requires_grad_(False)
+    else:
+        ref_model = None
+
     if args.load_ckpt:
         print(f"Loading checkpoint: {args.load_ckpt}")
         ckpt = torch.load(args.load_ckpt, map_location="cuda")
         sd = ckpt["state_dict"]
-        
+
         # Handle vocab size mismatch for 'from scratch' start
         for key in ["embed.weight", "lm_head.weight"]:
             if key in sd and sd[key].shape != model.state_dict()[key].shape:
@@ -104,29 +128,16 @@ def main():
                 n_copy = min(sd[key].shape[0], new_param.shape[0])
                 new_param[:n_copy] = sd[key][:n_copy]
                 sd[key] = new_param
-        
+
         model.load_state_dict(sd, strict=False)
-        ref_model.load_state_dict(sd, strict=False)
+        if ref_model is not None:
+            ref_model.load_state_dict(sd, strict=False)
         
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
-    
-    # 2. Setup RAG Database (In-Memory Tensor)
-    rag_keys = None
-    if args.enable_rag:
-        print(f"Initializing In-Memory RAG DB ({args.rag_n_chunks} chunks)...")
-        rag_ds = load_dataset(args.rag_dataset, streaming=True, split="train")
-        chunks = []
-        with torch.no_grad():
-            for i, x in enumerate(rag_ds):
-                ids = tok(x[args.text_field], truncation=True, max_length=256, return_tensors="pt")["input_ids"].to("cuda")
-                if ids.shape[1] < 50: continue
-                _, hidden = ref_model(ids, return_hidden=True)
-                chunks.append(hidden.mean(dim=1)) # (1, d_model)
-                if len(chunks) >= args.rag_n_chunks: break
-                if len(chunks) % 500 == 0: print(f"  Embedded {len(chunks)}/{args.rag_n_chunks}")
-        rag_keys = torch.cat(chunks, dim=0) # (N, d_model)
-        rag_keys = F.normalize(rag_keys, p=2, dim=1)
-        print(f"RAG DB Ready: {rag_keys.shape}")
+
+    if args.use_memory:
+        print(f"Working memory: enabled, mem_size={args.mem_size}, "
+              f"mem_dim={args.mem_dim if args.mem_dim > 0 else args.d_model}")
 
     # 3. Setup Dataset
     ds = load_dataset(args.dataset, streaming=True, split="train")
@@ -157,23 +168,58 @@ def main():
         
     print(f"\n{'step':>6}  {'reward':>8}  {'advantages':>8}  {'think_rate':>8}  {'avg_depth':>8}")
     
+    # Wrap the policy forward when --think_checkpointing is requested. Per
+    # GEMINI.md this is mandated for max_depth > 2 to keep activation memory
+    # within budget during the loss-bearing pass.
+    from torch.utils.checkpoint import checkpoint as _grad_checkpoint
+
+    def policy_forward(input_ids_grad: torch.Tensor):
+        if args.think_checkpointing:
+            # checkpoint() doesn't pass kwargs into the wrapped fn directly; use
+            # a closure so the model still receives the gate flag.
+            def _fwd(ids):
+                return model(ids, return_gate=True)
+            return _grad_checkpoint(_fwd, input_ids_grad, use_reentrant=False)
+        return model(input_ids_grad, return_gate=True)
+
+    pad_token_id = int(tok.eos_token_id) if tok.eos_token_id is not None else 0
+    min_pos = max(2, int(args.min_decision_pos))
+
+
     for step in range(args.steps):
         try:
             batch = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
             batch = next(train_iter)
-            
+
         input_ids = batch["input_ids"].to("cuda")
         B, T = input_ids.shape
-        
-        # Pick one random token position per row to optimize (for efficiency)
-        # Or optimize all? For now, let's pick a random mid-sequence position.
-        pos = torch.randint(1, T-1, (B,))
-        
-        initial_contexts = [input_ids[i, :pos[i]].tolist() for i in range(B)]
+
+        # Per-row decision position. Pick from the non-pad region so we don't
+        # ask the model to predict an eos pad as the target. The loader
+        # right-pads with `eos_token_id` (see TokenizedDataset.__iter__), so
+        # the run of pad tokens lives at the tail.
+        is_pad = input_ids == pad_token_id
+        # First pad index per row (or T if no pad)
+        first_pad = torch.where(
+            is_pad.any(dim=1),
+            is_pad.float().argmax(dim=1),
+            torch.full((B,), T, device=is_pad.device),
+        )
+        # Upper bound for pos: predict a token that is itself non-pad → pos < first_pad
+        upper = torch.clamp(first_pad, max=T - 1)
+        lower = torch.full_like(upper, min_pos)
+        # If upper <= lower for some row, fall back to lower (will be a noisy
+        # signal but won't crash). Guarantees pos ≥ min_pos ≥ 2.
+        span = (upper - lower).clamp(min=1)
+        offset = (torch.rand(B, device=upper.device) * span.float()).long()
+        pos = (lower + offset).clamp(min=min_pos, max=T - 1)
+        pos_list = pos.tolist()
+
+        initial_contexts = [input_ids[i, :pos_list[i]].tolist() for i in range(B)]
         target_ids = input_ids[range(B), pos].tolist()
-        
+
         # Phase 1: Rollout
         trajectory_groups = generate_thought_trajectories(
             model, initial_contexts, target_ids,
@@ -182,112 +228,159 @@ def main():
             thinking_token_id=thinking_token_id,
             block_size=args.T,
             device="cuda",
-            rag_keys=rag_keys
+            pad_token_id=pad_token_id,
         )
-        
+
         # Phase 2: Advantages
         advantages = compute_grpo_advantages(trajectory_groups, args.grpo_ponder_cost).to("cuda")
-        
-        # Collect rewards for logging
-        rewards = torch.zeros((B, args.grpo_n_group))
+
+        # Pure-task rewards (for logging) — exclude the ponder term so the
+        # reported PPL is true perplexity of the optimised token. Also bucket
+        # CE by trajectory depth to see whether thinking actually reduces CE.
+        task_rewards = torch.zeros((B, args.grpo_n_group))
+        all_depths: list[int] = []
+        depth_ce: dict[int, list[float]] = {}
         for i, group in enumerate(trajectory_groups):
             for j, t in enumerate(group):
                 target = torch.tensor(t.target_id)
                 logits = t.final_logits.unsqueeze(0)
                 ce = F.cross_entropy(logits, target.unsqueeze(0))
-                rewards[i, j] = -ce.item() - (args.grpo_ponder_cost * t.depth)
+                task_rewards[i, j] = -ce.item()
+                all_depths.append(t.depth)
+                depth_ce.setdefault(t.depth, []).append(float(ce.item()))
 
-        # Phase 3: GRPO Update
-        # Re-run forward only for the decision points to get gradients
-        # We need the log_probs under current policy for the sampled actions.
-        
-        loss = torch.zeros((), device="cuda")
-        
+        # Phase 3: Batched GRPO update.
+        # Build one (B*N, T_max) tensor from every trajectory's final context,
+        # run a single grad-enabled policy forward, gather the last-position
+        # gate logit per row, and assemble the loss in one vector op. This
+        # collapses the previous 16 sequential graphs into 1.
         total_trajs = B * args.grpo_n_group
-        all_rewards = []
-        all_depths = []
-        
-        # Batch re-run for efficiency
-        # For each trajectory, we need the gate logits at each step.
-        # This is slightly complex because trajectories have different lengths.
-        
-        # For this prototype, we'll do a simplified update: 
-        # only backprop through the decision points.
-        
+        ctxs: list[list[int]] = []
         for i in range(B):
             for j in range(args.grpo_n_group):
                 traj = trajectory_groups[i][j]
-                adv = advantages[i, j]
-                
-                # Re-run with gradients
-                # Construct context
                 ctx = (traj.initial_context + [thinking_token_id] * traj.depth)[-args.T:]
-                input_ids_grad = torch.tensor([ctx], dtype=torch.long, device="cuda")
-                
-                # We need all gate logits along the trajectory to compute the policy probability
-                # p(traj) = product p(action_t)
-                # But for Linear RNNs, we can just run the whole sequence.
-                logits, gate = model(input_ids_grad, return_gate=True)
-                # We only need the positions where we took actions (the last positions of each pass)
-                # In our current DeltaNet implementation, one forward pass = many tokens.
-                # But when thinking, it's one pass = one thought step.
-                
-                # Simplified: only optimize the very last decision point for now
-                # (whether to Emit or Think one more time)
-                # Real GRPO would optimize the whole chain.
-                
-                current_gate_logit = model._last_gate_logits[0, -1]
-                # Prob(Emit) = sigmoid(logit), Prob(Think) = 1 - Prob(Emit)
-                
-                action = traj.actions[-1] # 1 for Think, 0 for Emit
-                if action == 1:
-                    log_prob = F.logsigmoid(-current_gate_logit)
-                else:
-                    log_prob = F.logsigmoid(current_gate_logit)
-                    
-                # Reference model for KL
-                with torch.no_grad():
-                    ref_logits, ref_gate = ref_model(input_ids_grad, return_gate=True)
-                    ref_gate_logit = ref_model._last_gate_logits[0, -1]
-                    if action == 1:
-                        ref_log_prob = F.logsigmoid(-ref_gate_logit)
-                    else:
-                        ref_log_prob = F.logsigmoid(ref_gate_logit)
-                
-                ratio = torch.exp(log_prob - traj.action_logprobs[-1])
-                surr1 = ratio * adv
-                surr2 = torch.clamp(ratio, 1.0 - args.grpo_epsilon, 1.0 + args.grpo_epsilon) * adv
-                
-                policy_loss = -torch.min(surr1, surr2)
-                kl_loss = args.grpo_kl_beta * (log_prob - ref_log_prob) # Simplified KL
-                
-                loss += (policy_loss + kl_loss) / total_trajs
-                
-                all_depths.append(traj.depth)
+                ctxs.append(ctx)
+        # Left-pad to common length (min 2 to keep chunked-conv path engaged).
+        from experiments.thinking import MIN_ROLLOUT_LEN
+        max_len = max(MIN_ROLLOUT_LEN, max(len(c) for c in ctxs))
+        ids_grad = torch.full(
+            (total_trajs, max_len), pad_token_id, dtype=torch.long, device="cuda",
+        )
+        last_pos = torch.empty(total_trajs, dtype=torch.long, device="cuda")
+        for k, c in enumerate(ctxs):
+            ids_grad[k, -len(c):] = torch.tensor(c, dtype=torch.long, device="cuda")
+            last_pos[k] = max_len - 1
+
+        _, _ = policy_forward(ids_grad)  # populates model._last_gate_logits
+        row_idx = torch.arange(total_trajs, device="cuda")
+        cur_gate_logits = model._last_gate_logits[row_idx, last_pos]  # (BN,)
+
+        # Per-traj action: 1 = Think, 0 = Emit (matches thinking.py convention).
+        # Gate sigmoid(logit) = P(Emit), so:
+        actions_t = torch.tensor(
+            [trajectory_groups[i][j].actions[-1]
+             for i in range(B) for j in range(args.grpo_n_group)],
+            dtype=torch.long, device="cuda",
+        )
+        # log P(action | cur_gate_logits): action==0 → logsigmoid(logit);
+        # action==1 → logsigmoid(-logit)
+        log_p = torch.where(
+            actions_t == 1,
+            F.logsigmoid(-cur_gate_logits),
+            F.logsigmoid(cur_gate_logits),
+        )
+        old_log_p = torch.tensor(
+            [trajectory_groups[i][j].action_logprobs[-1]
+             for i in range(B) for j in range(args.grpo_n_group)],
+            dtype=log_p.dtype, device="cuda",
+        )
+        adv_flat = advantages.reshape(-1).to(log_p.dtype)
+        ratio = torch.exp(log_p - old_log_p)
+        surr1 = ratio * adv_flat
+        surr2 = torch.clamp(ratio, 1.0 - args.grpo_epsilon,
+                            1.0 + args.grpo_epsilon) * adv_flat
+        policy_loss = -torch.minimum(surr1, surr2).mean()
+
+        if args.grpo_kl_beta > 0:
+            with torch.no_grad():
+                _ = ref_model(ids_grad, return_gate=True)
+                ref_gate_logits = ref_model._last_gate_logits[row_idx, last_pos]
+                ref_log_p = torch.where(
+                    actions_t == 1,
+                    F.logsigmoid(-ref_gate_logits),
+                    F.logsigmoid(ref_gate_logits),
+                )
+            kl_loss = args.grpo_kl_beta * (log_p - ref_log_p).mean()
+        else:
+            kl_loss = torch.zeros((), device="cuda", dtype=log_p.dtype)
+
+        loss = policy_loss + kl_loss
 
         opt.zero_grad()
         loss.backward()
         opt.step()
-        
+
         # Logging
         if step % 10 == 0:
-            avg_reward = rewards.mean().item()
+            avg_task_reward = task_rewards.mean().item()
             think_rate = sum(1 for d in all_depths if d > 0) / len(all_depths)
             avg_depth = sum(all_depths) / len(all_depths)
-            
-            # Compute PPL from rewards (Reward = -CE, so PPL = exp(-Reward))
-            # Note: This is PPL specifically for the tokens being optimized
-            current_ppl = torch.exp(torch.tensor(-avg_reward)).item()
+            current_ppl = float(torch.exp(torch.tensor(-avg_task_reward)).item())
 
-            print(f"{step:>6}  {avg_reward:>8.4f}  {advantages.std().item():>8.4f}  {think_rate:>8.4f}  {avg_depth:>8.4f}  ppl={current_ppl:.2f}")
-            
+            print(f"{step:>6}  {avg_task_reward:>8.4f}  {advantages.std().item():>8.4f}  "
+                  f"{think_rate:>8.4f}  {avg_depth:>8.4f}  ppl={current_ppl:.2f}")
+
+            # Diagnostics: gate distribution, weight-norm bootstrap, depth-CE.
+            gate_sigmoid = torch.sigmoid(cur_gate_logits.detach()).float()
+            gate_mean = gate_sigmoid.mean().item()
+            gate_std = gate_sigmoid.std().item() if gate_sigmoid.numel() > 1 else 0.0
+            gate_head_norm = float(model.gate_head.weight.detach().norm().item())
+
+            # Memory-side diagnostics: weight norms + mean write-gate value over
+            # the loss-bearing forward's positions. If any of these stay
+            # bit-flat, the memory path is dead — same failure mode the
+            # old rag_projection had.
+            if model.use_memory:
+                mem = model.memory
+                mem_proj_norm = float(mem.W_proj.weight.detach().norm().item())
+                mem_write_norm = float(mem.W_write.weight.detach().norm().item())
+                mem_query_norm = float(mem.W_q.weight.detach().norm().item())
+                mem_value_norm = float(mem.W_v.weight.detach().norm().item())
+                # Read the last write-gate produced by the most recent
+                # policy_forward (just above) — these are the actual gates
+                # computed on the loss-bearing tokens.
+                last_g = getattr(mem, "_last_write_gate", None)
+                write_gate_mean = float(last_g.mean().item()) if last_g is not None else 0.0
+            else:
+                mem_proj_norm = mem_write_norm = mem_query_norm = mem_value_norm = 0.0
+                write_gate_mean = 0.0
+
             if tb:
                 tb.add_scalar("grpo/loss", loss.item(), step)
+                tb.add_scalar("grpo/policy_loss", policy_loss.item(), step)
+                tb.add_scalar("grpo/kl_loss", kl_loss.item(), step)
                 tb.add_scalar("grpo/think_rate", think_rate, step)
                 tb.add_scalar("grpo/avg_depth", avg_depth, step)
-                tb.add_scalar("grpo/reward", avg_reward, step)
+                tb.add_scalar("grpo/task_reward", avg_task_reward, step)
                 tb.add_scalar("grpo/ppl", current_ppl, step)
-                tb.add_histogram("grpo/depth_dist", torch.tensor(all_depths, dtype=torch.float), step)
+                tb.add_scalar("grpo/gate_mean", gate_mean, step)
+                tb.add_scalar("grpo/gate_std", gate_std, step)
+                tb.add_scalar("grpo/gate_head_norm", gate_head_norm, step)
+                if model.use_memory:
+                    tb.add_scalar("mem/proj_norm", mem_proj_norm, step)
+                    tb.add_scalar("mem/write_norm", mem_write_norm, step)
+                    tb.add_scalar("mem/query_norm", mem_query_norm, step)
+                    tb.add_scalar("mem/value_norm", mem_value_norm, step)
+                    tb.add_scalar("mem/write_gate_mean", write_gate_mean, step)
+                for d_bucket, ces in depth_ce.items():
+                    tb.add_scalar(
+                        f"grpo/depth_ce_d{d_bucket}",
+                        sum(ces) / len(ces),
+                        step,
+                    )
+                tb.add_histogram("grpo/depth_dist",
+                                 torch.tensor(all_depths, dtype=torch.float), step)
                 
         if step > 0 and step % 1000 == 0:
             torch.save({
@@ -295,6 +388,14 @@ def main():
                 "state_dict": model.state_dict(),
                 "config": model_config,
             }, args.save_ckpt)
+
+    # Final save at end-of-training (the % 1000 schedule above skips step 999).
+    torch.save({
+        "step": args.steps - 1,
+        "state_dict": model.state_dict(),
+        "config": model_config,
+    }, args.save_ckpt)
+    print(f"Saved final checkpoint to {args.save_ckpt}")
 
 if __name__ == "__main__":
     main()

@@ -906,6 +906,130 @@ class MultiScaleFeedbackProjection(nn.Module):
         return x
 
 
+class WorkingMemory(nn.Module):
+    """Bounded, write-gated working memory read at thinking positions.
+
+    Pipeline (single forward, fully differentiable):
+        Per position t (input is `h ∈ ℝ^{B×T×d}`, already out-normed):
+          g_t = σ(W_write(h_t)) ∈ [0,1]              # write gate
+          v_t = W_v(h_t)            ∈ ℝ^{d_mem}      # value to write
+          q_t = W_q(h_t)            ∈ ℝ^{d_mem}      # query
+        Per row, select the top-K positions by g_t (K = min(T, mem_size)):
+          buf_k = v[top_idx[k]],  g_buf_k = g[top_idx[k]]
+        For each position p:
+          score_{p,k} = (q_p · buf_k)/√d_mem + log(g_buf_k + ε)
+          mask: -∞ if top_idx[k] ≥ p (strict-causal) or src was a pad token
+          α = softmax_k(score)
+          read_p = Σ_k α_{p,k} buf_k
+        At think positions only:
+          h_p ← h_p + W_proj(read_p)
+
+    Cost is O(B·T·K·d_mem) — linear in T with constant K, matching the
+    SSM ethos. No O(T²) attention is introduced.
+
+    Gradient flows through values, queries, gate (via log-bias and value
+    scaling), and W_proj — none of which start at zero, so the path can
+    bootstrap.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_mem: int,
+        mem_size: int,
+        thinking_token_id: int,
+        pad_token_id: int | None = None,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.d_mem = d_mem
+        self.mem_size = int(mem_size)
+        self.thinking_token_id = int(thinking_token_id)
+        self.pad_token_id = pad_token_id
+
+        # Write side
+        self.W_write = nn.Linear(d_model, 1, bias=True)
+        self.W_v = nn.Linear(d_model, d_mem, bias=False)
+        # Read side
+        self.W_q = nn.Linear(d_model, d_mem, bias=False)
+        self.W_proj = nn.Linear(d_mem, d_model, bias=False)
+
+        # Init — small-random everywhere, *zero bias on W_write* so the gate
+        # starts at σ(0)=0.5 (model can write or not at start). W_proj is
+        # explicitly small-random (NOT zero), so the read path has a
+        # non-vanishing gradient signal from step 0.
+        for lin in (self.W_v, self.W_q, self.W_proj):
+            nn.init.normal_(lin.weight, std=0.02)
+        nn.init.normal_(self.W_write.weight, std=0.02)
+        nn.init.zeros_(self.W_write.bias)
+
+    def forward(self, h: torch.Tensor, input_ids: torch.Tensor,
+                read_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """`read_mask` (B, T) bool/float: 1 where memory should be injected.
+        If None, derived from `input_ids == thinking_token_id`."""
+        B, T, _ = h.shape
+        device = h.device
+
+        # ---- Write side: compute gate + value at every position --------------
+        write_logits = self.W_write(h).squeeze(-1)              # (B, T)
+        g = torch.sigmoid(write_logits)                          # (B, T)
+        v = self.W_v(h)                                          # (B, T, d_mem)
+        # Stash for diagnostics (mirrors TinyLM._last_gate_logits pattern).
+        self._last_write_gate = g.detach()
+
+        # Mask pad-position contributions out before top-K so the buffer never
+        # contains padding rows.
+        if self.pad_token_id is not None:
+            is_pad = input_ids == int(self.pad_token_id)          # (B, T)
+            g = g.masked_fill(is_pad, 0.0)
+
+        K_eff = min(T, self.mem_size)
+
+        # ---- Top-K positions per row by write-gate ---------------------------
+        # top_idx: (B, K_eff). Gradient flows through `v` & `g` at the
+        # *selected* positions exactly as torch.topk semantics dictate.
+        _, top_idx = torch.topk(g, k=K_eff, dim=-1)              # (B, K_eff)
+        gather_idx_v = top_idx.unsqueeze(-1).expand(-1, -1, self.d_mem)  # (B, K, d_mem)
+        buf_v = torch.gather(v, dim=1, index=gather_idx_v)        # (B, K, d_mem)
+        buf_g = torch.gather(g, dim=1, index=top_idx)             # (B, K)
+
+        # ---- Read side: query for every position -----------------------------
+        # We only USE the result at think positions (mask later); cheaper than
+        # gather-only-think indices but keeps the implementation uniform.
+        q = self.W_q(h)                                          # (B, T, d_mem)
+        scale = 1.0 / math.sqrt(self.d_mem)
+        # scores: (B, T, K)
+        scores = torch.einsum("btd,bkd->btk", q, buf_v) * scale
+        # Log-gate bias: tiny ε to keep log finite when a row's K-th slot has g=0.
+        scores = scores + torch.log(buf_g.clamp_min(1e-6)).unsqueeze(1)
+
+        # Causal mask: position t can attend to buffer-slot k iff top_idx[k] < t.
+        # top_idx: (B, K) → (B, 1, K). pos: (1, T, 1).
+        pos = torch.arange(T, device=device).view(1, T, 1)
+        src_pos = top_idx.unsqueeze(1)                           # (B, 1, K)
+        causal_mask = src_pos >= pos                              # (B, T, K)
+        scores = scores.masked_fill(causal_mask, float("-inf"))
+
+        # Some rows (t < min source position) get all -inf. Softmax of all
+        # -inf is NaN; replace those rows with zero attention so the read is
+        # zero (and the injection is zero).
+        all_masked = causal_mask.all(dim=-1, keepdim=True)        # (B, T, 1)
+        attn = torch.softmax(scores, dim=-1)
+        attn = torch.where(all_masked, torch.zeros_like(attn), attn)
+
+        read = torch.einsum("btk,bkd->btd", attn, buf_v)          # (B, T, d_mem)
+        injection = self.W_proj(read)                             # (B, T, d_model)
+
+        # Inject only at "read positions" — either an explicit mask the
+        # caller provided (e.g. MQAR query positions) or the default
+        # thinking-token-based mask.
+        if read_mask is None:
+            inj = (input_ids == self.thinking_token_id).unsqueeze(-1).to(h.dtype)
+        else:
+            inj = read_mask.to(h.dtype).unsqueeze(-1)
+        return h + injection * inj
+
+
 class TinyLM(nn.Module):
     def __init__(
         self,
@@ -992,6 +1116,16 @@ class TinyLM(nn.Module):
                                               # Init: zero weight, bias=+2.0
                                               # (g ≈ 0.88 at start so training
                                               # starts near standard LM).
+        use_memory: bool = False,             # Enable bounded working memory:
+                                              # write-gated, top-K-bounded
+                                              # store of past hidden states,
+                                              # soft-attention-read at think
+                                              # positions only.
+        mem_size: int = 1024,
+        mem_dim: int | None = None,
+        thinking_token_id: int | None = None,  # Required when use_memory=True.
+        pad_token_id: int | None = None,      # Optional; used to keep padding
+                                              # rows out of the memory.
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1199,10 +1333,28 @@ class TinyLM(nn.Module):
             self.gate_head = nn.Linear(d_model, 1, bias=True)
             nn.init.zeros_(self.gate_head.weight)
             nn.init.constant_(self.gate_head.bias, 2.0)
-            
-        self.rag_projection = nn.Linear(d_model, d_model)
-        nn.init.zeros_(self.rag_projection.weight)
-        nn.init.zeros_(self.rag_projection.bias)
+
+        # Bounded working memory: write-gated buffer + soft-attention read
+        # at thinking positions only. See WorkingMemory docstring.
+        self.use_memory = bool(use_memory)
+        self.thinking_token_id = thinking_token_id
+        self.pad_token_id = pad_token_id
+        if self.use_memory:
+            if thinking_token_id is None:
+                raise ValueError("use_memory=True requires thinking_token_id")
+            self.memory = WorkingMemory(
+                d_model=d_model,
+                d_mem=int(mem_dim) if mem_dim is not None else d_model,
+                mem_size=int(mem_size),
+                thinking_token_id=int(thinking_token_id),
+                pad_token_id=pad_token_id,
+            )
+            # Re-init the thinking-token embedding row to the mean of the
+            # other rows. PyTorch's default init makes it random noise, which
+            # corrupts the recurrence every time a think token is appended.
+            with torch.no_grad():
+                mean_row = self.embed.weight.mean(dim=0)
+                self.embed.weight[int(thinking_token_id)].copy_(mean_row)
 
     def _sparse_pass_collect_sources(self,
                                       x: torch.Tensor,
@@ -1246,17 +1398,24 @@ class TinyLM(nn.Module):
                 out_src[L] = h
         return out_src
 
+    def _apply_memory(self, h_normed: torch.Tensor,
+                      input_ids: torch.Tensor,
+                      read_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """No-op unless use_memory; else inject working-memory read at the
+        positions selected by read_mask (default: think-token positions)."""
+        if not self.use_memory:
+            return h_normed
+        return self.memory(h_normed, input_ids, read_mask=read_mask)
+
     def forward(self, input_ids: torch.Tensor,
                 return_aux: bool = False,
                 return_surprise: bool = False,
                 return_hidden: bool = False,
                 return_gate: bool = False,
-                rag_hidden: torch.Tensor | None = None,
+                mem_read_mask: torch.Tensor | None = None,
                 ) -> torch.Tensor | tuple:
         x = self.embed(input_ids)
-        if rag_hidden is not None:
-            x = x + self.rag_projection(rag_hidden)
-            
+
         if self.max_T > 0:
             T = input_ids.shape[1]
             pos = torch.arange(T, device=input_ids.device)
@@ -1278,6 +1437,7 @@ class TinyLM(nn.Module):
             for blk in self.blocks:
                 x = blk(x, input_ids=input_ids)
             h = self.out_norm(x)
+            h = self._apply_memory(h, input_ids, read_mask=mem_read_mask)
             lm_logits = self.lm_head(h)
             outs = (lm_logits,)
             if return_aux and self.aux_dim > 0:
@@ -1332,6 +1492,7 @@ class TinyLM(nn.Module):
                     )
                 h = blk(h, input_ids=input_ids)
             h = self.out_norm(h)
+            h = self._apply_memory(h, input_ids, read_mask=mem_read_mask)
             lm_logits = self.lm_head(h)
             outs = (lm_logits,)
             if return_aux and self.aux_dim > 0:
@@ -1371,6 +1532,7 @@ class TinyLM(nn.Module):
                         h = self.xattn_feedback[str(L)](h, src_states)
                 h = blk(h, input_ids=input_ids)
             h = self.out_norm(h)
+            h = self._apply_memory(h, input_ids, read_mask=mem_read_mask)
             lm_logits = self.lm_head(h)
             outs = (lm_logits,)
             if return_aux and self.aux_dim > 0:
@@ -1485,6 +1647,7 @@ class TinyLM(nn.Module):
                     if L in source_layers:
                         final_src_states[L] = h
                 h_norm = self.out_norm(h)
+                h_norm = self._apply_memory(h_norm, input_ids, read_mask=mem_read_mask)
                 lm_logits = self.lm_head(h_norm)
                 # Cache final pass's source states so the eval/diagnostic
                 # callers can compute self-consistency norms cheaply.
@@ -1545,6 +1708,7 @@ class TinyLM(nn.Module):
                                                             self.feedback_lag)
                     h = self.sparse_feedback[str(L)](h, state_above_lagged)
             h = self.out_norm(h)
+            h = self._apply_memory(h, input_ids, read_mask=mem_read_mask)
             lm_logits = self.lm_head(h)
             outs = (lm_logits,)
             if return_aux and self.aux_dim > 0:
@@ -1600,6 +1764,7 @@ class TinyLM(nn.Module):
                 h = blk(h_input, input_ids=input_ids)
 
         h = self.out_norm(h)
+        h = self._apply_memory(h, input_ids, read_mask=mem_read_mask)
         lm_logits = self.lm_head(h)
         outs = (lm_logits,)
         if return_aux and self.aux_dim > 0:

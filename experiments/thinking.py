@@ -36,7 +36,12 @@ class ThoughtTrajectory:
     action_logprobs: list[float]
     final_logits: torch.Tensor | None = None
     depth: int = 0
-    rag_history: list[int] | None = None # Indices of retrieved facts
+
+
+# fla's short_conv routes seq_len==1 through a decode/step path that requires
+# a cache tensor; the rollout always passes None for cache, which crashes
+# Triton's autotuner. Keep every rollout input ≥ MIN_ROLLOUT_LEN.
+MIN_ROLLOUT_LEN = 2
 
 
 @torch.no_grad()
@@ -50,95 +55,83 @@ def generate_thought_trajectories(
     block_size: int,
     temperature: float = 1.0,
     device: str = "cuda",
-    rag_keys: torch.Tensor | None = None,
+    pad_token_id: int = 0,
 ) -> list[list[ThoughtTrajectory]]:
-    """Sample n_group trajectories per (context, target) pair."""
+    """Sample n_group trajectories per (context, target) pair.
+
+    The model decides at each step whether to emit (terminate) or think
+    (append another thinking token and retry). The working memory inside
+    `TinyLM.forward` reads from past hidden states of the same sequence at
+    every think position — there is no external RAG store in this rollout.
+    """
     B = len(initial_contexts)
     N = n_group
-    
+
     # Initialize trajectories: [B][N]
     trajectories: list[list[ThoughtTrajectory]] = [
-        [ThoughtTrajectory(initial_context=ctx, target_id=tid, actions=[], action_logprobs=[], rag_history=[])
+        [ThoughtTrajectory(initial_context=ctx, target_id=tid, actions=[], action_logprobs=[])
          for _ in range(N)]
         for ctx, tid in zip(initial_contexts, target_ids)
     ]
-    
+
     # Active trajectories: flat list of (B*N)
     active_trajs: list[ThoughtTrajectory] = [t for group in trajectories for t in group]
     finished_mask = torch.zeros(B * N, dtype=torch.bool, device=device)
-    
-    # Track the embedding to inject in the NEXT pass for each trajectory
-    # Shape: (BN, d_model)
-    d_model = model.d_model if hasattr(model, "d_model") else 576
-    next_injection = torch.zeros((B * N, d_model), device=device)
-    
+
+    # Cap context so appending the worst-case (max_depth) thinking tokens never
+    # overflows block_size — keeps the chunked-conv path engaged consistently.
+    ctx_budget = max(MIN_ROLLOUT_LEN, block_size - max_depth)
+
     for d in range(max_depth + 1):
         if finished_mask.all():
             break
-            
+
         ctx_list = []
-        for i, t in enumerate(active_trajs):
-            ctx = (t.initial_context + ([thinking_token_id] * t.depth))[-block_size:]
+        for t in active_trajs:
+            ctx = (t.initial_context + ([thinking_token_id] * t.depth))[-ctx_budget:]
             ctx_list.append(ctx)
-            
-        # Pad contexts for batching
-        max_len = max(len(c) for c in ctx_list)
-        input_ids = torch.full((B * N, max_len), 0, dtype=torch.long, device=device)
+
+        # Pad contexts for batching. Always pad to at least MIN_ROLLOUT_LEN so
+        # fla's short_conv does not route seq_len=1 inputs through the
+        # decode/step path (which expects a cache tensor and crashes).
+        max_len = max(MIN_ROLLOUT_LEN, max(len(c) for c in ctx_list))
+        input_ids = torch.full(
+            (B * N, max_len), int(pad_token_id), dtype=torch.long, device=device
+        )
+        last_positions = torch.empty(B * N, dtype=torch.long, device=device)
         for i, c in enumerate(ctx_list):
             input_ids[i, -len(c):] = torch.tensor(c, dtype=torch.long, device=device)
-        
-        # Build rag_hidden: inject at the last position only
-        rag_hidden = torch.zeros((B * N, max_len, d_model), device=device)
-        rag_hidden[:, -1, :] = next_injection
-        
-        # Forward pass
-        logits, gate = model(input_ids, return_gate=True, rag_hidden=rag_hidden)
-        
-        # We only care about the last position
-        last_logits = logits[:, -1]
-        last_gate = gate[:, -1]
-        
-        # Perform retrieval for the NEXT step
-        if rag_keys is not None:
-            # Query is the hidden state at the last position
-            _, hidden = model(input_ids, return_hidden=True, rag_hidden=rag_hidden)
-            query = hidden[:, -1, :]
-            query = F.normalize(query, p=2, dim=1)
-            
-            # Simple MatMul search
-            scores = torch.matmul(query, rag_keys.T) # (BN, N_chunks)
-            best_idx = scores.argmax(dim=-1)
-            next_injection = rag_keys[best_idx]
-            
-            # Record history
-            for i, t in enumerate(active_trajs):
-                if not finished_mask[i]:
-                    t.rag_history.append(int(best_idx[i].item()))
-        
-        # Action probability: gate = prob(Emit)
-        # So prob(Think) = 1 - gate
-        probs = torch.stack([1 - last_gate, last_gate], dim=-1) # [BN, 2]
-        
+            last_positions[i] = max_len - 1  # left-padded: real tokens end at -1
+
+        # Single forward pass.
+        logits, gate = model(input_ids, return_gate=True)
+
+        # Gather at the last real position per row.
+        row_idx = torch.arange(B * N, device=device)
+        last_logits = logits[row_idx, last_positions]
+        last_gate = gate[row_idx, last_positions]
+
+        # Action probability: gate = prob(Emit), so prob(Think) = 1 - gate
+        probs = torch.stack([1 - last_gate, last_gate], dim=-1)  # [BN, 2]
         dist = torch.distributions.Categorical(probs=probs)
-        actions = dist.sample() # 0: Think, 1: Emit
+        actions = dist.sample()  # 0: Think, 1: Emit
         log_probs = dist.log_prob(actions)
-        
+
         for i, t in enumerate(active_trajs):
             if finished_mask[i]:
                 continue
-            
+
             action = int(actions[i].item())
-            t.actions.append(1 - action) # Store 1 for Think, 0 for Emit
+            t.actions.append(1 - action)  # Store 1 for Think, 0 for Emit
             t.action_logprobs.append(float(log_probs[i].item()))
-            
-            if action == 1 or d == max_depth: # Emit or reached max depth
+
+            if action == 1 or d == max_depth:  # Emit or reached max depth
                 finished_mask[i] = True
-                # Mask thinking token from logits before storing
                 t.final_logits = mask_token_logit(last_logits[i], thinking_token_id).cpu()
                 t.depth = d
             else:
                 t.depth += 1
-                
+
     return trajectories
 
 

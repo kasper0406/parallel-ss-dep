@@ -59,12 +59,18 @@ class RunResult:
     params: int
 
 
-def _val(model, T, n_classes, batch_size, device):
+def _val(model, T, n_classes, batch_size, device, use_memory=False):
     model.eval()
     with torch.no_grad():
         x, y = dyck_batch(batch_size, T, n_types=2, max_depth=n_classes - 1,
                           device=device)
-        logits = model(x)
+        # Dyck is per-position depth tracking — every position is a "query".
+        # When memory is on we let reads happen everywhere so the architecture
+        # can use its buffer for the depth-tracking task.
+        read_mask = torch.ones_like(x, dtype=torch.bool) if use_memory else None
+        logits = model(x, mem_read_mask=read_mask)
+        # If we widened vocab for the extra thinking-token slot, slice it off.
+        logits = logits[..., :n_classes]
         loss = F.cross_entropy(logits.reshape(-1, n_classes), y.reshape(-1)).item()
         preds = logits.argmax(dim=-1)
         per_tok_acc = (preds == y).float().mean().item()
@@ -87,7 +93,7 @@ def _val(model, T, n_classes, batch_size, device):
 
 def train_one(arch_or_layers, T, steps, batch_size, d_model, n_layers,
               n_heads, d_head, lr, log_every, max_depth=15, device="cuda",
-              seed=0):
+              seed=0, use_memory=False, mem_size=256, mem_dim=0):
     n_classes = max_depth + 1                          # 0..max_depth
     n_tokens = 4                                       # 2 bracket types × 2
 
@@ -103,9 +109,16 @@ def train_one(arch_or_layers, T, steps, batch_size, d_model, n_layers,
     # Build with vocab=max(n_tokens, n_classes) and slice if needed; or just
     # use a separate linear head. Simpler: vocab=n_classes (>= n_tokens).
     vocab = max(n_tokens, n_classes)
+    vocab_eff = vocab + (1 if use_memory else 0)
+    thinking_id = vocab_eff - 1 if use_memory else None
     model = TinyLM(
-        vocab_size=vocab, d_model=d_model, n_layers=n_layers,
-        n_heads=n_heads, d_head=d_head, max_T=T, **attn_kw,
+        vocab_size=vocab_eff, d_model=d_model, n_layers=n_layers,
+        n_heads=n_heads, d_head=d_head, max_T=T,
+        use_memory=use_memory,
+        mem_size=mem_size,
+        mem_dim=mem_dim if mem_dim > 0 else d_model,
+        thinking_token_id=thinking_id,
+        **attn_kw,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95),
                             weight_decay=0.0)
@@ -113,8 +126,8 @@ def train_one(arch_or_layers, T, steps, batch_size, d_model, n_layers,
         opt, T_max=steps, eta_min=lr * 0.1,
     )
 
-    print(f"\n[{arch_or_layers}]  T={T}  max_depth={max_depth}  "
-          f"params={model.num_params():,}")
+    print(f"\n[{arch_or_layers}{' +mem' if use_memory else ''}]  "
+          f"T={T}  max_depth={max_depth}  params={model.num_params():,}")
     print(f"{'step':>6}  {'tloss':>8}  {'vloss':>8}  {'val_acc':>8}  "
           f"{'end_acc':>8}  q1/q2/q3/q4")
 
@@ -123,7 +136,9 @@ def train_one(arch_or_layers, T, steps, batch_size, d_model, n_layers,
     for step in range(1, steps + 1):
         x, y = dyck_batch(batch_size, T, n_types=2, max_depth=max_depth,
                           device=device)
-        logits = model(x)
+        read_mask = torch.ones_like(x, dtype=torch.bool) if use_memory else None
+        logits = model(x, mem_read_mask=read_mask)
+        logits = logits[..., :n_classes]
         loss = F.cross_entropy(logits.reshape(-1, n_classes), y.reshape(-1))
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -133,12 +148,14 @@ def train_one(arch_or_layers, T, steps, batch_size, d_model, n_layers,
         last_train_loss = loss.item()
 
         if step % log_every == 0 or step == steps:
-            v_loss, v_acc, e_acc, q = _val(model, T, n_classes, 512, device)
+            v_loss, v_acc, e_acc, q = _val(model, T, n_classes, 512, device,
+                                            use_memory=use_memory)
             qs = "/".join(f"{x:.2f}" for x in q)
             print(f"{step:>6d}  {last_train_loss:>8.4f}  {v_loss:>8.4f}  "
                   f"{v_acc:>8.3f}  {e_acc:>8.3f}  {qs}")
 
-    v_loss, v_acc, e_acc, _ = _val(model, T, n_classes, 1024, device)
+    v_loss, v_acc, e_acc, _ = _val(model, T, n_classes, 1024, device,
+                                     use_memory=use_memory)
     secs = time.perf_counter() - t0
     return RunResult(
         arch=arch_or_layers, T=T, steps=steps,
@@ -163,6 +180,11 @@ def main():
     p.add_argument("--lr", type=float, default=3e-3)
     p.add_argument("--log_every", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--use_memory", action="store_true",
+                   help="Enable bounded working memory (reads at every position).")
+    p.add_argument("--mem_size", type=int, default=256)
+    p.add_argument("--mem_dim", type=int, default=0,
+                   help="0 = use d_model.")
     args = p.parse_args()
 
     if args.arches is None and args.layers is None:
@@ -186,6 +208,9 @@ def main():
             n_heads=args.n_heads, d_head=args.d_head,
             lr=args.lr, log_every=args.log_every,
             max_depth=args.max_depth, seed=args.seed,
+            use_memory=args.use_memory,
+            mem_size=args.mem_size,
+            mem_dim=args.mem_dim,
         )
         results.append(r)
 

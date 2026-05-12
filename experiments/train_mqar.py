@@ -57,13 +57,17 @@ class RunResult:
     params: int
 
 
-def _val(model, T, n_pairs, vocab, batch_size, device):
+def _val(model, T, n_pairs, vocab, batch_size, device, use_memory=False):
     model.eval()
     with torch.no_grad():
         x, y, mask = mqar_batch(batch_size, T, vocab_size=vocab,
                                 n_pairs=n_pairs, device=device)
-        logits = model(x)
-        # CE only on query positions.
+        # Memory reads happen at query positions (where the mask is 1).
+        read_mask = mask.bool() if use_memory else None
+        logits = model(x, mem_read_mask=read_mask)
+        # Slice to MQAR-vocab columns so the recall@1 / CE comparison is
+        # fair across mem-on (vocab+1) and mem-off (vocab) builds.
+        logits = logits[..., :vocab]
         loss = F.cross_entropy(
             logits.reshape(-1, vocab), y.reshape(-1), reduction="none",
         ).reshape(batch_size, T)
@@ -78,14 +82,26 @@ def _val(model, T, n_pairs, vocab, batch_size, device):
 
 def train_one(arch, T, n_pairs, vocab, steps, batch_size,
               d_model, n_layers, n_heads, d_head, lr, log_every,
-              device="cuda", seed=0, feedback="none"):
+              device="cuda", seed=0, feedback="none",
+              use_memory=False, mem_size=1024, mem_dim=0):
     torch.manual_seed(seed)
     cls = ARCHES[arch]
+    # When use_memory=True we need a thinking_token_id slot; reserve the
+    # last id of the vocab (MQAR's actual tokens are in [0, vocab-1] but the
+    # generator only uses values < n_pairs*2 + queries, so the top slot is
+    # always free). The token doesn't actually appear in MQAR inputs — we
+    # drive reads via mem_read_mask instead — but the model needs a valid id.
+    vocab_eff = vocab + (1 if use_memory else 0)
+    thinking_id = vocab_eff - 1 if use_memory else None
     model = TinyLM(
-        vocab_size=vocab, d_model=d_model, n_layers=n_layers,
+        vocab_size=vocab_eff, d_model=d_model, n_layers=n_layers,
         n_heads=n_heads, d_head=d_head, attention_cls=cls,
         max_T=T,                              # learnable abs pos embed
         feedback_mode=feedback,
+        use_memory=use_memory,
+        mem_size=mem_size,
+        mem_dim=mem_dim if mem_dim > 0 else d_model,
+        thinking_token_id=thinking_id,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95),
                             weight_decay=0.0)
@@ -93,7 +109,8 @@ def train_one(arch, T, n_pairs, vocab, steps, batch_size,
         opt, T_max=steps, eta_min=lr * 0.1,
     )
 
-    print(f"\n[{arch}]  T={T}  n_pairs={n_pairs}  vocab={vocab}  "
+    print(f"\n[{arch}{' +mem' if use_memory else ''}]  "
+          f"T={T}  n_pairs={n_pairs}  vocab={vocab}  "
           f"params={model.num_params():,}")
     print(f"{'step':>6}  {'train_loss':>11}  {'val_loss':>9}  {'recall':>8}")
 
@@ -102,9 +119,14 @@ def train_one(arch, T, n_pairs, vocab, steps, batch_size,
     for step in range(1, steps + 1):
         x, y, mask = mqar_batch(batch_size, T, vocab_size=vocab,
                                 n_pairs=n_pairs, device=device)
-        logits = model(x)
+        read_mask = mask.bool() if use_memory else None
+        logits = model(x, mem_read_mask=read_mask)
+        # Logits cover vocab_eff slots; CE targets MQAR tokens in [0, vocab).
+        # Take only the MQAR-vocab columns for CE (the extra slot for the
+        # thinking-token id never appears in targets).
+        loss_logits = logits[..., :vocab] if use_memory else logits
         loss = F.cross_entropy(
-            logits.reshape(-1, vocab), y.reshape(-1), reduction="none",
+            loss_logits.reshape(-1, vocab), y.reshape(-1), reduction="none",
         ).reshape(batch_size, T)
         loss = (loss * mask).sum() / mask.sum().clamp_min(1)
 
@@ -116,11 +138,13 @@ def train_one(arch, T, n_pairs, vocab, steps, batch_size,
         last_train_loss = loss.item()
 
         if step % log_every == 0 or step == steps:
-            v_loss, recall = _val(model, T, n_pairs, vocab, 512, device)
+            v_loss, recall = _val(model, T, n_pairs, vocab, 512, device,
+                                   use_memory=use_memory)
             print(f"{step:>6d}  {last_train_loss:>11.4f}  "
                   f"{v_loss:>9.4f}  {recall:>8.3f}")
 
-    v_loss, recall = _val(model, T, n_pairs, vocab, 1024, device)
+    v_loss, recall = _val(model, T, n_pairs, vocab, 1024, device,
+                           use_memory=use_memory)
     secs = time.perf_counter() - t0
     return RunResult(
         arch=arch, T=T, n_pairs=n_pairs, vocab=vocab, steps=steps,
@@ -146,6 +170,13 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--feedback", type=str, default="none",
                    choices=["none", "additive", "film", "predictive"])
+    p.add_argument("--use_memory", action="store_true",
+                   help="Add the bounded working-memory module; reads at "
+                        "query positions.")
+    p.add_argument("--mem_size", type=int, default=256,
+                   help="Max entries in the write-gated memory buffer.")
+    p.add_argument("--mem_dim", type=int, default=0,
+                   help="0 = use d_model.")
     args = p.parse_args()
 
     arches = args.arches.split(",")
@@ -162,6 +193,9 @@ def main():
                 n_heads=args.n_heads, d_head=args.d_head,
                 lr=args.lr, log_every=args.log_every, seed=args.seed,
                 feedback=args.feedback,
+                use_memory=args.use_memory,
+                mem_size=args.mem_size,
+                mem_dim=args.mem_dim,
             )
             results.append(r)
 

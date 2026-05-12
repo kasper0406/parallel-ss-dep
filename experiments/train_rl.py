@@ -58,6 +58,9 @@ def main():
 
     p.add_argument("--save_ckpt", type=str, default="checkpoints/think_rl.pt")
     p.add_argument("--load_ckpt", type=str, help="Load a pre-trained BPTT checkpoint.")
+    p.add_argument("--tokenizer", type=str, default="HuggingFaceTB/SmolLM2-135M",
+                   help="HF tokenizer to use. Must match the load_ckpt's "
+                        "training tokenizer for sane vocab + token ids.")
     p.add_argument("--tb_dir", type=str, help="TensorBoard log directory.")
     p.add_argument("--think_checkpointing", action="store_true",
                    help="Wrap the policy forward in torch.utils.checkpoint to cut "
@@ -79,9 +82,32 @@ def main():
     print(f"GRPO Training: {args.arch} scale {args.d_model}d")
     
     # 1. Setup Model & Reference
-    tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    tok = AutoTokenizer.from_pretrained(args.tokenizer)
+    # Use `len(tok)` (full size including added tokens) rather than vocab_size
+    # so the thinking_token_id slot is one past the highest existing id.
     thinking_token_id = len(tok)
     model_vocab_size = len(tok) + 1
+    # If we're loading a checkpoint whose embed table was sized differently
+    # (e.g. distillation pads vocab up to a multiple of 64 + an optional gate
+    # slot), match it. Otherwise the resize logic below truncates the
+    # pretrained embedding table.
+    if args.load_ckpt:
+        try:
+            ck_cfg = torch.load(args.load_ckpt, map_location="cpu",
+                                weights_only=False).get("config", {})
+            ck_vocab = int(ck_cfg.get("vocab_size", 0))
+            if ck_vocab >= model_vocab_size:
+                model_vocab_size = ck_vocab + (0 if ck_vocab > thinking_token_id else 1)
+                # If the ckpt had its own thinking_token_id, respect it; else
+                # use ours, but make sure it's representable in the embed.
+                if ck_cfg.get("thinking_token_id") is not None:
+                    thinking_token_id = int(ck_cfg["thinking_token_id"])
+                else:
+                    thinking_token_id = model_vocab_size - 1
+                print(f"  matched ckpt vocab: model_vocab_size={model_vocab_size}, "
+                      f"thinking_token_id={thinking_token_id}")
+        except Exception as e:
+            print(f"  warn: could not read ckpt cfg ({e}); using tokenizer-derived vocab")
     
     fb_pairs = []
     if args.feedback_pairs:
@@ -101,8 +127,10 @@ def main():
         mem_dim=int(args.mem_dim) if args.mem_dim > 0 else args.d_model,
         thinking_token_id=int(thinking_token_id),
         pad_token_id=int(pad_token_id_int),
-        attention_cls=DeltaNetAttention
+        attention_cls=DeltaNetAttention,
     )
+    # Extra fields saved to ckpt cfg (but not passed to TinyLM ctor).
+    ckpt_cfg_extras = dict(tokenizer=args.tokenizer, arch=args.arch)
     
     model = TinyLM(**model_config).to("cuda")
     # Only materialise the reference model if a KL penalty is actually used —
@@ -254,68 +282,120 @@ def main():
         # run a single grad-enabled policy forward, gather the last-position
         # gate logit per row, and assemble the loss in one vector op. This
         # collapses the previous 16 sequential graphs into 1.
+        # ----------------------------------------------------------------
+        # Full-trajectory GRPO credit assignment.
+        #
+        # Each trajectory of depth d made d+1 gate decisions (one per
+        # iteration in the rollout). Its policy log-prob is the SUM of
+        # log P(action_i) over all those decisions. We recompute every
+        # gate logit in one batched forward and gather at the per-decision
+        # positions, then sum.
+        #
+        # For a trajectory with final context  initial + [think]*depth
+        # (length N + depth), the gate decisions happened at positions
+        # [N-1, N, ..., N+depth-1] in that context. After left-padding to
+        # max_len, those become [N-1+pad, ..., N+depth-1+pad].
+        # ----------------------------------------------------------------
         total_trajs = B * args.grpo_n_group
+        from experiments.thinking import MIN_ROLLOUT_LEN
+
         ctxs: list[list[int]] = []
+        per_traj_decisions: list[list[int]] = []   # per-traj decision positions IN CTX
+        per_traj_actions:   list[list[int]] = []   # aligned actions (1=Think, 0=Emit)
+        per_traj_old_logp:  list[list[float]] = [] # aligned rollout log-probs
         for i in range(B):
             for j in range(args.grpo_n_group):
                 traj = trajectory_groups[i][j]
-                ctx = (traj.initial_context + [thinking_token_id] * traj.depth)[-args.T:]
+                ctx_full = traj.initial_context + [thinking_token_id] * traj.depth
+                ctx = ctx_full[-args.T:]
+                ctx_len = len(ctx)
+                # How many of the (initial + think) suffix are visible after
+                # the [-args.T:] crop: depth is small (≤ max_depth), and we
+                # require initial-tokens to remain (the rollout already
+                # caps initial_context this way).
+                initial_in_ctx = ctx_len - traj.depth
+                # decision positions in ctx coordinates
+                decisions = [initial_in_ctx - 1 + k for k in range(traj.depth + 1)]
+                # Drop any that fell off the left edge (negative positions)
+                # together with their corresponding actions / old logprobs.
+                actions = list(traj.actions)             # length depth+1
+                old_logps = list(traj.action_logprobs)    # length depth+1
+                kept = [(p, a, lp) for p, a, lp in zip(decisions, actions, old_logps) if p >= 0]
+                if not kept:
+                    # Pathological: nothing recoverable. Skip — should be impossible
+                    # given the rollout's MIN_ROLLOUT_LEN guard.
+                    kept = [(0, int(traj.actions[-1]), float(traj.action_logprobs[-1]))]
                 ctxs.append(ctx)
-        # Left-pad to common length (min 2 to keep chunked-conv path engaged).
-        from experiments.thinking import MIN_ROLLOUT_LEN
+                per_traj_decisions.append([p for p, _, _ in kept])
+                per_traj_actions.append([a for _, a, _ in kept])
+                per_traj_old_logp.append([lp for _, _, lp in kept])
+
         max_len = max(MIN_ROLLOUT_LEN, max(len(c) for c in ctxs))
+        max_decisions = max(len(d) for d in per_traj_decisions)
+
         ids_grad = torch.full(
             (total_trajs, max_len), pad_token_id, dtype=torch.long, device="cuda",
         )
-        last_pos = torch.empty(total_trajs, dtype=torch.long, device="cuda")
-        for k, c in enumerate(ctxs):
-            ids_grad[k, -len(c):] = torch.tensor(c, dtype=torch.long, device="cuda")
-            last_pos[k] = max_len - 1
+        # Padded decision-position / action / old-logprob tensors, with a
+        # boolean validity mask.
+        dec_pos_t   = torch.zeros((total_trajs, max_decisions), dtype=torch.long, device="cuda")
+        actions_t   = torch.zeros((total_trajs, max_decisions), dtype=torch.long, device="cuda")
+        old_logp_t  = torch.zeros((total_trajs, max_decisions), dtype=torch.float32, device="cuda")
+        valid_t     = torch.zeros((total_trajs, max_decisions), dtype=torch.bool,  device="cuda")
+        for k, (ctx, decisions, actions, oldlp) in enumerate(zip(
+                ctxs, per_traj_decisions, per_traj_actions, per_traj_old_logp)):
+            ids_grad[k, -len(ctx):] = torch.tensor(ctx, dtype=torch.long, device="cuda")
+            pad_offset = max_len - len(ctx)
+            for di, (p, a, lp) in enumerate(zip(decisions, actions, oldlp)):
+                dec_pos_t[k, di]  = p + pad_offset
+                actions_t[k, di]  = int(a)
+                old_logp_t[k, di] = float(lp)
+                valid_t[k, di]    = True
 
-        _, _ = policy_forward(ids_grad)  # populates model._last_gate_logits
-        row_idx = torch.arange(total_trajs, device="cuda")
-        cur_gate_logits = model._last_gate_logits[row_idx, last_pos]  # (BN,)
+        _, _ = policy_forward(ids_grad)  # populates model._last_gate_logits (BN, T)
+        row_idx = torch.arange(total_trajs, device="cuda").unsqueeze(1).expand(-1, max_decisions)
+        gate_logits = model._last_gate_logits[row_idx, dec_pos_t]   # (BN, D)
 
-        # Per-traj action: 1 = Think, 0 = Emit (matches thinking.py convention).
-        # Gate sigmoid(logit) = P(Emit), so:
-        actions_t = torch.tensor(
-            [trajectory_groups[i][j].actions[-1]
-             for i in range(B) for j in range(args.grpo_n_group)],
-            dtype=torch.long, device="cuda",
-        )
-        # log P(action | cur_gate_logits): action==0 → logsigmoid(logit);
-        # action==1 → logsigmoid(-logit)
-        log_p = torch.where(
+        # log P(action | gate_logit): σ(gate) = P(Emit), so
+        #   action==Think (1) → logsigmoid(-gate)
+        #   action==Emit  (0) → logsigmoid( gate)
+        log_p_per_dec = torch.where(
             actions_t == 1,
-            F.logsigmoid(-cur_gate_logits),
-            F.logsigmoid(cur_gate_logits),
+            F.logsigmoid(-gate_logits),
+            F.logsigmoid(gate_logits),
         )
-        old_log_p = torch.tensor(
-            [trajectory_groups[i][j].action_logprobs[-1]
-             for i in range(B) for j in range(args.grpo_n_group)],
-            dtype=log_p.dtype, device="cuda",
-        )
-        adv_flat = advantages.reshape(-1).to(log_p.dtype)
-        ratio = torch.exp(log_p - old_log_p)
-        surr1 = ratio * adv_flat
-        surr2 = torch.clamp(ratio, 1.0 - args.grpo_epsilon,
-                            1.0 + args.grpo_epsilon) * adv_flat
+        # Mask invalid decisions to zero (so they contribute 0 to the sum).
+        valid_f = valid_t.to(log_p_per_dec.dtype)
+        log_p_traj  = (log_p_per_dec * valid_f).sum(dim=1)              # (BN,)
+        old_logp_traj = (old_logp_t.to(log_p_per_dec.dtype) * valid_f).sum(dim=1)
+
+        adv_flat = advantages.reshape(-1).to(log_p_traj.dtype)
+        ratio  = torch.exp(log_p_traj - old_logp_traj)
+        surr1  = ratio * adv_flat
+        surr2  = torch.clamp(ratio, 1.0 - args.grpo_epsilon,
+                              1.0 + args.grpo_epsilon) * adv_flat
         policy_loss = -torch.minimum(surr1, surr2).mean()
 
-        if args.grpo_kl_beta > 0:
+        # ---- KL to reference, also over the full trajectory --------------
+        if args.grpo_kl_beta > 0 and ref_model is not None:
             with torch.no_grad():
                 _ = ref_model(ids_grad, return_gate=True)
-                ref_gate_logits = ref_model._last_gate_logits[row_idx, last_pos]
-                ref_log_p = torch.where(
+                ref_gate_logits = ref_model._last_gate_logits[row_idx, dec_pos_t]
+                ref_log_p_per_dec = torch.where(
                     actions_t == 1,
                     F.logsigmoid(-ref_gate_logits),
                     F.logsigmoid(ref_gate_logits),
                 )
-            kl_loss = args.grpo_kl_beta * (log_p - ref_log_p).mean()
+                ref_log_p_traj = (ref_log_p_per_dec * valid_f).sum(dim=1)
+            kl_loss = args.grpo_kl_beta * (log_p_traj - ref_log_p_traj).mean()
         else:
-            kl_loss = torch.zeros((), device="cuda", dtype=log_p.dtype)
+            kl_loss = torch.zeros((), device="cuda", dtype=log_p_traj.dtype)
 
         loss = policy_loss + kl_loss
+        # Compatibility shims for the diagnostics block below that still
+        # references `cur_gate_logits` / `actions_t`.
+        cur_gate_logits = gate_logits[valid_t]                # (sum_valid,)
+        actions_t_flat  = actions_t[valid_t]                  # (sum_valid,)
 
         opt.zero_grad()
         loss.backward()
@@ -386,14 +466,14 @@ def main():
             torch.save({
                 "step": step,
                 "state_dict": model.state_dict(),
-                "config": model_config,
+                "config": {**model_config, **ckpt_cfg_extras},
             }, args.save_ckpt)
 
     # Final save at end-of-training (the % 1000 schedule above skips step 999).
     torch.save({
         "step": args.steps - 1,
         "state_dict": model.state_dict(),
-        "config": model_config,
+        "config": {**model_config, **ckpt_cfg_extras},
     }, args.save_ckpt)
     print(f"Saved final checkpoint to {args.save_ckpt}")
 

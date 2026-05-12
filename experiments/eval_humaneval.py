@@ -123,9 +123,13 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
         prompt = problem["prompt"]
         # Tokenise; check fits in model's max_T.
         prompt_ids = tok.encode(prompt, add_special_tokens=False)
-        if len(prompt_ids) + max_gen > cfg["max_T"]:
+        # max_T==0 means "no positional embedding limit" — the model has no
+        # built-in T cap. Use a generous cap of 2048 to keep generation
+        # bounded; don't truncate when the prompt is short.
+        eff_max_T = cfg["max_T"] if cfg["max_T"] > 0 else 2048
+        if len(prompt_ids) + max_gen > eff_max_T:
             # Truncate from start (keep tail).
-            prompt_ids = prompt_ids[-(cfg["max_T"] - max_gen):]
+            prompt_ids = prompt_ids[-(eff_max_T - max_gen):]
         prompt_t = torch.tensor(prompt_ids, dtype=torch.long, device="cuda").unsqueeze(0)
 
         any_passed = False

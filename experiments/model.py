@@ -1331,7 +1331,18 @@ class TinyLM(nn.Module):
         self.output_gate = bool(output_gate)
         if self.output_gate:
             self.gate_head = nn.Linear(d_model, 1, bias=True)
-            nn.init.zeros_(self.gate_head.weight)
+            # Small-random weight (NOT zero) so the gate has position-dependent
+            # output at init — the gate logit varies across the sequence even
+            # before any training. The previous zero-weight init was tuned for
+            # BPTT thinking-curriculum (which keeps the gate near uniform on
+            # purpose to ease early training); for RL the result was a flat
+            # gate with zero gradient signal across positions — RL could
+            # never differentiate hard from easy tokens.
+            #
+            # Bias = +2.0 still puts mean σ(gate) ≈ 0.88 at init (mostly
+            # emit), but each position is now perturbed by the W·h term,
+            # giving non-trivial gate_std and a usable RL gradient.
+            nn.init.normal_(self.gate_head.weight, std=0.02)
             nn.init.constant_(self.gate_head.bias, 2.0)
 
         # Bounded working memory: write-gated buffer + soft-attention read

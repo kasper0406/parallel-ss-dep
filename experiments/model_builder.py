@@ -112,6 +112,7 @@ def build_model_from_args(args, *, vocab_size: int,
                      or (args.enable_thinking_token
                          and args.think_decision == "gate")),
         activation_checkpointing=args.activation_checkpointing,
+        layer_drop_max=float(getattr(args, "layer_drop_max", 0.0)),
         **mem_kwargs,
         **attn_kw,
     ).to("cuda")

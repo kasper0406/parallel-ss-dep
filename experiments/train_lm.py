@@ -46,27 +46,7 @@ from experiments.thinking import (
 )
 
 
-_NAME_TO_CLS = {
-    "deltanet":   DeltaNetAttention,
-    "transformer": SoftmaxAttention,
-    "mamba2":     Mamba2Attention,
-}
-
-
-def build_arch(name: str, n_layers: int):
-    """Map an arch name to a single attention class or a per-layer list.
-
-    Use --layers for an explicit comma-separated list.
-    """
-    if name in _NAME_TO_CLS:
-        return dict(attention_cls=_NAME_TO_CLS[name])
-    raise ValueError(f"unknown arch: {name}")
-
-
-def parse_layers_arg(spec: str) -> list:
-    """Parse comma-separated --layers spec into a class list."""
-    parts = [p.strip() for p in spec.split(",") if p.strip()]
-    return [_NAME_TO_CLS[p] for p in parts]
+from experiments.build_arch import build_arch, parse_layers_arg, _NAME_TO_CLS  # noqa: F401
 
 
 class TokenisedStream(IterableDataset):
@@ -297,7 +277,7 @@ def main():
     from experiments.optim_utils import build_optimizer
     opts, scheds = build_optimizer(
         model, optimizer=args.optimizer, lr=args.lr, lr_muon=args.lr_muon,
-        alpha_wd=args.alpha_wd, steps=args.steps,
+        alpha_wd=args.alpha_wd, steps=args.steps, wd=args.wd,
     )
     # Backwards-compat aliases used elsewhere in the loop.
     opt = opts[0]

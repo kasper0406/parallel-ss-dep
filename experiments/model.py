@@ -1002,6 +1002,10 @@ class TinyLM(nn.Module):
         thinking_token_id: int | None = None,  # Required when use_memory=True.
         pad_token_id: int | None = None,      # Optional; used to keep padding
                                               # rows out of the memory.
+        layer_drop_max: float = 0.0,          # Stochastic Depth: linearly
+                                              # increasing per-block drop
+                                              # prob 0 → layer_drop_max
+                                              # with depth. 0 = off.
         activation_checkpointing: bool = False,  # Wrap each Block's
                                               # loss-bearing forward in
                                               # torch.utils.checkpoint to
@@ -1209,6 +1213,7 @@ class TinyLM(nn.Module):
         # Activation checkpointing on the loss-bearing block loop. See the
         # forward() helper _block_fwd() for usage.
         self.activation_checkpointing = bool(activation_checkpointing)
+        self.layer_drop_max = float(layer_drop_max)
         if self.use_memory:
             if thinking_token_id is None:
                 raise ValueError("use_memory=True requires thinking_token_id")
@@ -1269,14 +1274,24 @@ class TinyLM(nn.Module):
         return out_src
 
     def _block_fwd(self, blk: nn.Module, h: torch.Tensor,
-                   input_ids: torch.Tensor | None) -> torch.Tensor:
-        """Run one Block; optionally checkpoint it.
+                   input_ids: torch.Tensor | None,
+                   L: int = -1) -> torch.Tensor:
+        """Run one Block; optionally checkpoint and/or stochastically drop.
 
-        Trades ~30% extra compute for a large reduction in stored
-        activations. Skipped when grad is disabled (e.g. the no_grad
-        passes in K-self-feed) since checkpointing without grad is pure
-        overhead.
+        Activation checkpointing trades ~30% extra compute for a large
+        reduction in stored activations; skipped when grad is disabled.
+
+        LayerDrop (Huang et al. 2016 / Fan et al. 2020): with probability
+        `layer_drop_max · L / (n_layers - 1)`, return `h` unchanged —
+        i.e., the block's contribution is dropped. Only active during
+        training. No survivor rescaling (Fan-et-al. convention).
         """
+        if (self.training and self.layer_drop_max > 0.0 and L >= 0
+                and self.layer_drop_max * L
+                / max(1, len(self.blocks) - 1) > 0.0):
+            p_L = self.layer_drop_max * L / max(1, len(self.blocks) - 1)
+            if torch.rand((), device=h.device).item() < p_L:
+                return h
         if self.activation_checkpointing and torch.is_grad_enabled():
             return _ckpt_run_block(blk, h, input_ids)
         return blk(h, input_ids=input_ids)
@@ -1346,8 +1361,8 @@ class TinyLM(nn.Module):
 
         if (self.feedback_mode == "none"
                 and not self.feedback_xattn_pairs):
-            for blk in self.blocks:
-                x = self._block_fwd(blk, x, input_ids)
+            for L, blk in enumerate(self.blocks):
+                x = self._block_fwd(blk, x, input_ids, L=L)
             return self._finalize(x, input_ids, mem_read_mask,
                                    return_aux, return_hidden, return_gate,
                                    _maybe_gate)
@@ -1481,7 +1496,7 @@ class TinyLM(nn.Module):
                         src = self.sparse_target_to_source[L]
                         sup = surprise_per_target.get(L) if surprise_per_target else None
                         h = self.sparse_feedback[str(L)](h, film_in[src], surprise=sup)
-                    h = self._block_fwd(blk, h, input_ids)
+                    h = self._block_fwd(blk, h, input_ids, L=L)
                     if L in self.sparse_target_to_source and self.feedback_position == "post":
                         src = self.sparse_target_to_source[L]
                         sup = surprise_per_target.get(L) if surprise_per_target else None
@@ -1533,7 +1548,7 @@ class TinyLM(nn.Module):
                     state_above_lagged = _shift_right_by_k(pass1_at_sources[src],
                                                             self.feedback_lag)
                     h = self.sparse_feedback[str(L)](h, state_above_lagged)
-                h = self._block_fwd(blk, h, input_ids)
+                h = self._block_fwd(blk, h, input_ids, L=L)
                 if L in self.sparse_target_to_source and self.feedback_position == "post":
                     src = self.sparse_target_to_source[L]
                     state_above_lagged = _shift_right_by_k(pass1_at_sources[src],

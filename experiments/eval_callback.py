@@ -52,6 +52,8 @@ def run_humaneval(ckpt_path: str, n_problems: int = 50,
                    use_thinking: bool = False,
                    emit_threshold: float = 0.5,
                    max_think_per_step: int = 8,
+                   min_emit_before_eos: int = 0,
+                   gate_floor: float = 0.0,
                    timeout_s: int = 1800,
                    python_executable: str | None = None,
                    ) -> tuple[float | None, str]:
@@ -75,6 +77,10 @@ def run_humaneval(ckpt_path: str, n_problems: int = 50,
             "--emit_threshold", str(emit_threshold),
             "--max_think_per_step", str(max_think_per_step),
         ]
+    if min_emit_before_eos > 0:
+        cmd += ["--min_emit_before_eos", str(min_emit_before_eos)]
+    if gate_floor > 0.0:
+        cmd += ["--gate_floor", str(gate_floor)]
     env = None  # inherit; PYTHONPATH will already include repo if launcher set it
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -91,12 +97,16 @@ def run_eval(ckpt_path: str, tokens_seen: int, step: int,
               n_problems: int = 50, max_gen: int = 192,
               use_thinking: bool = False,
               emit_threshold: float = 0.5,
+              min_emit_before_eos: int = 0,
+              gate_floor: float = 0.0,
               ) -> EvalResult:
     """Convenience wrapper: HumanEval only for now (MBPP path can be added
     once `eval_mbpp.py` exists in this repo)."""
     he_rate, log_tail = run_humaneval(
         ckpt_path, n_problems=n_problems, max_gen=max_gen,
         use_thinking=use_thinking, emit_threshold=emit_threshold,
+        min_emit_before_eos=min_emit_before_eos,
+        gate_floor=gate_floor,
     )
     return EvalResult(
         humaneval_pass_rate=float(he_rate) if he_rate is not None else float("nan"),

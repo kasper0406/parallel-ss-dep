@@ -32,6 +32,144 @@ The thinking head + memory architecture below is in service of that target.
 3. Once HumanEval pass@1 is nonzero, the existing GRPO infra +
    `code_grader.grade` is the natural follow-up.
 
+### Queued: make pretrain teach *useful* thinking, not just *benign* thinking (2026-05-13)
+
+**Motivation.** v2 pretrain trains the thinking *substrate* (gate head learns
+positional difficulty, think-token embedding stays sane, memory writes + reads
+get gradient at burst positions) but **not** the value of thinking. Bursts are
+inserted at random chunk boundaries, uncorrelated with token difficulty, so the
+model has no incentive to put *useful* content into the hidden state during a
+think step — its next emit's CE is the same whether the think token did work
+or just passed through. This shifts the entire "thinking helps" learning to
+RL, which is a heavy lift if pretrain leaves the memory module functionally
+dormant (writes happen but contents are noise).
+
+**Proposed pretrain-v3 augmentation: supervised memory-utility task.**
+
+1. With probability ~0.2, *occlude* a contiguous span of K∈{4, 8, 16} tokens
+   in the input by replacing them with a `[MASKED]` token.
+2. At the next chunk boundary insert a think-burst of depth 1-3.
+3. Targets at occluded positions remain non-masked in the loss — so the model
+   must recover the occluded content via the working memory read at the think
+   burst.
+
+This gives a direct gradient signal: "if you wrote the occluded tokens into
+memory before they were masked, the think-burst read can recover them and
+your CE on those positions drops." Both `WorkingMemory.W_write` and
+`WorkingMemory.W_read` get loss-shaped gradient. Closes the gap between
+"memory has weights that move" (today) and "memory is doing useful work"
+(target).
+
+Implementation surface: `data_mix.py` chunk emitter + a new `--mem_occlude_prob`
+flag in `train_lm.py`. ~80 lines new code + a unit test that verifies the
+masked positions appear, the corresponding `mem_read_mask` aligns to the
+think burst, and the loss is non-zero at masked positions.
+
+**Risk to flag**: if occlusion is too aggressive, the standard LM signal
+degrades. Start with a small occlude probability (≤ 0.2) and a small span
+(K=4) and ramp up if memory utility is low.
+
+### Queued: Fill-in-the-Middle (FIM) augmentation for v4+ pretrain (2026-05-13)
+
+**Motivation.** Even with EOS-mask-in-targets (Task #63) and inference-time
+EOS suppression (already shipped in `eval_humaneval.py`), the model has no
+positive incentive to produce useful intermediate content given a
+prompt-suffix pair. FIM (Bavarian et al., 2022; the standard recipe in
+StarCoder / CodeLlama / DeepSeek-Coder / Qwen-Coder) reformulates a
+fraction of training samples as:
+
+    <FIM_PREFIX> prefix <FIM_SUFFIX> suffix <FIM_MIDDLE> middle
+
+The model is trained to predict `middle` from the surrounding context.
+This:
+- Eliminates the halt-at-docstring trap structurally — when the
+  training set contains `prefix=docstring + suffix=def next_func()`,
+  the model must produce a non-empty middle (the function body).
+- Doubles as an "infill" capability — the model learns to complete code
+  given context on both sides, useful for IDE-style completion later.
+- Empirically lifts HumanEval pass@1 by ~5-15 pp on small code models;
+  see StarCoder Figure 3.
+
+**Implementation surface**: ~120 lines in `experiments/data_mix.py`:
+- 3 new sentinel tokens at vocab tail (after `[THINKING]`): `<FIM_PREFIX>`,
+  `<FIM_SUFFIX>`, `<FIM_MIDDLE>`. Snap vocab_size up to next multiple of 64.
+- Per-chunk: with probability `fim_prob` (~0.5 per StarCoder), pick a
+  random span [a, b] uniform in `[1, len-1]`, reformat as
+  `[FIM_PREFIX] chunk[:a] [FIM_SUFFIX] chunk[b:] [FIM_MIDDLE] chunk[a:b]`.
+- Labels at sentinel positions: -100 (no loss contribution).
+- Two FIM modes: "PSM" (Prefix-Suffix-Middle, format above) and "SPM"
+  (Suffix-Prefix-Middle, used by CodeLlama for left-to-right consistency).
+  Default 0.5/0.5 mix per Bavarian.
+
+**Inference**: existing `eval_humaneval.py` works unchanged — FIM is a
+training-time augmentation; the model still does left-to-right generation
+for HumanEval. The benefit shows up as higher pass@1 from better
+representations.
+
+**Risk to flag**: FIM with `fim_prob` too high (>0.7) measurably hurts
+left-to-right perplexity. Start at 0.5 and ablate down if perplexity
+suffers.
+
+**When to enable**: only after the cheaper fixes (Task #63 EOS-mask,
+Task #64 EOS-suppression inference) are validated. If suppressed EOS at
+inference doesn't lift v2's HumanEval pass-rate at the 1B-token mid-eval,
+prioritise EOS-mask training first; FIM is the next escalation.
+
+### Queued: verify the model uses memory efficiently — read vs write probes (2026-05-13)
+
+**Motivation.** Even after the memory-utility task above, "reads happen" and
+"reads are useful" are not the same thing — and they can fail independently.
+The model could write noise but read it sharply, or write meaningful content
+but read it diffusely. We need a way to separate the two failure modes
+post-training.
+
+**Probe 1: separability lesion test (post-pretrain, cheap).** Take a trained
+ckpt, run on a synthetic recall task (a small MQAR variant: 8 random (key,
+value) pairs in a 256-token context, query the value for a key at position
+T-1). Run three conditions:
+
+- **Both**: model's own writes + model's own reads — baseline accuracy.
+- **Oracle write**: replace `WorkingMemory._write` so every token gets stored
+  verbatim (no gate). If accuracy jumps → *write* was the bottleneck.
+- **Oracle read**: keep model's writes, replace read with mean-pool of the
+  memory. If accuracy *doesn't* drop much → *read* was the bottleneck (sharp
+  reads weren't adding much beyond the average).
+
+Cost: ~10 min on a single GPU. Implement as `experiments/probe_memory.py`,
+wired to load `build_model_from_ckpt`.
+
+**Probe 2: write quality via linear decoder (orthogonal sanity check).** Take
+the final memory contents after a forward pass, train a small linear probe
+to recover the original input tokens from the memory slots. High top-1
+recovery rate → writes preserve information; chance-level recovery → writes
+are noise. Doesn't tell you *which* information is preserved, but it tells
+you whether the write gate is doing more than gating uniformly.
+
+**Probe 3: read attention diagnostics during training.** Cheap, runnable as
+part of the existing TB logging in `train_lm.py`. At each VAL pass, sample
+~16 think-burst positions and log:
+- Mean read-attention entropy (high entropy = uniform / uninformative reads)
+- Mean read-attention max weight (high max = sharp / committed reads)
+- Read-position distribution (close to current token? distant?)
+
+A model that uses memory effectively should show entropy *decreasing* and
+max-weight *increasing* through training; a dormant memory plateaus.
+
+**What "memory is working" should look like in the metrics:**
+
+| metric | dormant | working |
+|---|---|---|
+| write-gate mean (TB scalar) | 0.5 (uniform init unchanged) | varies by token type |
+| read-attention entropy | ~log(K) | < log(K)/2 |
+| Probe 1 baseline-vs-oracle-write gap | large (write is broken) | small |
+| Probe 1 baseline-vs-oracle-read gap | small (read does nothing) | large |
+
+**Tie-in to v2 outcome.** Once v2 hits its first mid-eval, run Probe 3 against
+the saved ckpt — that tells us, before we kick off SFT or RL, whether the
+working memory is doing visible work in pretrain. If entropy is at uniform
+and max-weight is at 1/K, the memory is dormant and the memory-utility task
+above moves up the priority list.
+
 ### Ablations to revisit at training scale (post-pretrain-v1)
 
 Observed in `pretrain_mix_v1` (217 M / mixed-corpus / Muon / 60 k+ steps):

@@ -273,6 +273,7 @@ class MixedSourceStream(IterableDataset):
                  think_max_bursts: int = 2,
                  think_max_burst_depth: int = 6,
                  base_seed: int = 0,
+                 mask_eos_in_targets: bool = False,
                  ):
         if not sources:
             raise ValueError("sources must be non-empty")
@@ -289,6 +290,7 @@ class MixedSourceStream(IterableDataset):
         self.think_max_bursts = int(think_max_bursts)
         self.think_max_burst_depth = int(think_max_burst_depth)
         self.base_seed = int(base_seed)
+        self.mask_eos_in_targets = bool(mask_eos_in_targets)
         self._filters = [_build_filter(s.filter_spec) for s in sources]
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
@@ -383,6 +385,16 @@ class MixedSourceStream(IterableDataset):
                 think_mask = (targets == int(self.thinking_token_id))
                 if think_mask.any():
                     targets = targets.masked_fill(think_mask, -100)
+            # Optionally mask EOS in targets. Stops the model from learning
+            # "predict EOS at sample boundary" (the halt-after-docstring
+            # artifact observed at v2 attempt 3, 500M-token ckpt: HumanEval
+            # generations terminated on the first emit because the model
+            # learned EOS-after-`"""` from short documents). Off by default
+            # for backwards compat with already-checked-in v2 launchers.
+            if self.mask_eos_in_targets:
+                eos_mask = (targets == int(eos))
+                if eos_mask.any():
+                    targets = targets.masked_fill(eos_mask, -100)
             # Stash diagnostics on the tensor (so the smoke script can read
             # them); kept as Python ints to survive DataLoader serialisation.
             yield inputs, targets

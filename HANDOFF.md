@@ -1,4 +1,28 @@
-# Handoff — 2026-05-13 (mixed-corpus pretrain, fast-mode, α probe, CVE data)
+# Handoff — 2026-05-13 (v2 mid-eval, halt-after-docstring fixes, refactor)
+
+## TL;DR
+
+Picked up the v2 pretrain mid-run. First mid-eval at 500 M tokens returned **HumanEval 0/50** — diagnosed as **halt-after-docstring trap** (model halts on first emitted token after `"""`, the canonical EOS-at-small-doc-boundary artifact) plus genuine undertraining at 2.3 tokens/param. Shipped three layers of fix: inference-time EOS suppression (`--min_emit_before_eos`), inference-time gate-floor clamp (`--gate_floor`, mirrors training-time clamp), and a data-level `--mask_eos_in_targets` for the next pretrain run. FIM augmentation queued as v4 escalation.
+
+Also fixed two attempt-3 pretrain-collapse issues earlier in the session:
+- Attempt-1 OOM at val: added `torch.cuda.empty_cache()` after val + dropped batch 8→7 (149 k steps preserves 2.13 B token budget).
+- Attempt-2 maladaptive-thinking collapse at floor=0.0: added `--gate_floor_min` flag; v2 retry uses `0.5` with `--gate_warmup_steps 20000`. VAL ppl dropped 49 → 10.6 over the first 30 k steps cleanly.
+
+Major refactor pass after a 3-axis code review:
+- `train_lm.py`: **2466 → 1407 lines** (−1059)
+- `model.py`: ~2050 → **1636 lines** (−414); five exit-tails collapsed into `TinyLM._finalize()`
+- Dead-direction flags + branches removed (semantic loss, scratchpad, KL-on-logits, predictive feedback, gated_deltanet, symgrounded, multipass arches)
+- Argparse extracted to `experiments/train_lm_args.py`; model construction to `experiments/model_builder.py`; optimizer to `experiments/optim_utils.py`; speed knobs to `experiments/speed_knobs.py`
+- `--alpha_wd` default flipped 0.1 → 0.0 per CLAUDE.md mandate
+- Added `--load_ckpt` + `--start_step` resume mechanism (LR scheduler fast-forward) as insurance against auto-stop
+
+v2 currently at step ~54 k of 149 k (≈ 770 M tokens), tloss 1.62, α drifted to −1.09 (still going negative without WD, opposite sign from v1's WD-equilibrium +0.748). Next mid-eval at 1 B tokens (~step 70 k, ~2.5 hr away). Auto-stop needs 3 consecutive flat evals to fire so we have margin.
+
+Tests: **58 passing** (was 52); added `test_activation_checkpointing.py` (bit-identical fwd/bwd) and `test_eos_mask.py`.
+
+---
+
+# Previous handoff — 2026-05-13 (mixed-corpus pretrain, fast-mode, α probe, CVE data)
 
 ## TL;DR
 

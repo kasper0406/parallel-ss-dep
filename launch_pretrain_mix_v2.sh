@@ -30,13 +30,26 @@ mkdir -p runs checkpoints
 #                    1.83 × WD·|α|. The "saturation" was actually a slow
 #                    creep regime where gradient barely beat WD. Remove
 #                    WD on α and let it find its real equilibrium.
-# --batch 8        : bf16 frees ~50% activation footprint vs fp32, but
-#                    tried batch=10 first and OOMed at the cross-entropy
-#                    allocation (~30.2 GB used on a 31.4 GB card with
-#                    expandable_segments on). 8 is the proven safe ceiling.
-# --steps 130000   : batch*T = 8*2048 = 16384 tok/step, so 130k steps ≈
-#                    2.13 B tokens (same total budget as the original v1
-#                    plan).
+# --batch 7        : First attempt at batch=8 OOMed at step 2000 right
+#                    after the first VAL pass (30.24 GB used, 1.50 GB
+#                    allocation for backward failed). Val activations
+#                    fragmented the heap past what the next train step
+#                    could fit. Mitigations: drop train batch by one and
+#                    add torch.cuda.empty_cache() after val (in
+#                    train_lm.py). batch=10 also OOMed at startup.
+# --steps 149000   : batch*T = 7*2048 = 14336 tok/step, so 149k steps ≈
+#                    2.13 B tokens (preserves original v1 token budget).
+# --gate_floor_min 0.5  : hard minimum on the gate-floor clamp. Attempt 2
+#                    collapsed (val ppl 49 → 940 over 2k steps) when the
+#                    default curriculum hit floor=0.0: the model routed
+#                    nearly all probability mass into the think token at
+#                    every position, driving gated train loss low while
+#                    the actual next-token prediction CE exploded. Floor
+#                    ≥ 0.5 keeps gradient flowing into the LM head at
+#                    every position regardless of the gate decision.
+# --gate_warmup_steps 20000  : slow the floor decay (1.0 → 0.5) so the
+#                    gate has time to learn position-dependence before
+#                    it's allowed to weight emit/think.
 
 CUDA_VISIBLE_DEVICES=${GPU:-0} nohup .venv/bin/python -u experiments/train_lm.py \
     --arch deltanet \
@@ -47,11 +60,12 @@ CUDA_VISIBLE_DEVICES=${GPU:-0} nohup .venv/bin/python -u experiments/train_lm.py
     --data_mix configs/pretrain_mix_v2_with_cve.yaml \
     --tokenizer HuggingFaceTB/SmolLM2-135M \
     --think_burst_prob 0.5 --think_max_bursts 2 --think_max_burst_depth 6 \
-    --T 2048 --batch 8 \
+    --T 2048 --batch 7 \
     --bf16 --tf32 \
     --alpha_wd 0.0 \
+    --gate_floor_min 0.5 --gate_warmup_steps 20000 \
     --optimizer muon --lr 3e-4 --lr_muon 1e-3 \
-    --steps 130000 \
+    --steps 149000 \
     --val_every 2000 --log_every 100 \
     --mid_eval_every_tokens 500000000 \
     --mid_eval_n_problems 50 --mid_eval_max_gen 192 \

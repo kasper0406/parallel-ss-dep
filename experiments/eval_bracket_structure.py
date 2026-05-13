@@ -44,9 +44,7 @@ def build_model_from_ckpt(ckpt_path: str):
         cls_list = parse_layers_arg(cfg["layers_spec"])
         attn_kw = dict(attention_cls_per_layer=cls_list)
     elif cfg.get("arch"):
-        attn_kw = build_arch(cfg["arch"], cfg["n_layers"],
-                             vocab_size=cfg["vocab_size"],
-                             n_symbols=cfg.get("n_symbols", 512))
+        attn_kw = build_arch(cfg["arch"], cfg["n_layers"])
     else:
         raise ValueError("checkpoint has neither arch nor layers_spec")
     # Linear-RNN architectures train with max_T=0 (no pos embed); the

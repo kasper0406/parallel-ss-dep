@@ -92,6 +92,8 @@ def generate(model, prompt_ids: torch.Tensor, max_gen: int = 256,
              max_think_per_step: int = 8,
              total_think_budget: int | None = None,
              emit_threshold: float = 0.5,
+             min_emit_before_eos: int = 0,
+             gate_floor: float = 0.0,
              ) -> tuple[torch.Tensor, dict]:
     """Token-by-token generation.
 
@@ -126,11 +128,17 @@ def generate(model, prompt_ids: torch.Tensor, max_gen: int = 256,
                 gate_val = 1.0  # force emit
                 break
             # σ(gate_head(h)) at last position; >threshold ⇒ emit.
+            # Mirror training's clamp: during pretrain the loss used
+            # g.clamp(min=gate_floor_min), so the gate is indifferent to raw
+            # values below the floor. Apply the same clamp at inference
+            # to keep the train/inference gate distributions aligned.
             gate_t = getattr(model, "_last_gate", None)
             if gate_t is None:
                 gate_val = 1.0
             else:
                 gate_val = float(gate_t[0, -1].item())
+                if gate_floor > 0.0:
+                    gate_val = max(gate_val, gate_floor)
             force_emit = (
                 thinks_this_step >= max_think_per_step
                 or think_total >= total_think_budget
@@ -147,6 +155,17 @@ def generate(model, prompt_ids: torch.Tensor, max_gen: int = 256,
         if use_thinking and thinking_token_id is not None:
             next_logits = next_logits.clone()
             next_logits[..., int(thinking_token_id)] = -float("inf")
+        # Suppress EOS for the first `min_emit_before_eos` emitted tokens.
+        # Works around the well-known pretrain "halt-after-docstring" trap
+        # where small documents in the training data place EOS right after a
+        # closing `"""`, biasing the model to stop at HumanEval's
+        # prompt-final docstring.
+        if (eos_token_id is not None
+                and min_emit_before_eos > 0
+                and emit_count < min_emit_before_eos):
+            if not (use_thinking and thinking_token_id is not None):
+                next_logits = next_logits.clone()
+            next_logits[..., int(eos_token_id)] = -float("inf")
         if temperature == 0.0:
             next_tok = next_logits.argmax(dim=-1, keepdim=True)
         else:
@@ -175,7 +194,9 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
              use_thinking: bool = False,
              max_think_per_step: int = 8,
              total_think_budget: int | None = None,
-             emit_threshold: float = 0.5):
+             emit_threshold: float = 0.5,
+             min_emit_before_eos: int = 0,
+             gate_floor: float = 0.0):
     print(f"Loading checkpoint: {ckpt_path}")
     model, cfg = build_model_from_ckpt(ckpt_path)
     print(f"  feedback={cfg.get('feedback_mode')}  n_layers={cfg['n_layers']}")
@@ -247,6 +268,8 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
                 max_think_per_step=max_think_per_step,
                 total_think_budget=total_think_budget,
                 emit_threshold=emit_threshold,
+                min_emit_before_eos=min_emit_before_eos,
+                gate_floor=gate_floor,
             )
             last_diag = diag
             gen_only_full = gen[0, len(prompt_ids):].tolist()
@@ -326,6 +349,20 @@ def main():
                         "Default = 2 × max_gen.")
     p.add_argument("--emit_threshold", type=float, default=0.5,
                    help="σ(gate) threshold above which we emit (else think).")
+    p.add_argument("--min_emit_before_eos", type=int, default=0,
+                   help="Suppress eos_token_id for the first N emitted tokens. "
+                        "Mitigates the pretrain halt-after-docstring artifact "
+                        "where the model learned to predict EOS at "
+                        "small-document boundaries (very common in mixed-corpus "
+                        "code data). Recommended: 30 for HumanEval.")
+    p.add_argument("--gate_floor", type=float, default=0.0,
+                   help="Clamp σ(gate) from below at inference, mirroring "
+                        "the training-time loss clamp g.clamp(min=gate_floor_min). "
+                        "Without this, the gate distribution at deploy can land "
+                        "systematically below emit_threshold because training "
+                        "made the model indifferent to gate values < floor. "
+                        "Use the same value as --gate_floor_min was during "
+                        "pretrain (e.g. 0.5).")
     args = p.parse_args()
 
     all_results = {}
@@ -338,6 +375,8 @@ def main():
             max_think_per_step=args.max_think_per_step,
             total_think_budget=args.total_think_budget,
             emit_threshold=args.emit_threshold,
+            min_emit_before_eos=args.min_emit_before_eos,
+            gate_floor=args.gate_floor,
         )
 
     print("\n" + "=" * 70)

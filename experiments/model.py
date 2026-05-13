@@ -85,10 +85,21 @@ class Block(nn.Module):
 #   - none:      no feedback; identity (control)
 #   - additive:  x_in += α · W_fb · state_above_lagged
 #   - film:      x_in = x_in · (1 + α·scale) + α·shift  (FiLM modulation)
-#   - predictive: TopDown predicts lower layer's pass-1 output; the
-#                 ERROR (pass-1 - prediction) is what propagates to L+1.
-#                 Optional surprise_loss aux: MSE on prediction error.
 # ---------------------------------------------------------------------------
+
+
+def _run_block(blk: nn.Module, h: torch.Tensor,
+               input_ids: torch.Tensor | None) -> torch.Tensor:
+    """Free function so torch.utils.checkpoint can pickle / re-run it
+    cleanly (closures over `self` cause occasional issues with the
+    non-reentrant checkpoint implementation)."""
+    return blk(h, input_ids=input_ids)
+
+
+def _ckpt_run_block(blk: nn.Module, h: torch.Tensor,
+                    input_ids: torch.Tensor | None) -> torch.Tensor:
+    from torch.utils.checkpoint import checkpoint
+    return checkpoint(_run_block, blk, h, input_ids, use_reentrant=False)
 
 
 def _shift_right_by_1(o: torch.Tensor) -> torch.Tensor:
@@ -141,7 +152,7 @@ class FeedbackProjection(nn.Module):
         # IMPORTANT: keep W_fb / W_scale / W_shift at *normal* init so the
         # gradient on α is non-zero from the first step. Earlier bug: with
         # both α=0 AND W_*=0, gradient on α is zero and α never moves.
-        if mode in ("additive", "predictive"):
+        if mode == "additive":
             self.W_fb = nn.Linear(d_model, d_model, bias=False)
             # Use a smallish gain so initial feedback magnitude isn't
             # huge once α grows.
@@ -236,7 +247,7 @@ class FeedbackProjection(nn.Module):
                     a = self.alpha_zero * torch.sigmoid(self.surprise_bias)
             else:
                 a = self.get_per_token_alpha(surprise)   # (B, T, 1)
-        if self.mode in ("additive", "predictive"):
+        if self.mode == "additive":
             fb = self.W_fb(state_above_lagged)
             return x + a * fb
         if self.mode == "film":
@@ -686,123 +697,6 @@ class AllToAllSigmoidFeedback(nn.Module):
         return x * (1.0 + a * scale) + a * shift
 
 
-class SurpriseScratchpadFeedback(nn.Module):
-    """Surprise-gated cross-layer attention scratchpad with FiLM output.
-
-    For target layer t with source layer s:
-      - At each query position p, the scratchpad is the *causal* sequence
-        of source-layer pass-1 outputs at positions ≤ p (with the
-        standard t−1 lag for parallel-scan friendliness).
-      - Attention scores are *biased* by per-position surprise scores —
-        high-surprise positions in the past get larger weight.
-      - Output is FiLM-form (multiplicative scale + additive shift) since
-        the mechanism analysis (Phase 14b–g) showed multiplicative form
-        is required for the negative-α basin.
-
-    Surprise is computed externally from the pass-1 logits and passed in
-    as a (B, T) tensor with non-negative values (clamped at 0).
-
-    Memory at training time: O(T) (full causal attention over T keys).
-    At inference time: only the *latest* source state is needed per token,
-    so memory is O(K) for a fixed-budget K-slot cache; we use full T
-    here for simplicity in this prototype.
-    """
-
-    def __init__(self, d_model: int, n_heads: int = 4,
-                 d_head: int | None = None,
-                 routing: str = "softmax"):
-        super().__init__()
-        if d_head is None:
-            d_head = d_model // n_heads
-        assert n_heads * d_head == d_model
-        self.n_heads = n_heads
-        self.d_head = d_head
-        self.scale_qk = d_head ** -0.5
-        # Routing modes — disentangling write vs read contributions:
-        #   'softmax'           — content (Q·K) softmax + surprise log-bias
-        #   'sigmoid'           — content (Q·K) sigmoid + surprise multiplicative
-        #   'sigmoid_uniform'   — content (Q·K) sigmoid, surprise IGNORED
-        #                         (tests pure content addressing on the write set)
-        #   'uniform_surprise'  — Q·K IGNORED, just surprise-weighted average
-        #                         (tests pure saliency-based retrieval)
-        assert routing in ("softmax", "sigmoid", "sigmoid_uniform",
-                            "uniform_surprise"), f"unknown routing: {routing!r}"
-        self.routing = routing
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        # V emits 2·d_model per source — split into scale-half and shift-half.
-        self.v_proj = nn.Linear(d_model, 2 * d_model, bias=False)
-        self.out_proj_scale = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj_shift = nn.Linear(d_model, d_model, bias=False)
-        for m in [self.q_proj, self.k_proj, self.v_proj,
-                  self.out_proj_scale, self.out_proj_shift]:
-            nn.init.normal_(m.weight, std=1.0 / math.sqrt(d_model))
-        self.alpha = nn.Parameter(torch.zeros(1))
-        self.freeze_alpha = False
-
-    def get_alpha(self) -> torch.Tensor:
-        return torch.zeros_like(self.alpha) if self.freeze_alpha else self.alpha
-
-    def forward(self, x_target: torch.Tensor,
-                source_states_lagged: torch.Tensor,
-                surprise: torch.Tensor) -> torch.Tensor:
-        # x_target:              (B, T, d) — pass-2 hidden state at target layer
-        # source_states_lagged:  (B, T, d) — pass-1 output of source layer, t−1 lagged
-        # surprise:              (B, T)    — per-position surprise score, ≥ 0
-        B, T, D = x_target.shape
-        H, Dh = self.n_heads, self.d_head
-
-        q = self.q_proj(x_target).view(B, T, H, Dh)            # (B, T_q, H, Dh)
-        k = self.k_proj(source_states_lagged).view(B, T, H, Dh)  # (B, T_k, H, Dh)
-        v_pair = self.v_proj(source_states_lagged)              # (B, T_k, 2D)
-        v_scale, v_shift = v_pair.chunk(2, dim=-1)              # (B, T_k, D) each
-        v_scale = v_scale.view(B, T, H, Dh)
-        v_shift = v_shift.view(B, T, H, Dh)
-
-        # Attention scores: (B, T_q, T_k, H)
-        scores = torch.einsum("bthd,bshd->btsh", q, k) * self.scale_qk
-
-        # Causal mask: query position t can attend to key positions ≤ t.
-        mask = torch.ones(T, T, dtype=torch.bool, device=x_target.device).triu(diagonal=1)
-
-        if self.routing == "softmax":
-            # Content (Q·K) softmax + surprise log-bias.
-            surprise_bias = torch.log(surprise.clamp(min=0) + 1e-4)  # (B, T_k)
-            scores = scores + surprise_bias.unsqueeze(1).unsqueeze(-1)
-            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(-1), float("-inf"))
-            attn = F.softmax(scores, dim=2)
-        elif self.routing == "sigmoid":
-            # Content (Q·K) sigmoid + surprise multiplicative.
-            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(-1), -50.0)
-            gates = torch.sigmoid(scores)
-            attn = gates * surprise.unsqueeze(1).unsqueeze(-1)
-            attn = attn / (attn.sum(dim=2, keepdim=True) + 1e-6)
-        elif self.routing == "sigmoid_uniform":
-            # Content-only — Q·K sigmoid, surprise IGNORED (uniform writes).
-            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(-1), -50.0)
-            gates = torch.sigmoid(scores)
-            # Causal mask in float (1 inside causal region, 0 outside).
-            causal_float = (~mask).float().unsqueeze(0).unsqueeze(-1)
-            attn = gates * causal_float
-            attn = attn / (attn.sum(dim=2, keepdim=True) + 1e-6)
-        else:  # 'uniform_surprise'
-            # Saliency-only — Q·K IGNORED, surprise-weighted average.
-            # Per query position t, just weighted-avg by surprise of keys 0..t.
-            causal_float = (~mask).float()  # (T_q, T_k)
-            attn_flat = surprise.unsqueeze(1) * causal_float.unsqueeze(0)  # (B, T_q, T_k)
-            attn_flat = attn_flat / (attn_flat.sum(dim=-1, keepdim=True) + 1e-6)
-            # Broadcast same weights over heads.
-            attn = attn_flat.unsqueeze(-1).expand(-1, -1, -1, self.n_heads)
-
-        # Weighted sums of v_scale and v_shift.
-        scale_mix = torch.einsum("btsh,bshd->bthd", attn, v_scale).reshape(B, T, D)
-        shift_mix = torch.einsum("btsh,bshd->bthd", attn, v_shift).reshape(B, T, D)
-        scale = self.out_proj_scale(scale_mix)
-        shift = self.out_proj_shift(shift_mix)
-        a = self.get_alpha()
-        return x_target * (1.0 + a * scale) + a * shift
-
-
 class CrossLayerAttentionFeedback(nn.Module):
     """Cross-layer attention top-down feedback.
 
@@ -1043,7 +937,7 @@ class TinyLM(nn.Module):
         max_T: int = 0,                       # 0 = no positional encoding
         attention_cls_per_layer: list[Callable[..., nn.Module]] | None = None,
         aux_dim: int = 0,                     # 0 = no aux head
-        feedback_mode: str = "none",          # none / additive / film / predictive
+        feedback_mode: str = "none",          # none / additive / film
         feedback_distances: tuple[int, ...] = (1,),  # multi-scale top-down
         feedback_pairs: tuple = (),           # sparse (target_L, source_L) pairs;
                                               # if non-empty overrides distances
@@ -1065,14 +959,6 @@ class TinyLM(nn.Module):
         tie_embeddings: bool = False,         # share weights between embedding
                                               # and lm_head (~halves params for
                                               # large-vocab Qwen tokenizer).
-        feedback_scratchpad_pairs: tuple = (),  # surprise-gated scratchpad
-                                              # tuple of (target_L, source_L);
-                                              # at each target the cross-layer
-                                              # attention is biased by per-pos
-                                              # surprise (computed from pass-1
-                                              # logits, stop-grad).
-        feedback_scratchpad_heads: int = 4,
-        feedback_scratchpad_routing: str = "softmax",  # 'softmax' or 'sigmoid'
         feedback_self_k: int = 0,             # K-iteration self-feeding training.
                                               # 0 = off, 2 = K=2 (cold start +
                                               # one self-feed), 3 = K=3
@@ -1096,16 +982,6 @@ class TinyLM(nn.Module):
                                               # Adds 3 learnable scalars per
                                               # FiLM target. Requires
                                               # feedback_self_k >= 2.
-        semantic_loss_dim: int = 0,           # Phase 22 / structural-surprise
-                                              # full PoC: dimensionality of the
-                                              # oracle's embedding space (0 =
-                                              # off; non-zero = construct a
-                                              # learnable W: d_model -> dim
-                                              # projection used by the trainer
-                                              # to align pooled hidden states
-                                              # to the frozen oracle's E(s_t).
-                                              # Saved with the checkpoint so
-                                              # eval can reuse the W.
         output_gate: bool = False,            # Learned per-position output gate.
                                               # When True, adds a gate_head
                                               # (d_model → 1) whose sigmoid
@@ -1126,6 +1002,20 @@ class TinyLM(nn.Module):
         thinking_token_id: int | None = None,  # Required when use_memory=True.
         pad_token_id: int | None = None,      # Optional; used to keep padding
                                               # rows out of the memory.
+        activation_checkpointing: bool = False,  # Wrap each Block's
+                                              # loss-bearing forward in
+                                              # torch.utils.checkpoint to
+                                              # trade ~30% compute for a
+                                              # large reduction in
+                                              # activation memory. No effect
+                                              # under torch.no_grad (early
+                                              # K-self-feed passes), so
+                                              # only the final loss-bearing
+                                              # pass pays the cost. Output
+                                              # is bit-identical because
+                                              # the model has no dropout
+                                              # and preserve_rng_state=True
+                                              # by default.
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1214,24 +1104,6 @@ class TinyLM(nn.Module):
         )
         self.feedback_xattn_form = feedback_xattn_form
         self.xattn_target_to_sources = {t: srcs for t, srcs in self.feedback_xattn_pairs}
-        # Surprise-gated scratchpad pairs (target → source; one source per target).
-        self.feedback_scratchpad_pairs = tuple(
-            (int(t), int(s)) for t, s in feedback_scratchpad_pairs
-        )
-        self.feedback_scratchpad_routing = feedback_scratchpad_routing
-        if self.feedback_scratchpad_pairs:
-            self.scratchpad_feedback = nn.ModuleDict({
-                str(t): SurpriseScratchpadFeedback(
-                    d_model=d_model, n_heads=feedback_scratchpad_heads,
-                    routing=feedback_scratchpad_routing,
-                )
-                for t, _ in self.feedback_scratchpad_pairs
-            })
-            self.scratchpad_target_to_source = {
-                t: s for t, s in self.feedback_scratchpad_pairs
-            }
-        else:
-            self.scratchpad_target_to_source = {}
         if self.feedback_xattn_pairs and feedback_xattn_form == "all_sigmoid":
             # Single shared module across all (target, source) pairs with
             # parameter sharing per source layer. Used when feedback_xattn=='all'
@@ -1308,22 +1180,6 @@ class TinyLM(nn.Module):
                 for _ in range(n_layers)
             ])
 
-        # Phase 22 / structural-surprise full PoC: linear projection
-        # W: R^{d_model} -> R^{semantic_loss_dim}, used by the trainer to
-        # align pooled hidden states to the frozen oracle's E(s_t).
-        self.semantic_loss_dim = int(semantic_loss_dim)
-        if self.semantic_loss_dim > 0:
-            # Identity-like init when the dims match (576 -> 576). Helps
-            # the projection start near the encoder's representation space.
-            self.W_semantic = nn.Linear(d_model, self.semantic_loss_dim,
-                                         bias=False)
-            if self.semantic_loss_dim == d_model:
-                with torch.no_grad():
-                    self.W_semantic.weight.copy_(torch.eye(d_model))
-            else:
-                nn.init.normal_(self.W_semantic.weight,
-                                std=1.0 / math.sqrt(d_model))
-
         # Output gate (emit/think per-position gate, Phase 23).
         # gate_head: d_model → 1; sigmoid gives g_t ∈ (0, 1).
         # Bias = +2.0 → sigmoid(2) ≈ 0.88 so all positions start near
@@ -1350,6 +1206,9 @@ class TinyLM(nn.Module):
         self.use_memory = bool(use_memory)
         self.thinking_token_id = thinking_token_id
         self.pad_token_id = pad_token_id
+        # Activation checkpointing on the loss-bearing block loop. See the
+        # forward() helper _block_fwd() for usage.
+        self.activation_checkpointing = bool(activation_checkpointing)
         if self.use_memory:
             if thinking_token_id is None:
                 raise ValueError("use_memory=True requires thinking_token_id")
@@ -1409,6 +1268,19 @@ class TinyLM(nn.Module):
                 out_src[L] = h
         return out_src
 
+    def _block_fwd(self, blk: nn.Module, h: torch.Tensor,
+                   input_ids: torch.Tensor | None) -> torch.Tensor:
+        """Run one Block; optionally checkpoint it.
+
+        Trades ~30% extra compute for a large reduction in stored
+        activations. Skipped when grad is disabled (e.g. the no_grad
+        passes in K-self-feed) since checkpointing without grad is pure
+        overhead.
+        """
+        if self.activation_checkpointing and torch.is_grad_enabled():
+            return _ckpt_run_block(blk, h, input_ids)
+        return blk(h, input_ids=input_ids)
+
     def _apply_memory(self, h_normed: torch.Tensor,
                       input_ids: torch.Tensor,
                       read_mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -1418,9 +1290,39 @@ class TinyLM(nn.Module):
             return h_normed
         return self.memory(h_normed, input_ids, read_mask=read_mask)
 
+    def _finalize(self, h_raw: torch.Tensor,
+                  input_ids: torch.Tensor,
+                  mem_read_mask: torch.Tensor | None,
+                  return_aux: bool,
+                  return_hidden: bool,
+                  return_gate: bool,
+                  maybe_gate,
+                  extra: tuple = ()):
+        """Shared exit-tail for every forward branch:
+        out_norm → memory → lm_head → (aux, hidden, gate) packing.
+
+        `maybe_gate` is the closure defined in forward() so the gate side
+        effect (`self._last_gate*`) lands consistently.
+        `extra` is appended to the outputs after aux/hidden/gate — used by
+        the dense-feedback path to thread `surprise_loss` through.
+        """
+        h = self.out_norm(h_raw)
+        h = self._apply_memory(h, input_ids, read_mask=mem_read_mask)
+        lm_logits = self.lm_head(h)
+        outs = (lm_logits,)
+        if return_aux and self.aux_dim > 0:
+            outs = outs + (self.aux_head(h),)
+        if return_hidden:
+            outs = outs + (h,)
+        if return_gate:
+            outs = outs + (maybe_gate(h),)
+        else:
+            maybe_gate(h)
+        outs = outs + tuple(extra)
+        return outs[0] if len(outs) == 1 else outs
+
     def forward(self, input_ids: torch.Tensor,
                 return_aux: bool = False,
-                return_surprise: bool = False,
                 return_hidden: bool = False,
                 return_gate: bool = False,
                 mem_read_mask: torch.Tensor | None = None,
@@ -1443,76 +1345,13 @@ class TinyLM(nn.Module):
             return g
 
         if (self.feedback_mode == "none"
-                and not self.feedback_xattn_pairs
-                and not self.feedback_scratchpad_pairs):
+                and not self.feedback_xattn_pairs):
             for blk in self.blocks:
-                x = blk(x, input_ids=input_ids)
-            h = self.out_norm(x)
-            h = self._apply_memory(h, input_ids, read_mask=mem_read_mask)
-            lm_logits = self.lm_head(h)
-            outs = (lm_logits,)
-            if return_aux and self.aux_dim > 0:
-                outs = outs + (self.aux_head(h),)
-            if return_hidden:
-                outs = outs + (h,)
-            if return_gate:
-                outs = outs + (_maybe_gate(h),)
-            else:
-                _maybe_gate(h)   # still populate _last_gate as side effect
-            return outs[0] if len(outs) == 1 else outs
+                x = self._block_fwd(blk, x, input_ids)
+            return self._finalize(x, input_ids, mem_read_mask,
+                                   return_aux, return_hidden, return_gate,
+                                   _maybe_gate)
 
-        # Surprise-gated scratchpad feedback. Pass 1 vanilla, pass 1 logits to
-        # compute per-position surprise (stop-grad), pass 2 applies the
-        # scratchpad attention biased by surprise at the target layer(s).
-        if self.feedback_scratchpad_pairs:
-            needed_sources = set(s for _, s in self.feedback_scratchpad_pairs)
-            pass1_at_sources: dict = {}
-            h1 = x
-            for L, blk in enumerate(self.blocks):
-                h1 = blk(h1, input_ids=input_ids)
-                if L in needed_sources:
-                    pass1_at_sources[L] = h1
-            # Pass-1 logits → per-position CE → surprise = CE − running mean.
-            pass1_top = self.out_norm(h1)
-            pass1_logits = self.lm_head(pass1_top)             # (B, T, V)
-            B, T, V = pass1_logits.shape
-            with torch.no_grad():
-                if T > 1:
-                    ce_pp = F.cross_entropy(
-                        pass1_logits[:, :-1].reshape(-1, V),
-                        input_ids[:, 1:].reshape(-1),
-                        reduction="none",
-                    ).reshape(B, T - 1)
-                    # Causal cumulative mean.
-                    cum_ce = ce_pp.cumsum(dim=-1)
-                    pos = torch.arange(1, T, device=x.device, dtype=ce_pp.dtype)
-                    running_mean = cum_ce / pos
-                    surprise = (ce_pp - running_mean).clamp(min=0.0)
-                    # Pad position 0 (no prediction yet) with 0 surprise.
-                    surprise = F.pad(surprise, (1, 0), value=0.0)
-                else:
-                    surprise = torch.zeros(B, T, device=x.device)
-            # Pass 2 with scratchpad feedback.
-            h = x
-            for L, blk in enumerate(self.blocks):
-                if L in self.scratchpad_target_to_source:
-                    src = self.scratchpad_target_to_source[L]
-                    state_above_lagged = _shift_right_by_1(pass1_at_sources[src])
-                    h = self.scratchpad_feedback[str(L)](
-                        h, state_above_lagged, surprise=surprise,
-                    )
-                h = blk(h, input_ids=input_ids)
-            h = self.out_norm(h)
-            h = self._apply_memory(h, input_ids, read_mask=mem_read_mask)
-            lm_logits = self.lm_head(h)
-            outs = (lm_logits,)
-            if return_aux and self.aux_dim > 0:
-                outs = outs + (self.aux_head(h),)
-            if return_gate:
-                outs = outs + (_maybe_gate(h),)
-            else:
-                _maybe_gate(h)
-            return outs[0] if len(outs) == 1 else outs
         if self.feedback_xattn_pairs:
             # Pass 1: vanilla. Collect outputs at every layer that any target
             # references as a source (union across all targets).
@@ -1542,17 +1381,9 @@ class TinyLM(nn.Module):
                         src_states = [lagged_pass1[s] for s in srcs]
                         h = self.xattn_feedback[str(L)](h, src_states)
                 h = blk(h, input_ids=input_ids)
-            h = self.out_norm(h)
-            h = self._apply_memory(h, input_ids, read_mask=mem_read_mask)
-            lm_logits = self.lm_head(h)
-            outs = (lm_logits,)
-            if return_aux and self.aux_dim > 0:
-                outs = outs + (self.aux_head(h),)
-            if return_gate:
-                outs = outs + (_maybe_gate(h),)
-            else:
-                _maybe_gate(h)
-            return outs[0] if len(outs) == 1 else outs
+            return self._finalize(h, input_ids, mem_read_mask,
+                                   return_aux, return_hidden, return_gate,
+                                   _maybe_gate)
         if self.feedback_pairs:
             source_layers = set(s for _, s in self.feedback_pairs)
 
@@ -1650,16 +1481,13 @@ class TinyLM(nn.Module):
                         src = self.sparse_target_to_source[L]
                         sup = surprise_per_target.get(L) if surprise_per_target else None
                         h = self.sparse_feedback[str(L)](h, film_in[src], surprise=sup)
-                    h = blk(h, input_ids=input_ids)
+                    h = self._block_fwd(blk, h, input_ids)
                     if L in self.sparse_target_to_source and self.feedback_position == "post":
                         src = self.sparse_target_to_source[L]
                         sup = surprise_per_target.get(L) if surprise_per_target else None
                         h = self.sparse_feedback[str(L)](h, film_in[src], surprise=sup)
                     if L in source_layers:
                         final_src_states[L] = h
-                h_norm = self.out_norm(h)
-                h_norm = self._apply_memory(h_norm, input_ids, read_mask=mem_read_mask)
-                lm_logits = self.lm_head(h_norm)
                 # Cache final pass's source states so the eval/diagnostic
                 # callers can compute self-consistency norms cheaply.
                 self._last_self_feed_final_src = {
@@ -1682,16 +1510,9 @@ class TinyLM(nn.Module):
                 else:
                     self._last_surprise_per_target = {}
                     self._last_alpha_t_per_target = {}
-                outs = (lm_logits,)
-                if return_aux and self.aux_dim > 0:
-                    outs = outs + (self.aux_head(h_norm),)
-                if return_hidden:
-                    outs = outs + (h_norm,)
-                if return_gate:
-                    outs = outs + (_maybe_gate(h_norm),)
-                else:
-                    _maybe_gate(h_norm)
-                return outs[0] if len(outs) == 1 else outs
+                return self._finalize(h, input_ids, mem_read_mask,
+                                       return_aux, return_hidden, return_gate,
+                                       _maybe_gate)
             # ----------------------------------------------------------------
             # Standard 2-pass sparse FiLM (existing path).
             # ----------------------------------------------------------------
@@ -1712,25 +1533,15 @@ class TinyLM(nn.Module):
                     state_above_lagged = _shift_right_by_k(pass1_at_sources[src],
                                                             self.feedback_lag)
                     h = self.sparse_feedback[str(L)](h, state_above_lagged)
-                h = blk(h, input_ids=input_ids)
+                h = self._block_fwd(blk, h, input_ids)
                 if L in self.sparse_target_to_source and self.feedback_position == "post":
                     src = self.sparse_target_to_source[L]
                     state_above_lagged = _shift_right_by_k(pass1_at_sources[src],
                                                             self.feedback_lag)
                     h = self.sparse_feedback[str(L)](h, state_above_lagged)
-            h = self.out_norm(h)
-            h = self._apply_memory(h, input_ids, read_mask=mem_read_mask)
-            lm_logits = self.lm_head(h)
-            outs = (lm_logits,)
-            if return_aux and self.aux_dim > 0:
-                outs = outs + (self.aux_head(h),)
-            if return_hidden:
-                outs = outs + (h,)
-            if return_gate:
-                outs = outs + (_maybe_gate(h),)
-            else:
-                _maybe_gate(h)
-            return outs[0] if len(outs) == 1 else outs
+            return self._finalize(h, input_ids, mem_read_mask,
+                                   return_aux, return_hidden, return_gate,
+                                   _maybe_gate)
         # Pass 1: vanilla forward, collect each layer's output.
         pass1_outs: list[torch.Tensor] = []
         h = x
@@ -1742,7 +1553,6 @@ class TinyLM(nn.Module):
         # shifted right by 1 along T. Multi-scale: each layer L sees
         # states from layers {L+d for d in feedback_distances}.
         h = x
-        surprise_loss = torch.zeros((), device=x.device)
         N = len(self.blocks)
         for L, blk in enumerate(self.blocks):
             if self.feedback_mode == "none":
@@ -1756,37 +1566,12 @@ class TinyLM(nn.Module):
                     states_above.append(_shift_right_by_1(pass1_outs[src]))
                 else:
                     states_above.append(None)
-            if self.feedback_mode == "predictive":
-                # Predictive coding (Ali/Kietzmann lineage). For multi-scale,
-                # surprise loss accumulates over each distance's prediction.
-                # Apply each modulation serially (same as MultiScale forward),
-                # but track surprise per distance.
-                multi = self.feedback[L]
-                for proj, state in zip(multi.projs, states_above):
-                    if state is None:
-                        continue
-                    pred = proj.W_fb(state)
-                    h = h + proj.get_alpha() * pred
-                    err = pass1_outs[L].detach() - pred
-                    surprise_loss = surprise_loss + (err ** 2).mean()
-                h = blk(h, input_ids=input_ids)
-            else:
-                h_input = self.feedback[L](h, states_above)
-                h = blk(h_input, input_ids=input_ids)
+            h_input = self.feedback[L](h, states_above)
+            h = blk(h_input, input_ids=input_ids)
 
-        h = self.out_norm(h)
-        h = self._apply_memory(h, input_ids, read_mask=mem_read_mask)
-        lm_logits = self.lm_head(h)
-        outs = (lm_logits,)
-        if return_aux and self.aux_dim > 0:
-            outs = outs + (self.aux_head(h),)
-        if return_surprise:
-            outs = outs + (surprise_loss,)
-        if return_gate:
-            outs = outs + (_maybe_gate(h),)
-        else:
-            _maybe_gate(h)
-        return outs[0] if len(outs) == 1 else outs
+        return self._finalize(h, input_ids, mem_read_mask,
+                               return_aux, return_hidden, return_gate,
+                               _maybe_gate)
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

@@ -53,6 +53,8 @@ class DiagReport:
     overall_ce: float
     per_layer_lens_ce: list[float]
     per_layer_eff_rank: list[float]
+    per_layer_resid_add: list[float] = field(default_factory=list)  # ||h[L]-h[L-1]||/||h[L-1]||
+    per_layer_h_norm: list[float] = field(default_factory=list)     # mean ||h[L]||
     per_source_ce: dict[str, float] = field(default_factory=dict)
     n_tokens_scored: int = 0
 
@@ -62,12 +64,16 @@ class DiagReport:
                f"n_tokens={self.n_tokens_scored})"]
         n = len(self.per_layer_lens_ce)
         if n:
-            out.append("per-layer logit-lens CE + effective rank:")
+            out.append("per-layer  logit-lens CE | effrank | ||h|| | Δh/||h_prev||")
             for L in range(n):
                 er = self.per_layer_eff_rank[L]
                 er_str = (f"{er:5.1f}/{d_model}" if d_model else f"{er:5.1f}")
-                out.append(f"  L{L:02d}  lensCE={self.per_layer_lens_ce[L]:.3f}"
-                           f"  effrank={er_str}")
+                hn = self.per_layer_h_norm[L] if L < len(self.per_layer_h_norm) else float("nan")
+                add = self.per_layer_resid_add[L] if L < len(self.per_layer_resid_add) else float("nan")
+                out.append(f"  L{L:02d}  lensCE={self.per_layer_lens_ce[L]:6.3f}"
+                           f"  effrank={er_str}"
+                           f"  ||h||={hn:7.2f}"
+                           f"  Δh/||h_prev||={add:6.3f}")
         if self.per_source_ce:
             out.append("per-source CE (lower = model fits that stream better):")
             for name, ce in sorted(self.per_source_ce.items(),
@@ -201,14 +207,26 @@ def run_diag(ckpt_path: str, *,
         inputs = torch.stack(xs).to(device)
         targets = torch.stack(ys).to(device)
         hooks = _LayerHooks(model)
+        per_layer_resid_add: list[float] = []
+        per_layer_h_norm: list[float] = []
         try:
             logits = model(inputs)
             overall_ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
                                           targets.reshape(-1),
                                           ignore_index=-100).item()
+            prev = None
             for h in hooks.captured:
                 per_layer_lens_ce.append(_logit_lens_ce(model, h, targets))
                 per_layer_eff_rank.append(_effective_rank(h))
+                hn = h.float().norm(dim=-1).mean().item()
+                per_layer_h_norm.append(hn)
+                if prev is None:
+                    per_layer_resid_add.append(float("nan"))
+                else:
+                    delta = (h - prev).float().norm(dim=-1).mean().item()
+                    prev_n = prev.float().norm(dim=-1).mean().item() + 1e-9
+                    per_layer_resid_add.append(delta / prev_n)
+                prev = h
         finally:
             hooks.close()
 
@@ -247,6 +265,8 @@ def run_diag(ckpt_path: str, *,
         overall_ce=overall_ce,
         per_layer_lens_ce=per_layer_lens_ce,
         per_layer_eff_rank=per_layer_eff_rank,
+        per_layer_resid_add=per_layer_resid_add if data_mix_yaml else [],
+        per_layer_h_norm=per_layer_h_norm if data_mix_yaml else [],
         per_source_ce=per_source_ce,
         n_tokens_scored=n_tokens_scored,
     )

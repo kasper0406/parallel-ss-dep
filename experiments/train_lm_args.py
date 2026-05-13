@@ -401,23 +401,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "matmul, so safe for training stability. Pair with "
                         "--bf16 for the full speed stack.")
     p.add_argument("--wd", type=float, default=0.1,
-                   help="Weight-decay applied to all non-α params (Muon "
-                        "regular group + AdamW regular group). Default 0.1 "
-                        "matches the legacy hard-coded value. v3 ablation: "
-                        "drop to 0.01 — the diag_ckpt run on v2 mid-eval "
-                        "ckpts showed residual-stream collapse (||h||@L0 "
-                        "8.1→3.5 over 500M→1B tokens) and per-source CE "
-                        "divergence consistent with weights being held "
-                        "too small. SmolLM2-135M reference has ||h||@L0 "
-                        "≈ 44 on the same data.")
+                   help="Weight decay for non-α params (Muon + AdamW "
+                        "regular groups). Default 0.1.")
     p.add_argument("--layer_drop_max", type=float, default=0.0,
-                   help="Stochastic Depth (Huang et al. 2016, Fan et al. "
-                        "2020 LayerDrop): linearly-increasing per-block "
-                        "drop probability, 0 at L0 → layer_drop_max at "
-                        "L_{n-1}. Default 0.0 = off. The diag found that "
-                        "the residual stream concentrates predictive work "
-                        "in the last 3 layers; LayerDrop forces every "
-                        "layer's contribution to survive on its own.")
+                   help="Stochastic Depth: per-block drop probability "
+                        "ramps linearly 0 → this value across depth. "
+                        "Default 0.0 (off).")
     p.add_argument("--alpha_wd", type=float, default=0.0,
                    help="Weight-decay applied to FiLM α scalars (matched by "
                         "name suffix '.alpha' inside any feedback container). "

@@ -217,6 +217,12 @@ def compute_grpo_advantages(
     else:  # quadratic
         depth_cost = ponder_cost * (depths ** 2)
 
+    # Use the biased (population) std estimator so single-element groups
+    # don't blow up to NaN — `unbiased=True` with N=1 has 0 degrees of
+    # freedom and returns NaN. The 1e-8 epsilon then prevents division by
+    # zero. This matches standard GRPO / PPO advantage-normalisation
+    # convention.
+
     if counterfactual:
         # Clamp the task component at the depth-0 baseline ("thinking
         # never makes the task reward worse than not thinking") and
@@ -225,7 +231,7 @@ def compute_grpo_advantages(
         task_component = torch.maximum(task_rewards_d, task_rewards_0)
         rewards = task_component - depth_cost
         means = rewards.mean(dim=1, keepdim=True)
-        stds = rewards.std(dim=1, keepdim=True) + 1e-8
+        stds = rewards.std(dim=1, unbiased=False, keepdim=True) + 1e-8
         return (rewards - means) / stds
 
     if separate_ponder_norm:
@@ -233,14 +239,15 @@ def compute_grpo_advantages(
         # group-relative comparison doesn't squash its (typically small)
         # magnitude into noise.
         task_means = task_rewards_d.mean(dim=1, keepdim=True)
-        task_stds = task_rewards_d.std(dim=1, keepdim=True) + 1e-8
+        task_stds = task_rewards_d.std(dim=1, unbiased=False,
+                                         keepdim=True) + 1e-8
         return (task_rewards_d - task_means) / task_stds - depth_cost
 
     # Original behavior (backward-compatible): ponder bundled into reward,
     # full reward z-scored within group.
     rewards = task_rewards_d - depth_cost
     means = rewards.mean(dim=1, keepdim=True)
-    stds = rewards.std(dim=1, keepdim=True) + 1e-8
+    stds = rewards.std(dim=1, unbiased=False, keepdim=True) + 1e-8
     return (rewards - means) / stds
 
 

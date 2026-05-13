@@ -617,6 +617,12 @@ def main():
                         "matmul (bf16 mantissa, fp32 exponent) but only on "
                         "matmul, so safe for training stability. Pair with "
                         "--bf16 for the full speed stack.")
+    p.add_argument("--alpha_wd", type=float, default=0.1,
+                   help="Weight-decay applied to FiLM α scalars (matched by "
+                        "name suffix '.alpha' inside any feedback container). "
+                        "Default 0.1 matches the rest of AdamW. Set to 0.0 "
+                        "to test whether α was being held back by WD rather "
+                        "than truly saturating (see the WD-equilibrium probe).")
     args = p.parse_args()
     if args.enable_thinking_token and args.output_gate:
         raise SystemExit(
@@ -993,16 +999,42 @@ def main():
                   f"(temperature T = {args.logit_kl_temp})")
 
     # Optimizer construction — single AdamW (default) or Muon + AdamW split.
+    # FiLM α scalars are split into their own param group when
+    # `args.alpha_wd != 0.1` so we can experiment with WD on α
+    # independently of the other AdamW params.
+    def _is_film_alpha(name: str) -> bool:
+        """Match the learnable α inside any feedback container
+        (sparse_feedback, xattn_feedback, scratchpad_feedback, feedback)."""
+        if not name.endswith(".alpha"):
+            return False
+        return any(name.startswith(prefix) or f".{prefix}" in name
+                   for prefix in ("sparse_feedback.", "xattn_feedback.",
+                                  "scratchpad_feedback.", "feedback."))
+
     if args.optimizer == "adamw":
-        opts = [torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                   betas=(0.9, 0.95), weight_decay=0.1)]
+        # Split AdamW params into a regular group and an α group with a
+        # separate weight_decay. Only emit the α group when there's
+        # something in it.
+        regular_params, alpha_params = [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            (alpha_params if _is_film_alpha(name) else regular_params).append(p)
+        groups = [{"params": regular_params, "weight_decay": 0.1}]
+        if alpha_params:
+            groups.append({"params": alpha_params,
+                           "weight_decay": args.alpha_wd})
+            print(f"  α-WD split: {len(alpha_params)} FiLM α params get "
+                  f"weight_decay={args.alpha_wd}")
+        opts = [torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.95))]
         scheds = [torch.optim.lr_scheduler.CosineAnnealingLR(
             opts[0], T_max=args.steps, eta_min=args.lr * 0.1)]
     else:  # muon
         # Split params: ≥2D hidden-layer matrices → Muon; embeddings, lm_head,
-        # and 1D params (alphas, RMSNorm scales) → AdamW.
+        # and 1D params (alphas, RMSNorm scales) → AdamW. FiLM α scalars
+        # get their own AdamW param group with weight_decay=args.alpha_wd.
         embed_or_head_names = {"embed.weight", "pos_embed.weight", "lm_head.weight"}
-        muon_params, adamw_params = [], []
+        muon_params, adamw_regular, adamw_alpha = [], [], []
         seen = set()
         for name, p in model.named_parameters():
             if not p.requires_grad or id(p) in seen:
@@ -1011,18 +1043,26 @@ def main():
             # Muon supports strictly 2D matrices. Embeddings/lm_head + 1D
             # params + 3D+ tensors (short_conv kernels, etc.) go to AdamW.
             if name in embed_or_head_names or p.ndim != 2:
-                adamw_params.append(p)
+                if _is_film_alpha(name):
+                    adamw_alpha.append(p)
+                else:
+                    adamw_regular.append(p)
             else:
                 muon_params.append(p)
         print(f"  optimizer split: {len(muon_params)} Muon params "
               f"({sum(p.numel() for p in muon_params)/1e6:.1f}M), "
-              f"{len(adamw_params)} AdamW params "
-              f"({sum(p.numel() for p in adamw_params)/1e6:.1f}M)")
+              f"{len(adamw_regular) + len(adamw_alpha)} AdamW params "
+              f"({sum(p.numel() for p in adamw_regular + adamw_alpha)/1e6:.1f}M)")
+        adamw_groups = [{"params": adamw_regular, "weight_decay": 0.1}]
+        if adamw_alpha:
+            adamw_groups.append({"params": adamw_alpha,
+                                  "weight_decay": args.alpha_wd})
+            print(f"  α-WD split: {len(adamw_alpha)} FiLM α params get "
+                  f"weight_decay={args.alpha_wd}")
         opts = [
             torch.optim.Muon(muon_params, lr=args.lr_muon,
                              momentum=0.95, weight_decay=0.1),
-            torch.optim.AdamW(adamw_params, lr=args.lr,
-                              betas=(0.9, 0.95), weight_decay=0.1),
+            torch.optim.AdamW(adamw_groups, lr=args.lr, betas=(0.9, 0.95)),
         ]
         scheds = [
             torch.optim.lr_scheduler.CosineAnnealingLR(

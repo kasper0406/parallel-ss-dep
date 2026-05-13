@@ -1325,6 +1325,11 @@ def main():
             model.train()
             mid_eval_controller.append(res)
             print(f"[mid-eval] {mid_eval_controller.summary_line()}")
+            if res.humaneval_pass_rate != res.humaneval_pass_rate:  # NaN
+                print("[mid-eval] WARNING: humaneval=NaN — eval subprocess "
+                      "did not emit a parseable `pass@k =` line. Last 2 kB "
+                      "of its stdout/stderr:")
+                print(res.raw_log_tail)
             if tb is not None:
                 tb.add_scalar("eval/humaneval", res.humaneval_pass_rate, step)
                 tb.add_scalar("eval/humaneval_vs_tokens",

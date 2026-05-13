@@ -32,6 +32,57 @@ The thinking head + memory architecture below is in service of that target.
 3. Once HumanEval pass@1 is nonzero, the existing GRPO infra +
    `code_grader.grade` is the natural follow-up.
 
+### Ablations to revisit at training scale (post-pretrain-v1)
+
+Observed in `pretrain_mix_v1` (217 M / mixed-corpus / Muon / 60 k+ steps):
+the FiLM (2, 28) scalar α grew **monotonically** from 0 → +0.75 over 60 k
+steps and appears to be saturating in the last 5 k (range 0.743-0.756).
+
+Trajectory:
+
+| step | α |
+|---:|---:|
+| 100 | +0.003 |
+| 1 k | +0.026 |
+| 5 k | +0.127 |
+| 10 k | +0.271 |
+| 20 k | +0.478 |
+| 40 k | +0.677 |
+| 60 k | +0.748 |
+
+Compared to the original FiLM validation runs (α ≈ +0.16 to ±0.20 at
+5-15 k steps), this run pushes the scalar 3-5× higher. **Saturation
+suggests the *scalar-α* form is hitting its capacity ceiling** — the
+model is asking for more cross-layer signal than a single learnable
+scalar can deliver.
+
+Things worth retrying at full-pretrain scale, motivated by this
+observation:
+
+- **Cross-attention feedback** (`--feedback_xattn_pairs`) — tested at
+  short scale (5 k steps, codeparrot only) and didn't beat scalar-α
+  FiLM there. With scalar-α now visibly saturated, the higher-capacity
+  cross-attention form has a real shot at paying back. Try a 1-2 B
+  token rerun with e.g. `--feedback_xattn "2:14,21,28"` (layer 2's
+  input attends over layers 14, 21, 28).
+- **Per-channel α** (`--feedback_per_channel_alpha`) — scalar α
+  forces every channel to share one feedback strength. If different
+  channels have different needs, per-channel α should unlock more
+  capacity at much lower compute cost than full cross-attention.
+  Cheap experiment.
+- **Multi-scale feedback distances** (`--feedback_distances 1,2,4`) —
+  the current run uses single-step lag. Multi-scale was validated
+  at short scale; revisit whether it compounds at long training.
+- **K=4 or K=5 self-feed** (currently K=3) — if the self-feed
+  amplifies the FiLM effect and K=3 is on a plateau, more iterations
+  might extend it. Cheap diagnostic.
+
+Decision: queue these for after pretrain-v1 finishes. Run the
+`--freeze_alpha` control first to attribute how much of the actual
+val-PPL drop is FiLM-driven; then run the highest-capacity variant
+(cross-attention) at matched compute to see if the headline metric
+moves.
+
 ### Historical context (original 2026-05-10 framing below)
 
 While the sparse far-distance feedback (Finding 9) remains a core architectural

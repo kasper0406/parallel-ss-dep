@@ -1,3 +1,18 @@
+# Handoff — 2026-05-13 (mixed-corpus pretrain, fast-mode, α probe, CVE data)
+
+## TL;DR
+
+Built and launched the **mixed-corpus pretrain pipeline** (`experiments/data_mix.py`, 9 → 11 weighted HF streams, chunk-boundary think-burst injection). First v1 run (fp32, batch 4) showed the pipeline works end-to-end but ran slow (~18 k tok/s); killed at ~30 % when **bf16 + TF32 fast-mode** confirmed a **2.28× speedup** in a parallel smoke. Active run is `pretrain_mix_v2`: 217 M DeltaNet + FiLM(2,28) + memory(1024) + thinking-gate on the v2 mix (adds BigVul + CyberNative CVE data at ~7 % combined), bf16 + TF32 + batch 8, `--alpha_wd 0.0` per the WD-equilibrium probe finding. ETA ~14 hr.
+
+Other deliverables this session:
+- **THESIS.md** + **PHASE_C_RL.md** — project framing (small-model methodology research is under-served) and the prediction-as-RL-signal proposal for post-SFT.
+- **52 unit tests** across `data_mix`, `thinking` (GRPO advantage shaping), `eval_callback` (auto-stop), `sft_code` (think-burst masking). Already caught 2 bugs: BigVul `vul=0` rejection and GRPO NaN on size-1 groups.
+- **α-WD probe** (`experiments/probe_alpha_wd.py`) — verdict on the saturating FiLM α: NOT saturated; gradient (mean +0.137) was ~1.83× the WD pull-down (0.075). WD was the brake, not the loss landscape. Next pretrain runs with `--alpha_wd 0.0`.
+- **GRPO ponder shaping** — quadratic / counterfactual / separate-norm / curriculum knobs added to `compute_grpo_advantages`. All opt-in, default-off, ready for the next RL run.
+- **Inference-time thinking** wired into `eval_humaneval.py::generate` (consults `model._last_gate`, appends think tokens when σ(gate) < threshold, strips before decode + grading).
+
+The **local fla fork at `~/ml/flash-linear-attention`** is now required in the venv (pip-published 0.5.1 is missing Blackwell allocator fix). See updated CLAUDE.md `Conventions` section for the setup recipe.
+
 # Handoff — 2026-05-12 (thinking + memory + RL)
 
 ## TL;DR

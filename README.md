@@ -4,15 +4,19 @@
 
 The active goal of this repo is to build a **small, efficient code model that competes with much larger models on coding benchmarks** under tight compute (2× RTX 5090). The architectural research below feeds into that target.
 
-Stack as of 2026-05-12:
-- **Gated DeltaNet** backbone — bounded-state linear RNN, no KV-cache cost.
+Stack as of 2026-05-13:
+- **DeltaNet** backbone (`--arch deltanet`) — bounded-state linear RNN, no KV-cache cost. *Note: `gated_deltanet` is broken on sm_120 RTX 5090 (FLA Triton kernel bug); plain `deltanet` works.*
 - **Sparse FiLM feedback (2, 28)** + K=3 self-feeding — −3 % to −5 % PPL at 217 M / 360 M / 708 M, single forward at deploy.
 - **Bounded working memory** ([`experiments/model.py::WorkingMemory`](experiments/model.py)) — write-gated buffer of past hidden states, read via soft attention at "think" / query positions. **+11.1 pp recall** on saturated MQAR (T=512, K=128) vs DeltaNet alone, no O(T²) attention cost. Validated 2026-05-12 — see [SESSION_FINDINGS](SESSION_FINDINGS.md).
 - **Thinking gate** — per-position σ head choosing emit vs think. Allows extra recurrent passes at hard positions and triggers memory reads.
+- **Mixed-corpus pretrain** (`experiments/data_mix.py`, `configs/pretrain_mix_v*.yaml`) — 9–11 weighted HuggingFace streams (code, instruct, CS textbooks, Wikipedia, optionally BigVul + CyberNative CVE data) with chunk-boundary think-burst injection so memory + gate train from step 0. Auto-stop on flat HumanEval over two 500 M-token intervals.
+- **Speed**: `--bf16 --tf32` measured 2.28× over fp32 on 5090 (~18 k → ~42 k tok/s).
 
-Open work: cross-task validation of the memory module (induction, dyck, var-binding), boundary sweep of the saturation threshold, then a real pretrain on enough code tokens to make HumanEval comparison meaningful (the current SFT base scores 0 / 20).
+Active run (2026-05-13): [`launch_pretrain_mix_v2.sh`](launch_pretrain_mix_v2.sh) — 217 M, 2.13 B tokens, ~14 hr ETA.
 
-Full architectural write-up: [`WORKING_MEMORY_FINDINGS.md`](WORKING_MEMORY_FINDINGS.md).
+Project framing: [`THESIS.md`](THESIS.md).
+Post-pretrain RL plan: [`PHASE_C_RL.md`](PHASE_C_RL.md).
+Architectural write-up: [`WORKING_MEMORY_FINDINGS.md`](WORKING_MEMORY_FINDINGS.md).
 
 ---
 

@@ -107,6 +107,35 @@ Interpretation:
   climb much further if untethered. Strong signal that the
   feedback-from-deep-layers prior is load-bearing.
 
+#### Result of the probe (run 2026-05-13 on v1 mid-eval ckpt @500M tokens)
+
+`experiments/probe_alpha_wd.py` on `pretrain_mix_v1_step61036_tok500006912.pt`
+with 6 batches of (B=4, T=2048) from the v1 mix:
+
+| | value |
+|---|---:|
+| α | +0.7471 |
+| WD · \|α\| | 0.0747 |
+| mean(grad on α) over 6 batches | **+0.137** |
+| per-batch grads | all positive: +0.04, +0.06, +0.09, +0.26, +0.21, +0.16 |
+| \|mean grad\| / (WD·α) | **1.83** |
+
+**Interpretation: borderline WD-equilibrium / WD under-weighting.**
+The gradient consistently wants α higher (every batch positive), and
+its magnitude is ~1.8× the WD pull-down. The "saturation" appearance
+in the training-log trajectory (α range 0.743–0.756 over last 5k
+steps) was an artifact of a slow-creep regime where gradient barely
+beat WD; the actual movement was ~+0.002 per 5k steps, below per-step
+noise.
+
+**Action implied:** before doing the cross-attention ablation, do the
+cheap experiment first — remove WD on α (or reparametrise as
+`α_eff = scale * tanh(raw)` with WD only on `raw`) and see whether α
+climbs to 1.5–2.0 and val PPL drops further. If yes, the
+single-scalar-FiLM form is still load-bearing and we haven't actually
+needed more capacity. If α climbs and val PPL stays flat, *then*
+scalar-α is at its true ceiling and cross-attention is justified.
+
 ### Historical context (original 2026-05-10 framing below)
 
 While the sparse far-distance feedback (Finding 9) remains a core architectural

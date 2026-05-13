@@ -602,6 +602,21 @@ def main():
                         "two consecutive mid-eval intervals (< 1pp gain each).")
     p.add_argument("--auto_stop_threshold", type=float, default=0.01)
     p.add_argument("--auto_stop_k", type=int, default=2)
+    # ---- Mixed-precision / speed knobs ----
+    p.add_argument("--bf16", action="store_true",
+                   help="Wrap model.forward in torch.autocast(bfloat16). "
+                        "Master weights stay fp32 (Muon/AdamW expect that). "
+                        "Typical 1.5-2x speedup on 5090 because FLA's gated "
+                        "delta-rule kernels are bf16 internally and avoid "
+                        "round-trip casts. Loss + backward run normally.")
+    p.add_argument("--tf32", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Enable TF32 for the residual fp32 matmul path. "
+                        "Off by default (matches torch's 'highest' default); "
+                        "set --tf32 to use TF32 — same numerics as bf16 "
+                        "matmul (bf16 mantissa, fp32 exponent) but only on "
+                        "matmul, so safe for training stability. Pair with "
+                        "--bf16 for the full speed stack.")
     args = p.parse_args()
     if args.enable_thinking_token and args.output_gate:
         raise SystemExit(
@@ -900,6 +915,22 @@ def main():
         **mem_kwargs,
         **attn_kw,
     ).to("cuda")
+    # ---- Speed knobs (must run AFTER model is built but BEFORE the train
+    # loop touches it).
+    if args.tf32:
+        torch.set_float32_matmul_precision("high")
+        print("TF32 enabled for fp32 matmul (high precision mode)")
+    if args.bf16:
+        # Wrap model.forward in bf16 autocast. Master weights stay fp32
+        # (Muon + AdamW expect that); only forward+intermediates run in
+        # bf16. Backward runs through the same autocast graph
+        # (PyTorch handles the casts).
+        _orig_model_forward = model.forward
+        def _bf16_forward(*fwd_args, **fwd_kwargs):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                return _orig_model_forward(*fwd_args, **fwd_kwargs)
+        model.forward = _bf16_forward
+        print("bf16 autocast wrapping model.forward")
     if args.freeze_alpha and (args.feedback != "none" or fb_xattn_pairs):
         model.freeze_alpha()
     if fb_xattn_pairs:

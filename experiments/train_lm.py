@@ -1224,10 +1224,7 @@ def main():
             n_val = 0
             with torch.no_grad():
                 for vbatch in val_loader:
-                    if needs_ast:
-                        vx, vy, *_ = vbatch
-                    else:
-                        vx, vy = vbatch
+                    vx, vy, *_ = vbatch
                     vx, vy = vx.to("cuda"), vy.to("cuda")
                     vlogits = model(vx)
                     if args.enable_thinking_token:

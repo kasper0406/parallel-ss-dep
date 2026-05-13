@@ -83,6 +83,30 @@ val-PPL drop is FiLM-driven; then run the highest-capacity variant
 (cross-attention) at matched compute to see if the headline metric
 moves.
 
+#### Pre-ablation step: distinguish real saturation from WD equilibrium
+
+Before scaling to cross-attention, do a **30-second one-shot probe**
+against the final pretrain ckpt to determine whether α=+0.75 is
+real saturation (loss flat in the α direction) or just where
+weight-decay-pull-down equals gradient-pull-up:
+
+1. Load the final pretrain ckpt with `weights_only=False`.
+2. Set Muon WD=0 for the α parameter only; do one forward+backward
+   on a 4-sample mini-batch from the same data mix.
+3. Inspect `model.sparse_feedback['2'].alpha.grad.item()`.
+
+Interpretation:
+- `|grad| ≪ 0.075` (≈ WD·α): **true saturation** — loss is genuinely
+  flat in the α direction. Cross-attention is the right next step.
+- `|grad| ≈ 0.075`: **WD equilibrium** — the loss wants higher α but
+  WD is the brake. Cheapest first follow-up: remove WD from α (or
+  re-parameterise α = scale × tanh(raw_α) to remove the shrink-to-0
+  pressure). Cross-attention is still worth trying but the result
+  will be interpretable.
+- `|grad| ≫ 0.075`: WD is meaningfully *under-weighting* — α would
+  climb much further if untethered. Strong signal that the
+  feedback-from-deep-layers prior is load-bearing.
+
 ### Historical context (original 2026-05-10 framing below)
 
 While the sparse far-distance feedback (Finding 9) remains a core architectural

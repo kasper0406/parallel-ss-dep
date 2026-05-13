@@ -30,9 +30,9 @@ CUDA_VISIBLE_DEVICES=${GPU:-0} nohup .venv/bin/python -u experiments/train_lm.py
     --data_mix configs/pretrain_mix_v1.yaml \
     --tokenizer HuggingFaceTB/SmolLM2-135M \
     --think_burst_prob 0.5 --think_max_bursts 2 --think_max_burst_depth 6 \
-    --T 2048 --batch 8 \
+    --T 2048 --batch 4 \
     --optimizer muon --lr 3e-4 --lr_muon 1e-3 \
-    --steps 130000 \
+    --steps 260000 \
     --val_every 2000 --log_every 100 \
     --mid_eval_every_tokens 500000000 \
     --mid_eval_n_problems 50 --mid_eval_max_gen 192 \

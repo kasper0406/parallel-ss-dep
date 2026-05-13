@@ -85,11 +85,23 @@ def _filter_always() -> Callable[[dict], bool]:
     return lambda ex: True
 
 
+def _filter_bigvul_vulnerable() -> Callable[[dict], bool]:
+    """BigVul has two records per CVE: vul=0 (safe state, used for classifier
+    training, before==after) and vul=1 (the actually-vulnerable code paired
+    with its patch, before≠after). For generative training we want vul=1
+    only — that's where the bug→fix lesson lives. ~7% of records by stream
+    order, so the source weight should be bumped to compensate."""
+    def f(ex):
+        return int(ex.get("vul", 0)) == 1
+    return f
+
+
 FILTER_REGISTRY: dict[str, Callable[..., Callable[[dict], bool]]] = {
     "min_content_len": lambda min_chars=100: _filter_min_content_len(min_chars),
     "se_score": lambda min_score=3, programming_only=True: _filter_se_score(
         min_score, programming_only),
     "gh_issue_resolved": lambda: _filter_gh_issue_resolved(),
+    "bigvul_vulnerable": lambda: _filter_bigvul_vulnerable(),
     "always": lambda: _filter_always(),
 }
 
@@ -118,6 +130,8 @@ class SourceConfig:
     name: str
     dataset_id: str
     text_field: str | list = "text"  # str: single field; list[str]: join with \n\n
+    text_builder: str | None = None  # named builder in TEXT_BUILDER_REGISTRY;
+                                      # if set, overrides text_field.
     weight: float = 1.0
     split: str = "train"
     hf_extra: dict | None = None     # passed to load_dataset (e.g. {'name': 'python'})
@@ -125,10 +139,78 @@ class SourceConfig:
     skip_first: int = 0              # for shuffled streaming, optional
 
 
-def _extract_text(example: dict, text_field) -> str | None:
-    """Pull text from an example. `text_field` is either a string (single key)
-    or a list of keys whose values are joined with '\\n\\n'. Returns None when
-    nothing usable is present."""
+# ---------------------------------------------------------------------------
+# Text builders: for sources where the training text is a *composition* of
+# multiple fields (e.g. BigVul = CVE-id + commit-msg + before/after code).
+# Each builder takes an HF example dict and returns either the assembled
+# string, or None to skip the example (missing required fields, etc.).
+
+def _builder_bigvul(ex: dict) -> str | None:
+    """BigVul (vulnerable→fixed C/C++ function pairs from CVE patches).
+    Schema: 'CVE ID', 'CWE ID', 'commit_message', 'func_before', 'func_after',
+    'lang', 'project'. Format as a CVE-prefixed before/after block so the
+    model sees vulnerability description + bug pattern + fix together."""
+    before = (ex.get("func_before") or "").strip()
+    after = (ex.get("func_after") or "").strip()
+    # Skip examples missing either side — both are required for the lesson
+    # to make sense.
+    if not before or not after or before == after:
+        return None
+    cve = ex.get("CVE ID") or "CVE-?"
+    cwe = ex.get("CWE ID") or "CWE-?"
+    lang = ex.get("lang") or "code"
+    project = ex.get("project") or ""
+    msg = (ex.get("commit_message") or "").strip()
+    if len(msg) > 1200:
+        msg = msg[:1200] + " ..."
+    proj_str = f"in {project}" if project else ""
+    return (
+        f"Security fix {proj_str}\n"
+        f"{cve}  ({cwe})\n"
+        f"Fix description:\n{msg}\n\n"
+        f"Vulnerable {lang} code:\n```{lang}\n{before}\n```\n\n"
+        f"Patched {lang} code:\n```{lang}\n{after}\n```"
+    )
+
+
+def _builder_cybernative_dpo(ex: dict) -> str | None:
+    """CyberNative/Code_Vulnerability_Security_DPO. Preference-pair dataset
+    with `vulnerability`, `question`, `chosen`, `rejected`. For pretraining
+    we use only the *chosen* (safe) side — the rejected side teaches bad
+    patterns we don't want to reinforce."""
+    vuln = (ex.get("vulnerability") or "").strip()
+    question = (ex.get("question") or "").strip()
+    chosen = (ex.get("chosen") or "").strip()
+    if not question or not chosen:
+        return None
+    lang = ex.get("lang") or "code"
+    return (
+        f"Vulnerability awareness ({lang}): {vuln}\n\n"
+        f"Task: {question}\n\n"
+        f"Safe implementation:\n{chosen}"
+    )
+
+
+TEXT_BUILDER_REGISTRY: dict[str, callable] = {
+    "bigvul": _builder_bigvul,
+    "cybernative_dpo": _builder_cybernative_dpo,
+}
+
+
+def _extract_text(example: dict, text_field, text_builder: str | None = None
+                  ) -> str | None:
+    """Pull text from an example.
+
+    - If `text_builder` is set, dispatch to that builder (see
+      TEXT_BUILDER_REGISTRY) which takes the full example dict.
+    - Else `text_field` is a string (single key) or a list of keys whose
+      values are joined with '\\n\\n'.
+    Returns None when nothing usable is present.
+    """
+    if text_builder:
+        if text_builder not in TEXT_BUILDER_REGISTRY:
+            raise ValueError(f"unknown text_builder: {text_builder!r}")
+        return TEXT_BUILDER_REGISTRY[text_builder](example)
     if isinstance(text_field, str):
         val = example.get(text_field)
         if val is None:
@@ -240,7 +322,9 @@ class MixedSourceStream(IterableDataset):
             target = self.block_size + 1
             tok = self.tokenizer
             f = self._filters[idx]
-            text_field = self.sources[idx].text_field
+            src = self.sources[idx]
+            text_field = src.text_field
+            text_builder = src.text_builder
             while len(buffers[idx]) < target:
                 try:
                     ex = next(iters[idx])
@@ -248,7 +332,7 @@ class MixedSourceStream(IterableDataset):
                     return False
                 if not f(ex):
                     continue
-                text = _extract_text(ex, text_field)
+                text = _extract_text(ex, text_field, text_builder=text_builder)
                 if text is None:
                     continue
                 ids = tok.encode(text, add_special_tokens=False)
@@ -321,6 +405,7 @@ def load_sources_from_yaml(path: str) -> list[SourceConfig]:
             name=src["name"],
             dataset_id=src["dataset_id"],
             text_field=src.get("text_field", "text"),
+            text_builder=src.get("text_builder"),
             weight=float(src.get("weight", 1.0)),
             split=src.get("split", "train"),
             hf_extra=src.get("hf_extra"),

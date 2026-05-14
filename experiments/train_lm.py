@@ -49,6 +49,54 @@ from experiments.thinking import (
 from experiments.build_arch import build_arch, parse_layers_arg, _NAME_TO_CLS  # noqa: F401
 
 
+# ---------------------------------------------------------------------------
+# Per-layer learning diagnostics. Logged every --log_every steps to answer a
+# specific question: are early layers gradient-starved (the vanishing-gradient
+# signature) or is the gradient healthy and "slow early layers" just a misread
+# of the logit-lens? Cheap — grad norms are free post-backward; the
+# update-ratio clones one matrix per block on log steps only.
+
+def _block_repr_weight(blk):
+    """First 2D weight in a block — the representative matrix tracked for the
+    update-to-weight ratio."""
+    return next((p for p in blk.parameters() if p.ndim == 2), None)
+
+
+def _block_grad_norms(model) -> list[float]:
+    """Per-block total gradient L2 norm. Call after backward(), before clip."""
+    out = []
+    for blk in model.blocks:
+        sq = 0.0
+        for p in blk.parameters():
+            if p.grad is not None:
+                sq += float(p.grad.detach().float().pow(2).sum())
+        out.append(sq ** 0.5)
+    return out
+
+
+def _block_weight_snapshot(model) -> list:
+    """Clone each block's representative weight (call pre-step)."""
+    snap = []
+    for blk in model.blocks:
+        w = _block_repr_weight(blk)
+        snap.append(None if w is None else w.detach().clone())
+    return snap
+
+
+def _block_update_ratios(model, snapshot) -> list[float]:
+    """‖ΔW‖/‖W‖ for each block's representative weight (call post-step)."""
+    out = []
+    for blk, w_before in zip(model.blocks, snapshot):
+        w_after = _block_repr_weight(blk)
+        if w_before is None or w_after is None:
+            out.append(float("nan"))
+            continue
+        delta = float((w_after.detach() - w_before).float().norm())
+        denom = max(float(w_before.float().norm()), 1e-9)
+        out.append(delta / denom)
+    return out
+
+
 class TokenisedStream(IterableDataset):
     """Streaming IterableDataset of fixed-length tokenised chunks."""
 
@@ -1065,11 +1113,18 @@ def main():
             lm_loss = (ce_per_token * valid).sum() / denom
         loss = lm_loss + args.aux_weight * aux_loss
         loss.backward()
+        _log_this_step = (step % args.log_every == 0 or step == args.steps)
+        # Per-layer diagnostics: grad norms must be read before clip; the
+        # weight snapshot must be taken before opt.step().
+        _blk_gnorms = _block_grad_norms(model) if _log_this_step else None
+        _blk_wsnap = _block_weight_snapshot(model) if _log_this_step else None
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         for o in opts:
             o.step()
         for s in scheds:
             s.step()
+        _blk_uratios = (_block_update_ratios(model, _blk_wsnap)
+                        if _log_this_step else None)
         losses.append(lm_loss.item())  # track LM loss alone for comparison
         if args.output_gate:
             g_detached = model._last_gate.detach()
@@ -1178,12 +1233,28 @@ def main():
                           f"bp={q_pressure:.2f},"
                           f"cap={depth_cap:.0f},"
                           f"drop={q_dropped:.0f})")
+            if _blk_gnorms is not None:
+                gn, ur = _blk_gnorms, _blk_uratios
+                n = len(gn)
+                mid = n // 2
+                line += (f"  gnorm(L0={gn[0]:.2e},L{mid}={gn[mid]:.2e},"
+                         f"L{n-1}={gn[n-1]:.2e},last/first="
+                         f"{gn[-1] / max(gn[0], 1e-12):.1f})")
+                line += (f"  uratio(L0={ur[0]:.1e},L{mid}={ur[mid]:.1e},"
+                         f"L{n-1}={ur[n-1]:.1e})")
             print(line)
             if tb is not None:
                 tb.add_scalar("train/loss", tloss_avg, step)
                 tb.add_scalar("train/ppl", float(torch.tensor(tloss_avg).exp()), step)
                 tb.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
                 tb.add_scalar("train/tok_per_sec", tok_per_sec, step)
+                if _blk_gnorms is not None:
+                    for L, (g, u) in enumerate(zip(_blk_gnorms, _blk_uratios)):
+                        tb.add_scalar(f"layer_grad_norm/L{L:02d}", g, step)
+                        tb.add_scalar(f"layer_update_ratio/L{L:02d}", u, step)
+                    tb.add_scalar("layer_grad_norm/last_over_first",
+                                  _blk_gnorms[-1] / max(_blk_gnorms[0], 1e-12),
+                                  step)
                 if args.output_gate and losses_gate_window:
                     tb.add_scalar("gate/think_frac", 1.0 - emit_frac, step)
                     tb.add_scalar("gate/mean_gate", mean_g, step)

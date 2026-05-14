@@ -1,5 +1,28 @@
 # NEXT_DIRECTIONS.md
 
+## Update (2026-05-14): residual-collapse fix, v3 family, v4 plan
+
+The v2 pretrain's bad undertraining was diagnosed to a **root cause**: weight
+decay 0.1 was collapsing the residual stream (||h|| shrinking, not growing,
+over training). Fixes landed and validated — see `SESSION_FINDINGS.md`
+(2026-05-14 entry) and the `GEMINI.md` mandates. Headline decisions:
+
+- **`--wd 0.01`** (not the legacy 0.1) — un-collapses the residual stream;
+  v3a beat v2 on every per-source CE.
+- **`--lr_schedule wsd`** is the new default — cosine's commit-`T_max`-upfront
+  was flooring the LR exactly when token counts got interesting.
+- **LayerDrop is a dead end** — v3b clean negative result; flag stays, off.
+- **Dense execution-grounded GRPO reward** + the **iterative self-repair loop**
+  designed and the grader built — see `PHASE_C_RL.md`.
+
+**v4 plan**: re-weighted mix (the one thing still unfixed — `bigvul`/
+`cybernative` drift *up* in CE in every run; down-weight jinaai/codeparrot,
+up-weight bigvul/wiki) + the staged knobs (`--wd 0.01 --lr_schedule wsd
+--compile --feedback_self_k_warmup_steps`). Gate `--compile` + the K-curriculum
+on the `profile_train.py` validation run first.
+
+---
+
 ## Current Focus (2026-05-12): Small Super-Coder
 
 The top-level goal is now a small DeltaNet-backbone code model that competes

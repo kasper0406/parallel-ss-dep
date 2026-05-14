@@ -252,3 +252,66 @@ After Phase A (current pretrain, ~30 hr) and Phase B (SFT, ~1
 day) produce a base scoring ≥ 10 % HumanEval. Open this doc, set
 up the prompt template + trace executor + reward shaping, run for
 24–48 hr, and report against the success criteria above.
+
+---
+
+## Dense execution-grounded reward (landed 2026-05-14)
+
+Binary pass/fail kills GRPO when a weak model solves nothing — every
+rollout scores 0, the group has zero advantage variance, zero
+gradient. `experiments/code_grader.py` now returns a **dense**
+`GradingResult`:
+
+- Tier ladder, `score ∈ [0,1]`: `syntax_error` 0.0 < `exec_error`
+  0.05 < `runtime_error` 0.2 < `partial` 0.2 + 0.7·(n_passed/n_tests)
+  < `pass` 1.0. The gap between partial-at-max (0.9) and pass (1.0)
+  is the fully-correct boost.
+- `_exec_target` AST-splits `check()` and runs it
+  statement-by-statement, so one failing assert no longer masks the
+  rest — that's where the fractional signal comes from.
+- `GradingResult.error_text` is the formatted diagnosis (SyntaxError
+  + line, exec traceback, the failed-assert source lines).
+- Tests: `experiments/test_code_grader.py` (15).
+
+**Explicitly rejected: embedding-similarity-to-reference reward.**
+It's reward-hackable (the model learns to produce code that *looks*
+like the answer), there is no single target (test suites admit many
+correct solutions), and code embeddings barely track functional
+correctness (a one-token `<`→`<=` edit flips correctness but is ~99 %
+cosine-similar). Code has an execution verifier — lean into it; make
+*it* dense rather than substituting a noisy proxy.
+
+**Remaining wiring:** `train_rl.py`'s GRPO reward path still consumes
+binary pass/fail — swap it for `result.score`. The ponder-cost
+shaping above layers on top unchanged.
+
+## Iterative self-repair loop (designed 2026-05-14, Phase-C-next)
+
+Turn single-shot generation into an iterative debugging loop: when a
+rollout fails, **re-add it to the rollout pool as a new task**,
+`prompt' = original_prompt + failed_code + error_text`, same target.
+The model learns "code + error → fix" as a first-class skill because
+those `(prompt', target)` pairs are now in the training distribution.
+
+The framing that keeps it tractable: this is **curriculum
+generation, not multi-turn trajectory credit assignment**. Each turn
+is graded independently with the dense `score` above — no
+long-horizon credit assignment. A failed attempt just manufactures a
+harder, information-rich training example.
+
+- **Justification**: the project target is *agent* tasks, where the
+  model has execution feedback at inference. So an error-augmented
+  training distribution *matches* deployment — not distribution shift.
+- **Mechanics**: cap retry depth ~2–3, TTL the queue. The
+  `experiments/thinking.py` queue infra
+  (`ThinkContinuation`/`ThinkReplay`, `safety_max_depth`,
+  `think_queue_ttl`) is structurally the same enqueue-with-capped-
+  depth pattern — reuse it.
+- **Reward-hacking check**: independent per-turn grading means the
+  model always prefers a one-shot 1.0 over fail-then-fix; no
+  incentive to fail on purpose.
+- **Composes with the thinking gate**: the diagnosis turn is a
+  natural "think" trigger — read error → think → emit fix.
+- **Prerequisite**: `code_grader.error_text` — done. The loop logic
+  itself is gated on a base that produces *fixable* failures (not
+  garbage), i.e. post-v3-long/v4.

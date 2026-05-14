@@ -4,15 +4,16 @@
 
 The active goal of this repo is to build a **small, efficient code model that competes with much larger models on coding benchmarks** under tight compute (2× RTX 5090). The architectural research below feeds into that target.
 
-Stack as of 2026-05-13:
+Stack as of 2026-05-14:
 - **DeltaNet** backbone (`--arch deltanet`) — bounded-state linear RNN, no KV-cache cost. *Note: `gated_deltanet` is broken on sm_120 RTX 5090 (FLA Triton kernel bug); plain `deltanet` works.*
 - **Sparse FiLM feedback (2, 28)** + K=3 self-feeding — −3 % to −5 % PPL at 217 M / 360 M / 708 M, single forward at deploy.
 - **Bounded working memory** ([`experiments/model.py::WorkingMemory`](experiments/model.py)) — write-gated buffer of past hidden states, read via soft attention at "think" / query positions. **+11.1 pp recall** on saturated MQAR (T=512, K=128) vs DeltaNet alone, no O(T²) attention cost. Validated 2026-05-12 — see [SESSION_FINDINGS](SESSION_FINDINGS.md).
 - **Thinking gate** — per-position σ head choosing emit vs think. Allows extra recurrent passes at hard positions and triggers memory reads.
 - **Mixed-corpus pretrain** (`experiments/data_mix.py`, `configs/pretrain_mix_v*.yaml`) — 9–11 weighted HuggingFace streams (code, instruct, CS textbooks, Wikipedia, optionally BigVul + CyberNative CVE data) with chunk-boundary think-burst injection so memory + gate train from step 0. Auto-stop on flat HumanEval over two 500 M-token intervals.
 - **Speed**: `--bf16 --tf32` measured 2.28× over fp32 on 5090 (~18 k → ~42 k tok/s).
+- **Training-methodology fixes (2026-05-14)** — diagnostic tooling ([`diag_ckpt.py`](experiments/diag_ckpt.py), [`diag_reference_lm.py`](experiments/diag_reference_lm.py)) found **residual-stream collapse** under the legacy weight decay 0.1; `--wd 0.01` un-collapses it and beats the prior run on every per-source CE. `--lr_schedule wsd` (warmup-stable-decay) replaces cosine as the default. Dense execution-grounded GRPO reward ([`code_grader.py`](experiments/code_grader.py)). See the 2026-05-14 entry in [SESSION_FINDINGS](SESSION_FINDINGS.md).
 
-Active run (2026-05-13): [`launch_pretrain_mix_v2.sh`](launch_pretrain_mix_v2.sh) — 217 M, 2.13 B tokens, ~14 hr ETA.
+Active run (2026-05-14): [`launch_pretrain_mix_v3_long.sh`](launch_pretrain_mix_v3_long.sh) — 217 M, `--wd 0.01`, 2.13 B tokens.
 
 Project framing: [`THESIS.md`](THESIS.md).
 Post-pretrain RL plan: [`PHASE_C_RL.md`](PHASE_C_RL.md).

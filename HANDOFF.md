@@ -1,3 +1,37 @@
+# Handoff — 2026-05-14 (residual-collapse diagnosis, WD fix, v3 family, WSD, RL-reward prep)
+
+## TL;DR
+
+Diagnosed why the v2 pretrain was undertraining badly and fixed the root cause. Built a diagnostic toolkit (`diag_ckpt.py`, `diag_reference_lm.py`), which found **residual-stream collapse**: ||h||@L0 *shrank* 8.1 → 3.5 between v2's 500 M and 1 B ckpts, vs SmolLM2-135M (matched 30L×576d shape) at ||h||@L0 ≈ 44 growing 20× over depth. Root cause: **weight decay 0.1 was holding weights too small**. Added `--wd` (default 0.1 back-compat, **use 0.01**); v3a confirmed the fix — un-collapsed residual stream, beat v2 on every per-source CE including the hard CVE streams v2 was *regressing* on.
+
+Ran a v3 family of pretrains:
+- **v3a** `--wd 0.01`, 70 k steps / 1 B tokens — WD fix validated. Done.
+- **v3b** `--wd 0.01 --layer_drop_max 0.2` — clean **negative result**: LayerDrop does what Stochastic Depth promises (lens saturates ~5 layers earlier) but makes deep layers vestigial and costs CE on every source. Don't use it.
+- **v3-long** `--wd 0.01`, 149 k steps / 2.13 B tokens — active run testing the schedule hypothesis. At 1.5 B it's at overall CE 1.92, already past v3a/v3b's *finals*, with the decay tail still ahead.
+
+Diagnosed the "modest 500 M→1 B gain" as a **cosine-schedule artifact** (LR floored exactly when token counts got interesting) → added **WSD** (`--lr_schedule wsd`, now default): warmup → constant peak LR → short decay, no wasted low-LR tail, stoppable anywhere.
+
+Speed work: `--compile` (default-on, `torch.compile`), FiLM K-self-feed warmup curriculum (`--feedback_self_k_warmup_steps`), `profile_train.py` harness. All GPU-unvalidated (CPU smoke only) — profiler is the gate. Fixed a latent refactor bug (`build_arch.py` was imported but never created) and a `needs_ast` NameError in the val loop.
+
+Added per-layer **gradient-norm + update-to-weight-ratio logging** (default-on) to settle whether early layers are gradient-starved — the decisive `last_over_first` signal lands on the next launch.
+
+RL-reward prep: `code_grader.py` now returns a **dense** `GradingResult` (tier ladder + fractional `score` + formatted `error_text`) instead of binary pass/fail, so GRPO has gradient signal before the model can fully solve tasks. Designed the **iterative self-repair loop** (failed attempt → re-added prompt with the error text → model learns to diagnose); `error_text` is its prerequisite and is done.
+
+## State of the runs at handoff
+
+- v3a, v3b: complete, ckpts on disk, diag'd.
+- v3-long: running on GPU 0, ~step 131 k of 149 k, VAL ppl ~6.30, in the decay tail. 2 B mid-eval + completion ~1 hr out. Monitor armed. **Next action: run `diag_ckpt` on the final step-149 k ckpt** — that's the clean v3-long-vs-v3a verdict on whether the longer schedule pays off.
+- `profile_train.py` running on GPU 1 (background) — A/B of baseline / `--compile` / `--film_bypass`. Report the ms/step numbers when done.
+
+## Open tasks
+
+- **#78** GPU-validate `--compile` + K-curriculum (profiler running).
+- **#79** Dense grader — core done; remaining: wire `result.score` into `train_rl.py`'s GRPO reward.
+- **#80** Iterative self-repair loop — prerequisite (`error_text`) done; loop logic is Phase-C-next.
+- **v4**: re-weighted mix (fix the bigvul drift) + the staged knobs (`--wd 0.01 --lr_schedule wsd --compile --feedback_self_k_warmup_steps`).
+
+---
+
 # Handoff — 2026-05-13 (v2 mid-eval, halt-after-docstring fixes, refactor)
 
 ## TL;DR

@@ -40,6 +40,26 @@ target.
   architecture is moving the needle on real text).
 - The eval harness (`experiments/code_grader.py`) is ready.
 
+### Update (2026-05-14) — pretrain is now the active blocker, not RL
+
+Diagnosed why pretrain was undertraining badly (residual-stream collapse
+from WD 0.1) and fixed it. **The plan above is paused** — RL on an
+undertrained base is the cold-start failure mode the docs already warn
+about. Sequence now:
+
+1. **v3-long** (active): `--wd 0.01`, 2.13 B tokens. Clean schedule test.
+2. **v4 pretrain**: re-weighted mix (the `bigvul`/`cybernative` upward CE
+   drift is the one thing still unfixed — mix imbalance) + the staged
+   knobs (`--wd 0.01 --lr_schedule wsd --compile
+   --feedback_self_k_warmup_steps`).
+3. SFT, then GRPO — with the **dense execution-grounded reward** (tier
+   ladder + fractional score, `code_grader.py` rebuilt 2026-05-14) and
+   the **iterative self-repair loop** (re-add failed tasks with the
+   compiler/test `error_text`). See `PHASE_C_RL.md`.
+
+Authoritative current state: `GEMINI.md` "Current state" + the
+2026-05-14 entries in `HANDOFF.md` / `SESSION_FINDINGS.md`.
+
 The formalisation work below is still the *backbone* of why we use
 DeltaNet; the active research is now applying that backbone to the
 super-coder target.

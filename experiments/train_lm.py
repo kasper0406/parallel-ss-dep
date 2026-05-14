@@ -327,6 +327,8 @@ def main():
     opts, scheds = build_optimizer(
         model, optimizer=args.optimizer, lr=args.lr, lr_muon=args.lr_muon,
         alpha_wd=args.alpha_wd, steps=args.steps, wd=args.wd,
+        lr_schedule=args.lr_schedule, warmup_steps=args.warmup_steps,
+        decay_frac=args.lr_decay_frac,
     )
     # Backwards-compat aliases used elsewhere in the loop.
     opt = opts[0]

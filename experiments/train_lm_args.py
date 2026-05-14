@@ -333,6 +333,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr_muon", type=float, default=1e-3,
                    help="Muon learning rate (used only when --optimizer muon). "
                         "AdamW LR for the remaining params is taken from --lr.")
+    p.add_argument("--lr_schedule", type=str, default="wsd",
+                   choices=["cosine", "wsd"],
+                   help="LR schedule. 'wsd' (default) = warmup-stable-decay: "
+                        "constant peak LR for the bulk of training, short "
+                        "decay over the last --lr_decay_frac. No wasted "
+                        "low-LR tail, and the run can be stopped anywhere. "
+                        "'cosine' = legacy cosine anneal to 0.1*peak.")
+    p.add_argument("--warmup_steps", type=int, default=2000,
+                   help="Linear LR warmup steps. Used by --lr_schedule wsd.")
+    p.add_argument("--lr_decay_frac", type=float, default=0.15,
+                   help="Fraction of total steps for the WSD decay phase "
+                        "(cosine 1->0). Used by --lr_schedule wsd.")
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--val_every", type=int, default=500)
     p.add_argument("--tokenizer", type=str,

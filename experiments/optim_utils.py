@@ -13,11 +13,50 @@ Both modes return parallel `(opts, scheds)` lists. The caller calls
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
 
 _EMBED_OR_HEAD_NAMES = {"embed.weight", "pos_embed.weight", "lm_head.weight"}
+
+
+def _wsd_lambda(total_steps: int, warmup_steps: int, decay_frac: float):
+    """Warmup-Stable-Decay LR multiplier in [0, 1].
+
+    - warmup: linear 0 -> 1 over `warmup_steps`
+    - stable: constant 1.0 for the bulk of training
+    - decay:  cosine 1.0 -> 0.0 over the last `decay_frac` of steps
+
+    The stable phase means no wasted low-LR tail; the decay can be run
+    from any stopping point to "cash out" a checkpoint, which is why WSD
+    suits open-ended-horizon runs better than cosine.
+    """
+    decay_steps = max(1, int(decay_frac * total_steps))
+    stable_end = max(warmup_steps, total_steps - decay_steps)
+
+    def fn(step: int) -> float:
+        if step < warmup_steps:
+            return (step + 1) / max(1, warmup_steps)
+        if step < stable_end:
+            return 1.0
+        progress = min(1.0, (step - stable_end) / decay_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return fn
+
+
+def _make_scheduler(opt, *, base_lr: float, schedule: str, steps: int,
+                    warmup_steps: int, decay_frac: float):
+    """Cosine (legacy, byte-identical to before) or WSD."""
+    if schedule == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=steps, eta_min=base_lr * 0.1)
+    if schedule == "wsd":
+        return torch.optim.lr_scheduler.LambdaLR(
+            opt, _wsd_lambda(steps, warmup_steps, decay_frac))
+    raise ValueError(f"unknown lr_schedule {schedule!r}")
 
 
 def is_film_alpha(name: str) -> bool:
@@ -32,9 +71,15 @@ def is_film_alpha(name: str) -> bool:
 def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                     lr_muon: float, alpha_wd: float, steps: int,
                     wd: float = 0.1,
+                    lr_schedule: str = "cosine",
+                    warmup_steps: int = 0,
+                    decay_frac: float = 0.15,
                     verbose: bool = True
                     ) -> tuple[list[torch.optim.Optimizer], list]:
-    """Build optimizer(s) + cosine schedulers. See module docstring."""
+    """Build optimizer(s) + LR schedulers. See module docstring.
+
+    `lr_schedule`: "cosine" (legacy) or "wsd" (warmup-stable-decay).
+    """
     if optimizer == "adamw":
         regular, alphas = [], []
         for name, p in model.named_parameters():
@@ -48,8 +93,13 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                 print(f"  α-WD split: {len(alphas)} FiLM α params get "
                       f"weight_decay={alpha_wd}")
         opts = [torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95))]
-        scheds = [torch.optim.lr_scheduler.CosineAnnealingLR(
-            opts[0], T_max=steps, eta_min=lr * 0.1)]
+        scheds = [_make_scheduler(opts[0], base_lr=lr, schedule=lr_schedule,
+                                  steps=steps, warmup_steps=warmup_steps,
+                                  decay_frac=decay_frac)]
+        if verbose:
+            print(f"  lr_schedule={lr_schedule}"
+                  + (f" (warmup={warmup_steps}, decay_frac={decay_frac})"
+                     if lr_schedule == "wsd" else ""))
         return opts, scheds
 
     if optimizer != "muon":
@@ -84,9 +134,15 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
     if verbose:
         print(f"  Muon weight_decay={wd}; AdamW(regular) weight_decay={wd}")
     scheds = [
-        torch.optim.lr_scheduler.CosineAnnealingLR(
-            opts[0], T_max=steps, eta_min=lr_muon * 0.1),
-        torch.optim.lr_scheduler.CosineAnnealingLR(
-            opts[1], T_max=steps, eta_min=lr * 0.1),
+        _make_scheduler(opts[0], base_lr=lr_muon, schedule=lr_schedule,
+                        steps=steps, warmup_steps=warmup_steps,
+                        decay_frac=decay_frac),
+        _make_scheduler(opts[1], base_lr=lr, schedule=lr_schedule,
+                        steps=steps, warmup_steps=warmup_steps,
+                        decay_frac=decay_frac),
     ]
+    if verbose:
+        print(f"  lr_schedule={lr_schedule}"
+              + (f" (warmup={warmup_steps}, decay_frac={decay_frac})"
+                 if lr_schedule == "wsd" else ""))
     return opts, scheds

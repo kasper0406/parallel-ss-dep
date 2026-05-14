@@ -12,8 +12,10 @@ import torch.nn as nn
 
 
 def apply_speed_knobs(model: nn.Module, bf16: bool = True, tf32: bool = True,
+                       compile_model: bool = False,
                        verbose: bool = True) -> nn.Module:
-    """Apply bf16 autocast + TF32 to a built model. Returns the model.
+    """Apply bf16 autocast + TF32 (+ optional torch.compile) to a built
+    model. Returns the model.
 
     Must be called AFTER model construction but BEFORE the optimizer
     references `model.parameters()` (parameters are unaffected; the
@@ -37,4 +39,16 @@ def apply_speed_knobs(model: nn.Module, bf16: bool = True, tf32: bool = True,
         model.forward = _bf16_forward
         if verbose:
             print("bf16 autocast wrapping model.forward")
+    if compile_model:
+        # Compile the (possibly bf16-wrapped) forward. The FLA Triton
+        # kernels are opaque to Dynamo, so each is a graph break — compile
+        # still fuses the PyTorch glue between them (RMSNorm, GLU MLP,
+        # FiLM projections, gate/memory heads). fullgraph=False is
+        # required (the graph breaks are expected, not errors).
+        # Control-flow changes (e.g. the K-self-feed curriculum flipping
+        # _film_bypass) trigger a one-time recompile — acceptable.
+        model.forward = torch.compile(model.forward, fullgraph=False)
+        if verbose:
+            print("torch.compile applied to model.forward "
+                  "(fullgraph=False; FLA kernels are graph breaks)")
     return model

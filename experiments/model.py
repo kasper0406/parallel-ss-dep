@@ -1085,6 +1085,11 @@ class TinyLM(nn.Module):
             raise ValueError(
                 f"feedback_self_k must be 0, 2, or 3 (got {feedback_self_k!r})"
             )
+        # Runtime curriculum flag: when True, forward() takes the plain
+        # block-loop path (1 forward, no FiLM passes) regardless of
+        # feedback_mode. The trainer flips this off after a warmup so the
+        # expensive K-self-feed isn't paid while early grad is just noise.
+        self._film_bypass = False
         if self.feedback_self_k > 0 and not feedback_pairs:
             raise ValueError(
                 "feedback_self_k requires sparse feedback_pairs to be non-empty"
@@ -1359,8 +1364,13 @@ class TinyLM(nn.Module):
             self._last_gate = g  # side-effect: accessible after forward()
             return g
 
-        if (self.feedback_mode == "none"
+        if ((self.feedback_mode == "none" or self._film_bypass)
                 and not self.feedback_xattn_pairs):
+            # Plain block loop: 1 forward, no FiLM passes. Reached when
+            # feedback is genuinely off, OR when the trainer has set
+            # _film_bypass during the K-self-feed warmup. FiLM params get
+            # no gradient on bypassed steps — intentional (early grad is
+            # noise; the K-self-feed tax isn't worth paying yet).
             for L, blk in enumerate(self.blocks):
                 x = self._block_fwd(blk, x, input_ids, L=L)
             return self._finalize(x, input_ids, mem_read_mask,

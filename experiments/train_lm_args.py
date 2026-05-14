@@ -76,6 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "self-consistent under lagged-cached deployment, "
                         "closing the train/inference gap. Requires "
                         "--feedback_pairs to be set.")
+    p.add_argument("--feedback_self_k_warmup_steps", type=int, default=0,
+                   help="Steps to run with FiLM bypassed (plain 1-pass "
+                        "forward) before enabling the configured "
+                        "--feedback_self_k. Default 0 (off).")
     p.add_argument("--feedback_alpha_mode", type=str, default="scalar",
                    choices=["scalar", "surprise_modulated"],
                    help="α form for sparse-FiLM feedback. "
@@ -400,6 +404,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "matmul (bf16 mantissa, fp32 exponent) but only on "
                         "matmul, so safe for training stability. Pair with "
                         "--bf16 for the full speed stack.")
+    p.add_argument("--compile", action="store_true",
+                   help="Apply torch.compile to model.forward. Fuses the "
+                        "PyTorch glue around the FLA Triton kernels. Off "
+                        "by default.")
     p.add_argument("--wd", type=float, default=0.1,
                    help="Weight decay for non-α params (Muon + AdamW "
                         "regular groups). Default 0.1.")

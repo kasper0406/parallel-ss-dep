@@ -253,7 +253,8 @@ def main():
     # ---- Speed knobs (must run AFTER model is built but BEFORE the train
     # loop touches it). See experiments/speed_knobs.py.
     from experiments.speed_knobs import apply_speed_knobs
-    apply_speed_knobs(model, bf16=bool(args.bf16), tf32=bool(args.tf32))
+    apply_speed_knobs(model, bf16=bool(args.bf16), tf32=bool(args.tf32),
+                      compile_model=bool(args.compile))
     if fb_xattn_pairs:
         n_total_pairs = sum(len(srcs) for _, srcs in fb_xattn_pairs)
         feedback_desc = (f"xattn[{args.feedback_xattn_form}]"
@@ -636,6 +637,16 @@ def main():
             batch = next(train_iter)
         x, y = batch
         x, y = x.to("cuda"), y.to("cuda")
+        # K-self-feed curriculum: bypass FiLM (1-pass forward) until the
+        # warmup boundary, then run the configured --feedback_self_k.
+        if args.feedback_self_k_warmup_steps > 0:
+            bypass = step <= args.feedback_self_k_warmup_steps
+            if bypass != model._film_bypass:
+                model._film_bypass = bypass
+                if not bypass:
+                    print(f"[step {step}] FiLM K-self-feed curriculum: "
+                          f"warmup over, enabling feedback_self_k="
+                          f"{args.feedback_self_k}")
         for o in opts:
             o.zero_grad(set_to_none=True)
         pre_think_stats: dict[str, float] | None = None

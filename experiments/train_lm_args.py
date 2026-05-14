@@ -404,10 +404,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "matmul (bf16 mantissa, fp32 exponent) but only on "
                         "matmul, so safe for training stability. Pair with "
                         "--bf16 for the full speed stack.")
-    p.add_argument("--compile", action="store_true",
-                   help="Apply torch.compile to model.forward. Fuses the "
-                        "PyTorch glue around the FLA Triton kernels. Off "
-                        "by default.")
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Apply torch.compile to model.forward (fuses the "
+                        "PyTorch glue around the FLA Triton kernels). "
+                        "Default on; pass --no-compile to disable — e.g. "
+                        "if compile errors on the nightly-torch / FLA / "
+                        "Blackwell stack or triggers recompilation storms.")
     p.add_argument("--wd", type=float, default=0.1,
                    help="Weight decay for non-α params (Muon + AdamW "
                         "regular groups). Default 0.1.")

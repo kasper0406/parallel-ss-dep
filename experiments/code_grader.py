@@ -22,8 +22,13 @@ import multiprocessing as mp
 import pathlib
 import signal
 import sys
+import traceback
 from contextlib import contextmanager
 from typing import Callable
+
+# Cap on the formatted error text fed back into a re-added (self-repair)
+# prompt — long enough to diagnose, short enough not to bloat the prompt.
+_ERROR_TEXT_CAP = 1000
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -91,6 +96,11 @@ class GradingResult:
     `passed` is kept as a field for backward compatibility (eval scripts
     read it) but is fully determined by `tier == "pass"`. `score` is the
     dense reward — that's what the GRPO trainer should consume.
+
+    `error_text` is the human-readable diagnosis — SyntaxError message +
+    offending line, the exec traceback, the failed-assertion source
+    lines, etc. It's what the self-repair loop (task #80) feeds back into
+    a re-added prompt so the model learns to diagnose. None on a pass.
     """
     passed: bool               # True iff every assertion passed (tier == "pass")
     tier: str = "syntax_error"  # one of _TIER_BASE_SCORE keys
@@ -98,6 +108,7 @@ class GradingResult:
     n_tests: int = 0           # total assertions found in check() (0 if not splittable)
     n_passed: int = 0          # assertions that passed
     error: str | None = None   # exception class name if it raised; "timeout" on timeout
+    error_text: str | None = None  # formatted diagnosis for the self-repair loop
     elapsed_s: float = 0.0
 
 
@@ -114,18 +125,21 @@ def truncate_at_stop(text: str) -> str:
 def _run_check_granular(check_fn: ast.FunctionDef, ns: dict, candidate):
     """Run a `check(candidate)` body statement-by-statement so a single
     failing assert doesn't mask the rest. Returns (tier, error, n_tests,
-    n_passed).
+    n_passed, error_text).
 
     - `assert` statements are counted individually (pass/fail); a failed
-      one does NOT stop the run.
+      one does NOT stop the run. The source line of each failed assert
+      (plus the exception, if it wasn't a plain AssertionError) is
+      collected into `error_text`.
     - non-assert statements are setup (assignments, loops, imports); if
       one raises, the test harness itself broke past that point ->
-      `runtime_error`.
+      `runtime_error`, with the statement source + traceback.
     """
     local_ns = dict(ns)
     local_ns["candidate"] = candidate
     n_tests = 0
     n_passed = 0
+    failures: list[str] = []  # "  <assert src>  ->  <exc>"
     for stmt in check_fn.body:
         src = ast.unparse(stmt)
         if isinstance(stmt, ast.Assert):
@@ -135,42 +149,67 @@ def _run_check_granular(check_fn: ast.FunctionDef, ns: dict, candidate):
                 n_passed += 1
             except TimeoutError:
                 raise
-            except Exception:
-                pass  # failed assertion or candidate crash — count as fail, continue
+            except AssertionError:
+                failures.append(f"  {src}  ->  AssertionError")
+            except Exception as exc:
+                failures.append(f"  {src}  ->  {type(exc).__name__}: {exc}")
         else:
             try:
                 exec(src, local_ns)
             except TimeoutError:
                 raise
             except Exception as exc:
-                return ("runtime_error", type(exc).__name__, n_tests, n_passed)
+                tb = traceback.format_exc(limit=3)
+                txt = (f"test-harness setup statement crashed:\n"
+                       f"  {src}\n{tb}")[:_ERROR_TEXT_CAP]
+                return ("runtime_error", type(exc).__name__,
+                        n_tests, n_passed, txt)
     if n_tests == 0:
         # check() had no assert statements at all — nothing to grade on.
-        return ("grader_error", "no-asserts", 0, 0)
-    tier = "pass" if n_passed == n_tests else "partial"
-    return (tier, None, n_tests, n_passed)
+        return ("grader_error", "no-asserts", 0, 0,
+                "check() contained no assert statements")
+    if n_passed == n_tests:
+        return ("pass", None, n_tests, n_passed, None)
+    # partial: format the failed assertions for the self-repair prompt.
+    n_fail = n_tests - n_passed
+    lines = [f"{n_fail}/{n_tests} assertions failed:"]
+    lines.extend(failures[:8])
+    if len(failures) > 8:
+        lines.append(f"  ... and {len(failures) - 8} more")
+    txt = "\n".join(lines)[:_ERROR_TEXT_CAP]
+    return ("partial", "assertion-failed", n_tests, n_passed, txt)
 
 
 def _exec_target(code: str, test: str, entry_point: str, q: mp.Queue):
     """Subprocess body: compile + exec the solution, exec the test block,
-    then run check() granularly. Puts (tier, error, n_tests, n_passed)."""
+    then run check() granularly. Puts
+    (tier, error, n_tests, n_passed, error_text)."""
     try:
         with _time_limit(5):
             # 1) Does the generated code even compile?
             try:
                 compiled = compile(code, "<solution>", "exec")
             except SyntaxError as exc:
-                q.put(("syntax_error", type(exc).__name__, 0, 0))
+                txt = f"SyntaxError: {exc.msg}"
+                if exc.lineno is not None:
+                    txt += f" (line {exc.lineno})"
+                if exc.text:
+                    txt += f"\n  {exc.text.rstrip()}"
+                q.put(("syntax_error", type(exc).__name__, 0, 0,
+                       txt[:_ERROR_TEXT_CAP]))
                 return
             # 2) Does exec'ing the solution itself raise?
             ns: dict = {}
             try:
                 exec(compiled, ns)
             except Exception as exc:
-                q.put(("exec_error", type(exc).__name__, 0, 0))
+                q.put(("exec_error", type(exc).__name__, 0, 0,
+                       traceback.format_exc(limit=4)[:_ERROR_TEXT_CAP]))
                 return
             if entry_point not in ns:
-                q.put(("exec_error", "entry-point-undefined", 0, 0))
+                q.put(("exec_error", "entry-point-undefined", 0, 0,
+                       f"the generated code never defined `{entry_point}` "
+                       f"(the function the tests call)"))
                 return
             # 3) Exec the dataset's test block to define check(). A failure
             # here is the dataset's fault, not the model's.
@@ -178,7 +217,9 @@ def _exec_target(code: str, test: str, entry_point: str, q: mp.Queue):
                 exec(test, ns)
                 check_tree = ast.parse(test)
             except Exception as exc:
-                q.put(("grader_error", type(exc).__name__, 0, 0))
+                q.put(("grader_error", type(exc).__name__, 0, 0,
+                       f"dataset test block failed to load: "
+                       f"{type(exc).__name__}: {exc}"))
                 return
             check_fn = next(
                 (n for n in ast.walk(check_tree)
@@ -186,14 +227,17 @@ def _exec_target(code: str, test: str, entry_point: str, q: mp.Queue):
                 None,
             )
             if check_fn is None:
-                q.put(("grader_error", "no-check-fn", 0, 0))
+                q.put(("grader_error", "no-check-fn", 0, 0,
+                       "dataset test block defined no check() function"))
                 return
             # 4) Granular run.
             q.put(_run_check_granular(check_fn, ns, ns[entry_point]))
     except TimeoutError:
-        q.put(("timeout", "timeout", 0, 0))
+        q.put(("timeout", "timeout", 0, 0,
+               "execution exceeded the time limit (possible infinite loop)"))
     except Exception as exc:
-        q.put(("grader_error", type(exc).__name__, 0, 0))
+        q.put(("grader_error", type(exc).__name__, 0, 0,
+               f"grader internal error: {type(exc).__name__}: {exc}"))
 
 
 def grade(problem: Problem, completion: str, timeout_s: int = 7) -> GradingResult:
@@ -231,17 +275,21 @@ def grade(problem: Problem, completion: str, timeout_s: int = 7) -> GradingResul
         p.join()
         return GradingResult(passed=False, tier="timeout", score=0.05,
                              error="timeout",
+                             error_text="execution exceeded the wall-clock "
+                                        "limit (possible infinite loop)",
                              elapsed_s=time.perf_counter() - t0)
     try:
-        tier, err, n_tests, n_passed = q.get_nowait()
+        tier, err, n_tests, n_passed, error_text = q.get_nowait()
     except Exception:
         return GradingResult(passed=False, tier="grader_error", score=0.0,
                              error="no-result",
+                             error_text="grader subprocess produced no result",
                              elapsed_s=time.perf_counter() - t0)
     return GradingResult(
         passed=(tier == "pass"), tier=tier,
         score=_compute_score(tier, n_tests, n_passed),
         n_tests=n_tests, n_passed=n_passed, error=err,
+        error_text=error_text,
         elapsed_s=time.perf_counter() - t0,
     )
 

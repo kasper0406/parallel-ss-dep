@@ -114,3 +114,54 @@ def test_score_ladder_monotonic():
     s_partial_hi = _compute_score("partial", 4, 3)
     s_pass = _compute_score("pass", 4, 4)
     assert s_syntax < s_exec < s_runtime <= s_partial_lo < s_partial_hi < s_pass
+
+
+# --- error_text: the diagnosis fed back into the self-repair loop (#80) ---
+
+def test_error_text_none_on_pass():
+    res = grade(_problem(_FOUR_ASSERT_CHECK), "def f(x):\n    return x + 1\n")
+    assert res.error_text is None
+
+
+def test_error_text_syntax_error_has_line():
+    res = grade(_problem(_FOUR_ASSERT_CHECK), "def f(x)\n    return x + 1\n")
+    assert res.error_text is not None
+    assert "SyntaxError" in res.error_text
+    assert "line" in res.error_text
+
+
+def test_error_text_exec_error_has_traceback():
+    res = grade(_problem(_FOUR_ASSERT_CHECK),
+                "raise ValueError('boom')\ndef f(x):\n    return x + 1\n")
+    assert res.error_text is not None
+    assert "ValueError" in res.error_text and "boom" in res.error_text
+
+
+def test_error_text_partial_lists_failed_asserts():
+    # `return -1` fails every assertion — error_text should list them.
+    res = grade(_problem(_FOUR_ASSERT_CHECK), "def f(x):\n    return -1\n")
+    assert res.tier == "partial"
+    assert res.error_text is not None
+    assert "4/4 assertions failed" in res.error_text
+    # the actual failed assertion source must appear, so the model can diagnose
+    assert "candidate(1) == 2" in res.error_text
+    assert "AssertionError" in res.error_text
+
+
+def test_error_text_entry_point_undefined():
+    res = grade(_problem(_FOUR_ASSERT_CHECK), "g = 1\n")
+    assert res.error_text is not None
+    assert "f" in res.error_text and "never defined" in res.error_text
+
+
+def test_error_text_runtime_error_shows_statement():
+    check = (
+        "def check(candidate):\n"
+        "    assert candidate(1) == 2\n"
+        "    boom = 1 / 0\n"
+    )
+    res = grade(_problem(check), "def f(x):\n    return x + 1\n")
+    assert res.tier == "runtime_error"
+    assert res.error_text is not None
+    assert "ZeroDivisionError" in res.error_text
+    assert "1 / 0" in res.error_text

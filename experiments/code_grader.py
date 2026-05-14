@@ -16,6 +16,7 @@ CLI usage (sanity-check a checkpoint):
 from __future__ import annotations
 
 import argparse
+import ast
 import dataclasses
 import multiprocessing as mp
 import pathlib
@@ -59,9 +60,43 @@ class Problem:
     gold_solution: str | None = None
 
 
+# Dense reward ladder. Each tier is a qualitatively different failure
+# mode; `score` is the GRPO reward in [0, 1]. The point is that a weak
+# model gets a non-zero, *differentiated* signal long before it can
+# fully solve a task — so GRPO groups have advantage variance to learn
+# from. `partial` interpolates on the fraction of unit tests passed;
+# the gap between partial-at-max (0.9) and pass (1.0) is the
+# "fully-correct" boost.
+_TIER_BASE_SCORE: dict[str, float] = {
+    "syntax_error":  0.0,   # generated code doesn't compile
+    "grader_error":  0.0,   # the dataset's own test block is broken (not the model's fault)
+    "exec_error":    0.05,  # compiles, but exec'ing the solution raises / entry_point undefined
+    "timeout":       0.05,  # ran but hit the wall-clock limit (e.g. infinite loop)
+    "runtime_error": 0.2,   # check() ran but a setup statement crashed before/between asserts
+    "partial":       0.2,   # + 0.7 * (n_passed / n_tests)
+    "pass":          1.0,   # every assertion passed
+}
+
+
+def _compute_score(tier: str, n_tests: int, n_passed: int) -> float:
+    if tier == "partial" and n_tests > 0:
+        return 0.2 + 0.7 * (n_passed / n_tests)
+    return _TIER_BASE_SCORE.get(tier, 0.0)
+
+
 @dataclasses.dataclass
 class GradingResult:
-    passed: bool               # True iff the test block ran to completion without raising
+    """Dense grading outcome.
+
+    `passed` is kept as a field for backward compatibility (eval scripts
+    read it) but is fully determined by `tier == "pass"`. `score` is the
+    dense reward — that's what the GRPO trainer should consume.
+    """
+    passed: bool               # True iff every assertion passed (tier == "pass")
+    tier: str = "syntax_error"  # one of _TIER_BASE_SCORE keys
+    score: float = 0.0         # dense reward in [0, 1]
+    n_tests: int = 0           # total assertions found in check() (0 if not splittable)
+    n_passed: int = 0          # assertions that passed
     error: str | None = None   # exception class name if it raised; "timeout" on timeout
     elapsed_s: float = 0.0
 
@@ -76,19 +111,89 @@ def truncate_at_stop(text: str) -> str:
     return text[:earliest]
 
 
+def _run_check_granular(check_fn: ast.FunctionDef, ns: dict, candidate):
+    """Run a `check(candidate)` body statement-by-statement so a single
+    failing assert doesn't mask the rest. Returns (tier, error, n_tests,
+    n_passed).
+
+    - `assert` statements are counted individually (pass/fail); a failed
+      one does NOT stop the run.
+    - non-assert statements are setup (assignments, loops, imports); if
+      one raises, the test harness itself broke past that point ->
+      `runtime_error`.
+    """
+    local_ns = dict(ns)
+    local_ns["candidate"] = candidate
+    n_tests = 0
+    n_passed = 0
+    for stmt in check_fn.body:
+        src = ast.unparse(stmt)
+        if isinstance(stmt, ast.Assert):
+            n_tests += 1
+            try:
+                exec(src, local_ns)
+                n_passed += 1
+            except TimeoutError:
+                raise
+            except Exception:
+                pass  # failed assertion or candidate crash — count as fail, continue
+        else:
+            try:
+                exec(src, local_ns)
+            except TimeoutError:
+                raise
+            except Exception as exc:
+                return ("runtime_error", type(exc).__name__, n_tests, n_passed)
+    if n_tests == 0:
+        # check() had no assert statements at all — nothing to grade on.
+        return ("grader_error", "no-asserts", 0, 0)
+    tier = "pass" if n_passed == n_tests else "partial"
+    return (tier, None, n_tests, n_passed)
+
+
 def _exec_target(code: str, test: str, entry_point: str, q: mp.Queue):
-    """Subprocess body: exec the solution, then the test block, then check()."""
+    """Subprocess body: compile + exec the solution, exec the test block,
+    then run check() granularly. Puts (tier, error, n_tests, n_passed)."""
     try:
-        ns: dict = {}
-        # The HumanEval test block defines `check(candidate)`; calling
-        # check(ns[entry_point]) is the actual assertion.
         with _time_limit(5):
-            exec(code, ns)
-            exec(test, ns)
-            ns["check"](ns[entry_point])
-        q.put(("ok", None))
+            # 1) Does the generated code even compile?
+            try:
+                compiled = compile(code, "<solution>", "exec")
+            except SyntaxError as exc:
+                q.put(("syntax_error", type(exc).__name__, 0, 0))
+                return
+            # 2) Does exec'ing the solution itself raise?
+            ns: dict = {}
+            try:
+                exec(compiled, ns)
+            except Exception as exc:
+                q.put(("exec_error", type(exc).__name__, 0, 0))
+                return
+            if entry_point not in ns:
+                q.put(("exec_error", "entry-point-undefined", 0, 0))
+                return
+            # 3) Exec the dataset's test block to define check(). A failure
+            # here is the dataset's fault, not the model's.
+            try:
+                exec(test, ns)
+                check_tree = ast.parse(test)
+            except Exception as exc:
+                q.put(("grader_error", type(exc).__name__, 0, 0))
+                return
+            check_fn = next(
+                (n for n in ast.walk(check_tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "check"),
+                None,
+            )
+            if check_fn is None:
+                q.put(("grader_error", "no-check-fn", 0, 0))
+                return
+            # 4) Granular run.
+            q.put(_run_check_granular(check_fn, ns, ns[entry_point]))
+    except TimeoutError:
+        q.put(("timeout", "timeout", 0, 0))
     except Exception as exc:
-        q.put(("err", type(exc).__name__))
+        q.put(("grader_error", type(exc).__name__, 0, 0))
 
 
 def grade(problem: Problem, completion: str, timeout_s: int = 7) -> GradingResult:
@@ -120,17 +225,23 @@ def grade(problem: Problem, completion: str, timeout_s: int = 7) -> GradingResul
     p.start()
     p.join(timeout=timeout_s)
     if p.is_alive():
+        # Outer wall-clock guard (the inner _time_limit alarm should fire
+        # first, but a hung subprocess that ignores SIGALRM lands here).
         p.terminate()
         p.join()
-        return GradingResult(passed=False, error="timeout",
+        return GradingResult(passed=False, tier="timeout", score=0.05,
+                             error="timeout",
                              elapsed_s=time.perf_counter() - t0)
     try:
-        status, err = q.get_nowait()
+        tier, err, n_tests, n_passed = q.get_nowait()
     except Exception:
-        return GradingResult(passed=False, error="no-result",
+        return GradingResult(passed=False, tier="grader_error", score=0.0,
+                             error="no-result",
                              elapsed_s=time.perf_counter() - t0)
     return GradingResult(
-        passed=(status == "ok"), error=err,
+        passed=(tier == "pass"), tier=tier,
+        score=_compute_score(tier, n_tests, n_passed),
+        n_tests=n_tests, n_passed=n_passed, error=err,
         elapsed_s=time.perf_counter() - t0,
     )
 
@@ -217,7 +328,9 @@ def _self_test_with_gold(problems: list[Problem], max_problems: int) -> None:
         if res.passed:
             n_pass += 1
         else:
-            print(f"  ✗ {prob.task_id}  err={res.error}")
+            print(f"  ✗ {prob.task_id}  tier={res.tier} "
+                  f"score={res.score:.2f} "
+                  f"tests={res.n_passed}/{res.n_tests} err={res.error}")
     print(f"\nGold solution check: {n_pass}/{n} pass "
           f"({100 * n_pass / max(1, n):.1f}%)")
 

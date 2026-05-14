@@ -274,6 +274,7 @@ class MixedSourceStream(IterableDataset):
                  think_max_burst_depth: int = 6,
                  base_seed: int = 0,
                  mask_eos_in_targets: bool = False,
+                 emit_doc_ids: bool = False,
                  ):
         if not sources:
             raise ValueError("sources must be non-empty")
@@ -291,6 +292,7 @@ class MixedSourceStream(IterableDataset):
         self.think_max_burst_depth = int(think_max_burst_depth)
         self.base_seed = int(base_seed)
         self.mask_eos_in_targets = bool(mask_eos_in_targets)
+        self.emit_doc_ids = bool(emit_doc_ids)
         self._filters = [_build_filter(s.filter_spec) for s in sources]
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
@@ -316,6 +318,11 @@ class MixedSourceStream(IterableDataset):
 
         # One persistent buffer per source so leftover tokens are reused.
         buffers: list[list[int]] = [[] for _ in self.sources]
+        # Parallel per-position document ids (only filled when emit_doc_ids):
+        # every token of a document shares an id; the trailing EOS belongs to
+        # the *closing* document; the next document's first token increments.
+        buffer_docids: list[list[int]] = [[] for _ in self.sources]
+        doc_counters = [0] * len(self.sources)
         source_counts = [0] * len(self.sources)  # for smoke diagnostics
 
         def fill_buffer(idx: int) -> bool:
@@ -340,6 +347,10 @@ class MixedSourceStream(IterableDataset):
                 ids = tok.encode(text, add_special_tokens=False)
                 buffers[idx].extend(ids)
                 buffers[idx].append(eos)
+                if self.emit_doc_ids:
+                    c = doc_counters[idx]
+                    buffer_docids[idx].extend([c] * (len(ids) + 1))  # +1 = EOS
+                    doc_counters[idx] = c + 1
             return True
 
         while True:
@@ -354,6 +365,11 @@ class MixedSourceStream(IterableDataset):
             source_counts[idx] += 1
             chunk = buffers[idx][: self.block_size + 1]
             buffers[idx] = buffers[idx][self.block_size:]
+            if self.emit_doc_ids:
+                chunk_docids = buffer_docids[idx][: self.block_size + 1]
+                buffer_docids[idx] = buffer_docids[idx][self.block_size:]
+            else:
+                chunk_docids = None
             # Random think-burst insertion at chunk boundary.
             if (self.thinking_token_id is not None
                     and self.think_burst_prob > 0.0
@@ -364,20 +380,38 @@ class MixedSourceStream(IterableDataset):
                 # what matters is the inserted think tokens at random positions.
                 ids_only = chunk[:]
                 fake_labels = chunk[:]  # placeholder; rebuilt below
-                ids_with_thinks, _ = insert_think_bursts(
-                    ids_only, fake_labels,
-                    thinking_token_id=int(self.thinking_token_id),
-                    max_len=self.block_size + 1,
-                    max_bursts=self.think_max_bursts,
-                    max_burst_depth=self.think_max_burst_depth,
-                    rng=torch_rng,
-                )
+                if chunk_docids is not None:
+                    ids_with_thinks, _, docids_with_thinks = insert_think_bursts(
+                        ids_only, fake_labels,
+                        thinking_token_id=int(self.thinking_token_id),
+                        max_len=self.block_size + 1,
+                        max_bursts=self.think_max_bursts,
+                        max_burst_depth=self.think_max_burst_depth,
+                        rng=torch_rng,
+                        aligned=chunk_docids[:],
+                    )
+                else:
+                    ids_with_thinks, _ = insert_think_bursts(
+                        ids_only, fake_labels,
+                        thinking_token_id=int(self.thinking_token_id),
+                        max_len=self.block_size + 1,
+                        max_bursts=self.think_max_bursts,
+                        max_burst_depth=self.think_max_burst_depth,
+                        rng=torch_rng,
+                    )
+                    docids_with_thinks = None
                 # Re-pad if shortened (insert_think_bursts caps at max_len; can
                 # be shorter if the bursts pushed the tail off and we already
                 # had < max_len real tokens). Pad with eos.
                 while len(ids_with_thinks) < self.block_size + 1:
                     ids_with_thinks.append(eos)
+                    if docids_with_thinks is not None:
+                        # Padding belongs to the last document seen.
+                        docids_with_thinks.append(
+                            docids_with_thinks[-1] if docids_with_thinks else 0)
                 chunk = ids_with_thinks[: self.block_size + 1]
+                if docids_with_thinks is not None:
+                    chunk_docids = docids_with_thinks[: self.block_size + 1]
             # Shift to (inputs, targets); mask targets at think positions.
             inputs = torch.tensor(chunk[:-1], dtype=torch.long)
             targets = torch.tensor(chunk[1:], dtype=torch.long)
@@ -395,9 +429,15 @@ class MixedSourceStream(IterableDataset):
                 eos_mask = (targets == int(eos))
                 if eos_mask.any():
                     targets = targets.masked_fill(eos_mask, -100)
-            # Stash diagnostics on the tensor (so the smoke script can read
-            # them); kept as Python ints to survive DataLoader serialisation.
-            yield inputs, targets
+            if self.emit_doc_ids:
+                # Align with `inputs` (drop the last position) and normalise
+                # to 0-based per chunk so doc_ids start at 0 in every row.
+                row = chunk_docids[:-1]
+                mn = min(row) if row else 0
+                doc_ids = torch.tensor([d - mn for d in row], dtype=torch.long)
+                yield inputs, targets, doc_ids
+            else:
+                yield inputs, targets
 
 
 # ---------------------------------------------------------------------------

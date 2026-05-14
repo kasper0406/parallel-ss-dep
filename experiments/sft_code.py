@@ -112,7 +112,8 @@ def insert_think_bursts(
     thinking_token_id: int, max_len: int,
     max_bursts: int = 3, max_burst_depth: int = 8,
     rng: torch.Generator | None = None,
-) -> tuple[list[int], list[int]]:
+    aligned: list[int] | None = None,
+) -> tuple[list[int], list[int]] | tuple[list[int], list[int], list[int]]:
     """Insert random-depth thinking-token bursts into a (input_ids, labels) pair.
 
     Each burst is a run of `depth` think tokens; depth ~ U[1, max_burst_depth].
@@ -125,22 +126,33 @@ def insert_think_bursts(
     contribute), but every real-token prediction that follows a think burst
     requires the model to have processed those think tokens gracefully, so
     the think-embedding and memory weights have to learn to be useful.
+
+    `aligned`: an optional per-token array (same length as `input_ids`, e.g.
+    document ids) that must stay aligned through the same insertions. Each
+    inserted think token copies the doc id of the preceding real token, so a
+    think burst belongs to the document it sits inside. When given, the
+    return is a 3-tuple `(new_ids, new_labels, new_aligned)`; otherwise the
+    2-tuple `(new_ids, new_labels)` — existing callers are unaffected.
     """
+    def _ret(ids, labs, al):
+        return (ids, labs, al) if aligned is not None else (ids, labs)
+
     if rng is None:
         rng = torch.Generator().manual_seed(0)
     if max_bursts <= 0:
-        return input_ids, labels
+        return _ret(input_ids, labels, aligned)
     n = len(input_ids)
     if n < 4:
-        return input_ids, labels
+        return _ret(input_ids, labels, aligned)
     n_bursts = int(torch.randint(0, max_bursts + 1, (1,), generator=rng).item())
     if n_bursts == 0:
-        return input_ids, labels
+        return _ret(input_ids, labels, aligned)
     burst_positions = sorted(
         torch.randperm(n, generator=rng)[:n_bursts].tolist()
     )
     new_ids: list[int] = []
     new_labels: list[int] = []
+    new_aligned: list[int] = []
     last = 0
     for p in burst_positions:
         new_ids.extend(input_ids[last:p])
@@ -150,13 +162,22 @@ def insert_think_bursts(
         )
         new_ids.extend([int(thinking_token_id)] * depth)
         new_labels.extend([-100] * depth)
+        if aligned is not None:
+            new_aligned.extend(aligned[last:p])
+            # Inserted think tokens belong to the document of the preceding
+            # real token (or the first document, at position 0).
+            fill = aligned[p - 1] if p > 0 else aligned[0]
+            new_aligned.extend([fill] * depth)
         last = p
     new_ids.extend(input_ids[last:])
     new_labels.extend(labels[last:])
+    if aligned is not None:
+        new_aligned.extend(aligned[last:])
     if len(new_ids) > max_len:
         new_ids = new_ids[:max_len]
         new_labels = new_labels[:max_len]
-    return new_ids, new_labels
+        new_aligned = new_aligned[:max_len]
+    return _ret(new_ids, new_labels, new_aligned)
 
 
 def main() -> int:

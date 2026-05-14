@@ -423,13 +423,28 @@ def build_parser() -> argparse.ArgumentParser:
                         "Default on; pass --no-compile to disable — e.g. "
                         "if compile errors on the nightly-torch / FLA / "
                         "Blackwell stack or triggers recompilation storms.")
-    p.add_argument("--wd", type=float, default=0.1,
+    p.add_argument("--wd", type=float, default=0.01,
                    help="Weight decay for non-α params (Muon + AdamW "
-                        "regular groups). Default 0.1.")
+                        "regular groups). Default 0.01 (the validated value; "
+                        "0.1 is the Moonlight-scale setting and over-brakes "
+                        "at our token budget — see the residual-collapse "
+                        "diagnosis).")
     p.add_argument("--layer_drop_max", type=float, default=0.0,
                    help="Stochastic Depth: per-block drop probability "
                         "ramps linearly 0 → this value across depth. "
                         "Default 0.0 (off).")
+    p.add_argument("--grad_accum", type=int, default=1,
+                   help="Gradient-accumulation microbatches per optimizer "
+                        "step. Effective batch = batch * grad_accum. Only "
+                        "supported on the non-thinking-token (pretrain) "
+                        "path. Default 1.")
+    p.add_argument("--grad_clip", type=float, default=1.0,
+                   help="Global grad-norm clip applied before each optimizer "
+                        "step. 0 disables clipping. Default 1.0.")
+    p.add_argument("--z_loss", type=float, default=1e-4,
+                   help="Weight on the z-loss regulariser "
+                        "mean(logsumexp(logits)^2), which keeps output "
+                        "logits from drifting. Default 1e-4; 0 disables.")
     p.add_argument("--alpha_wd", type=float, default=0.0,
                    help="Weight-decay applied to FiLM α scalars (matched by "
                         "name suffix '.alpha' inside any feedback container). "

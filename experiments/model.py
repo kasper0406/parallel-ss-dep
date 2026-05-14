@@ -54,11 +54,17 @@ class Block(nn.Module):
         self.mlp = GLU(d_model, d_ff)
 
     def forward(self, x: torch.Tensor,
-                input_ids: torch.Tensor | None = None) -> torch.Tensor:
+                input_ids: torch.Tensor | None = None,
+                cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
         # Symbol-grounded attention needs the raw token IDs to key its
         # sparse table. Other attentions ignore input_ids.
+        # cu_seqlens (cross-document isolation) is passed only to attentions
+        # that advertise `accepts_cu_seqlens` — FLA recurrent kernels.
         if getattr(self.attn, "needs_input_ids", False):
             x = x + self.attn(self.attn_norm(x), input_ids=input_ids)
+        elif cu_seqlens is not None and getattr(
+                self.attn, "accepts_cu_seqlens", False):
+            x = x + self.attn(self.attn_norm(x), cu_seqlens=cu_seqlens)
         else:
             x = x + self.attn(self.attn_norm(x))
         x = x + self.mlp(self.mlp_norm(x))
@@ -89,17 +95,56 @@ class Block(nn.Module):
 
 
 def _run_block(blk: nn.Module, h: torch.Tensor,
-               input_ids: torch.Tensor | None) -> torch.Tensor:
+               input_ids: torch.Tensor | None,
+               cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
     """Free function so torch.utils.checkpoint can pickle / re-run it
     cleanly (closures over `self` cause occasional issues with the
     non-reentrant checkpoint implementation)."""
-    return blk(h, input_ids=input_ids)
+    return blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
 
 
 def _ckpt_run_block(blk: nn.Module, h: torch.Tensor,
-                    input_ids: torch.Tensor | None) -> torch.Tensor:
+                    input_ids: torch.Tensor | None,
+                    cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
     from torch.utils.checkpoint import checkpoint
-    return checkpoint(_run_block, blk, h, input_ids, use_reentrant=False)
+    return checkpoint(_run_block, blk, h, input_ids, cu_seqlens,
+                      use_reentrant=False)
+
+
+def _build_cu_seqlens(doc_ids: torch.Tensor | None) -> torch.Tensor | None:
+    """Ragged `cu_seqlens` (int32, shape [N_segments + 1]) over the
+    row-major-flattened (B, T) batch, for FLA's packed-sequence kernels.
+
+    A new segment starts at every row boundary and wherever `doc_ids`
+    changes within a row — so multiple documents packed into one T-length
+    sequence each become an independent segment, and the DeltaNet recurrent
+    state never flows across a document boundary.
+
+    Returns None when `doc_ids` is None: the caller then takes the plain
+    batched path, where each row is already an independent sequence (state
+    does not flow across the batch dim) — the leak-free default for any
+    stream that does not pack multiple documents per row.
+    """
+    if doc_ids is None:
+        return None
+    B, T = doc_ids.shape
+    device = doc_ids.device
+    if B * T == 0:
+        return torch.zeros(1, dtype=torch.int32, device=device)
+    flat = doc_ids.reshape(-1)
+    idx = torch.arange(1, B * T, device=device)
+    change = flat[1:] != flat[:-1]
+    row_start = (idx % T) == 0
+    is_start = torch.cat([
+        torch.ones(1, dtype=torch.bool, device=device),
+        change | row_start,
+    ])
+    starts = is_start.nonzero(as_tuple=False).flatten()
+    cu = torch.cat([
+        starts,
+        torch.tensor([B * T], dtype=starts.dtype, device=device),
+    ]).to(torch.int32)
+    return cu
 
 
 def _shift_right_by_1(o: torch.Tensor) -> torch.Tensor:
@@ -858,9 +903,15 @@ class WorkingMemory(nn.Module):
         nn.init.zeros_(self.W_write.bias)
 
     def forward(self, h: torch.Tensor, input_ids: torch.Tensor,
-                read_mask: torch.Tensor | None = None) -> torch.Tensor:
+                read_mask: torch.Tensor | None = None,
+                doc_ids: torch.Tensor | None = None) -> torch.Tensor:
         """`read_mask` (B, T) bool/float: 1 where memory should be injected.
-        If None, derived from `input_ids == thinking_token_id`."""
+        If None, derived from `input_ids == thinking_token_id`.
+
+        `doc_ids` (B, T): when given, a query position may only read buffer
+        slots from its own document — a think token in document 2 never
+        attends to document 1's hidden states. None → no document masking
+        (behaviour unchanged)."""
         B, T, _ = h.shape
         device = h.device
 
@@ -904,10 +955,20 @@ class WorkingMemory(nn.Module):
         causal_mask = src_pos >= pos                              # (B, T, K)
         scores = scores.masked_fill(causal_mask, float("-inf"))
 
-        # Some rows (t < min source position) get all -inf. Softmax of all
-        # -inf is NaN; replace those rows with zero attention so the read is
-        # zero (and the injection is zero).
-        all_masked = causal_mask.all(dim=-1, keepdim=True)        # (B, T, 1)
+        # Document mask: a query at position t may only read buffer slots whose
+        # source token lies in the same document. Without this the memory
+        # leaks hidden states across packed-document boundaries.
+        blocked = causal_mask
+        if doc_ids is not None:
+            buf_doc = torch.gather(doc_ids, 1, top_idx)           # (B, K)
+            doc_mask = buf_doc.unsqueeze(1) != doc_ids.unsqueeze(-1)  # (B, T, K)
+            scores = scores.masked_fill(doc_mask, float("-inf"))
+            blocked = causal_mask | doc_mask
+
+        # Some rows (t < min source position, or no in-document predecessor)
+        # get all -inf. Softmax of all -inf is NaN; replace those rows with
+        # zero attention so the read is zero (and the injection is zero).
+        all_masked = blocked.all(dim=-1, keepdim=True)            # (B, T, 1)
         attn = torch.softmax(scores, dim=-1)
         attn = torch.where(all_masked, torch.zeros_like(attn), attn)
 
@@ -1242,6 +1303,7 @@ class TinyLM(nn.Module):
                                       film_sources_lagged: dict | None,
                                       input_ids: torch.Tensor | None,
                                       surprise: torch.Tensor | None = None,
+                                      cu_seqlens: torch.Tensor | None = None,
                                       ) -> dict:
         """One sparse-FiLM forward pass — collect source-layer outputs for
         use as next iteration's FiLM input.
@@ -1267,7 +1329,7 @@ class TinyLM(nn.Module):
                 src = self.sparse_target_to_source[L]
                 h = self.sparse_feedback[str(L)](h, film_sources_lagged[src],
                                                   surprise=surprise)
-            h = blk(h, input_ids=input_ids)
+            h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
             if (film_sources_lagged is not None
                     and L in self.sparse_target_to_source
                     and self.feedback_position == "post"):
@@ -1280,7 +1342,8 @@ class TinyLM(nn.Module):
 
     def _block_fwd(self, blk: nn.Module, h: torch.Tensor,
                    input_ids: torch.Tensor | None,
-                   L: int = -1) -> torch.Tensor:
+                   L: int = -1,
+                   cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
         """Run one Block; optionally checkpoint and/or stochastically drop.
 
         Activation checkpointing trades ~30% extra compute for a large
@@ -1298,17 +1361,20 @@ class TinyLM(nn.Module):
             if torch.rand((), device=h.device).item() < p_L:
                 return h
         if self.activation_checkpointing and torch.is_grad_enabled():
-            return _ckpt_run_block(blk, h, input_ids)
-        return blk(h, input_ids=input_ids)
+            return _ckpt_run_block(blk, h, input_ids, cu_seqlens)
+        return blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
 
     def _apply_memory(self, h_normed: torch.Tensor,
                       input_ids: torch.Tensor,
-                      read_mask: torch.Tensor | None = None) -> torch.Tensor:
+                      read_mask: torch.Tensor | None = None,
+                      doc_ids: torch.Tensor | None = None) -> torch.Tensor:
         """No-op unless use_memory; else inject working-memory read at the
-        positions selected by read_mask (default: think-token positions)."""
+        positions selected by read_mask (default: think-token positions).
+        `doc_ids` (when given) confines reads/writes to within a document."""
         if not self.use_memory:
             return h_normed
-        return self.memory(h_normed, input_ids, read_mask=read_mask)
+        return self.memory(h_normed, input_ids, read_mask=read_mask,
+                           doc_ids=doc_ids)
 
     def _finalize(self, h_raw: torch.Tensor,
                   input_ids: torch.Tensor,
@@ -1317,7 +1383,8 @@ class TinyLM(nn.Module):
                   return_hidden: bool,
                   return_gate: bool,
                   maybe_gate,
-                  extra: tuple = ()):
+                  extra: tuple = (),
+                  doc_ids: torch.Tensor | None = None):
         """Shared exit-tail for every forward branch:
         out_norm → memory → lm_head → (aux, hidden, gate) packing.
 
@@ -1325,9 +1392,11 @@ class TinyLM(nn.Module):
         effect (`self._last_gate*`) lands consistently.
         `extra` is appended to the outputs after aux/hidden/gate — used by
         the dense-feedback path to thread `surprise_loss` through.
+        `doc_ids` confines working-memory reads/writes to within a document.
         """
         h = self.out_norm(h_raw)
-        h = self._apply_memory(h, input_ids, read_mask=mem_read_mask)
+        h = self._apply_memory(h, input_ids, read_mask=mem_read_mask,
+                               doc_ids=doc_ids)
         lm_logits = self.lm_head(h)
         outs = (lm_logits,)
         if return_aux and self.aux_dim > 0:
@@ -1346,8 +1415,15 @@ class TinyLM(nn.Module):
                 return_hidden: bool = False,
                 return_gate: bool = False,
                 mem_read_mask: torch.Tensor | None = None,
+                doc_ids: torch.Tensor | None = None,
                 ) -> torch.Tensor | tuple:
         x = self.embed(input_ids)
+
+        # Cross-document isolation: when `doc_ids` marks multiple documents
+        # packed into one T-length row, `cu_seqlens` makes the DeltaNet
+        # recurrent kernel reset state at each document boundary. None →
+        # plain batched path (each row already an independent sequence).
+        cu_seqlens = _build_cu_seqlens(doc_ids)
 
         if self.max_T > 0:
             T = input_ids.shape[1]
@@ -1372,10 +1448,11 @@ class TinyLM(nn.Module):
             # no gradient on bypassed steps — intentional (early grad is
             # noise; the K-self-feed tax isn't worth paying yet).
             for L, blk in enumerate(self.blocks):
-                x = self._block_fwd(blk, x, input_ids, L=L)
+                x = self._block_fwd(blk, x, input_ids, L=L,
+                                    cu_seqlens=cu_seqlens)
             return self._finalize(x, input_ids, mem_read_mask,
                                    return_aux, return_hidden, return_gate,
-                                   _maybe_gate)
+                                   _maybe_gate, doc_ids=doc_ids)
 
         if self.feedback_xattn_pairs:
             # Pass 1: vanilla. Collect outputs at every layer that any target
@@ -1386,7 +1463,7 @@ class TinyLM(nn.Module):
             pass1_at_sources: dict = {}
             h1 = x
             for L, blk in enumerate(self.blocks):
-                h1 = blk(h1, input_ids=input_ids)
+                h1 = blk(h1, input_ids=input_ids, cu_seqlens=cu_seqlens)
                 if L in needed_sources:
                     pass1_at_sources[L] = h1
             # Pass 2: at each target layer, gather lagged source states and
@@ -1405,10 +1482,10 @@ class TinyLM(nn.Module):
                         srcs = self.xattn_target_to_sources[L]
                         src_states = [lagged_pass1[s] for s in srcs]
                         h = self.xattn_feedback[str(L)](h, src_states)
-                h = blk(h, input_ids=input_ids)
+                h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
             return self._finalize(h, input_ids, mem_read_mask,
                                    return_aux, return_hidden, return_gate,
-                                   _maybe_gate)
+                                   _maybe_gate, doc_ids=doc_ids)
         if self.feedback_pairs:
             source_layers = set(s for _, s in self.feedback_pairs)
 
@@ -1435,7 +1512,7 @@ class TinyLM(nn.Module):
                 with torch.no_grad():
                     src_states = self._sparse_pass_collect_sources(
                         x, source_layers, film_sources_lagged=None,
-                        input_ids=input_ids,
+                        input_ids=input_ids, cu_seqlens=cu_seqlens,
                     )
                 # Iterations 1 .. K-2 (if K>2): self-feed. Detached so backward
                 # never reaches them.
@@ -1461,7 +1538,7 @@ class TinyLM(nn.Module):
                         prev_src_states = src_states   # save iter K-2 (= prev)
                         src_states = self._sparse_pass_collect_sources(
                             x, source_layers, film_sources_lagged=film_in,
-                            input_ids=input_ids,
+                            input_ids=input_ids, cu_seqlens=cu_seqlens,
                         )
                 # Final iteration K-1: this is the loss-bearing pass. Backprop
                 # flows through this forward only. FiLM inputs come from the
@@ -1506,7 +1583,8 @@ class TinyLM(nn.Module):
                         src = self.sparse_target_to_source[L]
                         sup = surprise_per_target.get(L) if surprise_per_target else None
                         h = self.sparse_feedback[str(L)](h, film_in[src], surprise=sup)
-                    h = self._block_fwd(blk, h, input_ids, L=L)
+                    h = self._block_fwd(blk, h, input_ids, L=L,
+                                    cu_seqlens=cu_seqlens)
                     if L in self.sparse_target_to_source and self.feedback_position == "post":
                         src = self.sparse_target_to_source[L]
                         sup = surprise_per_target.get(L) if surprise_per_target else None
@@ -1537,7 +1615,7 @@ class TinyLM(nn.Module):
                     self._last_alpha_t_per_target = {}
                 return self._finalize(h, input_ids, mem_read_mask,
                                        return_aux, return_hidden, return_gate,
-                                       _maybe_gate)
+                                       _maybe_gate, doc_ids=doc_ids)
             # ----------------------------------------------------------------
             # Standard 2-pass sparse FiLM (existing path).
             # ----------------------------------------------------------------
@@ -1545,7 +1623,7 @@ class TinyLM(nn.Module):
             pass1_at_sources: dict = {}
             h1 = x
             for L, blk in enumerate(self.blocks):
-                h1 = blk(h1, input_ids=input_ids)
+                h1 = blk(h1, input_ids=input_ids, cu_seqlens=cu_seqlens)
                 if L in source_layers:
                     pass1_at_sources[L] = h1
             # Pass 2: forward with sparse modulation at target layers.
@@ -1558,7 +1636,8 @@ class TinyLM(nn.Module):
                     state_above_lagged = _shift_right_by_k(pass1_at_sources[src],
                                                             self.feedback_lag)
                     h = self.sparse_feedback[str(L)](h, state_above_lagged)
-                h = self._block_fwd(blk, h, input_ids, L=L)
+                h = self._block_fwd(blk, h, input_ids, L=L,
+                                    cu_seqlens=cu_seqlens)
                 if L in self.sparse_target_to_source and self.feedback_position == "post":
                     src = self.sparse_target_to_source[L]
                     state_above_lagged = _shift_right_by_k(pass1_at_sources[src],
@@ -1566,7 +1645,7 @@ class TinyLM(nn.Module):
                     h = self.sparse_feedback[str(L)](h, state_above_lagged)
             return self._finalize(h, input_ids, mem_read_mask,
                                    return_aux, return_hidden, return_gate,
-                                   _maybe_gate)
+                                   _maybe_gate, doc_ids=doc_ids)
         # Pass 1: vanilla forward, collect each layer's output.
         pass1_outs: list[torch.Tensor] = []
         h = x
@@ -1581,7 +1660,7 @@ class TinyLM(nn.Module):
         N = len(self.blocks)
         for L, blk in enumerate(self.blocks):
             if self.feedback_mode == "none":
-                h = blk(h, input_ids=input_ids)
+                h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
                 continue
             # Gather multi-scale lagged states for layer L.
             states_above: list = []
@@ -1592,7 +1671,7 @@ class TinyLM(nn.Module):
                 else:
                     states_above.append(None)
             h_input = self.feedback[L](h, states_above)
-            h = blk(h_input, input_ids=input_ids)
+            h = blk(h_input, input_ids=input_ids, cu_seqlens=cu_seqlens)
 
         return self._finalize(h, input_ids, mem_read_mask,
                                return_aux, return_hidden, return_gate,

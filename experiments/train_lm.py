@@ -97,6 +97,54 @@ def _block_update_ratios(model, snapshot) -> list[float]:
     return out
 
 
+def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
+                           doc_ids=None):
+    """Forward + LM loss for the non-thinking-token (pretrain) path.
+
+    Returns (logits, ce_per_token, lm_loss, aux_loss). Factored out of the
+    step loop so gradient accumulation can run it once per microbatch.
+    Mirrors the inline forward + gate/plain-loss branches exactly.
+    """
+    if args.aux_brackets:
+        logits, aux_logits = model(x, return_aux=True, doc_ids=doc_ids)
+        depth = bracket_depth(x, bracket_deltas).clamp(0, args.aux_max_depth)
+        aux_loss = F.cross_entropy(
+            aux_logits.reshape(-1, args.aux_max_depth + 1),
+            depth.reshape(-1),
+        )
+    else:
+        logits = model(x, doc_ids=doc_ids)
+        aux_loss = torch.zeros((), device="cuda")
+    V = logits.shape[-1]
+    ce_per_token = F.cross_entropy(
+        logits.reshape(-1, V), y.reshape(-1), reduction="none",
+    ).reshape(y.shape)                                                   # (B, T)
+    if args.output_gate:
+        g = model._last_gate                                             # (B, T)
+        if args.gate_warmup_steps > 0:
+            progress = min(1.0, step / args.gate_warmup_steps)
+            gate_floor = (1.0 - progress) * 1.0 + progress * args.gate_floor_min
+        else:
+            gate_floor = args.gate_floor_min
+        g_eff = g.clamp(min=gate_floor) if gate_floor > 0.0 else g
+        gate_terms = g_eff * ce_per_token + (1.0 - g_eff) * args.gate_lambda
+        valid = (y != -100).float()
+        denom = valid.sum().clamp(min=1.0)
+        lm_loss = (gate_terms * valid).sum() / denom
+    else:
+        valid = (y != -100).float()
+        denom = valid.sum().clamp(min=1.0)
+        lm_loss = (ce_per_token * valid).sum() / denom
+    return logits, ce_per_token, lm_loss, aux_loss
+
+
+def _z_loss_term(logits, weight):
+    """z-loss regulariser: weight * mean(logsumexp(logits)^2)."""
+    if weight <= 0.0:
+        return logits.new_zeros(())
+    return weight * (torch.logsumexp(logits, dim=-1) ** 2).mean()
+
+
 class TokenisedStream(IterableDataset):
     """Streaming IterableDataset of fixed-length tokenised chunks."""
 
@@ -169,6 +217,14 @@ def main():
         raise SystemExit("--think_replay_weight must be non-negative.")
     if args.enable_thinking_token and args.think_aux_loss_scale < 0:
         raise SystemExit("--think_aux_loss_scale must be non-negative.")
+    if args.grad_accum < 1:
+        raise SystemExit("--grad_accum must be >= 1.")
+    if args.grad_accum > 1 and args.enable_thinking_token:
+        raise SystemExit(
+            "--grad_accum > 1 is only supported on the non-thinking-token "
+            "(pretrain) path; the thinking-token path has its own "
+            "--think_queue_accum_steps."
+        )
     if args.enable_thinking_token and args.think_queue_accum_steps < 0:
         raise SystemExit("--think_queue_accum_steps must be non-negative.")
     if args.enable_thinking_token and args.think_queue_accum_max_steps < 0:
@@ -246,6 +302,7 @@ def main():
             think_max_burst_depth=args.think_max_burst_depth,
             base_seed=args.seed,
             mask_eos_in_targets=bool(args.mask_eos_in_targets),
+            emit_doc_ids=True,
         )
         # Val: same sources, different seed, burst injection off so val PPL
         # reflects the clean data distribution.
@@ -255,6 +312,7 @@ def main():
             think_burst_prob=0.0,
             base_seed=args.seed + 999_983,
             mask_eos_in_targets=bool(args.mask_eos_in_targets),
+            emit_doc_ids=True,
         )
         train_loader = DataLoader(train_ds, batch_size=args.batch, num_workers=2)
         val_loader = DataLoader(val_ds, batch_size=args.batch, num_workers=1)
@@ -685,8 +743,12 @@ def main():
         except StopIteration:
             train_iter = iter(train_loader)
             batch = next(train_iter)
-        x, y = batch
+        # Streams may yield (x, y) or (x, y, doc_ids); doc_ids drives
+        # cross-document state isolation in the model (None = one document
+        # per row, the leak-free default for the non-data_mix path).
+        x, y, *_rest = batch
         x, y = x.to("cuda"), y.to("cuda")
+        doc_ids = _rest[0].to("cuda") if _rest else None
         # K-self-feed curriculum: bypass FiLM (1-pass forward) until the
         # warmup boundary, then run the configured --feedback_self_k.
         if args.feedback_self_k_warmup_steps > 0:
@@ -791,28 +853,28 @@ def main():
                 x = torch.cat(packed_rows, dim=0)
                 y = torch.cat(packed_targets, dim=0)
             fresh_offset = n_cont + n_replay
-        if args.aux_brackets:
-            logits, aux_logits = model(x, return_aux=True)
-        else:
-            logits = model(x)
-            aux_logits = None
-        if args.aux_brackets:
-            depth = bracket_depth(x, bracket_deltas).clamp(0, args.aux_max_depth)
-            aux_loss = F.cross_entropy(
-                aux_logits.reshape(-1, args.aux_max_depth + 1),
-                depth.reshape(-1),
-            )
-        else:
-            aux_loss = torch.zeros((), device="cuda")
         # Gated loss (Phase 23): L = mean(g_t * CE_t + (1-g_t) * λ).
         # g_t is stored in model._last_gate by the forward pass (side effect).
         # When output_gate is off, fall back to standard mean CE.
-        V = logits.shape[-1]
-        ce_per_token = F.cross_entropy(
-            logits.reshape(-1, V), y.reshape(-1),
-            reduction="none",
-        ).reshape(y.shape)                                               # (B, T)
         if args.enable_thinking_token:
+            if args.aux_brackets:
+                logits, aux_logits = model(x, return_aux=True)
+            else:
+                logits = model(x)
+                aux_logits = None
+            if args.aux_brackets:
+                depth = bracket_depth(x, bracket_deltas).clamp(0, args.aux_max_depth)
+                aux_loss = F.cross_entropy(
+                    aux_logits.reshape(-1, args.aux_max_depth + 1),
+                    depth.reshape(-1),
+                )
+            else:
+                aux_loss = torch.zeros((), device="cuda")
+            V = logits.shape[-1]
+            ce_per_token = F.cross_entropy(
+                logits.reshape(-1, V), y.reshape(-1),
+                reduction="none",
+            ).reshape(y.shape)                                               # (B, T)
             schedule = apply_queue_backpressure(thinking_schedule(step))
             think_curriculum = schedule["curriculum"]
             think_explore_prob_eff = schedule["explore_prob"]
@@ -1087,40 +1149,36 @@ def main():
                 merge_thinking_stats(pre_think_stats, think_stats)
                 think_stats = pre_think_stats
             think_stats_window.append(think_stats)
-        elif args.output_gate:
-            g = model._last_gate                                         # (B, T)
-            # Warmup floor: clamp gate from below, decaying 1.0 → gate_floor_min
-            # over gate_warmup_steps. Prevents early collapse when initial CE >> λ
-            # AND (with gate_floor_min > 0) prevents the late maladaptive-thinking
-            # trap where the model collapses to predict the think token everywhere.
-            if args.gate_warmup_steps > 0:
-                progress = min(1.0, step / args.gate_warmup_steps)
-                gate_floor = (1.0 - progress) * 1.0 + progress * args.gate_floor_min
-            else:
-                gate_floor = args.gate_floor_min
-            if gate_floor > 0.0:
-                g_eff = g.clamp(min=gate_floor)
-            else:
-                g_eff = g
-            gate_terms = g_eff * ce_per_token + (1.0 - g_eff) * args.gate_lambda
-            # Mask positions where the target is -100 (e.g. positions where
-            # the model is predicting a think token under mixed-corpus burst
-            # injection — no loss should accrue there).
-            valid = (y != -100).float()
-            denom = valid.sum().clamp(min=1.0)
-            lm_loss = (gate_terms * valid).sum() / denom
+            loss = lm_loss + args.aux_weight * aux_loss
+            loss = loss + _z_loss_term(logits, args.z_loss)
+            loss.backward()
         else:
-            valid = (y != -100).float()
-            denom = valid.sum().clamp(min=1.0)
-            lm_loss = (ce_per_token * valid).sum() / denom
-        loss = lm_loss + args.aux_weight * aux_loss
-        loss.backward()
+            # Non-thinking (pretrain) path: gradient accumulation over
+            # --grad_accum microbatches, one optimizer step per `step`.
+            # The gate/plain-loss branches live in _nonthink_forward_loss.
+            n_micro = max(1, args.grad_accum)
+            for micro in range(n_micro):
+                if micro > 0:
+                    try:
+                        batch = next(train_iter)
+                    except StopIteration:
+                        train_iter = iter(train_loader)
+                        batch = next(train_iter)
+                    x, y, *_rest = batch
+                    x, y = x.to("cuda"), y.to("cuda")
+                    doc_ids = _rest[0].to("cuda") if _rest else None
+                logits, ce_per_token, lm_loss, aux_loss = _nonthink_forward_loss(
+                    model, x, y, args, step, bracket_deltas, doc_ids=doc_ids)
+                loss = lm_loss + args.aux_weight * aux_loss
+                loss = loss + _z_loss_term(logits, args.z_loss)
+                (loss / n_micro).backward()
         _log_this_step = (step % args.log_every == 0 or step == args.steps)
         # Per-layer diagnostics: grad norms must be read before clip; the
         # weight snapshot must be taken before opt.step().
         _blk_gnorms = _block_grad_norms(model) if _log_this_step else None
         _blk_wsnap = _block_weight_snapshot(model) if _log_this_step else None
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if args.grad_clip > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         for o in opts:
             o.step()
         for s in scheds:
@@ -1144,7 +1202,8 @@ def main():
 
         if step % args.log_every == 0 or step == args.steps:
             now = time.perf_counter()
-            tok_per_sec = (step - last_log_step) * args.batch * args.T / (now - last_log)
+            tok_per_sec = ((step - last_log_step) * args.batch * args.T
+                           * args.grad_accum / (now - last_log))
             tloss_avg = sum(losses[-args.log_every:]) / max(1, len(losses[-args.log_every:]))
             line = (f"{step:>6d}  {tok_per_sec:>8.0f}  "
                     f"{tloss_avg:>8.4f}  "
@@ -1308,9 +1367,10 @@ def main():
             n_val = 0
             with torch.no_grad():
                 for vbatch in val_loader:
-                    vx, vy, *_ = vbatch
+                    vx, vy, *_vrest = vbatch
                     vx, vy = vx.to("cuda"), vy.to("cuda")
-                    vlogits = model(vx)
+                    vdoc_ids = _vrest[0].to("cuda") if _vrest else None
+                    vlogits = model(vx, doc_ids=vdoc_ids)
                     if args.enable_thinking_token:
                         vloss = cross_entropy_masking_token(
                             vlogits.reshape(-1, vlogits.shape[-1]), vy.reshape(-1),
@@ -1339,7 +1399,7 @@ def main():
         # loop so far. At every `mid_eval_every_tokens` boundary, save a
         # ckpt, shell out to eval_humaneval.py, log pass-rate to TB,
         # append to controller, optionally stop.
-        tokens_seen = step * args.batch * args.T
+        tokens_seen = step * args.batch * args.T * args.grad_accum
         if (mid_eval_controller is not None
                 and tokens_seen >= next_eval_at):
             # Snapshot to a numbered ckpt — kept for the curve plot.

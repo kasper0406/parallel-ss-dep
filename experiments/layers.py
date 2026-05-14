@@ -157,16 +157,35 @@ class _FlaWrapper(nn.Module):
     fla's chunked kernels (chunk_delta_rule, etc.) assert non-fp32 inputs.
     We cast hidden_states to bf16 on entry and back to the caller's dtype
     on exit so the rest of the (fp32) model is unaffected.
+
+    `accepts_cu_seqlens`: FLA's recurrent kernels take a `cu_seqlens` ragged
+    index for packed variable-length sequences (cross-document isolation).
+    When `Block.forward` passes one, we flatten (B, T, d) -> (1, B*T, d) so
+    the kernel sees a single ragged batch, then reshape back. Default False
+    (conservative — an unverified fla layer could choke on the kwarg);
+    subclasses whose underlying fla layer is verified to accept `cu_seqlens`
+    opt in by setting this True.
     """
+
+    accepts_cu_seqlens = False
 
     def __init__(self, fla_layer: nn.Module):
         super().__init__()
         self.layer = fla_layer
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None
+                ) -> torch.Tensor:
         # fla's chunked kernels assert non-fp32 inputs. Use mixed-precision
         # autocast so weights stay fp32 (master copy) and the kernel sees bf16.
         in_dtype = x.dtype
+        if cu_seqlens is not None and self.accepts_cu_seqlens:
+            B, T, d = x.shape
+            x_flat = x.reshape(1, B * T, d)
+            with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+                out = self.layer(x_flat, cu_seqlens=cu_seqlens)
+            if isinstance(out, tuple):
+                out = out[0]
+            return out.reshape(B, T, d).to(in_dtype)
         with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
             out = self.layer(x)
         if isinstance(out, tuple):
@@ -176,6 +195,11 @@ class _FlaWrapper(nn.Module):
 
 class DeltaNetAttention(_FlaWrapper):
     """fla DeltaNet — same KV-state size as our linear_attn, plus delta updates."""
+
+    # fla's DeltaNet.forward reads cu_seqlens from kwargs and threads it into
+    # chunk_delta_rule + all three ShortConvolutions (fwd + bwd). Verified in
+    # the local fork — see CROSS_DOC_ISOLATION_PLAN.md.
+    accepts_cu_seqlens = True
 
     def __init__(self, d_model: int, n_heads: int, d_head: int):
         from fla.layers import DeltaNet

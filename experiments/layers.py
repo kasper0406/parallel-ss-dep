@@ -175,20 +175,21 @@ class _FlaWrapper(nn.Module):
 
     def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None
                 ) -> torch.Tensor:
-        # The trainer's `apply_speed_knobs` wraps `model.forward` in bf16
-        # autocast, so the Q/K/V Linears inside DeltaNet downcast their
-        # inputs to bf16 before the kernel sees them — no nested autocast
-        # needed. We still cast the output back to the wrapper's input
-        # dtype to keep the residual stream dtype stable across blocks.
+        # fla's chunked kernels assert non-fp32 inputs. The trainer wraps
+        # model.forward in bf16 autocast via apply_speed_knobs, but eval
+        # callers (eval_humaneval.py, diag_ckpt.py, ...) don't — we keep
+        # the explicit autocast here as a safety net so any caller works.
         in_dtype = x.dtype
         if cu_seqlens is not None and self.accepts_cu_seqlens:
             B, T, d = x.shape
             x_flat = x.reshape(1, B * T, d)
-            out = self.layer(x_flat, cu_seqlens=cu_seqlens)
+            with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+                out = self.layer(x_flat, cu_seqlens=cu_seqlens)
             if isinstance(out, tuple):
                 out = out[0]
             return out.reshape(B, T, d).to(in_dtype)
-        out = self.layer(x)
+        with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+            out = self.layer(x)
         if isinstance(out, tuple):
             out = out[0]
         return out.to(in_dtype)

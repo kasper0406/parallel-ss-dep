@@ -461,6 +461,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Weight on the z-loss regulariser "
                         "mean(logsumexp(logits)^2), which keeps output "
                         "logits from drifting. Default 1e-4; 0 disables.")
+    p.add_argument("--bf16_optim_state", action="store_true",
+                   help="Store optimizer state (AdamW exp_avg/exp_avg_sq, "
+                        "Muon momentum_buffer) in bf16 instead of fp32. "
+                        "Saves ~550 MB persistent on the 218 M v4 model "
+                        "(see experiments/bf16_optim.py). Math runs in "
+                        "fp32 (lift → step → cast back), so it's lossless "
+                        "in the precision sense — validated on a small "
+                        "DeltaNet (max |Δ_loss| < 0.005 vs stock AdamW "
+                        "over 200 steps). Does NOT save peak GPU memory "
+                        "from gradients (autograd allocates fp32 "
+                        "intermediates regardless of grad_dtype).")
     p.add_argument("--alpha_wd", type=float, default=0.0,
                    help="Weight-decay applied to FiLM α scalars (matched by "
                         "name suffix '.alpha' inside any feedback container). "

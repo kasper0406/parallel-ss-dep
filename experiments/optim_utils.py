@@ -74,12 +74,24 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                     lr_schedule: str = "cosine",
                     warmup_steps: int = 0,
                     decay_frac: float = 0.15,
+                    bf16_optim_state: bool = False,
                     verbose: bool = True
                     ) -> tuple[list[torch.optim.Optimizer], list]:
     """Build optimizer(s) + LR schedulers. See module docstring.
 
     `lr_schedule`: "cosine" (legacy) or "wsd" (warmup-stable-decay).
+    `bf16_optim_state`: if True, AdamW exp_avg/exp_avg_sq and Muon
+        momentum_buffer are stored as bf16 (saves ~550 MB persistent
+        on the 218 M v4 model). See `experiments/bf16_optim.py`.
     """
+    if bf16_optim_state:
+        from experiments.bf16_optim import BF16StateAdamW, BF16StateMuon
+        AdamWCls = BF16StateAdamW
+        MuonCls = BF16StateMuon
+    else:
+        AdamWCls = torch.optim.AdamW
+        MuonCls = torch.optim.Muon
+
     if optimizer == "adamw":
         regular, alphas = [], []
         for name, p in model.named_parameters():
@@ -92,7 +104,7 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
             if verbose:
                 print(f"  α-WD split: {len(alphas)} FiLM α params get "
                       f"weight_decay={alpha_wd}")
-        opts = [torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95))]
+        opts = [AdamWCls(groups, lr=lr, betas=(0.9, 0.95))]
         scheds = [_make_scheduler(opts[0], base_lr=lr, schedule=lr_schedule,
                                   steps=steps, warmup_steps=warmup_steps,
                                   decay_frac=decay_frac)]
@@ -128,11 +140,12 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
             print(f"  α-WD split: {len(adamw_alpha)} FiLM α params get "
                   f"weight_decay={alpha_wd}")
     opts = [
-        torch.optim.Muon(muon_params, lr=lr_muon, momentum=0.95, weight_decay=wd),
-        torch.optim.AdamW(adamw_groups, lr=lr, betas=(0.9, 0.95)),
+        MuonCls(muon_params, lr=lr_muon, momentum=0.95, weight_decay=wd),
+        AdamWCls(adamw_groups, lr=lr, betas=(0.9, 0.95)),
     ]
     if verbose:
-        print(f"  Muon weight_decay={wd}; AdamW(regular) weight_decay={wd}")
+        print(f"  Muon weight_decay={wd}; AdamW(regular) weight_decay={wd}"
+              + ("  [bf16 optimizer state]" if bf16_optim_state else ""))
     scheds = [
         _make_scheduler(opts[0], base_lr=lr_muon, schedule=lr_schedule,
                         steps=steps, warmup_steps=warmup_steps,

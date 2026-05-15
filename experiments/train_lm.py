@@ -388,6 +388,7 @@ def main():
         alpha_wd=args.alpha_wd, steps=args.steps, wd=args.wd,
         lr_schedule=args.lr_schedule, warmup_steps=args.warmup_steps,
         decay_frac=args.lr_decay_frac,
+        bf16_optim_state=args.bf16_optim_state,
     )
     # Backwards-compat aliases used elsewhere in the loop.
     opt = opts[0]

@@ -130,6 +130,8 @@ def test_new_flags_defaults():
     assert a.grad_clip == 1.0
     assert a.z_loss == 1e-4
     assert a.wd == 0.01
+    assert a.lr == 1.4e-3
+    assert a.lr_muon == 5e-3
 
 
 def test_new_flags_parse():

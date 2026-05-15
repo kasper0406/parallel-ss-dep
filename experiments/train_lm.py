@@ -360,7 +360,8 @@ def main():
     # loop touches it). See experiments/speed_knobs.py.
     from experiments.speed_knobs import apply_speed_knobs
     apply_speed_knobs(model, bf16=bool(args.bf16), tf32=bool(args.tf32),
-                      compile_model=bool(args.compile))
+                      compile_model=bool(args.compile),
+                      compile_mode=args.compile_mode)
     if fb_xattn_pairs:
         n_total_pairs = sum(len(srcs) for _, srcs in fb_xattn_pairs)
         feedback_desc = (f"xattn[{args.feedback_xattn_form}]"

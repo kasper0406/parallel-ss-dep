@@ -322,17 +322,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n_heads", type=int, default=9)
     p.add_argument("--d_head", type=int, default=64)
     p.add_argument("--n_layers", type=int, default=30)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=1.4e-3,
+                   help="AdamW peak learning rate. Default 1.4e-3 — the "
+                        "sqrt-batch-scaled v4 value (validated in the "
+                        "batch-20 / lr_muon-5e-3 hi-LR smoke; ~4× faster "
+                        "VAL-ppl convergence vs the 5e-4 / 1.5e-3 baseline).")
     p.add_argument("--optimizer", type=str, default="adamw",
                    choices=["adamw", "muon"],
                    help="'adamw' (default) — single AdamW for all params. "
                         "'muon' — Muon for ≥2D hidden-layer matrices, AdamW "
                         "for embeddings, lm_head, and 1D params. Typically "
                         "30-50% faster convergence per Keller Jordan / NanoGPT "
-                        "speedrunning. Pair with --lr_muon ~1e-3.")
-    p.add_argument("--lr_muon", type=float, default=1e-3,
+                        "speedrunning. Pair with --lr_muon ~1.5e-3.")
+    p.add_argument("--lr_muon", type=float, default=5e-3,
                    help="Muon learning rate (used only when --optimizer muon). "
-                        "AdamW LR for the remaining params is taken from --lr.")
+                        "Default 5e-3 — the sqrt-batch-scaled v4 value (was "
+                        "1e-3 at v3-long's batch 7). Muon's spectrally-"
+                        "normalised update is tolerant of high LR (Moonlight "
+                        "ran at 6e-3 at 8M-token batches). AdamW LR for the "
+                        "remaining params is taken from --lr.")
     p.add_argument("--lr_schedule", type=str, default="wsd",
                    choices=["cosine", "wsd"],
                    help="LR schedule. 'wsd' (default) = warmup-stable-decay: "
@@ -423,6 +431,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "Default on; pass --no-compile to disable — e.g. "
                         "if compile errors on the nightly-torch / FLA / "
                         "Blackwell stack or triggers recompilation storms.")
+    p.add_argument("--compile_mode", type=str, default="default",
+                   choices=["default", "reduce-overhead",
+                            "max-autotune", "max-autotune-no-cudagraphs"],
+                   help="torch.compile mode. 'reduce-overhead' wraps "
+                        "compiled regions in CUDA Graphs (attacks the "
+                        "'Command Buffer Full' kernel-launch stall) but "
+                        "needs stable shapes — `cu_seqlens` shape varies "
+                        "with doc count per batch, so test before relying.")
     p.add_argument("--wd", type=float, default=0.01,
                    help="Weight decay for non-α params (Muon + AdamW "
                         "regular groups). Default 0.01 (the validated value; "

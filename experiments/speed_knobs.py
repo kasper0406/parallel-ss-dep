@@ -11,8 +11,59 @@ import torch
 import torch.nn as nn
 
 
+_FLA_DYNAMO_PATCHED = False
+
+
+def _disable_dynamo_on_fla_helpers(verbose: bool = True) -> None:
+    """Mark FLA's data-dependent helpers as `torch._dynamo.disable`.
+
+    `prepare_chunk_indices` builds an index tensor from `cu_seqlens.tolist()`
+    — a CPU sync over a data-dependent length list. Under `torch.compile`,
+    Dynamo cannot trace this and recompiles every batch (the doc-count
+    varies). Disabling tracing for the helper lets it run in eager,
+    silences the recompile loop, and is a prerequisite for ever enabling
+    `mode="reduce-overhead"` (CUDA Graphs need stable shapes).
+    """
+    global _FLA_DYNAMO_PATCHED
+    if _FLA_DYNAMO_PATCHED:
+        return
+    try:
+        import fla.ops.utils.index as _fla_index
+        disabled = torch._dynamo.disable(_fla_index.prepare_chunk_indices)
+        _fla_index.prepare_chunk_indices = disabled
+        # The kernel callers did `from fla.ops.utils.index import
+        # prepare_chunk_indices` at import time, so each holds a local
+        # binding to the ORIGINAL function — patching the source module
+        # alone leaves the recompile loop in place. Patch every chunk
+        # kernel module that imported the helper.
+        import importlib
+        patched_modules = []
+        for mod_name in (
+            "fla.ops.delta_rule.chunk",
+            "fla.ops.gated_delta_rule.chunk",
+            "fla.ops.gated_delta_product.chunk",
+            "fla.ops.delta_product.chunk",
+        ):
+            try:
+                mod = importlib.import_module(mod_name)
+            except ImportError:
+                continue
+            if hasattr(mod, "prepare_chunk_indices"):
+                mod.prepare_chunk_indices = disabled
+                patched_modules.append(mod_name)
+        _FLA_DYNAMO_PATCHED = True
+        if verbose:
+            print(f"torch._dynamo.disable applied to "
+                  f"prepare_chunk_indices in "
+                  f"fla.ops.utils.index + {len(patched_modules)} caller "
+                  f"modules (prevents cu_seqlens-driven recompile loop)")
+    except ImportError:
+        pass  # FLA not installed → nothing to patch.
+
+
 def apply_speed_knobs(model: nn.Module, bf16: bool = True, tf32: bool = True,
                        compile_model: bool = False,
+                       compile_mode: str = "default",
                        verbose: bool = True) -> nn.Module:
     """Apply bf16 autocast + TF32 (+ optional torch.compile) to a built
     model. Returns the model.
@@ -40,6 +91,10 @@ def apply_speed_knobs(model: nn.Module, bf16: bool = True, tf32: bool = True,
         if verbose:
             print("bf16 autocast wrapping model.forward")
     if compile_model:
+        # Prevent the cu_seqlens-driven recompile loop in FLA's
+        # `prepare_chunk_indices` (does a CPU sync over a data-dependent
+        # length list) BEFORE wrapping forward in torch.compile.
+        _disable_dynamo_on_fla_helpers(verbose=verbose)
         # Compile the (possibly bf16-wrapped) forward. The FLA Triton
         # kernels are opaque to Dynamo, so each is a graph break — compile
         # still fuses the PyTorch glue between them (RMSNorm, GLU MLP,
@@ -47,8 +102,10 @@ def apply_speed_knobs(model: nn.Module, bf16: bool = True, tf32: bool = True,
         # required (the graph breaks are expected, not errors).
         # Control-flow changes (e.g. the K-self-feed curriculum flipping
         # _film_bypass) trigger a one-time recompile — acceptable.
-        model.forward = torch.compile(model.forward, fullgraph=False)
+        model.forward = torch.compile(model.forward, fullgraph=False,
+                                       mode=compile_mode)
         if verbose:
-            print("torch.compile applied to model.forward "
-                  "(fullgraph=False; FLA kernels are graph breaks)")
+            print(f"torch.compile applied to model.forward "
+                  f"(fullgraph=False, mode={compile_mode!r}; "
+                  "FLA kernels are graph breaks)")
     return model

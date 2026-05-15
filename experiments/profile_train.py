@@ -53,7 +53,8 @@ def _build(args):
     )
     model, _ = build_model_from_args(
         ns, vocab_size=vocab_size, thinking_token_id=thinking_token_id)
-    apply_speed_knobs(model, bf16=True, tf32=True, compile_model=args.compile)
+    apply_speed_knobs(model, bf16=True, tf32=True, compile_model=args.compile,
+                       compile_mode=args.compile_mode)
     opts, _ = build_optimizer(
         model, optimizer="muon", lr=3e-4, lr_muon=1e-3, alpha_wd=0.0,
         steps=args.steps, wd=0.01, verbose=False)
@@ -94,6 +95,9 @@ def main():
                     help="Steps to run before profiling (kernel autotune "
                          "+ compile warmup land here).")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--compile_mode", type=str, default="default",
+                    choices=["default", "reduce-overhead",
+                             "max-autotune", "max-autotune-no-cudagraphs"])
     ap.add_argument("--film_bypass", action="store_true",
                     help="Profile the K-self-feed-bypassed (1-pass) path.")
     ap.add_argument("--activation_checkpointing", action="store_true")

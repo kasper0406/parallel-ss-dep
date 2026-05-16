@@ -94,6 +94,18 @@ def build_model_from_args(args, *, vocab_size: int,
             thinking_token_id=int(thinking_token_id),
         )
 
+    pkm_kwargs: dict = {}
+    if getattr(args, "use_pkm", False):
+        pkm_kwargs = dict(
+            use_pkm=True,
+            pkm_after_layer=int(args.pkm_after_layer),
+            pkm_n_keys=int(args.pkm_n_keys),
+            pkm_n_heads=int(args.pkm_n_heads),
+            pkm_k_dim=int(args.pkm_k_dim),
+            pkm_top_k=int(args.pkm_top_k),
+            pkm_value_bf16=bool(args.pkm_value_bf16),
+        )
+
     model = TinyLM(
         vocab_size=vocab_size, d_model=args.d_model, n_layers=n_layers,
         n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim,
@@ -114,6 +126,7 @@ def build_model_from_args(args, *, vocab_size: int,
         activation_checkpointing=args.activation_checkpointing,
         layer_drop_max=float(getattr(args, "layer_drop_max", 0.0)),
         **mem_kwargs,
+        **pkm_kwargs,
         **attn_kw,
     ).to("cuda")
 

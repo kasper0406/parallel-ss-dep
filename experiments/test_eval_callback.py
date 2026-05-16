@@ -122,6 +122,57 @@ def test_controller_summary_line_renders_with_and_without_history() -> None:
     assert "+0.030" in s
 
 
+def test_mid_eval_save_only_flag_in_args() -> None:
+    """Regression: the v4 crashed-22:11 run only saved one mid-eval ckpt
+    because the HumanEval subprocess OOMed on the trainer's GPU and the
+    user-restarted run forgot to re-pass --mid_eval_every_tokens. The
+    --mid_eval_save_only flag lets the trainer save mid-eval ckpts (the
+    load-bearing resume artifact) while explicitly skipping the
+    OOM-prone HumanEval subprocess. Make sure the flag exists and parses."""
+    from experiments.train_lm_args import build_parser
+    p = build_parser()
+    a = p.parse_args(["--mid_eval_save_only"])
+    assert a.mid_eval_save_only is True
+    a = p.parse_args([])  # default off — backwards compatible
+    assert a.mid_eval_save_only is False
+
+
+def test_mid_eval_min_free_gib_default_engages_auto_skip() -> None:
+    """The auto-skip is the failure mode that bit v4 (1 ckpt instead of 4
+    because every subsequent eval OOMed). Default --mid_eval_min_free_gib
+    must be > 0 so the trainer auto-skips when it's gobbling the GPU. 0
+    disables (legacy behaviour)."""
+    from experiments.train_lm_args import build_parser
+    p = build_parser()
+    a = p.parse_args([])
+    assert a.mid_eval_min_free_gib > 0.0, \
+        "default must engage auto-skip; pass 0 to disable explicitly"
+    a = p.parse_args(["--mid_eval_min_free_gib", "0"])
+    assert a.mid_eval_min_free_gib == 0.0
+
+
+def test_eval_result_sentinel_round_trips_through_controller() -> None:
+    """The skip path manufactures a NaN EvalResult and feeds it to the
+    controller. Make sure that round-trip works: append, summary_line
+    renders, should_stop stays False under NaN."""
+    c = EvalStopController(stop_threshold=0.01, k_consecutive_flat=2)
+    sentinel = EvalResult(
+        humaneval_pass_rate=float("nan"),
+        mbpp_pass_rate=None,
+        tokens_seen=500_000_000, step=1526,
+        ckpt_path="checkpoints/foo.pt",
+        raw_log_tail="<skipped: free GPU memory 0.45 GiB < 2.00 GiB>",
+    )
+    c.append(sentinel)
+    c.append(sentinel)
+    c.append(sentinel)
+    # NaN-safe stop rule: 3 NaN evals must NOT trigger stop (it'd be
+    # falsely concluding a plateau).
+    assert c.should_stop() is False
+    s = c.summary_line()
+    assert "nan" in s.lower() and "1526" in s
+
+
 if __name__ == "__main__":
     import sys
     import pytest

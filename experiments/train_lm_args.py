@@ -380,6 +380,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mem_size", type=int, default=1024)
     p.add_argument("--mem_dim", type=int, default=0,
                    help="Memory projection dim. 0 = match d_model.")
+    # ----- Persistent learned-RAG (Product-Key Memory) -----
+    p.add_argument("--use_pkm", action="store_true",
+                   help="Add a Product-Key Memory layer (Lample 2019 / "
+                        "Memory Layers at Scale 2024) at one mid-depth "
+                        "block. Sparse learned KV table — facts can live "
+                        "there instead of being amortised into the dense "
+                        "residual stream. See PKM_PLAN.md.")
+    p.add_argument("--pkm_after_layer", type=int, default=14,
+                   help="Insert PKM residual after this 0-indexed block.")
+    p.add_argument("--pkm_n_keys", type=int, default=256,
+                   help="Sub-key set size; total slots/head = n_keys^2.")
+    p.add_argument("--pkm_n_heads", type=int, default=4)
+    p.add_argument("--pkm_k_dim", type=int, default=128,
+                   help="Per-side query / sub-key dim.")
+    p.add_argument("--pkm_top_k", type=int, default=32,
+                   help="Number of values retrieved per query.")
+    p.add_argument("--pkm_value_bf16", action="store_true", default=True,
+                   help="Store the value table in bf16 (math fp32). "
+                        "Default on; halves persistent memory.")
+    p.add_argument("--no_pkm_value_bf16", dest="pkm_value_bf16",
+                   action="store_false")
     p.add_argument("--think_burst_prob", type=float, default=0.5,
                    help="Per-chunk probability of inserting random think-token "
                         "bursts during mixed-corpus pretrain (gives memory + "
@@ -391,6 +412,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "0 disables. Suggested: 500_000_000.")
     p.add_argument("--mid_eval_n_problems", type=int, default=50)
     p.add_argument("--mid_eval_max_gen", type=int, default=192)
+    p.add_argument("--mid_eval_save_only", action="store_true",
+                   help="Skip the HumanEval subprocess at every mid-eval "
+                        "trigger; just save the ckpt and advance the counter. "
+                        "Use when the only GPU is already occupied by the "
+                        "trainer (the eval subprocess would OOM trying to "
+                        "load its own copy of the model on the same device). "
+                        "The mid-eval ckpts are the load-bearing artifact for "
+                        "resume — HumanEval results during pretrain are noisy "
+                        "anyway, so this is the safe default when training is "
+                        "co-resident with another job.")
+    p.add_argument("--mid_eval_min_free_gib", type=float, default=2.0,
+                   help="If the trainer's GPU has less than this much free "
+                        "memory at a mid-eval trigger, auto-skip the HumanEval "
+                        "subprocess (it would OOM trying to load its own copy "
+                        "of the model). Ckpt save still happens, counter still "
+                        "advances. Set 0 to disable the auto-skip and always "
+                        "attempt the subprocess.")
     p.add_argument("--mask_eos_in_targets", action="store_true",
                    help="In data_mix.py, set targets equal to eos_token_id "
                         "to -100 so the model never gets a gradient on "

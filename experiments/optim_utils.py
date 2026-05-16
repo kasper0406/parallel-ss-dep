@@ -22,6 +22,19 @@ import torch.nn as nn
 _EMBED_OR_HEAD_NAMES = {"embed.weight", "pos_embed.weight", "lm_head.weight"}
 
 
+def _is_embedding_like(name: str) -> bool:
+    """Names of params Muon should NOT touch (they're table-shaped, not
+    hidden matrices): embeddings, lm_head, and PKM value tables (each
+    PKM value head is an nn.Embedding named pkm_layer.values.{i}.weight).
+    Newton-Schulz orthogonalisation on a 65 k×144 lookup table is wasted
+    compute and conceptually wrong."""
+    if name in _EMBED_OR_HEAD_NAMES:
+        return True
+    if name.startswith("pkm_layer.values.") and name.endswith(".weight"):
+        return True
+    return False
+
+
 def _wsd_lambda(total_steps: int, warmup_steps: int, decay_frac: float):
     """Warmup-Stable-Decay LR multiplier in [0, 1].
 
@@ -124,7 +137,7 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
         if not p.requires_grad or id(p) in seen:
             continue
         seen.add(id(p))
-        if name in _EMBED_OR_HEAD_NAMES or p.ndim != 2:
+        if _is_embedding_like(name) or p.ndim != 2:
             (adamw_alpha if is_film_alpha(name) else adamw_regular).append(p)
         else:
             muon_params.append(p)

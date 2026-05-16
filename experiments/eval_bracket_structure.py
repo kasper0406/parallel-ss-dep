@@ -60,6 +60,7 @@ def build_model_from_ckpt(ckpt_path: str):
     # with the right kwargs and avoid strict-load mismatches.
     has_gate = any(k.startswith("gate_head.") for k in sd_keys)
     has_memory = any(k.startswith("memory.") for k in sd_keys)
+    has_pkm = any(k.startswith("pkm_layer.") for k in sd_keys)
     mem_kwargs = {}
     if has_memory:
         # Infer mem_dim from W_proj's input dimension and mem_size has no
@@ -72,6 +73,33 @@ def build_model_from_ckpt(ckpt_path: str):
             thinking_token_id=int(cfg.get("thinking_token_id",
                                           cfg["vocab_size"] - 1)),
         )
+    pkm_kwargs = {}
+    if has_pkm:
+        # Infer all shape-derived PKM hyperparams from state dict.
+        # subkeys: (n_heads, 2, n_keys, k_dim)
+        sk = ckpt["state_dict"]["pkm_layer.subkeys"]
+        n_heads_pkm, _, n_keys, k_dim = sk.shape
+        # Count value-table heads (one nn.Embedding per head).
+        n_head_tables = sum(
+            1 for k in sd_keys
+            if k.startswith("pkm_layer.values.") and k.endswith(".weight")
+        )
+        assert n_head_tables == n_heads_pkm, (
+            f"PKM subkeys say n_heads={n_heads_pkm} but found "
+            f"{n_head_tables} value tables")
+        # value_bf16 from the dtype of values.0.weight.
+        v0_dtype = ckpt["state_dict"]["pkm_layer.values.0.weight"].dtype
+        # top_k and pkm_after_layer have no state-dict footprint; use cfg or
+        # the canonical defaults (32, 14) the v5-pkm run used.
+        pkm_kwargs = dict(
+            use_pkm=True,
+            pkm_after_layer=int(cfg.get("pkm_after_layer", 14)),
+            pkm_n_keys=int(n_keys),
+            pkm_n_heads=int(n_heads_pkm),
+            pkm_k_dim=int(k_dim),
+            pkm_top_k=int(cfg.get("pkm_top_k", 32)),
+            pkm_value_bf16=(v0_dtype == torch.bfloat16),
+        )
     model = TinyLM(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"],
         n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
@@ -82,6 +110,7 @@ def build_model_from_ckpt(ckpt_path: str):
         feedback_self_k=int(cfg.get("feedback_self_k", 0)),
         output_gate=bool(has_gate),
         **mem_kwargs,
+        **pkm_kwargs,
         **attn_kw,
     )
     # Backward-compat: old single-scale film checkpoints saved keys as

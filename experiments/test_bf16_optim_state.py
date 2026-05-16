@@ -161,3 +161,51 @@ def test_bf16_muon_matches_stock_muon():
         f"bf16 vs fp32 Muon last-20 mean |Δ|={diff:.5f}; "
         f"bf={bf[-1]:.4f} fp={fp[-1]:.4f}"
     )
+
+
+@CUDA
+def test_compiled_adamw_matches_eager_adamw():
+    """Regression: compile_step=True must produce bit-identical updates
+    (up to fp32 rounding from operator reordering inside the fused
+    kernel) to compile_step=False over many steps. Guards against silent
+    numerical drift introduced when the per-param-step kernel is fused
+    via torch.compile."""
+    def run(compile_step: bool):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed_all(0)
+        # Mix of shapes — exercises the per-shape compile cache.
+        params = [
+            nn.Parameter(torch.randn(8, 16, device="cuda")),
+            nn.Parameter(torch.randn(32, device="cuda")),       # 1-D
+            nn.Parameter(torch.randn(16, 16, device="cuda")),
+        ]
+        opt = BF16StateAdamW(params, lr=1e-3, weight_decay=0.01,
+                              compile_step=compile_step)
+        # Same gradients per step across both runs.
+        torch.manual_seed(123)
+        for _ in range(20):
+            for p in params:
+                p.grad = torch.randn_like(p)
+            opt.step()
+        return [p.detach().clone() for p in params]
+
+    eager_params = run(compile_step=False)
+    comp_params = run(compile_step=True)
+    for i, (pe, pc) in enumerate(zip(eager_params, comp_params)):
+        diff = (pe - pc).abs().max().item()
+        assert diff < 1e-5, (
+            f"param[{i}] shape={tuple(pe.shape)}: compiled vs eager "
+            f"max |Δ|={diff:.3e} (>1e-5; numerical drift from compile fusion)"
+        )
+
+
+@CUDA
+def test_compile_step_flag_defaults_on():
+    """The compile-step optimization is on by default; passing
+    compile_step=False is the kill-switch. Guards against accidentally
+    flipping the default (which would silently regress wall-clock)."""
+    import inspect
+    sig = inspect.signature(BF16StateAdamW.__init__)
+    assert sig.parameters["compile_step"].default is True, (
+        "compile_step default must be True; pass compile_step=False to disable"
+    )

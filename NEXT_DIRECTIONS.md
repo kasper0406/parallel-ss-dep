@@ -23,6 +23,126 @@ on the `profile_train.py` validation run first.
 
 ---
 
+## Phase-D candidate (2026-05-15): persistent learned-RAG / memory layer
+
+**Idea.** Add a *second* memory tier alongside `WorkingMemory`:
+
+- `WorkingMemory` (existing): per-sequence, ephemeral, written/read inside one
+  forward pass. Holds context the model just saw.
+- **New: persistent learned key-value memory** trained jointly with the
+  backbone. Entries persist across sequences and across training. Frozen at
+  inference. Idea: offload long-tail factual content (Wikipedia entities, API
+  signatures, CVE numbers, library quirks, algorithm complexities) to this
+  table so the residual stream's parameter budget can concentrate on
+  program-synthesis *skill*.
+
+This is the **product-key memory (PKM)** family — Lample 2019, scaled in
+Meta's "Memory Layers at Scale" (2024). A single PKM layer matched the lift of
+12 extra dense transformer blocks on language modeling. Drop-in inside an
+existing block, end-to-end differentiable, top-k product-key lookup is
+sub-linear so cost ≈ one MLP per token.
+
+**Why this is well-targeted to *our* mix specifically:**
+
+- Our v3/v4 pretrain mix is unusually fact-loaded for a code model: Wikipedia
+  + the CVE streams (bigvul, cybernative) are pure encyclopedic content —
+  named entities, version strings, function signatures. A 218 M dense model
+  has nowhere near capacity to memorize all that, and the **persistent
+  upward CE drift on bigvul/cybernative across every run** is the literal
+  symptom of "trying to memorize facts in too few weights." A memory layer
+  is a structurally appropriate fix, not just a re-weighting band-aid.
+- Algorithm/DS knowledge is the cleanest possible fact/skill decoupling:
+  `Floyd-Warshall is O(V³)` is a fact, *applying* it is a skill. Forcing
+  both into one residual wastes parameters.
+- Library-specific knowledge (`numpy.random.choice` signature,
+  `torch.nn.functional.cross_entropy` expects logits) is the canonical PKM
+  use case — long-tail, low-frequency, mostly self-contained.
+
+**Sizing for our hardware (32 GB consumer cards):**
+
+- 1 PKM layer mid-depth (between blocks 14/15 of the 30-block model).
+- Product keys: 2 sets × 256 keys → 65 536 slots (or 2 × 1024 → 1 M slots).
+- Top-k = 32, value dim = 576 (matches residual).
+- 65 k slots: ~75 MB params (bf16). 1 M slots: ~1.15 GB — still fits.
+
+**Honest reservations:**
+
+- **Sparse-gradient cold start.** Only top-k slots get gradient per query, so
+  most slots stay at init for a long time. PKM papers solve this with
+  key BatchNorm + small noise injection on the lookup; that has to be wired
+  right or the table never warms up. This is the biggest implementation risk.
+- **Risk of crutching.** At small scale the model might lean on retrieval for
+  things it should generalize. Need an ablation that toggles the layer at
+  eval to measure how much the rest of the network actually depends on it.
+- **Inference-time memory cost.** A 1 M-slot table is 1.15 GB always
+  resident. Fine for our hardware; bad for users on smaller GPUs. Probably
+  fine to defer that worry — fix the training-quality gap first.
+
+**Ablation plan that would settle whether it's worth full investment:**
+
+1. Train a v5 variant with one 65k-slot PKM layer mid-depth, same mix +
+   schedule as v4. Compare per-source CE on the eval streams.
+2. **Primary success metric: bigvul + cybernative CE stops drifting up.**
+   This is the existing pathology a memory layer ought to fix, and the
+   per-source CE plumbing is already in `diag_ckpt.py`.
+3. Secondary: HumanEval pass@1 (downstream code skill should be stable or
+   better — if it regresses, the memory layer is crutching).
+4. If 65k wins, scale to 1 M-slot and re-measure.
+
+**Sequencing:** orthogonal to v4 pretrain and the Phase-C RL plan; could go in
+parallel with either. Largest infra cost is the PKM layer itself + the
+key-BN warmup-stability bits; both are well-documented in prior work.
+
+---
+
+## Phase-D candidate (2026-05-15): MCTS-guided rollouts for code RL
+
+**Idea.** Replace (or supplement) plain temperature sampling in GRPO with a
+PUCT-style tree search over partial trajectories, using the dense
+`code_grader.score ∈ [0,1]` as the value signal. Train on the search-improved
+trajectories — either as expert iteration (ReST^EM / STaR-style SFT on
+MCTS-best) or as an off-policy correction layer over GRPO.
+
+**Why it fits this stack specifically:**
+
+- **DeltaNet state is cheap to fork.** Branching a transformer's KV cache costs
+  O(prefix·d) per node; forking DeltaNet's bounded recurrent state is O(d²)
+  flat. `WorkingMemory` adds O(K·d), still bounded. Tree search is
+  asymptotically *cheaper* on our backbone than on a transformer of equivalent
+  quality — most LM-MCTS papers (CodeRL, PG-TD, MCTS-DPO, RAP) are bottlenecked
+  by KV-cache fork cost. This is a real differentiator, not a wash.
+- **Dense grader = smooth value landscape.** The tier ladder
+  (`syntax_error 0.0 < exec_error 0.05 < runtime_error 0.2 < partial 0.2 +
+  0.7·passed/total < pass 1.0`) is exactly what UCT needs; pass/fail rewards
+  make tree search thrash. Already shipped — see `code_grader.py`.
+- **Thinking-gate gives a natural action factoring.** Branch at gate decisions
+  and at high-entropy emit positions, not at every token. The gate already
+  exists, costs nothing extra, and "think harder here" is a meaningful action.
+
+**Honest cons:**
+
+- **GRPO + biased samples don't compose naively.** The group baseline goes
+  optimistic when rollouts come from search. Cleanest split is two streams:
+  - GRPO continues on uniformly-sampled rollouts (unbiased baseline).
+  - Search-best trajectories feed an SFT / expert-iteration head.
+- **No value head.** AlphaZero needs one. The cheap substitute is grader
+  rollouts at every leaf (expensive). Could bootstrap one over time from
+  collected (prefix, score) pairs.
+- **Compute.** Real MCTS over codegen is a budget item.
+
+**Cheap precursor — do this first:** *best-of-N filtered by grader*. Literally
+MCTS with branching factor B, depth 1. Gives the variance-reduction win of
+search without any tree-search infrastructure. If best-of-N pays off in GRPO
+group quality, *then* invest in proper tree search. If it doesn't, MCTS won't
+either.
+
+**Sequencing:** runs after Phase-C plain GRPO and the iterative-self-repair
+loop are working (the self-repair loop is itself a degenerate form of search —
+iterative refinement along a single trajectory). Don't start MCTS until those
+have produced a baseline.
+
+---
+
 ## Current Focus (2026-05-12): Small Super-Coder
 
 The top-level goal is now a small DeltaNet-backbone code model that competes

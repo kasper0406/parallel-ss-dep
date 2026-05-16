@@ -14,11 +14,19 @@
 #                                    gradient is noise; +40 % over window
 #
 #  3. Pretrain-knobs review (2026-05-14):
-#       --activation_checkpointing   lets batch fit at 20
-#       --batch 20 --grad_accum 8    effective batch 160 seqs =
-#                                    ~327k tokens/step (was 14k — the
+#       --activation_checkpointing   lets batch fit at 14
+#       --batch 14 --grad_accum 8    effective batch 112 seqs =
+#                                    ~229k tokens/step (was 14k — the
 #                                    tiny-batch noise was a real
 #                                    convergence-efficiency drag)
+#
+#     NOTE 2026-05-16: bumped down from --batch 20 → 14. The earlier
+#     b=20 smoke test (v4_smoke_b20*) passed because it ran before
+#     --feedback_self_k_warmup_steps 1300 expired. At step 1301 the K=3
+#     self-feed kicks in, the forward path triples, activation memory
+#     spikes ~3.76 GiB, and b=20 OOMs (observed twice: yesterday's
+#     22:11 "mystery" crash AND today's relaunch attempt). Batch 14 is
+#     the CLAUDE.md-validated target with activation checkpointing.
 #       --grad_clip 1.0              global grad-norm clip (was hardcoded;
 #                                    now an explicit flag)
 #       --z_loss 1e-4                logit-drift regulariser
@@ -37,11 +45,12 @@
 #       --warmup_steps 400           longer warmup absorbs the bigger jump.
 #       --gate_warmup_steps 1500     scaled to the new step count.
 #
-# Batch-20 + activation_ckpt peak memory: 27.1 GB / 32.6 GB (5.5 GB margin,
-# survives post-VAL backward). Batch 24 OOMs at the VAL→train transition.
+# Batch-14 + activation_ckpt peak memory (estimated): ~21 GB / 32 GB at
+# K=1, +3-4 GB at K=3 onset → ~25 GB steady-state with K=3 self-feed.
+# Batch 20 fits at K=1 (~27 GB) but OOMs at K=3 onset (+3.76 GB).
 #
-#   tokens/step = batch * grad_accum * T = 20 * 8 * 2048 = 327,680
-#   2.13B tokens / 327,680  ~=  6,500 steps
+#   tokens/step = batch * grad_accum * T = 14 * 8 * 2048 = 229,376
+#   2.13B tokens / 229,376  ~=  9,300 steps
 #
 # Pinned to GPU 0 by default.
 
@@ -61,7 +70,7 @@ CUDA_VISIBLE_DEVICES=${GPU:-0} nohup .venv/bin/python -u experiments/train_lm.py
     --data_mix configs/pretrain_mix_v4.yaml \
     --tokenizer HuggingFaceTB/SmolLM2-135M \
     --think_burst_prob 0.5 --think_max_bursts 2 --think_max_burst_depth 6 \
-    --T 2048 --batch 20 --grad_accum 8 \
+    --T 2048 --batch 14 --grad_accum 8 \
     --activation_checkpointing \
     --bf16 --tf32 --compile \
     --alpha_wd 0.0 --wd 0.01 \
@@ -70,9 +79,10 @@ CUDA_VISIBLE_DEVICES=${GPU:-0} nohup .venv/bin/python -u experiments/train_lm.py
     --gate_floor_min 0.5 --gate_warmup_steps 1500 \
     --optimizer muon --lr 1.4e-3 --lr_muon 5e-3 \
     --lr_schedule wsd --warmup_steps 400 --lr_decay_frac 0.15 \
-    --steps 6500 \
+    --steps 9300 \
     --val_every 200 --log_every 20 \
     --mid_eval_every_tokens 500000000 \
+    --mid_eval_save_only \
     --mid_eval_n_problems 50 --mid_eval_max_gen 192 \
     --save_ckpt checkpoints/pretrain_mix_v4.pt \
     --tb_dir runs/tb/pretrain_mix_v4 \

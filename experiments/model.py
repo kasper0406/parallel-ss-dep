@@ -1081,6 +1081,18 @@ class TinyLM(nn.Module):
                                               # the model has no dropout
                                               # and preserve_rng_state=True
                                               # by default.
+        use_pkm: bool = False,                # Persistent learned-RAG /
+                                              # Product-Key Memory layer.
+                                              # Drop-in residual side-table
+                                              # at one mid-depth block. See
+                                              # PKM_PLAN.md and
+                                              # experiments/memory_layer.py.
+        pkm_after_layer: int = 14,
+        pkm_n_keys: int = 256,
+        pkm_n_heads: int = 4,
+        pkm_k_dim: int = 128,
+        pkm_top_k: int = 32,
+        pkm_value_bf16: bool = True,
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1297,6 +1309,38 @@ class TinyLM(nn.Module):
                 mean_row = self.embed.weight.mean(dim=0)
                 self.embed.weight[int(thinking_token_id)].copy_(mean_row)
 
+        # Persistent learned-RAG (Product-Key Memory). Drop-in residual
+        # at one mid-depth block. See PKM_PLAN.md.
+        self.use_pkm = bool(use_pkm)
+        self.pkm_after_layer = int(pkm_after_layer)
+        if self.use_pkm:
+            from experiments.memory_layer import PKMLayer
+            if not (0 <= self.pkm_after_layer < n_layers):
+                raise ValueError(
+                    f"pkm_after_layer={self.pkm_after_layer} out of range "
+                    f"for n_layers={n_layers}"
+                )
+            self.pkm_layer = PKMLayer(
+                d_model=d_model,
+                n_heads=int(pkm_n_heads),
+                n_keys=int(pkm_n_keys),
+                k_dim=int(pkm_k_dim),
+                top_k=int(pkm_top_k),
+                value_bf16=bool(pkm_value_bf16),
+            )
+
+    def _maybe_pkm(self, h: torch.Tensor, L: int) -> torch.Tensor:
+        """Apply the PKM residual side-table after layer L iff configured.
+
+        Called after every Block forward in the loss-bearing path AND in
+        the K-self-feed no-grad warmup passes — without the latter, the
+        FiLM source-state collected in passes 1/2 differs from what the
+        deployed model sees, breaking K=3 self-consistency.
+        """
+        if self.use_pkm and L == self.pkm_after_layer:
+            h = h + self.pkm_layer(h)
+        return h
+
     def _sparse_pass_collect_sources(self,
                                       x: torch.Tensor,
                                       source_layers: set,
@@ -1336,6 +1380,7 @@ class TinyLM(nn.Module):
                 src = self.sparse_target_to_source[L]
                 h = self.sparse_feedback[str(L)](h, film_sources_lagged[src],
                                                   surprise=surprise)
+            h = self._maybe_pkm(h, L)
             if L in source_layers:
                 out_src[L] = h
         return out_src
@@ -1361,8 +1406,10 @@ class TinyLM(nn.Module):
             if torch.rand((), device=h.device).item() < p_L:
                 return h
         if self.activation_checkpointing and torch.is_grad_enabled():
-            return _ckpt_run_block(blk, h, input_ids, cu_seqlens)
-        return blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
+            h = _ckpt_run_block(blk, h, input_ids, cu_seqlens)
+        else:
+            h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
+        return self._maybe_pkm(h, L)
 
     def _apply_memory(self, h_normed: torch.Tensor,
                       input_ids: torch.Tensor,
@@ -1464,6 +1511,7 @@ class TinyLM(nn.Module):
             h1 = x
             for L, blk in enumerate(self.blocks):
                 h1 = blk(h1, input_ids=input_ids, cu_seqlens=cu_seqlens)
+                h1 = self._maybe_pkm(h1, L)
                 if L in needed_sources:
                     pass1_at_sources[L] = h1
             # Pass 2: at each target layer, gather lagged source states and
@@ -1483,6 +1531,7 @@ class TinyLM(nn.Module):
                         src_states = [lagged_pass1[s] for s in srcs]
                         h = self.xattn_feedback[str(L)](h, src_states)
                 h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
+                h = self._maybe_pkm(h, L)
             return self._finalize(h, input_ids, mem_read_mask,
                                    return_aux, return_hidden, return_gate,
                                    _maybe_gate, doc_ids=doc_ids)
@@ -1624,6 +1673,7 @@ class TinyLM(nn.Module):
             h1 = x
             for L, blk in enumerate(self.blocks):
                 h1 = blk(h1, input_ids=input_ids, cu_seqlens=cu_seqlens)
+                h1 = self._maybe_pkm(h1, L)
                 if L in source_layers:
                     pass1_at_sources[L] = h1
             # Pass 2: forward with sparse modulation at target layers.
@@ -1649,8 +1699,9 @@ class TinyLM(nn.Module):
         # Pass 1: vanilla forward, collect each layer's output.
         pass1_outs: list[torch.Tensor] = []
         h = x
-        for blk in self.blocks:
+        for L, blk in enumerate(self.blocks):
             h = blk(h, input_ids=input_ids)
+            h = self._maybe_pkm(h, L)
             pass1_outs.append(h)
 
         # Pass 2: forward with top-down feedback from pass-1 outputs,
@@ -1661,6 +1712,7 @@ class TinyLM(nn.Module):
         for L, blk in enumerate(self.blocks):
             if self.feedback_mode == "none":
                 h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
+                h = self._maybe_pkm(h, L)
                 continue
             # Gather multi-scale lagged states for layer L.
             states_above: list = []
@@ -1672,6 +1724,7 @@ class TinyLM(nn.Module):
                     states_above.append(None)
             h_input = self.feedback[L](h, states_above)
             h = blk(h_input, input_ids=input_ids, cu_seqlens=cu_seqlens)
+            h = self._maybe_pkm(h, L)
 
         return self._finalize(h, input_ids, mem_read_mask,
                                return_aux, return_hidden, return_gate,

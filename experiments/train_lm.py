@@ -1425,6 +1425,13 @@ def main():
                 mem_size=int(args.mem_size) if args.use_memory else 0,
                 mem_dim=(int(args.mem_dim) if args.mem_dim > 0
                           else int(args.d_model)) if args.use_memory else 0,
+                use_pkm=bool(getattr(args, "use_pkm", False)),
+                pkm_after_layer=int(getattr(args, "pkm_after_layer", 14)),
+                pkm_n_keys=int(getattr(args, "pkm_n_keys", 256)),
+                pkm_n_heads=int(getattr(args, "pkm_n_heads", 4)),
+                pkm_k_dim=int(getattr(args, "pkm_k_dim", 128)),
+                pkm_top_k=int(getattr(args, "pkm_top_k", 32)),
+                pkm_value_bf16=bool(getattr(args, "pkm_value_bf16", True)),
                 output_gate=bool(args.output_gate
                                   or (args.enable_thinking_token
                                       and args.think_decision == "gate")),
@@ -1433,22 +1440,57 @@ def main():
                         "config": _save_cfg}, str(mid_path))
             print(f"\n[mid-eval] saved ckpt at step={step} tokens={tokens_seen:,}"
                   f" → {mid_path}")
-            print(f"[mid-eval] running HumanEval (max_problems="
-                  f"{args.mid_eval_n_problems}) ...")
-            model.eval()
-            res = run_eval(
-                str(mid_path), tokens_seen=tokens_seen, step=step,
-                n_problems=args.mid_eval_n_problems,
-                max_gen=args.mid_eval_max_gen,
-                use_thinking=bool(args.use_memory),
-                emit_threshold=0.5,
-                min_emit_before_eos=int(args.mid_eval_min_emit_before_eos),
-                gate_floor=float(args.gate_floor_min),
-            )
-            model.train()
+
+            # Decide whether to run the HumanEval subprocess. Two skip paths,
+            # both leave the ckpt on disk and advance the counter (resume
+            # artifact > HumanEval signal during pretrain):
+            #   1. --mid_eval_save_only: explicit user opt-out.
+            #   2. Auto-skip: trainer is using nearly all of GPU memory; the
+            #      eval subprocess would OOM trying to load its own model copy
+            #      on the same device (observed in v4 at step 1526).
+            skip_eval = False
+            skip_reason = ""
+            if args.mid_eval_save_only:
+                skip_eval = True
+                skip_reason = "--mid_eval_save_only"
+            elif args.mid_eval_min_free_gib > 0:
+                free_b, _ = torch.cuda.mem_get_info()
+                free_gib = free_b / (1024 ** 3)
+                if free_gib < args.mid_eval_min_free_gib:
+                    skip_eval = True
+                    skip_reason = (
+                        f"free GPU memory {free_gib:.2f} GiB < "
+                        f"{args.mid_eval_min_free_gib:.2f} GiB — eval "
+                        f"subprocess would OOM")
+
+            if skip_eval:
+                print(f"[mid-eval] SKIPPED HumanEval ({skip_reason}). "
+                      f"Ckpt is on disk; advancing counter.")
+                from experiments.eval_callback import EvalResult
+                res = EvalResult(
+                    humaneval_pass_rate=float("nan"),
+                    mbpp_pass_rate=None,
+                    tokens_seen=tokens_seen, step=step,
+                    ckpt_path=str(mid_path),
+                    raw_log_tail=f"<skipped: {skip_reason}>",
+                )
+            else:
+                print(f"[mid-eval] running HumanEval (max_problems="
+                      f"{args.mid_eval_n_problems}) ...")
+                model.eval()
+                res = run_eval(
+                    str(mid_path), tokens_seen=tokens_seen, step=step,
+                    n_problems=args.mid_eval_n_problems,
+                    max_gen=args.mid_eval_max_gen,
+                    use_thinking=bool(args.use_memory),
+                    emit_threshold=0.5,
+                    min_emit_before_eos=int(args.mid_eval_min_emit_before_eos),
+                    gate_floor=float(args.gate_floor_min),
+                )
+                model.train()
             mid_eval_controller.append(res)
             print(f"[mid-eval] {mid_eval_controller.summary_line()}")
-            if res.humaneval_pass_rate != res.humaneval_pass_rate:  # NaN
+            if not skip_eval and res.humaneval_pass_rate != res.humaneval_pass_rate:  # NaN
                 print("[mid-eval] WARNING: humaneval=NaN — eval subprocess "
                       "did not emit a parseable `pass@k =` line. Last 2 kB "
                       "of its stdout/stderr:")
@@ -1485,6 +1527,13 @@ def main():
                 "mem_size": (int(args.mem_size) if args.use_memory else 0),
                 "mem_dim": ((int(args.mem_dim) if args.mem_dim > 0
                              else int(args.d_model)) if args.use_memory else 0),
+                "use_pkm": bool(getattr(args, "use_pkm", False)),
+                "pkm_after_layer": int(getattr(args, "pkm_after_layer", 14)),
+                "pkm_n_keys": int(getattr(args, "pkm_n_keys", 256)),
+                "pkm_n_heads": int(getattr(args, "pkm_n_heads", 4)),
+                "pkm_k_dim": int(getattr(args, "pkm_k_dim", 128)),
+                "pkm_top_k": int(getattr(args, "pkm_top_k", 32)),
+                "pkm_value_bf16": bool(getattr(args, "pkm_value_bf16", True)),
                 "data_mix": args.data_mix,
                 "think_burst_prob": args.think_burst_prob,
                 "think_max_bursts": args.think_max_bursts,

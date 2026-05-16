@@ -4,16 +4,18 @@
 
 The active goal of this repo is to build a **small, efficient code model that competes with much larger models on coding benchmarks** under tight compute (2× RTX 5090). The architectural research below feeds into that target.
 
-Stack as of 2026-05-14:
+Stack as of 2026-05-16:
 - **DeltaNet** backbone (`--arch deltanet`) — bounded-state linear RNN, no KV-cache cost. *Note: `gated_deltanet` is broken on sm_120 RTX 5090 (FLA Triton kernel bug); plain `deltanet` works.*
 - **Sparse FiLM feedback (2, 28)** + K=3 self-feeding — −3 % to −5 % PPL at 217 M / 360 M / 708 M, single forward at deploy.
-- **Bounded working memory** ([`experiments/model.py::WorkingMemory`](experiments/model.py)) — write-gated buffer of past hidden states, read via soft attention at "think" / query positions. **+11.1 pp recall** on saturated MQAR (T=512, K=128) vs DeltaNet alone, no O(T²) attention cost. Validated 2026-05-12 — see [SESSION_FINDINGS](SESSION_FINDINGS.md).
+- **Bounded working memory** ([`experiments/model.py::WorkingMemory`](experiments/model.py)) — write-gated buffer of past hidden states, read via soft attention at "think" / query positions. **+11.1 pp recall** on saturated MQAR (T=512, K=128) vs DeltaNet alone, no O(T²) attention cost.
+- **Product-Key Memory side-table** ([`experiments/memory_layer.py::PKMLayer`](experiments/memory_layer.py), added 2026-05-16) — 4 heads × 256² = 262 k learned KV slots dropped in after block 14, sub-linear lookup via factorised sub-keys. **2.4× pretrain-token efficiency** vs the prior FiLM+WM stack at matched overall CE; large wins on long-tail factual streams (Wikipedia CE −0.37 vs v3-long final). Enable with `--use_pkm --pkm_after_layer 14`. Full design: [`PKM_PLAN.md`](PKM_PLAN.md).
 - **Thinking gate** — per-position σ head choosing emit vs think. Allows extra recurrent passes at hard positions and triggers memory reads.
-- **Mixed-corpus pretrain** (`experiments/data_mix.py`, `configs/pretrain_mix_v*.yaml`) — 9–11 weighted HuggingFace streams (code, instruct, CS textbooks, Wikipedia, optionally BigVul + CyberNative CVE data) with chunk-boundary think-burst injection so memory + gate train from step 0. Auto-stop on flat HumanEval over two 500 M-token intervals.
-- **Speed**: `--bf16 --tf32` measured 2.28× over fp32 on 5090 (~18 k → ~42 k tok/s).
-- **Training-methodology fixes (2026-05-14)** — diagnostic tooling ([`diag_ckpt.py`](experiments/diag_ckpt.py), [`diag_reference_lm.py`](experiments/diag_reference_lm.py)) found **residual-stream collapse** under the legacy weight decay 0.1; `--wd 0.01` un-collapses it and beats the prior run on every per-source CE. `--lr_schedule wsd` (warmup-stable-decay) replaces cosine as the default. Dense execution-grounded GRPO reward ([`code_grader.py`](experiments/code_grader.py)). See the 2026-05-14 entry in [SESSION_FINDINGS](SESSION_FINDINGS.md).
+- **Mixed-corpus pretrain** (`experiments/data_mix.py`, `configs/pretrain_mix_v*.yaml`) — 9–11 weighted HuggingFace streams (code, instruct, CS textbooks, Wikipedia, optionally BigVul + CyberNative CVE data) with chunk-boundary think-burst injection so memory + gate train from step 0.
+- **Speed**: `--bf16 --tf32 --compile` on 5090 (~37 k tok/s @ K=3 self-feed); `--bf16_optim_state` stores AdamW/Muon state in bf16 (saves ~550 MB persistent at 218 M); `BF16StateAdamW(compile_step=True)` fuses the optim-step Python loop into a torch-compiled kernel (~30-50 ms saved/step at 218 M).
+- **Training-methodology fixes (2026-05-14)** — diagnostic tooling ([`diag_ckpt.py`](experiments/diag_ckpt.py), [`diag_reference_lm.py`](experiments/diag_reference_lm.py)) found **residual-stream collapse** under the legacy weight decay 0.1; `--wd 0.01` un-collapses it. `--lr_schedule wsd` replaces cosine as the default. Dense execution-grounded GRPO reward via [`code_grader.py`](experiments/code_grader.py).
+- **Execution-grounded RL** ([`experiments/train_rl_grader.py`](experiments/train_rl_grader.py), added 2026-05-16) — GRPO with the dense `code_grader` score (tier ladder: syntax_error 0.0 → exec_error 0.05 → runtime_error 0.2 → partial 0.2-0.9 → pass 1.0) as reward, MBPP problems, PPO clipped policy. First validated lift on v5-pkm-SFT base: gate evolves from "always emit" to selective (think_rate 0.7-1.0, depth_mean drops with ponder warmup), pass-rate climbs from 1/16 at step 14 to 14 cumulative passes in 82 steps.
 
-Active run (2026-05-14): [`launch_pretrain_mix_v3_long.sh`](launch_pretrain_mix_v3_long.sh) — 217 M, `--wd 0.01`, 2.13 B tokens.
+Active runs (2026-05-16): v4 pretrain ([`launch_pretrain_mix_v4.sh`](launch_pretrain_mix_v4.sh), 218 M, 2.13 B tokens — for v5-pkm head-to-head); RL grader on v5-pkm-SFT base ([`experiments/train_rl_grader.py`](experiments/train_rl_grader.py)).
 
 Project framing: [`THESIS.md`](THESIS.md).
 Post-pretrain RL plan: [`PHASE_C_RL.md`](PHASE_C_RL.md).
@@ -149,21 +151,21 @@ Chinchilla-scale or frontier-finetune follow-up*.
                                          pass-2 input
 ```
 
-## Current Frontier: Reinforcement Learning (GRPO) & Deep Thinking
+## Current Frontier: Execution-grounded RL on the v5-pkm base
 
-We are currently transitioning the architecture from supervised BPTT to **Reinforcement Learning (GRPO)**.
+### What's working (2026-05-16)
 
-### Phase 24 Discovery: Autonomous Thinking "From Scratch"
-Recent experiments (May 2026) have established that:
-- **RL > Supervised:** Transitioning to GRPO has solved the "Maladaptive Thinking" trap. Models are now rewarded only when thinking directly improves next-token prediction.
-- **Autonomous Discovery:** We successfully trained a thinking model **from scratch** (starting from a non-thinking DN baseline). The model autonomously discovered the utility of the [THINKING] token, reaching a ~12% thought rate through pure RL exploration.
-- **Scaling Depth:** The "From SFT" model has already scaled to an average depth of 1.25 (max 10) while maintaining control over perplexity.
+- **PKM is a real token-efficiency win.** v5-pkm pretrain (218 M params, 884 M tokens, FiLM + WM + PKM) beats v3-long (no-PKM, 2.13 B tokens) on **every long-tail factual stream** (wikipedia −0.37 CE, bigvul −0.13, cybernative −0.12, python_codes −0.22) and ties overall CE — at 2.4× fewer tokens. PKM also broke the bigvul/cybernative monotonic upward drift that plagued v2/v3 pretrains. Per-head specialisation is concrete: single 1-in-262 k slots get hit 30-40× across 60-token generations.
+- **The thinking gate did learn an uncertainty signal during pretrain** — even though it was clamped at deploy. Inspection probe ([`experiments/inspect_v5_pkm.py`](experiments/inspect_v5_pkm.py)) on v5-pkm with `gate_floor=0.0` shows think_rate 83% on Wikipedia / Roman Empire prompts vs 7-10% on familiar code. WorkingMemory reads sharply (+53 to +63% below uniform, attending −40 to −200 tokens back into prompt). What pretrain *didn't* teach is using thinking *productively*: bursts increase but outputs degrade. That's an RL question, not a pretrain question.
+- **Execution-grounded RL is producing real capability lift.** [`train_rl_grader.py`](experiments/train_rl_grader.py) on the v5-pkm-SFT base with the dense `code_grader` reward, MBPP problems, ponder-cost shaping (`quadratic`, `counterfactual`, `warmup_steps=50`): pass-rate climbing from 1/16 rollouts at step 14 to 14 cumulative passes by step 82. The gate evolves from "always emit" toward "selective" (`think_rate` 0.69-1.00 in recent steps, `depth_mean` dropping after warmup) — exactly the design hypothesis: the dense reward + ponder cost teaches the model to think less but better.
 
-### Next Steps: Benchmark & RAG
-1.  **Evaluation:** We are now running the RL-trained agents on existing benchmarks (**HumanEval**, **MBPP**, and mechanistic tasks) to quantify the reasoning lift from extra "thought" passes.
-2.  **Continuous RAG:** Integrating the external vector database to give the model a concrete source of information to "think about."
+### Open follow-ups
 
-See [`RL_RAG_ROADMAP.md`](RL_RAG_ROADMAP.md) for the technical integration plan.
+1. **Bigger SFT data** to cross 0/50 HumanEval baseline (currently the SFT'd v5-pkm scores 0/50; per memory this is a data-scale issue, not architecture).
+2. **Incremental decoding for rollouts** ([`experiments/layers.py::_FlaWrapper.forward_step`](experiments/layers.py) foundation shipped; FiLM K=3 + WorkingMemory buffer integration deferred).
+3. **Intra-document hard-token think-burst injection** at pretrain (currently only chunk boundaries) — the cleanest pretrain lever to teach "thinking should improve outputs" before RL.
+
+See [`PHASE_C_RL.md`](PHASE_C_RL.md) and [`NEXT_DIRECTIONS.md`](NEXT_DIRECTIONS.md).
 
 ## Validation matrix
 

@@ -215,16 +215,48 @@ def main() -> int:
     # --- 1. Build model from ckpt ----------------------------------------
     print(f"loading checkpoint: {args.load_ckpt}")
     if args.with_thinking:
-        # Build the model directly with thinking + memory ON, then load the
-        # ckpt state with strict=False so memory + gate heads stay
-        # freshly-initialised (the loaded ckpt has neither). The think-token
-        # embedding gets fresh init at the new last vocab slot (later
-        # over-written to embed-mean inside TinyLM.__init__ when
-        # use_memory=True).
+        # Detect whether the loaded ckpt ALREADY has thinking infrastructure
+        # (memory + output gate + thinking-token vocab slot). v5-pkm and later
+        # ckpts have all of this baked in from pretrain; older distilled
+        # ckpts (the original SFT use case) do not, and we have to add it.
         import torch as _t
+        raw_ckpt = _t.load(args.load_ckpt, map_location="cpu", weights_only=False)
+        sd_keys = set(raw_ckpt["state_dict"].keys())
+        ckpt_has_memory = any(k.startswith("memory.") for k in sd_keys)
+        ckpt_has_gate = any(k.startswith("gate_head.") for k in sd_keys)
+        if ckpt_has_memory and ckpt_has_gate:
+            # Modern path: ckpt already has memory + gate (and possibly PKM).
+            # Use build_model_from_ckpt — it autodetects all three and gets
+            # the architecture exactly right. Skip the "expand vocab" code
+            # because the thinking-token slot is already in the saved vocab.
+            from experiments.eval_bracket_structure import build_model_from_ckpt
+            model, cfg = build_model_from_ckpt(args.load_ckpt)
+            thinking_token_id = cfg.get("thinking_token_id")
+            if thinking_token_id is None:
+                # Fall back to "last vocab slot" if cfg didn't store it.
+                thinking_token_id = int(cfg["vocab_size"]) - 1
+            print(f"  with-thinking + ckpt-already-has-thinking: loaded as-is "
+                  f"(memory + gate {'+ pkm ' if any(k.startswith('pkm_layer.') for k in sd_keys) else ''}"
+                  f"think_id={thinking_token_id})")
+            cfg["sft_with_thinking"] = True
+            base_vocab_for_loss = int(cfg["vocab_size"]) - 1
+            model.train()
+            # Skip the rest of the with-thinking branch below.
+            args_with_thinking_done = True
+        else:
+            args_with_thinking_done = False
+    else:
+        args_with_thinking_done = False
+
+    if args.with_thinking and not args_with_thinking_done:
+        # Legacy path: ckpt has no memory + gate. Build the model directly
+        # with thinking + memory ON, then load the ckpt state with
+        # strict=False so memory + gate heads stay freshly-initialised. The
+        # think-token embedding gets fresh init at the new last vocab slot
+        # (later over-written to embed-mean inside TinyLM.__init__ when
+        # use_memory=True).
         from experiments.model import TinyLM
         from experiments.layers import DeltaNetAttention
-        raw_ckpt = _t.load(args.load_ckpt, map_location="cpu", weights_only=False)
         cfg = dict(raw_ckpt["config"])  # copy
         sd = raw_ckpt["state_dict"]
         base_vocab = int(cfg["vocab_size"])
@@ -272,10 +304,17 @@ def main() -> int:
         model, cfg = build_model_from_ckpt(args.load_ckpt)
         thinking_token_id = cfg.get("thinking_token_id")
     model.train()
-    base_vocab_for_loss = int(cfg["vocab_size"]) - (1 if args.with_thinking else 0)
+    # base_vocab_for_loss = index BELOW which targets are valid emit tokens.
+    # Slicing logits[..., :base_vocab_for_loss] removes the thinking-token
+    # slot (and any kernel-alignment padding above it) from the CE softmax.
+    if args.with_thinking and thinking_token_id is not None:
+        base_vocab_for_loss = int(thinking_token_id)
+    else:
+        base_vocab_for_loss = int(cfg["vocab_size"])
     print(f"  model: {cfg['n_layers']}L  d_model={cfg['d_model']}  "
           f"params={model.num_params() / 1e6:.1f}M  "
-          f"with_thinking={args.with_thinking}")
+          f"with_thinking={args.with_thinking}  "
+          f"vocab={cfg['vocab_size']} loss_slice=:{base_vocab_for_loss}")
 
     # --- 2. Tokenizer ------------------------------------------------------
     from transformers import AutoTokenizer

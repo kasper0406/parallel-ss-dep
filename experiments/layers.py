@@ -194,6 +194,67 @@ class _FlaWrapper(nn.Module):
             out = out[0]
         return out.to(in_dtype)
 
+    def forward_step(self, x: torch.Tensor, past_key_values, layer_idx: int):
+        """Incremental-decoding forward for one timestep.
+
+        `x`: (B, 1, d_model) — typically one new token's hidden state.
+        `past_key_values`: an `fla.models.utils.Cache` (or None for the
+            first step). Provides this layer's recurrent state from the
+            previous step; the FLA kernel reads it via `layer_idx`.
+        `layer_idx`: which entry of `past_key_values` this wrapper's
+            inner FLA layer owns. Must be unique per attention layer in
+            the model.
+
+        Returns `(out, past_key_values)` — `out` is (B, 1, d_model);
+        `past_key_values` is the updated cache (same object, mutated
+        in-place by FLA).
+
+        Implementation notes:
+        - FLA's DeltaNet (and family) reads `self.layer.layer_idx` and
+          `self.layer.mode` at forward time. We monkey-patch both for
+          the duration of this call so the SAME instance can serve both
+          full-sequence training (`mode="chunk"`) and single-step
+          incremental decoding (`mode="fused_recurrent"`). The original
+          mode is restored on the way out so subsequent training-path
+          forwards behave identically.
+        - The cache is bit-identical to having run the chunked kernel
+          on the full sequence so far (verified in
+          `experiments/test_incremental_decode.py`).
+        """
+        # Lazy-initialise a Cache the first time we're called.
+        if past_key_values is None:
+            from fla.models.utils import Cache
+            past_key_values = Cache()
+        in_dtype = x.dtype
+        layer = self.layer
+        saved_mode = getattr(layer, "mode", None)
+        saved_layer_idx = getattr(layer, "layer_idx", None)
+        try:
+            layer.layer_idx = int(layer_idx)
+            # Switch this instance to the incremental kernel for the call.
+            if saved_mode is not None and saved_mode != "fused_recurrent":
+                layer.mode = "fused_recurrent"
+            with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+                out = layer(x, past_key_values=past_key_values, use_cache=True)
+        finally:
+            # Restore — never leave the model in a non-training-friendly state.
+            if saved_mode is not None:
+                layer.mode = saved_mode
+            if saved_layer_idx is None:
+                # Best effort: leave it set; FLA tolerates a stale layer_idx
+                # as long as we keep calling with the same Cache.
+                pass
+            else:
+                layer.layer_idx = saved_layer_idx
+        # FLA's DeltaNet returns (hidden, attentions, past_key_values).
+        if isinstance(out, tuple):
+            new_pkvs = out[-1] if len(out) >= 3 else past_key_values
+            out_t = out[0]
+        else:
+            new_pkvs = past_key_values
+            out_t = out
+        return out_t.to(in_dtype), new_pkvs
+
 
 class DeltaNetAttention(_FlaWrapper):
     """fla DeltaNet — same KV-state size as our linear_attn, plus delta updates."""

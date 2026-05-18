@@ -27,7 +27,9 @@ from experiments.layers import (
     DeltaNetAttention, GatedDeltaNetAttention, Mamba2Attention,
     OrthogonalScanAttention, RotConjAttention,
 )
+from experiments.bf16_optim import BF16StateAdamW
 from experiments.model import TinyLM
+from experiments.speed_knobs import apply_speed_knobs
 from experiments.tasks.mqar import make_batch as mqar_batch
 
 
@@ -55,6 +57,7 @@ class RunResult:
     recall_acc: float
     secs: float
     params: int
+    label: str = ""
 
 
 def _val(model, T, n_pairs, vocab, batch_size, device, use_memory=False):
@@ -80,10 +83,42 @@ def _val(model, T, n_pairs, vocab, batch_size, device, use_memory=False):
     return loss.item(), recall
 
 
+def _parse_xattn_spec(spec: str) -> tuple:
+    """Parse '2:8,9,10,11;4:8,9,10,11' → ((2,(8,9,10,11)),(4,(8,9,10,11)))."""
+    if not spec:
+        return ()
+    out = []
+    for chunk in spec.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        tgt_s, src_s = chunk.split(":")
+        srcs = tuple(int(x) for x in src_s.split(",") if x.strip())
+        out.append((int(tgt_s), srcs))
+    return tuple(out)
+
+
+def _parse_pairs_spec(spec: str) -> tuple:
+    """Parse '2,28;3,27' → ((2,28),(3,27)).  Empty → ()."""
+    if not spec:
+        return ()
+    out = []
+    for chunk in spec.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        t_s, s_s = chunk.split(",")
+        out.append((int(t_s), int(s_s)))
+    return tuple(out)
+
+
 def train_one(arch, T, n_pairs, vocab, steps, batch_size,
               d_model, n_layers, n_heads, d_head, lr, log_every,
               device="cuda", seed=0, feedback="none",
-              use_memory=False, mem_size=1024, mem_dim=0):
+              use_memory=False, mem_size=1024, mem_dim=0,
+              feedback_pairs="", feedback_self_k=0,
+              feedback_xattn="", feedback_xattn_form="attn",
+              feedback_xattn_heads=4, label=None):
     torch.manual_seed(seed)
     cls = ARCHES[arch]
     # When use_memory=True we need a thinking_token_id slot; reserve the
@@ -93,24 +128,54 @@ def train_one(arch, T, n_pairs, vocab, steps, batch_size,
     # drive reads via mem_read_mask instead — but the model needs a valid id.
     vocab_eff = vocab + (1 if use_memory else 0)
     thinking_id = vocab_eff - 1 if use_memory else None
+    fb_pairs = _parse_pairs_spec(feedback_pairs)
+    fb_xattn = _parse_xattn_spec(feedback_xattn)
+    # Param-count check before allocating
     model = TinyLM(
         vocab_size=vocab_eff, d_model=d_model, n_layers=n_layers,
         n_heads=n_heads, d_head=d_head, attention_cls=cls,
         max_T=T,                              # learnable abs pos embed
         feedback_mode=feedback,
+        feedback_pairs=fb_pairs,
+        feedback_self_k=int(feedback_self_k),
+        feedback_xattn_pairs=fb_xattn,
+        feedback_xattn_form=feedback_xattn_form,
+        feedback_xattn_heads=int(feedback_xattn_heads),
         use_memory=use_memory,
         mem_size=mem_size,
         mem_dim=mem_dim if mem_dim > 0 else d_model,
         thinking_token_id=thinking_id,
+        activation_checkpointing=False,
     ).to(device)
+    # NOTE: MQAR runs in fp32 (no bf16 autocast). MQAR's masked loss only
+    # carries gradient at ~25% of positions, so the per-token gradient is
+    # ~4× smaller than production pretrain (where every token contributes
+    # via packed-sequence CE). At that signal level bf16's 7-bit mantissa
+    # rounds the per-token update to noise and the model COLLAPSES to
+    # uniform logits — verified by direct probe (Phase 1, 2026-05-16): a
+    # 30L×576 + FiLM K=3 run at lr=1e-3 with bf16+ckpt drove logit_std from
+    # 0.58 → 0.34 over 20 steps while loss stayed flat at 6.40. fp32
+    # forward keeps things stable. apply_speed_knobs still gives us TF32 on
+    # the residual fp32 matmuls (~free).
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # Plain fp32 AdamW — keep MQAR pipeline simple and noise-free.
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95),
                             weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=steps, eta_min=lr * 0.1,
     )
 
-    print(f"\n[{arch}{' +mem' if use_memory else ''}]  "
-          f"T={T}  n_pairs={n_pairs}  vocab={vocab}  "
+    tag = label if label else arch
+    suffix = []
+    if use_memory:
+        suffix.append("+mem")
+    if fb_pairs:
+        suffix.append(f"+FiLM{fb_pairs}K={feedback_self_k}")
+    if fb_xattn:
+        suffix.append(f"+xattn[{feedback_xattn_form}]")
+    print(f"\n[{tag}{''.join(suffix)}]  "
+          f"L={n_layers} d={d_model}  T={T}  n_pairs={n_pairs}  vocab={vocab}  "
           f"params={model.num_params():,}")
     print(f"{'step':>6}  {'train_loss':>11}  {'val_loss':>9}  {'recall':>8}")
 
@@ -138,18 +203,23 @@ def train_one(arch, T, n_pairs, vocab, steps, batch_size,
         last_train_loss = loss.item()
 
         if step % log_every == 0 or step == steps:
-            v_loss, recall = _val(model, T, n_pairs, vocab, 512, device,
-                                   use_memory=use_memory)
+            # Use the training batch size for periodic val so we don't OOM
+            # at wider-d configs (the original 512/1024 eval batches were
+            # tuned for the 128d MQAR experiments).
+            v_loss, recall = _val(model, T, n_pairs, vocab, batch_size,
+                                   device, use_memory=use_memory)
             print(f"{step:>6d}  {last_train_loss:>11.4f}  "
                   f"{v_loss:>9.4f}  {recall:>8.3f}")
 
-    v_loss, recall = _val(model, T, n_pairs, vocab, 1024, device,
+    v_loss, recall = _val(model, T, n_pairs, vocab,
+                           min(2 * batch_size, 256), device,
                            use_memory=use_memory)
     secs = time.perf_counter() - t0
     return RunResult(
         arch=arch, T=T, n_pairs=n_pairs, vocab=vocab, steps=steps,
         final_train_loss=last_train_loss, final_val_loss=v_loss,
         recall_acc=recall, secs=secs, params=model.num_params(),
+        label=tag,
     )
 
 

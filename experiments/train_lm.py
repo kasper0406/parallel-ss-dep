@@ -101,9 +101,16 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
                            doc_ids=None):
     """Forward + LM loss for the non-thinking-token (pretrain) path.
 
-    Returns (logits, ce_per_token, lm_loss, aux_loss). Factored out of the
-    step loop so gradient accumulation can run it once per microbatch.
-    Mirrors the inline forward + gate/plain-loss branches exactly.
+    Returns (logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss).
+    Factored out of the step loop so gradient accumulation can run it once
+    per microbatch. Mirrors the inline forward + gate/plain-loss branches
+    exactly.
+
+    When --gate_entropy_aux_weight > 0, the gate logit gets an auxiliary
+    BCE target derived from the SAME forward's per-position next-token
+    entropy (detached): target_t = exp(-H_t/T). High entropy ⇒ low target
+    ⇒ gate trained to close (think). Costs nothing extra — no second
+    forward, just turns the gate into a free predictive-uncertainty head.
     """
     if args.aux_brackets:
         logits, aux_logits = model(x, return_aux=True, doc_ids=doc_ids)
@@ -114,7 +121,7 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
         )
     else:
         logits = model(x, doc_ids=doc_ids)
-        aux_loss = torch.zeros((), device="cuda")
+        aux_loss = logits.new_zeros(())
     V = logits.shape[-1]
     ce_per_token = F.cross_entropy(
         logits.reshape(-1, V), y.reshape(-1), reduction="none",
@@ -135,7 +142,31 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
         valid = (y != -100).float()
         denom = valid.sum().clamp(min=1.0)
         lm_loss = (ce_per_token * valid).sum() / denom
-    return logits, ce_per_token, lm_loss, aux_loss
+    # Entropy-grounded gate target (CE-reduction self-reward, cheap form).
+    gate_aux_loss = torch.zeros((), device=logits.device)
+    if args.output_gate and args.gate_entropy_aux_weight > 0.0:
+        gate_logits = model._last_gate_logits                            # (B, T)
+        # logsumexp + p·logp = stable entropy. We detach the source logits
+        # because the target is a SELF-supervised signal — gradient must
+        # flow into the gate head, not into the LM head.
+        lse = torch.logsumexp(logits.detach(), dim=-1)                   # (B, T)
+        # H_t = lse - sum(p * raw_logit) = lse - mean over support
+        # using p = softmax(logits): H = lse - sum(p*logits)
+        p = (logits.detach() - lse.unsqueeze(-1)).exp()                  # (B, T, V)
+        H = lse - (p * logits.detach()).sum(dim=-1)                      # (B, T) ≥ 0
+        T = max(args.gate_entropy_aux_temperature, 1e-6)
+        target = torch.exp(-H / T).clamp(0.0, 1.0)                       # (B, T)
+        c = args.gate_entropy_aux_target_clamp
+        if c > 0.0:
+            target = target.clamp(c, 1.0 - c)
+        # BCE-with-logits over valid (non-ignored) positions only.
+        valid = (y != -100).float()
+        bce = F.binary_cross_entropy_with_logits(
+            gate_logits, target, reduction="none",
+        )
+        denom = valid.sum().clamp(min=1.0)
+        gate_aux_loss = (bce * valid).sum() / denom
+    return logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss
 
 
 def _z_loss_term(logits, weight):
@@ -143,6 +174,44 @@ def _z_loss_term(logits, weight):
     if weight <= 0.0:
         return logits.new_zeros(())
     return weight * (torch.logsumexp(logits, dim=-1) ** 2).mean()
+
+
+def _pkm_diversity_loss(pkm) -> torch.Tensor:
+    """Negative entropy of the per-head slot-selection distribution.
+
+    Aggregates the per-head top-k retrievals into a (n_heads, n_slots)
+    histogram and returns the mean of (-H_per_head). Minimising this loss
+    increases entropy — encouraging the model to spread retrievals across
+    the full table rather than concentrate on a handful of hot slots.
+
+    Operates on the STASHED detached indices/weights from the last forward,
+    so this aux loss does NOT backprop through the router. It only affects
+    the value-table grads (which see a slightly more diverse retrieval
+    pattern across a training run).
+    """
+    if pkm._last_slot_idx is None:
+        # Forward hasn't been called yet (curriculum order during start);
+        # return a no-op zero.
+        device = next(pkm.parameters()).device
+        return torch.zeros((), device=device)
+    slot_idx = pkm._last_slot_idx       # (B, T, H, top_k), int64
+    weights = pkm._last_weights         # (B, T, H, top_k), float
+    H = pkm.n_heads
+    n_slots = pkm.n_keys * pkm.n_keys
+    B, T, _, tk = slot_idx.shape
+    # Build a per-head slot mass: (H, n_slots).
+    # Flatten (B,T,top_k) → mass scatter-adds into slot bins.
+    device = slot_idx.device
+    mass = torch.zeros(H, n_slots, device=device, dtype=torch.float32)
+    for h in range(H):
+        idx_h = slot_idx[:, :, h, :].reshape(-1)
+        w_h = weights[:, :, h, :].reshape(-1).float()
+        mass[h].scatter_add_(0, idx_h, w_h)
+    # Normalise per head so each row sums to 1.
+    mass = mass / mass.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+    # H(p) = -sum p log p ; we MAXIMISE entropy → minimise neg_entropy.
+    neg_entropy = (mass * (mass.clamp_min(1e-12).log())).sum(dim=-1)  # (H,)
+    return neg_entropy.mean()
 
 
 class TokenisedStream(IterableDataset):
@@ -389,6 +458,7 @@ def main():
         lr_schedule=args.lr_schedule, warmup_steps=args.warmup_steps,
         decay_frac=args.lr_decay_frac,
         bf16_optim_state=args.bf16_optim_state,
+        pkm_value_lr_mult=float(getattr(args, "pkm_value_lr_mult", 1.0)),
     )
     # Backwards-compat aliases used elsewhere in the loop.
     opt = opts[0]
@@ -761,6 +831,25 @@ def main():
                     print(f"[step {step}] FiLM K-self-feed curriculum: "
                           f"warmup over, enabling feedback_self_k="
                           f"{args.feedback_self_k}")
+        # PKM ε-greedy curriculum: linear anneal from --pkm_epsilon_start
+        # to 0 over --pkm_epsilon_warmup_steps. Forces every slot to get
+        # gradient early; the learned router takes over after warmup.
+        if (getattr(args, "use_pkm", False)
+                and getattr(args, "pkm_epsilon_start", 0.0) > 0.0):
+            warm = max(1, int(getattr(args, "pkm_epsilon_warmup_steps", 0)))
+            progress = min(1.0, step / warm) if warm > 0 else 1.0
+            eps = float(args.pkm_epsilon_start) * (1.0 - progress)
+            model.pkm_layer.random_slot_epsilon = eps
+        # PKM α-floor curriculum: linear anneal of the additive
+        # sign-preserving floor on the output gate. Forces a minimum PKM
+        # contribution during the value-table-bootstrap window so values
+        # get meaningful gradient before α can shrink. Synced with ε.
+        if (getattr(args, "use_pkm", False)
+                and getattr(args, "pkm_alpha_floor_start", 0.0) > 0.0):
+            warm = max(1, int(getattr(args, "pkm_alpha_floor_warmup_steps", 0)))
+            progress = min(1.0, step / warm) if warm > 0 else 1.0
+            floor = float(args.pkm_alpha_floor_start) * (1.0 - progress)
+            model.pkm_layer.alpha_floor = floor
         for o in opts:
             o.zero_grad(set_to_none=True)
         pre_think_stats: dict[str, float] | None = None
@@ -1169,10 +1258,26 @@ def main():
                     x, y, *_rest = batch
                     x, y = x.to("cuda"), y.to("cuda")
                     doc_ids = _rest[0].to("cuda") if _rest else None
-                logits, ce_per_token, lm_loss, aux_loss = _nonthink_forward_loss(
-                    model, x, y, args, step, bracket_deltas, doc_ids=doc_ids)
+                logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss = \
+                    _nonthink_forward_loss(
+                        model, x, y, args, step, bracket_deltas,
+                        doc_ids=doc_ids)
                 loss = lm_loss + args.aux_weight * aux_loss
                 loss = loss + _z_loss_term(logits, args.z_loss)
+                if args.output_gate and args.gate_entropy_aux_weight > 0.0:
+                    loss = loss + args.gate_entropy_aux_weight * gate_aux_loss
+                # PKM diversity-bonus: -H(slot-selection distribution) per
+                # head, averaged across batch and heads. We MAXIMISE entropy
+                # so the auxiliary loss is NEGATIVE entropy. This is the
+                # direct fix for v5-pkm's "4 % of slots cover 95 % of mass"
+                # failure mode. The slot indices are detached upstream so the
+                # router itself isn't trained to produce high entropy — we
+                # only nudge the *distribution* (via the value-table grad
+                # this implies for diverse retrievals).
+                if (getattr(args, "use_pkm", False)
+                        and getattr(args, "pkm_diversity_weight", 0.0) > 0.0):
+                    div_loss = _pkm_diversity_loss(model.pkm_layer)
+                    loss = loss + args.pkm_diversity_weight * div_loss
                 (loss / n_micro).backward()
         _log_this_step = (step % args.log_every == 0 or step == args.steps)
         # Per-layer diagnostics: grad norms must be read before clip; the
@@ -1305,6 +1410,57 @@ def main():
                          f"{gn[-1] / max(gn[0], 1e-12):.1f})")
                 line += (f"  uratio(L0={ur[0]:.1e},L{mid}={ur[mid]:.1e},"
                          f"L{n-1}={ur[n-1]:.1e})")
+            # PKM live diagnostics (v7.1): is the table actually waking up?
+            #   αL      = learned scalar gate (init 0)
+            #   αeff    = α + sign(α)·alpha_floor (the magnitude that
+            #             actually scales PKM output in the forward)
+            #   row     = mean row-norm of value table / expected init norm.
+            #             >1 means rows have GROWN from init; <1 means they
+            #             shrunk. =1 exactly means the table is frozen.
+            #             (Replaces the misleading `v_std` diagnostic which
+            #             is invariant under updates that preserve overall
+            #             Gaussian distribution — frozen and learning-but-
+            #             centred values both gave std≈1.)
+            #   slots/H = unique slots hit this microbatch (out of n_keys²)
+            #   top     = mass on the single hottest slot (lower=more diverse)
+            #   ε       = current ε-greedy exploration rate
+            #   φ       = current α-floor (decaying from start to 0)
+            if (getattr(args, "use_pkm", False)
+                    and hasattr(model, "pkm_layer")):
+                pkm = model.pkm_layer
+                with torch.no_grad():
+                    aL = float(pkm.out_alpha.detach()) if pkm.use_output_gate else float("nan")
+                    floor = float(getattr(pkm, "alpha_floor", 0.0))
+                    sign = 1.0 if aL >= 0.0 or abs(aL) < 1e-3 else -1.0
+                    aEff = aL + sign * floor if pkm.use_output_gate else float("nan")
+                    # Row-norm drift: mean over rows of ||v_row|| / expected_init.
+                    rn_mean = float(torch.stack([
+                        emb.weight.float().norm(dim=-1).mean()
+                        for emb in pkm.values
+                    ]).mean())
+                    init_norm = float(pkm._expected_init_row_norm)
+                    rn_ratio = rn_mean / max(init_norm, 1e-9)
+                    eps = float(getattr(pkm, "random_slot_epsilon", 0.0))
+                    n_slots = pkm.n_keys * pkm.n_keys
+                    if pkm._last_slot_idx is not None:
+                        idx = pkm._last_slot_idx       # (B, T, H, top_k)
+                        w = pkm._last_weights          # (B, T, H, top_k)
+                        H_ = pkm.n_heads
+                        slot_mass = torch.zeros(H_, n_slots,
+                                                 device=idx.device, dtype=torch.float32)
+                        for h_ in range(H_):
+                            slot_mass[h_].scatter_add_(
+                                0, idx[:, :, h_, :].reshape(-1),
+                                w[:, :, h_, :].reshape(-1).float())
+                        slot_mass = slot_mass / slot_mass.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                        unique_hit = int((slot_mass > 0).sum(dim=-1).float().mean())
+                        top_share = float(slot_mass.max(dim=-1).values.mean())
+                    else:
+                        unique_hit, top_share = 0, float("nan")
+                line += (f"  pkm(αL={aL:+.3f},αeff={aEff:+.3f},"
+                         f"row={rn_ratio:.3f},"
+                         f"slots/H={unique_hit}/{n_slots},top={top_share:.3f},"
+                         f"ε={eps:.2f},φ={floor:.2f})")
             print(line)
             if tb is not None:
                 tb.add_scalar("train/loss", tloss_avg, step)
@@ -1318,6 +1474,45 @@ def main():
                     tb.add_scalar("layer_grad_norm/last_over_first",
                                   _blk_gnorms[-1] / max(_blk_gnorms[0], 1e-12),
                                   step)
+                if (getattr(args, "use_pkm", False)
+                        and hasattr(model, "pkm_layer")):
+                    pkm = model.pkm_layer
+                    with torch.no_grad():
+                        if pkm.use_output_gate:
+                            tb.add_scalar("pkm/alpha_learned",
+                                          float(pkm.out_alpha.detach()), step)
+                        floor = float(getattr(pkm, "alpha_floor", 0.0))
+                        tb.add_scalar("pkm/alpha_floor", floor, step)
+                        rn_mean = float(torch.stack([
+                            emb.weight.float().norm(dim=-1).mean()
+                            for emb in pkm.values
+                        ]).mean())
+                        init_norm = float(pkm._expected_init_row_norm)
+                        tb.add_scalar("pkm/row_norm_mean", rn_mean, step)
+                        tb.add_scalar("pkm/row_norm_ratio_vs_init",
+                                      rn_mean / max(init_norm, 1e-9), step)
+                        tb.add_scalar("pkm/epsilon",
+                                      float(getattr(pkm, "random_slot_epsilon", 0.0)),
+                                      step)
+                        if pkm._last_slot_idx is not None:
+                            n_slots = pkm.n_keys * pkm.n_keys
+                            idx = pkm._last_slot_idx
+                            w_ = pkm._last_weights
+                            H_ = pkm.n_heads
+                            slot_mass = torch.zeros(H_, n_slots,
+                                                     device=idx.device,
+                                                     dtype=torch.float32)
+                            for h_ in range(H_):
+                                slot_mass[h_].scatter_add_(
+                                    0, idx[:, :, h_, :].reshape(-1),
+                                    w_[:, :, h_, :].reshape(-1).float())
+                            slot_mass = slot_mass / slot_mass.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                            uniq = (slot_mass > 0).sum(dim=-1).float().mean()
+                            top = slot_mass.max(dim=-1).values.mean()
+                            ent = -(slot_mass * slot_mass.clamp_min(1e-12).log()).sum(dim=-1).mean()
+                            tb.add_scalar("pkm/unique_slots_per_head", float(uniq), step)
+                            tb.add_scalar("pkm/top_slot_share", float(top), step)
+                            tb.add_scalar("pkm/slot_entropy", float(ent), step)
                 if args.output_gate and losses_gate_window:
                     tb.add_scalar("gate/think_frac", 1.0 - emit_frac, step)
                     tb.add_scalar("gate/mean_gate", mean_g, step)
@@ -1432,6 +1627,10 @@ def main():
                 pkm_k_dim=int(getattr(args, "pkm_k_dim", 128)),
                 pkm_top_k=int(getattr(args, "pkm_top_k", 32)),
                 pkm_value_bf16=bool(getattr(args, "pkm_value_bf16", True)),
+                # v7 PKM-bootstrap-fix package.
+                pkm_score_norm=str(getattr(args, "pkm_score_norm", "layer")),
+                pkm_value_init_std=float(getattr(args, "pkm_value_init_std", 1.0)),
+                pkm_use_output_gate=bool(getattr(args, "pkm_use_output_gate", True)),
                 output_gate=bool(args.output_gate
                                   or (args.enable_thinking_token
                                       and args.think_decision == "gate")),
@@ -1534,6 +1733,9 @@ def main():
                 "pkm_k_dim": int(getattr(args, "pkm_k_dim", 128)),
                 "pkm_top_k": int(getattr(args, "pkm_top_k", 32)),
                 "pkm_value_bf16": bool(getattr(args, "pkm_value_bf16", True)),
+                "pkm_score_norm": str(getattr(args, "pkm_score_norm", "layer")),
+                "pkm_value_init_std": float(getattr(args, "pkm_value_init_std", 1.0)),
+                "pkm_use_output_gate": bool(getattr(args, "pkm_use_output_gate", True)),
                 "data_mix": args.data_mix,
                 "think_burst_prob": args.think_burst_prob,
                 "think_max_bursts": args.think_max_bursts,

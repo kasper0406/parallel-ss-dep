@@ -91,6 +91,19 @@ def build_model_from_ckpt(ckpt_path: str):
         v0_dtype = ckpt["state_dict"]["pkm_layer.values.0.weight"].dtype
         # top_k and pkm_after_layer have no state-dict footprint; use cfg or
         # the canonical defaults (32, 14) the v5-pkm run used.
+        # v7 PKM-bootstrap-fix package: score_norm + value_init_std +
+        # use_output_gate. Auto-detect from state dict for back-compat
+        # with v5/v6 ckpts; cfg overrides the auto-detect when present.
+        if "pkm_layer.out_alpha" in sd_keys:
+            pkm_use_output_gate = True
+        else:
+            pkm_use_output_gate = bool(cfg.get("pkm_use_output_gate", False))
+        if "pkm_layer.bn_s1.weight" in sd_keys:
+            pkm_score_norm = "batch"
+        elif "pkm_layer.ln_s1.weight" in sd_keys:
+            pkm_score_norm = "layer"
+        else:
+            pkm_score_norm = str(cfg.get("pkm_score_norm", "batch"))
         pkm_kwargs = dict(
             use_pkm=True,
             pkm_after_layer=int(cfg.get("pkm_after_layer", 14)),
@@ -99,6 +112,9 @@ def build_model_from_ckpt(ckpt_path: str):
             pkm_k_dim=int(k_dim),
             pkm_top_k=int(cfg.get("pkm_top_k", 32)),
             pkm_value_bf16=(v0_dtype == torch.bfloat16),
+            pkm_score_norm=pkm_score_norm,
+            pkm_value_init_std=float(cfg.get("pkm_value_init_std", 1.0)),
+            pkm_use_output_gate=pkm_use_output_gate,
         )
     model = TinyLM(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"],

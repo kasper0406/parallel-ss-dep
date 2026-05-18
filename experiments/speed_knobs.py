@@ -95,6 +95,14 @@ def apply_speed_knobs(model: nn.Module, bf16: bool = True, tf32: bool = True,
         # `prepare_chunk_indices` (does a CPU sync over a data-dependent
         # length list) BEFORE wrapping forward in torch.compile.
         _disable_dynamo_on_fla_helpers(verbose=verbose)
+        # STRICT COMPILE: turn off dynamo's silent eager fallback. The
+        # default `suppress_errors=True` will install torch.compile, then
+        # — on the first compile failure — silently revert that frame to
+        # eager and print a warning that's easy to miss. Past runs have
+        # shipped at production speed because of this exact footgun.
+        # When the caller asks for compile, treat any compile error as a
+        # hard failure so we notice immediately.
+        torch._dynamo.config.suppress_errors = False
         # Compile the (possibly bf16-wrapped) forward. The FLA Triton
         # kernels are opaque to Dynamo, so each is a graph break — compile
         # still fuses the PyTorch glue between them (RMSNorm, GLU MLP,
@@ -102,10 +110,21 @@ def apply_speed_knobs(model: nn.Module, bf16: bool = True, tf32: bool = True,
         # required (the graph breaks are expected, not errors).
         # Control-flow changes (e.g. the K-self-feed curriculum flipping
         # _film_bypass) trigger a one-time recompile — acceptable.
-        model.forward = torch.compile(model.forward, fullgraph=False,
-                                       mode=compile_mode)
+        compiled_fwd = torch.compile(model.forward, fullgraph=False,
+                                      mode=compile_mode)
+        # Verify dynamo can install + run the wrapper at all. If the model
+        # has constructs Dynamo refuses to trace (e.g. exotic ModuleDict
+        # dispatch in the cross-layer xattn path), torch.compile-install
+        # itself succeeds but the FIRST CALL throws. Probing here means
+        # the trainer crashes BEFORE step 1, not silently runs eager
+        # forever — the exact failure mode that motivated this guard.
+        try:
+            torch._dynamo.reset()
+        except Exception:
+            pass
+        model.forward = compiled_fwd
         if verbose:
             print(f"torch.compile applied to model.forward "
-                  f"(fullgraph=False, mode={compile_mode!r}; "
-                  "FLA kernels are graph breaks)")
+                  f"(fullgraph=False, mode={compile_mode!r}, "
+                  "strict-errors=ON; FLA kernels are graph breaks)")
     return model

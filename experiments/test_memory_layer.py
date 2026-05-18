@@ -24,8 +24,14 @@ def test_pkm_topk_matches_naive():
     same scores, same value contribution."""
     torch.manual_seed(0)
     H, K, kd, tk, v = 1, 8, 16, 4, 16
+    # Use score_norm='batch' here because the rest of this test reaches into
+    # layer.bn_s1 / bn_s2 directly to replicate the score math. (The v7
+    # default is 'layer'; covered by separate tests.) Also disable the v7
+    # output_gate so the comparison against the naive lookup isn't multiplied
+    # by α=0.
     layer = PKMLayer(d_model=v, n_heads=H, n_keys=K, k_dim=kd, top_k=tk,
-                      value_bf16=False)
+                      value_bf16=False, score_norm="batch",
+                      use_output_gate=False)
     layer.eval()  # disable BN running-mean updates so we get a clean math eq
     x = torch.randn(2, 3, v)
     h_n = layer.norm(x)
@@ -85,8 +91,11 @@ def test_pkm_gradient_to_topk_only():
     rows (sparse update), not to every row in the table."""
     torch.manual_seed(1)
     H, K, kd, tk, v = 1, 16, 16, 4, 8
+    # use_output_gate=False because the v7 default α=0 would zero out the
+    # gradient to value rows entirely. This test is about the SPARSITY of
+    # the gradient w.r.t. value rows, not about α — disable α to isolate.
     layer = PKMLayer(d_model=v, n_heads=H, n_keys=K, k_dim=kd, top_k=tk,
-                      value_bf16=False)
+                      value_bf16=False, use_output_gate=False)
     x = torch.randn(2, 4, v, requires_grad=False)
     out = layer(x)
     out.sum().backward()
@@ -113,8 +122,11 @@ def test_pkm_cold_start_bn_spreads_lookup():
     """
     torch.manual_seed(2)
     H, K, kd, tk, v = 1, 16, 8, 4, 8
+    # score_norm='batch' to actually exercise BN. use_output_gate=False so α
+    # doesn't squash gradient to values.
     layer = PKMLayer(d_model=v, n_heads=H, n_keys=K, k_dim=kd, top_k=tk,
-                      value_bf16=False)
+                      value_bf16=False, score_norm="batch",
+                      use_output_gate=False)
     opt = torch.optim.SGD(layer.parameters(), lr=0.1)
     seen_slots = set()
     for step in range(20):
@@ -166,9 +178,251 @@ def test_pkm_param_count_matches_design():
     """Sanity-check the param accounting in PKM_PLAN.md."""
     layer = PKMLayer(d_model=576, n_heads=4, n_keys=256, k_dim=128, top_k=32)
     total = sum(p.numel() for p in layer.parameters())
-    # ~38.9M total per the plan.
+    # ~38.9M total per the plan. v7 adds 1 scalar (out_alpha) and swaps BN
+    # for LN (same param shape: 2*K per side); the difference is +1 scalar
+    # so total is still ~38.9M.
     assert 38_500_000 < total < 39_500_000, (
         f"param count {total/1e6:.2f}M outside expected ~38.9M range"
     )
     # Value table dominates.
     assert layer.n_value_params == 4 * 256 * 256 * 144
+
+
+# ============================================================================
+# v7 PKM-bootstrap-fix package tests (2026-05-17).
+# ============================================================================
+
+
+def test_pkm_v7_default_score_norm_is_layer():
+    """Default score_norm must be 'layer' (drops the v5-pkm BN). The legacy
+    'batch' form must still be available for back-compat / ablation."""
+    layer = PKMLayer(d_model=32, n_heads=2, n_keys=8, k_dim=8, top_k=4,
+                      value_bf16=False)
+    assert layer.score_norm_kind == "layer"
+    assert hasattr(layer, "ln_s1") and hasattr(layer, "ln_s2")
+    assert not hasattr(layer, "bn_s1")
+
+    layer_bn = PKMLayer(d_model=32, n_heads=2, n_keys=8, k_dim=8, top_k=4,
+                        value_bf16=False, score_norm="batch")
+    assert layer_bn.score_norm_kind == "batch"
+    assert hasattr(layer_bn, "bn_s1") and hasattr(layer_bn, "bn_s2")
+    assert not hasattr(layer_bn, "ln_s1")
+
+
+def test_pkm_v7_output_gate_zero_at_init():
+    """FIX 1: with use_output_gate=True (default), out_alpha is 0 at init
+    so PKM output is exactly 0 — the model can't be poisoned by random
+    initial PKM lookups."""
+    torch.manual_seed(0)
+    layer = PKMLayer(d_model=32, n_heads=2, n_keys=8, k_dim=8, top_k=4,
+                      value_bf16=False)
+    assert layer.use_output_gate
+    assert float(layer.out_alpha) == 0.0
+    x = torch.randn(2, 5, 32)
+    y = layer(x)
+    assert torch.allclose(y, torch.zeros_like(y))
+
+
+def test_pkm_v7_output_gate_learns():
+    """Backward through a non-trivial loss should put gradient on out_alpha
+    (so it can grow as PKM proves useful)."""
+    torch.manual_seed(0)
+    layer = PKMLayer(d_model=32, n_heads=2, n_keys=8, k_dim=8, top_k=4,
+                      value_bf16=False)
+    # Force α away from 0 to get a meaningful gradient path through values.
+    with torch.no_grad():
+        layer.out_alpha.copy_(torch.tensor([0.3]))
+    x = torch.randn(2, 5, 32)
+    y = layer(x)
+    target = torch.randn_like(y)
+    ((y - target).pow(2).mean()).backward()
+    assert layer.out_alpha.grad is not None
+    assert float(layer.out_alpha.grad.abs()) > 0.0
+
+
+def test_pkm_v7_epsilon_greedy_replaces_slots():
+    """FIX 2: with random_slot_epsilon=1.0 in training mode, every retrieved
+    slot index is replaced by a uniform random slot. The stashed
+    _last_slot_idx must then differ from the deterministic (eval) baseline."""
+    torch.manual_seed(0)
+    H, K, kd, tk, v = 1, 8, 16, 4, 16
+    layer = PKMLayer(d_model=v, n_heads=H, n_keys=K, k_dim=kd, top_k=tk,
+                      value_bf16=False, use_output_gate=False)
+    x = torch.randn(2, 5, v)
+
+    layer.eval()
+    layer.random_slot_epsilon = 0.0
+    _ = layer(x)
+    eval_slots = layer._last_slot_idx.clone()
+
+    layer.train()
+    layer.random_slot_epsilon = 1.0
+    torch.manual_seed(123)
+    _ = layer(x)
+    train_slots = layer._last_slot_idx.clone()
+
+    # With ε=1.0, virtually all slots should differ (probability of
+    # randomly drawing the same slot is 1/K² = 1/64; over 2*5*1*4 = 40
+    # picks the chance of ANY match is ~46% — but the chance of MORE THAN
+    # HALF matching is astronomically small).
+    diff_frac = (eval_slots != train_slots).float().mean().item()
+    assert diff_frac > 0.5, (
+        f"ε=1.0 should replace most slots; only {diff_frac:.2f} differ")
+
+
+def test_pkm_v7_epsilon_greedy_inactive_at_eval():
+    """ε-greedy must NOT fire in eval mode (validation must be deterministic)."""
+    layer = PKMLayer(d_model=16, n_heads=1, n_keys=8, k_dim=8, top_k=4,
+                      value_bf16=False, use_output_gate=False)
+    layer.eval()
+    layer.random_slot_epsilon = 1.0      # would be aggressive if it fired
+    x = torch.randn(2, 5, 16)
+    _ = layer(x)
+    slots_a = layer._last_slot_idx.clone()
+    _ = layer(x)
+    slots_b = layer._last_slot_idx.clone()
+    assert torch.equal(slots_a, slots_b), "eval mode must skip ε-greedy"
+
+
+def test_pkm_v7_value_init_std_is_configurable():
+    """FIX 3: value rows must respect the requested init std."""
+    for std in (0.04, 1.0, 2.0):
+        layer = PKMLayer(d_model=32, n_heads=2, n_keys=16, k_dim=8, top_k=4,
+                          value_bf16=False, value_init_std=std)
+        rows = layer.values[0].weight.float()
+        observed = rows.std().item()
+        # With ~256 rows × 16 dims = 4096 samples per init, std should be
+        # within ~5% of the requested value.
+        assert abs(observed - std) / std < 0.10, (
+            f"requested std={std}, observed {observed:.4f}")
+
+
+def test_pkm_v7_layernorm_score_norm_works():
+    """LayerNorm score normalisation must run end-to-end (forward + backward)
+    and produce non-NaN gradients."""
+    torch.manual_seed(0)
+    layer = PKMLayer(d_model=32, n_heads=2, n_keys=8, k_dim=8, top_k=4,
+                      value_bf16=False, score_norm="layer",
+                      use_output_gate=False)
+    x = torch.randn(2, 5, 32)
+    y = layer(x)
+    y.sum().backward()
+    for name, p in layer.named_parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all(), f"NaN/Inf grad on {name}"
+
+
+def test_pkm_v7_1_alpha_floor_preserves_sign():
+    """v7.1 FIX 1B: with alpha_floor > 0, the effective output gate is
+    α + sign(α)·floor — magnitude ≥ floor, sign of learned α preserved."""
+    torch.manual_seed(0)
+    layer = PKMLayer(d_model=16, n_heads=1, n_keys=8, k_dim=8, top_k=4,
+                      value_bf16=False)  # use_output_gate=True default
+    # α defaults to 0 → sign-default-positive → α_eff = +floor
+    layer.alpha_floor = 0.3
+    x = torch.randn(2, 5, 16)
+    y_with_floor = layer(x).detach().clone()
+    # Without floor and α=0 the gate is 0 → output is exactly 0
+    layer.alpha_floor = 0.0
+    y_no_floor = layer(x).detach()
+    assert torch.allclose(y_no_floor, torch.zeros_like(y_no_floor))
+    # With floor, contribution magnitude is non-trivial (~ floor * pkm_out)
+    assert y_with_floor.abs().sum() > 0.0
+    # Now set α to negative — α_eff should be negative (sign preserved)
+    with torch.no_grad():
+        layer.out_alpha.copy_(torch.tensor([-0.05]))
+    layer.alpha_floor = 0.3
+    y_neg_floor = layer(x).detach()
+    # With negative α and +floor, α_eff = -0.05 + (-1)*0.3 = -0.35 → opposite
+    # sign from positive-α case.
+    cos = (y_with_floor * y_neg_floor).sum() / (
+        y_with_floor.norm() * y_neg_floor.norm() + 1e-9)
+    assert cos < 0.0, f"sign-preservation broken: cos = {cos:.3f}"
+
+
+def test_pkm_v7_1_alpha_gets_gradient_through_floor():
+    """α should still receive gradient even when the floor is active —
+    so it can learn the right post-warmup magnitude."""
+    torch.manual_seed(0)
+    layer = PKMLayer(d_model=16, n_heads=1, n_keys=8, k_dim=8, top_k=4,
+                      value_bf16=False)
+    layer.alpha_floor = 0.3
+    x = torch.randn(2, 5, 16)
+    y = layer(x)
+    target = torch.randn_like(y)
+    loss = (y - target).pow(2).mean()
+    loss.backward()
+    assert layer.out_alpha.grad is not None
+    assert float(layer.out_alpha.grad.abs()) > 0.0
+
+
+def test_pkm_value_lr_mult_creates_separate_group():
+    """Build optimizer with pkm_value_lr_mult > 1; verify PKM value rows
+    land in a dedicated param group with the boosted LR."""
+    from experiments.optim_utils import build_optimizer
+    from experiments.model import TinyLM
+    from experiments.layers import DeltaNetAttention
+    torch.manual_seed(0)
+    m = TinyLM(vocab_size=64, d_model=64, n_layers=2, n_heads=2, d_head=32,
+                attention_cls=DeltaNetAttention,
+                use_pkm=True, pkm_after_layer=0,
+                pkm_n_heads=2, pkm_n_keys=16, pkm_k_dim=8, pkm_top_k=4,
+                pkm_value_bf16=False)
+    opts, _ = build_optimizer(
+        m, optimizer="adamw", lr=1e-3, lr_muon=5e-3, alpha_wd=0.0,
+        steps=10, wd=0.01, lr_schedule="cosine", warmup_steps=0,
+        decay_frac=0.0, pkm_value_lr_mult=10.0, verbose=False)
+    # Find the param group containing pkm value rows.
+    val_ids = {id(emb.weight) for emb in m.pkm_layer.values}
+    boosted_lrs = []
+    for g in opts[0].param_groups:
+        for p in g["params"]:
+            if id(p) in val_ids:
+                boosted_lrs.append(g["lr"])
+    assert len(boosted_lrs) == len(val_ids), "missing value rows in groups"
+    assert all(lr == 1e-2 for lr in boosted_lrs), (
+        f"PKM-value lr should be 10× base; got {boosted_lrs}")
+
+
+def test_pkm_value_lr_mult_disabled_at_1():
+    """pkm_value_lr_mult=1.0 means no separate group; values use base lr."""
+    from experiments.optim_utils import build_optimizer
+    from experiments.model import TinyLM
+    from experiments.layers import DeltaNetAttention
+    torch.manual_seed(0)
+    m = TinyLM(vocab_size=64, d_model=64, n_layers=2, n_heads=2, d_head=32,
+                attention_cls=DeltaNetAttention,
+                use_pkm=True, pkm_after_layer=0,
+                pkm_n_heads=2, pkm_n_keys=16, pkm_k_dim=8, pkm_top_k=4,
+                pkm_value_bf16=False)
+    opts, _ = build_optimizer(
+        m, optimizer="adamw", lr=1e-3, lr_muon=5e-3, alpha_wd=0.0,
+        steps=10, wd=0.01, lr_schedule="cosine", warmup_steps=0,
+        decay_frac=0.0, pkm_value_lr_mult=1.0, verbose=False)
+    val_ids = {id(emb.weight) for emb in m.pkm_layer.values}
+    lrs = set()
+    for g in opts[0].param_groups:
+        for p in g["params"]:
+            if id(p) in val_ids:
+                lrs.add(g["lr"])
+    assert lrs == {1e-3}
+
+
+def test_pkm_v7_diversity_loss_helper():
+    """train_lm._pkm_diversity_loss returns the negative entropy of the
+    per-head slot-selection distribution; lower (more negative) = more
+    diverse (higher entropy)."""
+    from experiments.train_lm import _pkm_diversity_loss
+    layer = PKMLayer(d_model=16, n_heads=2, n_keys=8, k_dim=8, top_k=4,
+                      value_bf16=False, use_output_gate=False)
+    x = torch.randn(4, 6, 16)
+    layer(x)
+    div1 = float(_pkm_diversity_loss(layer))
+    # Now FORCE concentration: stash all-zeros slot indices (every retrieval
+    # picks slot 0). Entropy collapses to 0, neg-entropy = 0 (higher than div1).
+    layer._last_slot_idx = torch.zeros_like(layer._last_slot_idx)
+    layer._last_weights = torch.ones_like(layer._last_weights)
+    div_concentrated = float(_pkm_diversity_loss(layer))
+    assert div_concentrated > div1, (
+        f"concentrated-slot loss {div_concentrated:.4f} should be larger "
+        f"(less negative entropy) than diverse-slot loss {div1:.4f}")

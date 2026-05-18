@@ -1093,6 +1093,10 @@ class TinyLM(nn.Module):
         pkm_k_dim: int = 128,
         pkm_top_k: int = 32,
         pkm_value_bf16: bool = True,
+        # v7 PKM-bootstrap-fix package (2026-05-17). See PKMLayer.__init__.
+        pkm_score_norm: str = "layer",
+        pkm_value_init_std: float = 1.0,
+        pkm_use_output_gate: bool = True,
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1327,6 +1331,9 @@ class TinyLM(nn.Module):
                 k_dim=int(pkm_k_dim),
                 top_k=int(pkm_top_k),
                 value_bf16=bool(pkm_value_bf16),
+                score_norm=str(pkm_score_norm),
+                value_init_std=float(pkm_value_init_std),
+                use_output_gate=bool(pkm_use_output_gate),
             )
 
     def _maybe_pkm(self, h: torch.Tensor, L: int) -> torch.Tensor:
@@ -1504,16 +1511,34 @@ class TinyLM(nn.Module):
         if self.feedback_xattn_pairs:
             # Pass 1: vanilla. Collect outputs at every layer that any target
             # references as a source (union across all targets).
+            # We use _block_fwd (not raw blk) so activation checkpointing —
+            # if enabled — applies to BOTH passes. Without checkpointing the
+            # two-pass forward would double the activation peak and OOM at
+            # batch+sequence-length combos that fit fine in the one-pass
+            # baseline.
+            #
+            # IMPORTANT: pass-1 runs UNDER no_grad. The xattn forward is the
+            # cross-layer analogue of FiLM K=3 self-feed, where K-1 warmup
+            # passes are no_grad and only the final pass carries gradient.
+            # Source-layer params still receive gradient via pass-2 (which
+            # also runs the full block stack); pass-1's only function is to
+            # *produce* source-layer hidden states for pass-2's xattn modules
+            # to attend over. Making pass-1 no_grad saves ~25% per-step
+            # (no autograd tape + no backward through pass-1) and brings
+            # xattn's per-step cost in line with FiLM K=3. Validated against
+            # the v5/v4 FiLM-K=3 protocol that proved no_grad warmup passes
+            # don't hurt quality.
             needed_sources = set()
             for _, srcs in self.feedback_xattn_pairs:
                 needed_sources.update(srcs)
             pass1_at_sources: dict = {}
-            h1 = x
-            for L, blk in enumerate(self.blocks):
-                h1 = blk(h1, input_ids=input_ids, cu_seqlens=cu_seqlens)
-                h1 = self._maybe_pkm(h1, L)
-                if L in needed_sources:
-                    pass1_at_sources[L] = h1
+            with torch.no_grad():
+                h1 = x
+                for L, blk in enumerate(self.blocks):
+                    h1 = self._block_fwd(blk, h1, input_ids, L=L,
+                                         cu_seqlens=cu_seqlens)
+                    if L in needed_sources:
+                        pass1_at_sources[L] = h1
             # Pass 2: at each target layer, gather lagged source states and
             # apply the chosen feedback module before the block's forward.
             h = x
@@ -1530,8 +1555,8 @@ class TinyLM(nn.Module):
                         srcs = self.xattn_target_to_sources[L]
                         src_states = [lagged_pass1[s] for s in srcs]
                         h = self.xattn_feedback[str(L)](h, src_states)
-                h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
-                h = self._maybe_pkm(h, L)
+                h = self._block_fwd(blk, h, input_ids, L=L,
+                                    cu_seqlens=cu_seqlens)
             return self._finalize(h, input_ids, mem_read_mask,
                                    return_aux, return_hidden, return_gate,
                                    _maybe_gate, doc_ids=doc_ids)

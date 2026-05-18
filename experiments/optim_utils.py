@@ -35,6 +35,13 @@ def _is_embedding_like(name: str) -> bool:
     return False
 
 
+def _is_pkm_value(name: str) -> bool:
+    """The 38-65 M-param PKM value tables. Eligible for the v7.1 value-LR
+    multiplier (--pkm_value_lr_mult), which compensates for the α·w_k·∂loss
+    multiplicative dampening of per-row gradient."""
+    return name.startswith("pkm_layer.values.") and name.endswith(".weight")
+
+
 def _wsd_lambda(total_steps: int, warmup_steps: int, decay_frac: float):
     """Warmup-Stable-Decay LR multiplier in [0, 1].
 
@@ -88,6 +95,7 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                     warmup_steps: int = 0,
                     decay_frac: float = 0.15,
                     bf16_optim_state: bool = False,
+                    pkm_value_lr_mult: float = 1.0,
                     verbose: bool = True
                     ) -> tuple[list[torch.optim.Optimizer], list]:
     """Build optimizer(s) + LR schedulers. See module docstring.
@@ -106,17 +114,29 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
         MuonCls = torch.optim.Muon
 
     if optimizer == "adamw":
-        regular, alphas = [], []
+        regular, alphas, pkm_values = [], [], []
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            (alphas if is_film_alpha(name) else regular).append(p)
+            if _is_pkm_value(name) and pkm_value_lr_mult != 1.0:
+                pkm_values.append(p)
+            elif is_film_alpha(name):
+                alphas.append(p)
+            else:
+                regular.append(p)
         groups = [{"params": regular, "weight_decay": wd}]
         if alphas:
             groups.append({"params": alphas, "weight_decay": alpha_wd})
             if verbose:
                 print(f"  α-WD split: {len(alphas)} FiLM α params get "
                       f"weight_decay={alpha_wd}")
+        if pkm_values:
+            groups.append({"params": pkm_values, "weight_decay": wd,
+                           "lr": lr * pkm_value_lr_mult})
+            if verbose:
+                print(f"  PKM-value LR boost: {len(pkm_values)} value tables "
+                      f"get lr={lr * pkm_value_lr_mult:.2e} "
+                      f"({pkm_value_lr_mult}× base lr={lr:.2e})")
         opts = [AdamWCls(groups, lr=lr, betas=(0.9, 0.95))]
         scheds = [_make_scheduler(opts[0], base_lr=lr, schedule=lr_schedule,
                                   steps=steps, warmup_steps=warmup_steps,
@@ -131,27 +151,39 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
         raise ValueError(f"unknown optimizer {optimizer!r}")
 
     # Muon: 2D hidden matrices only. Embeddings, lm_head, 1D, 3D+ → AdamW.
-    muon_params, adamw_regular, adamw_alpha = [], [], []
+    muon_params, adamw_regular, adamw_alpha, adamw_pkm_values = [], [], [], []
     seen = set()
     for name, p in model.named_parameters():
         if not p.requires_grad or id(p) in seen:
             continue
         seen.add(id(p))
         if _is_embedding_like(name) or p.ndim != 2:
-            (adamw_alpha if is_film_alpha(name) else adamw_regular).append(p)
+            if _is_pkm_value(name) and pkm_value_lr_mult != 1.0:
+                adamw_pkm_values.append(p)
+            elif is_film_alpha(name):
+                adamw_alpha.append(p)
+            else:
+                adamw_regular.append(p)
         else:
             muon_params.append(p)
     if verbose:
         print(f"  optimizer split: {len(muon_params)} Muon params "
               f"({sum(p.numel() for p in muon_params)/1e6:.1f}M), "
-              f"{len(adamw_regular) + len(adamw_alpha)} AdamW params "
-              f"({sum(p.numel() for p in adamw_regular + adamw_alpha)/1e6:.1f}M)")
+              f"{len(adamw_regular) + len(adamw_alpha) + len(adamw_pkm_values)} AdamW params "
+              f"({sum(p.numel() for p in adamw_regular + adamw_alpha + adamw_pkm_values)/1e6:.1f}M)")
     adamw_groups = [{"params": adamw_regular, "weight_decay": wd}]
     if adamw_alpha:
         adamw_groups.append({"params": adamw_alpha, "weight_decay": alpha_wd})
         if verbose:
             print(f"  α-WD split: {len(adamw_alpha)} FiLM α params get "
                   f"weight_decay={alpha_wd}")
+    if adamw_pkm_values:
+        adamw_groups.append({"params": adamw_pkm_values, "weight_decay": wd,
+                              "lr": lr * pkm_value_lr_mult})
+        if verbose:
+            print(f"  PKM-value LR boost: {len(adamw_pkm_values)} value "
+                  f"tables get lr={lr * pkm_value_lr_mult:.2e} "
+                  f"({pkm_value_lr_mult}× base lr={lr:.2e})")
     opts = [
         MuonCls(muon_params, lr=lr_muon, momentum=0.95, weight_decay=wd),
         AdamWCls(adamw_groups, lr=lr, betas=(0.9, 0.95)),

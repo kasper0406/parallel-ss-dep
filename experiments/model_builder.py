@@ -104,6 +104,10 @@ def build_model_from_args(args, *, vocab_size: int,
             pkm_k_dim=int(args.pkm_k_dim),
             pkm_top_k=int(args.pkm_top_k),
             pkm_value_bf16=bool(args.pkm_value_bf16),
+            # v7 PKM-bootstrap-fix package (forwarded to PKMLayer).
+            pkm_score_norm=str(getattr(args, "pkm_score_norm", "layer")),
+            pkm_value_init_std=float(getattr(args, "pkm_value_init_std", 1.0)),
+            pkm_use_output_gate=bool(getattr(args, "pkm_use_output_gate", True)),
         )
 
     model = TinyLM(

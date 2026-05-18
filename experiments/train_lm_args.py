@@ -121,6 +121,32 @@ def build_parser() -> argparse.ArgumentParser:
                         "real-token VAL ppl explodes). Empirically, v2 "
                         "attempt 2 collapsed to VAL ppl 940 (vs 49 at "
                         "step 2000) within 2k steps of the floor hitting 0.")
+    p.add_argument("--gate_entropy_aux_weight", type=float, default=0.0,
+                   help="Weight on an auxiliary BCE loss that supervises the "
+                        "output-gate logit with a predictive-uncertainty target "
+                        "derived from the SAME forward's logits (detached): "
+                        "  target_t = exp(-H_t),  H_t = entropy of next-token p. "
+                        "Confident position → target≈1 → gate trained to emit. "
+                        "Uncertain position → target≈0 → gate trained to think. "
+                        "Free signal — no second forward, just turns the "
+                        "existing gate logit into a position-grounded "
+                        "uncertainty head. Default 0.0 (off). Recommended 0.1 "
+                        "as a starting point; the loss term is in nats, same "
+                        "scale as CE, so 0.1 weights it about 1/10 of LM loss.")
+    p.add_argument("--gate_entropy_aux_temperature", type=float, default=1.0,
+                   help="Temperature for the entropy target. The raw target "
+                        "exp(-H) is mostly tiny (typical CE 1-3 nats → exp(-H) "
+                        "∈ (0.05, 0.37)). With T>1 we apply exp(-H/T) so the "
+                        "target distribution is less compressed near 0. T=1.0 "
+                        "is the unbiased entropy. T=2-4 broadens the gradient "
+                        "signal at uncertain positions.")
+    p.add_argument("--gate_entropy_aux_target_clamp", type=float, default=0.0,
+                   help="If > 0, clip the entropy target into "
+                        "[gate_entropy_aux_target_clamp, "
+                        "1-gate_entropy_aux_target_clamp] before BCE. Default 0 "
+                        "(no clip). Use 0.01 to prevent BCE blow-up at target=0 "
+                        "(rare in practice — exp(-H) > 0 always — but useful "
+                        "if the model emits a very-low-entropy collapse).")
     p.add_argument("--enable_thinking_token", action="store_true",
                    help="Enable discrete [THINKING] token training with an "
                         "on-policy continuation queue. A THINKING action pays "
@@ -401,6 +427,68 @@ def build_parser() -> argparse.ArgumentParser:
                         "Default on; halves persistent memory.")
     p.add_argument("--no_pkm_value_bf16", dest="pkm_value_bf16",
                    action="store_false")
+    # ---------- v7 PKM-bootstrap-fix package (2026-05-17) ----------
+    # The v5-pkm probe found 97 % of value rows still at random init and
+    # only ~4 % of slots ever firing. These flags break the bootstrap.
+    p.add_argument("--pkm_score_norm", type=str, default="layer",
+                   choices=["batch", "layer"],
+                   help="FIX 4: norm-on-scores kind. 'layer' is the v7 "
+                        "default (no noisy running stats); 'batch' replicates "
+                        "Lample/v5-pkm behaviour.")
+    p.add_argument("--pkm_value_init_std", type=float, default=1.0,
+                   help="FIX 3: value-row init std. v5-pkm used "
+                        "1/sqrt(d_model) ≈ 0.04 (residual contribution 1 %); "
+                        "v7 default 1.0 puts PKM output on residual scale "
+                        "from step 0.")
+    p.add_argument("--pkm_use_output_gate", action="store_true", default=True,
+                   help="FIX 1: scalar α (init 0) gating PKM output. Lets "
+                        "the model gradually trust PKM as gradient grows α "
+                        "— mirrors the FiLM α curriculum. v7 default on.")
+    p.add_argument("--no_pkm_use_output_gate", dest="pkm_use_output_gate",
+                   action="store_false")
+    p.add_argument("--pkm_epsilon_start", type=float, default=0.5,
+                   help="FIX 2: starting ε for random-slot exploration. With "
+                        "prob ε at training time, each top-k retrieval is "
+                        "replaced by a uniform random slot — forces every "
+                        "slot to receive gradient. 0.5 = half of retrievals "
+                        "random at step 0. Anneals linearly to 0 over "
+                        "--pkm_epsilon_warmup_steps. v5-pkm had ε=0 always "
+                        "and ended up with only 4 % of slots active.")
+    p.add_argument("--pkm_epsilon_warmup_steps", type=int, default=2000,
+                   help="Anneal --pkm_epsilon_start linearly to 0 over this "
+                        "many steps. 0 = no anneal (fixed ε throughout).")
+    p.add_argument("--pkm_diversity_weight", type=float, default=0.01,
+                   help="FIX 5: weight on slot-selection-entropy bonus. "
+                        "Penalises peaky retrieval distributions (the "
+                        "head_2/slot_8824 'one-slot-eats-40%%-of-the-mass' "
+                        "pattern observed in v5-pkm). Encourages full table "
+                        "usage. 0 disables. v7 default 0.01 = a gentle nudge.")
+    # ---- v7.1 PKM bootstrap follow-ups (after v7 α-decay observation) ----
+    # Step-440 trace showed α grew 0 → 0.085 (step 280) then *shrank* back
+    # to 0.04 because value rows hadn't moved (v_std = 1.000 throughout)
+    # so PKM was structurally noise. Two interventions below break the
+    # chicken-and-egg: force α high enough that values get gradient (α-
+    # floor), and run the value table on a much higher LR so it can move
+    # before α can shrink (value-LR multiplier).
+    p.add_argument("--pkm_alpha_floor_start", type=float, default=0.3,
+                   help="FIX 1B: starting sign-preserving additive floor on "
+                        "the PKM α gate. With α_floor > 0 the effective "
+                        "gate is α_eff = α + sign(α)·floor — guarantees a "
+                        "minimum PKM contribution magnitude during warmup "
+                        "so the value table receives meaningful gradient. "
+                        "Anneals linearly to 0 over --pkm_alpha_floor_"
+                        "warmup_steps. 0 disables (v7.0 behaviour).")
+    p.add_argument("--pkm_alpha_floor_warmup_steps", type=int, default=2000,
+                   help="Anneal --pkm_alpha_floor_start to 0 over this many "
+                        "steps. Default matches the ε-greedy curriculum so "
+                        "both interventions retire together.")
+    p.add_argument("--pkm_value_lr_mult", type=float, default=10.0,
+                   help="LR multiplier for the PKM value-table parameters "
+                        "(pkm_layer.values.*). The full chain α·w_k·∂loss "
+                        "dampens the per-row gradient by ~10⁴×; multiplying "
+                        "the per-row LR by 10× partially compensates and "
+                        "lets the table actually move in early training. "
+                        "Set 1.0 to disable. Default 10.0.")
     p.add_argument("--think_burst_prob", type=float, default=0.5,
                    help="Per-chunk probability of inserting random think-token "
                         "bursts during mixed-corpus pretrain (gives memory + "

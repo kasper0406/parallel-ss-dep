@@ -67,6 +67,15 @@ def main() -> int:
                         "downstream — each row has its tier+score so the "
                         "DPO trainer can pair passes with fails per "
                         "problem.")
+    p.add_argument("--shard_id", type=int, default=0,
+                   help="Which shard to process (0-indexed). Combined "
+                        "with --num_shards lets you run one process per "
+                        "GPU and `cat` the output shards. Sharding is "
+                        "STRIDED (problems[shard_id::num_shards]) so the "
+                        "easy/hard mix is balanced across shards.")
+    p.add_argument("--num_shards", type=int, default=1,
+                   help="Total number of shards. Default 1 = no sharding "
+                        "(old behaviour).")
     p.add_argument("--grade_workers", type=int, default=16,
                    help="Thread-pool size for parallel grading. Each "
                         "grade() spawns a subprocess that runs the "
@@ -98,6 +107,15 @@ def main() -> int:
     problems = LOADERS[args.dataset]()
     if args.max_problems is not None:
         problems = problems[:args.max_problems]
+    n_full = len(problems)
+    if args.num_shards > 1:
+        if not (0 <= args.shard_id < args.num_shards):
+            raise SystemExit(
+                f"--shard_id {args.shard_id} out of range for "
+                f"--num_shards {args.num_shards}")
+        problems = problems[args.shard_id::args.num_shards]
+        print(f"[reject-gen] shard {args.shard_id}/{args.num_shards}: "
+              f"{len(problems)} of {n_full} problems")
     print(f"[reject-gen] {len(problems)} problems, "
           f"N={args.n_rollouts}/problem, T={args.temperature}, "
           f"max_gen={args.max_gen}")

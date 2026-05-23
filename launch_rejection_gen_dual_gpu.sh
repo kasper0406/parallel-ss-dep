@@ -40,7 +40,7 @@ echo "  shard1 : $SHARD1 (GPU 1, log $LOG1)"
 echo "  merged : $OUT"
 echo "  extra  : ${EXTRA_ARGS[*]:-(none)}"
 
-export PYTHONPATH=".:$PYTHONPATH"
+export PYTHONPATH=".:${PYTHONPATH:-}"
 
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -u experiments/gen_rejection_data.py \
     --ckpt "$CKPT" \

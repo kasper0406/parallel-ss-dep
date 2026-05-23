@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as _cf
 import json
 import pathlib
 import sys
@@ -66,6 +67,14 @@ def main() -> int:
                         "downstream — each row has its tier+score so the "
                         "DPO trainer can pair passes with fails per "
                         "problem.")
+    p.add_argument("--grade_workers", type=int, default=16,
+                   help="Thread-pool size for parallel grading. Each "
+                        "grade() spawns a subprocess that runs the "
+                        "candidate code + MBPP tests; subprocess.run "
+                        "releases the GIL, so threads scale linearly "
+                        "until subprocess-spawn becomes the floor. "
+                        "Defaults to n_rollouts (16); use 1 for the "
+                        "old sequential behaviour.")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -103,6 +112,15 @@ def main() -> int:
     tier_hist: dict[str, int] = {}
     t0 = time.time()
 
+    # Parallel grading: each grade() spawns a Python subprocess to exec
+    # the candidate + MBPP tests. The candidate code is the SLOW part
+    # (often hits the per-call timeout); subprocess.run releases the
+    # GIL, so a thread pool gives near-linear speedup until subprocess-
+    # spawn overhead becomes the floor. Sequential grading was 96 % of
+    # per-problem wall time at 16 rollouts/problem.
+    grade_pool = (_cf.ThreadPoolExecutor(max_workers=args.grade_workers)
+                  if args.grade_workers > 1 else None)
+
     with open(out_path, "w") as f:
         for i, prob in enumerate(problems):
             prompt = build_mbpp_prompt(prob)
@@ -123,14 +141,31 @@ def main() -> int:
                     temperature=args.temperature,
                     min_emit_before_eos=args.min_emit_before_eos,
                 )
+            # First pass: lightweight CPU work per rollout (tokenize +
+            # extract). Keep on main thread — HF tokenizers are not
+            # reliably thread-safe across versions.
+            per_roll: list[tuple[int, str, str]] = []
             for j, r in enumerate(rollouts):
-                n_total_rollouts += 1
                 gen_only = [t for t in r.full_ids[r.prompt_len:]
                             if t != thinking_token_id]
                 gen_text = tok.decode(gen_only, skip_special_tokens=True)
                 code = extract_code_block(gen_text)
-                full_code = code if code is not None else truncate_at_stop(gen_text)
-                gr = grade(prob, full_code)
+                full_code = (code if code is not None
+                             else truncate_at_stop(gen_text))
+                per_roll.append((j, gen_text, full_code))
+            # Second pass: grade in parallel (or sequentially if the
+            # pool is disabled). Order is preserved by iterating the
+            # futures in submission order.
+            if grade_pool is not None:
+                futs = [grade_pool.submit(grade, prob, fc)
+                        for (_, _, fc) in per_roll]
+                grade_results = [fut.result() for fut in futs]
+            else:
+                grade_results = [grade(prob, fc) for (_, _, fc) in per_roll]
+            # Third pass: account + write (single-threaded, preserves
+            # JSONL order).
+            for (j, gen_text, full_code), gr in zip(per_roll, grade_results):
+                n_total_rollouts += 1
                 tier_hist[gr.tier] = tier_hist.get(gr.tier, 0) + 1
                 keep = (args.keep_all or
                         gr.tier == "pass" or
@@ -152,6 +187,7 @@ def main() -> int:
                     "score": float(gr.score),
                 }
                 f.write(json.dumps(rec) + "\n")
+            f.flush()
             if (i + 1) % 20 == 0:
                 elapsed = time.time() - t0
                 rate = n_total_rollouts / max(1, elapsed)
@@ -159,7 +195,10 @@ def main() -> int:
                 print(f"  [{i+1:>4}/{len(problems)}] "
                       f"passes={n_passes} partials={n_partials} "
                       f"({n_total_rollouts} rollouts, {rate:.1f}/s, "
-                      f"ETA {eta/60:.0f}m)")
+                      f"ETA {eta/60:.0f}m)",
+                      flush=True)
+    if grade_pool is not None:
+        grade_pool.shutdown(wait=False)
 
     print(f"\n[reject-gen] done in {(time.time()-t0)/60:.1f}m")
     print(f"  total rollouts: {n_total_rollouts}")

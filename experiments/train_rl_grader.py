@@ -775,10 +775,19 @@ def main():
 
         if args.save_ckpt and step % args.save_every == 0:
             pathlib.Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)
+            # Save with `_step{N}` suffix so we keep every milestone
+            # ckpt — RL peaks before collapse have happened before
+            # (v1 → step-100 peak, v2 → step-300 peak); we need the
+            # actual peak weights, not just the final ones.
+            base = args.save_ckpt
+            if base.endswith(".pt"):
+                step_path = f"{base[:-3]}_step{step}.pt"
+            else:
+                step_path = f"{base}_step{step}"
             torch.save({"state_dict": model.state_dict(),
                         "step": step, "config": cfg},
-                        args.save_ckpt)
-            print(f"  [saved {args.save_ckpt}]")
+                        step_path)
+            print(f"  [saved {step_path}]")
 
     print(f"\n[rl-grader] done in {time.time() - t0:.0f}s")
     if args.save_ckpt:

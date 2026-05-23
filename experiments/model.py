@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from experiments.gist_loss import trunk_gist_loss
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -878,6 +880,7 @@ class WorkingMemory(nn.Module):
         mem_size: int,
         thinking_token_id: int,
         pad_token_id: int | None = None,
+        write_only_at_think: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -885,6 +888,20 @@ class WorkingMemory(nn.Module):
         self.mem_size = int(mem_size)
         self.thinking_token_id = int(thinking_token_id)
         self.pad_token_id = pad_token_id
+        # FIX A (added 2026-05-18): when True, only think-token positions are
+        # eligible to win a buffer slot. The write-gate g is masked to a
+        # large negative value at non-think positions before topk, so the
+        # buffer always holds think-position content (modulo when n_think
+        # < K_eff, in which case the lowest-g non-think positions fill the
+        # remaining slots but contribute negligible log-gate bias and so
+        # effectively don't affect retrieval).
+        # Diagnostic from 2026-05-18 (diag_thinking_machinery.py) showed
+        # that the v7.1-distilled SFT model writes uniformly across think
+        # and emit positions, so the read-time sharp queries hit a buffer
+        # of arbitrary content. This flag mechanically forces the buffer
+        # to hold think-content; reads then retrieve actual intermediate
+        # computations.
+        self.write_only_at_think = bool(write_only_at_think)
 
         # Write side
         self.W_write = nn.Linear(d_model, 1, bias=True)
@@ -927,6 +944,15 @@ class WorkingMemory(nn.Module):
         if self.pad_token_id is not None:
             is_pad = input_ids == int(self.pad_token_id)          # (B, T)
             g = g.masked_fill(is_pad, 0.0)
+
+        # FIX A (write-only-at-think): mask g at non-think positions to a
+        # large negative value so topk preferentially selects think
+        # positions. -1.0 is well below σ()-range [0, 1] so any think
+        # position outranks any emit position; among think positions the
+        # learned gate values still rank them.
+        if self.write_only_at_think:
+            is_think_pos = input_ids == self.thinking_token_id    # (B, T)
+            g = torch.where(is_think_pos, g, torch.full_like(g, -1.0))
 
         K_eff = min(T, self.mem_size)
 
@@ -974,6 +1000,15 @@ class WorkingMemory(nn.Module):
 
         read = torch.einsum("btk,bkd->btd", attn, buf_v)          # (B, T, d_mem)
         injection = self.W_proj(read)                             # (B, T, d_model)
+        # Stash per-position pre-mask injection. Two versions:
+        #   `_last_injection_grad` — keeps the autograd graph, used by
+        #     auxiliary training losses (e.g. Option-A future-emb-pred
+        #     through WM, 2026-05-19) so gradient on the aux loss flows
+        #     to W_v / W_q / W_proj / W_write.
+        #   `_last_injection` — detached, safe for use in inference
+        #     generators and diagnostic probes.
+        self._last_injection_grad = injection
+        self._last_injection = injection.detach()
 
         # Inject only at "read positions" — either an explicit mask the
         # caller provided (e.g. MQAR query positions) or the default
@@ -1063,6 +1098,19 @@ class TinyLM(nn.Module):
         thinking_token_id: int | None = None,  # Required when use_memory=True.
         pad_token_id: int | None = None,      # Optional; used to keep padding
                                               # rows out of the memory.
+        mem_write_only_at_think: bool = False,  # FIX A (2026-05-18): when
+                                              # True, the WorkingMemory buffer
+                                              # is filled ONLY from think-
+                                              # position writes (non-think
+                                              # positions are masked to a
+                                              # very negative g before topk).
+                                              # Diagnostic showed write gate
+                                              # was firing uniformly across
+                                              # think/emit; this forces the
+                                              # buffer to hold think-content
+                                              # so sharp read queries finally
+                                              # retrieve intermediate
+                                              # computations.
         layer_drop_max: float = 0.0,          # Stochastic Depth: linearly
                                               # increasing per-block drop
                                               # prob 0 → layer_drop_max
@@ -1305,6 +1353,7 @@ class TinyLM(nn.Module):
                 mem_size=int(mem_size),
                 thinking_token_id=int(thinking_token_id),
                 pad_token_id=pad_token_id,
+                write_only_at_think=bool(mem_write_only_at_think),
             )
             # Re-init the thinking-token embedding row to the mean of the
             # other rows. PyTorch's default init makes it random noise, which
@@ -1312,6 +1361,25 @@ class TinyLM(nn.Module):
             with torch.no_grad():
                 mean_row = self.embed.weight.mean(dim=0)
                 self.embed.weight[int(thinking_token_id)].copy_(mean_row)
+            # v7 (2026-05-20): additive α-gated retrieval-as-input.
+            # The retrieval-as-input design (v5/v6) REPLACED the
+            # think-token input embedding with the WM retrieval — a
+            # destructive overwrite. The v6 long-context eval showed it
+            # corrupts precise recall (99%→61% as distance grows): a
+            # blurry retrieval fed in as the input wipes the precise
+            # binding the DeltaNet trunk was carrying. v7 makes the
+            # injection ADDITIVE and scalar-gated:
+            #     input[think] = think_embed + α · retrieval
+            # A useless retrieval contributes ≈0 (gradient shrinks α);
+            # a useful one is gated in. The think_embed baseline is
+            # always present, so a bad retrieval can never corrupt.
+            # Init 0.1 so the retrieval has a small effect from step 0
+            # and receives gradient. Mirrors the FiLM-α / PKM-α pattern.
+            # Consumed by sft_code.py (training) and
+            # eval_humaneval.generate_with_retrieval_as_input (eval) —
+            # the model.forward path itself is unchanged (the caller
+            # builds inputs_embeds). Keep WD off this parameter.
+            self.retrieval_input_alpha = nn.Parameter(torch.tensor(0.1))
 
         # Persistent learned-RAG (Product-Key Memory). Drop-in residual
         # at one mid-depth block. See PKM_PLAN.md.
@@ -1462,6 +1530,18 @@ class TinyLM(nn.Module):
         else:
             maybe_gate(h)
         outs = outs + tuple(extra)
+        # Trunk gist loss — computed INSIDE the forward and returned as a
+        # SCALAR. This is the torch.compile-safe wiring: handing the
+        # hidden state `h` OUT of the compiled forward (via the return
+        # tuple OR an attribute stash) trips AOTAutograd's output-alias
+        # replay (garbage-shape RuntimeError in gen_alias_from_base).
+        # A scalar reduction output cannot alias anything, so computing
+        # the loss here and exposing only the scalar sidesteps the bug.
+        # Gated on self.training so eval/validation forwards
+        # (model.eval()) return plain logits with no extra output.
+        if self.training and getattr(self, "_gist_loss_enabled", False):
+            outs = outs + (trunk_gist_loss(h, self.gist_heads,
+                                           self._gist_horizons),)
         return outs[0] if len(outs) == 1 else outs
 
     def forward(self, input_ids: torch.Tensor,
@@ -1470,8 +1550,30 @@ class TinyLM(nn.Module):
                 return_gate: bool = False,
                 mem_read_mask: torch.Tensor | None = None,
                 doc_ids: torch.Tensor | None = None,
+                inputs_embeds: torch.Tensor | None = None,
                 ) -> torch.Tensor | tuple:
-        x = self.embed(input_ids)
+        """
+        inputs_embeds (B, T, d_model) | None: when provided, BYPASSES the
+        embedding-table lookup for `input_ids`. The model uses these
+        embeddings directly as the trunk input. `input_ids` MUST still
+        be provided (used by WorkingMemory's think-position mask, by
+        cu_seqlens construction, by max_T positional embed, and for
+        loss-target alignment) but its embedding contribution is
+        replaced. This is the entry-point for the retrieval-as-input
+        thinking-token design (2026-05-19): at think positions, the
+        caller substitutes the retrieved WM/PKM value as the input
+        embedding so each think step gets a unique input signal
+        (avoids the homogeneous-think-position pathology that motivated
+        FIX A and then disproved it).
+        """
+        if inputs_embeds is not None:
+            if inputs_embeds.shape[:2] != input_ids.shape[:2]:
+                raise ValueError(
+                    f"inputs_embeds shape {inputs_embeds.shape[:2]} must "
+                    f"match input_ids shape {input_ids.shape[:2]}")
+            x = inputs_embeds
+        else:
+            x = self.embed(input_ids)
 
         # Cross-document isolation: when `doc_ids` marks multiple documents
         # packed into one T-length row, `cu_seqlens` makes the DeltaNet
@@ -1757,6 +1859,495 @@ class TinyLM(nn.Module):
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    # ------------------------------------------------------------------
+    # State-passing incremental decoding (2026-05-23).
+    #
+    # `prefill(input_ids)` runs ONE full forward over the prompt and
+    # extracts everything `forward_step` needs to continue the
+    # generation one token at a time at constant per-token cost.
+    #
+    # The cache is a plain dict (call it `IncrementalCache` for clarity)
+    # holding:
+    #
+    #   fla_cache: fla.models.utils.Cache
+    #       Per-layer recurrent + ShortConv state. Each DeltaNet layer
+    #       writes its state to slot `layer_idx` (we set `layer_idx`
+    #       per-layer at prefill / step time via _FlaWrapper.forward_step).
+    #
+    #   seen: int
+    #       Total tokens processed so far (= position of the NEXT token
+    #       when forward_step is called).
+    #
+    #   lagged_sources: dict[int, Tensor (B, 1, d_model)] | None
+    #       For FiLM (--feedback_pairs with K-self-feed): the previous
+    #       step's source-layer outputs, used as FiLM input for THIS
+    #       step's target layer (matches `decode_step_film` semantics —
+    #       at convergence of K-self-feed, the pass-2 lagged source
+    #       state is the right deploy-time input).
+    #       None when _film_bypass=True (the default at decode for the
+    #       v7 ckpt family, since generators set bypass=True).
+    #
+    #   wm_buf: dict with growing tensors
+    #       'gate':  (B, t_cur)        per-position write-gate sigmoid
+    #       'value': (B, t_cur, d_mem) per-position W_v(h)
+    #       'pos':   (B, t_cur) int    position index (for causal mask
+    #                                   in a future read)
+    #       'doc':   (B, t_cur) long | None    doc_id (always None at
+    #                                   inference)
+    #       'tok':   (B, t_cur) long   input_ids (only used to recompute
+    #                                   pad/think masks during a read)
+    #       Build is "append every step"; reads happen lazily at the
+    #       per-step `_apply_memory_incremental` call. For non-think
+    #       emit steps the read is masked out so we skip the read entirely
+    #       and just append to the buffer.
+    #
+    # Limitations / what's intentionally NOT supported in forward_step:
+    #   - Cross-document doc_ids — None at inference; not threaded.
+    #   - feedback_xattn (cross-layer attention) — v7 uses FiLM, not xattn;
+    #     the deployed generators set _film_bypass=True so even FiLM is
+    #     bypassed. xattn forward_step raises NotImplementedError.
+    #   - K-self-feed at decode time: ALWAYS run K=1 (`_film_bypass=True`
+    #     is the convention shipped in eval_humaneval / train_rl_grader;
+    #     when bypass is True, no FiLM is applied either, mirroring the
+    #     full forward's "plain block loop" branch).
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def prefill(self, input_ids: torch.Tensor,
+                inputs_embeds: torch.Tensor | None = None) -> dict:
+        """Run the prompt through a full forward, build an incremental
+        cache, and return (cache, last_logits).
+
+        The prompt's logits at the LAST position are also returned (the
+        generator typically samples the first emit from these without
+        ever calling forward_step on the first new token).
+
+        `inputs_embeds` is forwarded to support the retrieval-as-input
+        generator (which substitutes the embedding at the new position).
+        For prefill the prompt is plain input_ids and inputs_embeds is
+        usually None.
+
+        Side effect (preserves the existing public interface): the
+        usual `self._last_gate*` stashes are populated by the full
+        forward, so callers that read them keep working unchanged.
+        """
+        from fla.models.utils import Cache as FLACache
+
+        B, T_prompt = input_ids.shape
+
+        # Use a plain bypass forward over the prompt for state extraction.
+        # We need to populate (a) per-layer FLA cache, (b) FiLM lagged
+        # source state if feedback is active and NOT bypassed, (c) WM
+        # buffer entries for the entire prompt.
+        #
+        # The cleanest extraction: mirror the "_film_bypass / plain
+        # block loop" branch of forward(), but pass `past_key_values`
+        # into each block's attention so it caches the recurrent state.
+        if inputs_embeds is not None:
+            if inputs_embeds.shape[:2] != input_ids.shape[:2]:
+                raise ValueError(
+                    f"inputs_embeds shape {inputs_embeds.shape[:2]} must "
+                    f"match input_ids shape {input_ids.shape[:2]}")
+            x = inputs_embeds
+        else:
+            x = self.embed(input_ids)
+
+        if self.max_T > 0:
+            pos = torch.arange(T_prompt, device=input_ids.device)
+            x = x + self.pos_embed(pos)
+
+        fla_cache = FLACache(seen_tokens=0)
+        # We RUN the full plain-bypass block stack with use_cache=True
+        # so each attention layer populates fla_cache[layer_idx].
+        lagged_sources: dict[int, torch.Tensor] = {}
+        source_layers = set(s for _, s in self.feedback_pairs) \
+            if (self.feedback_pairs and not self._film_bypass) else set()
+
+        # If FiLM is bypassed (the standard deploy convention), we just
+        # run plain blocks. Otherwise (rare in practice for our v7
+        # generators), we run the K=1 lagged-cached FiLM at prefill so
+        # the FIRST forward step has correct lagged inputs.
+        use_film_at_decode = (self.feedback_pairs
+                              and not self._film_bypass
+                              and not self.feedback_xattn_pairs)
+
+        h = x
+        if use_film_at_decode:
+            # Pass 1: vanilla, collect source layer outputs (no cache —
+            # pass-1 state isn't used downstream, only the source-layer
+            # outputs matter for the FiLM lag).
+            h1 = x
+            pass1_at_sources: dict = {}
+            for L, blk in enumerate(self.blocks):
+                h1 = self._step_block(blk, h1, past=None, layer_idx=L)
+                h1 = self._maybe_pkm(h1, L)
+                if L in source_layers:
+                    pass1_at_sources[L] = h1
+            # Pass 2: FiLM at targets, populate the real cache.
+            for L, blk in enumerate(self.blocks):
+                if L in self.sparse_target_to_source and self.feedback_position == "pre":
+                    src = self.sparse_target_to_source[L]
+                    state_above_lagged = _shift_right_by_k(
+                        pass1_at_sources[src], self.feedback_lag)
+                    h = self.sparse_feedback[str(L)](h, state_above_lagged)
+                h = self._step_block(blk, h, past=fla_cache, layer_idx=L)
+                if L in self.sparse_target_to_source and self.feedback_position == "post":
+                    src = self.sparse_target_to_source[L]
+                    state_above_lagged = _shift_right_by_k(
+                        pass1_at_sources[src], self.feedback_lag)
+                    h = self.sparse_feedback[str(L)](h, state_above_lagged)
+                h = self._maybe_pkm(h, L)
+            # Lagged source for the NEXT decode step: the LAST position of
+            # pass-2's source-layer output (since pass-2 is what training
+            # actually computed; pass-1 only feeds FiLM). Match
+            # decode_step_film semantics.
+            #
+            # Subtle: decode_step_film actually caches PASS-2's source
+            # output for the NEXT step's FiLM input (it's a proxy for
+            # the true pass-1 lagged input). We mirror that.
+            for L in source_layers:
+                lagged_sources[L] = h.new_zeros(B, 1, h.shape[-1])
+            # Walk pass-2 again? No — `pass1_at_sources` already has them
+            # to lag from. But for the NEXT decode step we want pass-2's
+            # output at the last prompt position. Recompute by saving
+            # pass-2 source outputs:
+            # → do it in-line above. Repeating that here cleanly:
+            pass2_at_sources: dict = {}
+            h_p2 = x
+            for L, blk in enumerate(self.blocks):
+                if L in self.sparse_target_to_source and self.feedback_position == "pre":
+                    src = self.sparse_target_to_source[L]
+                    state_above_lagged = _shift_right_by_k(
+                        pass1_at_sources[src], self.feedback_lag)
+                    h_p2 = self.sparse_feedback[str(L)](h_p2, state_above_lagged)
+                # NOTE: this is a wasteful 2nd full forward; for now this
+                # branch is mainly correctness fallback. Production usage
+                # has _film_bypass=True so we never hit this code.
+                h_p2 = blk(h_p2, input_ids=input_ids)
+                if L in self.sparse_target_to_source and self.feedback_position == "post":
+                    src = self.sparse_target_to_source[L]
+                    state_above_lagged = _shift_right_by_k(
+                        pass1_at_sources[src], self.feedback_lag)
+                    h_p2 = self.sparse_feedback[str(L)](h_p2, state_above_lagged)
+                h_p2 = self._maybe_pkm(h_p2, L)
+                if L in source_layers:
+                    lagged_sources[L] = h_p2[:, -1:].clone()
+        else:
+            # Plain block loop (= _film_bypass branch). The single,
+            # primary code path for the v7 generator.
+            for L, blk in enumerate(self.blocks):
+                h = self._step_block(blk, h, past=fla_cache, layer_idx=L)
+                h = self._maybe_pkm(h, L)
+
+        # Gate + memory + lm_head (mirror _finalize).
+        h_normed = self.out_norm(h)
+        # Build the WM buffer entries for the prompt BEFORE applying
+        # memory injection — the buffer is computed from h_normed (same
+        # as WorkingMemory.forward does internally).
+        wm_buf = self._wm_init_buffer_from_prompt(h_normed, input_ids) \
+            if self.use_memory else None
+
+        # Memory injection for the prompt itself — needed so the prompt's
+        # last-position logits match the full forward exactly (used by
+        # the generator's "first sample comes from prefill" path).
+        h_normed = self._apply_memory(h_normed, input_ids, read_mask=None,
+                                       doc_ids=None)
+        lm_logits = self.lm_head(h_normed)
+        # Gate stash (matches _finalize / _maybe_gate behaviour).
+        if self.output_gate:
+            gate_logits = self.gate_head(h_normed).squeeze(-1)
+            g = torch.sigmoid(gate_logits)
+            self._last_gate_logits = gate_logits
+            self._last_gate = g
+
+        cache = {
+            "fla_cache": fla_cache,
+            "seen": int(T_prompt),
+            "lagged_sources": lagged_sources if use_film_at_decode else None,
+            "wm_buf": wm_buf,
+        }
+        return cache, lm_logits
+
+    def _step_block(self, blk: nn.Module, x: torch.Tensor,
+                    past, layer_idx: int) -> torch.Tensor:
+        """Run one Block, threading `past` through the attention layer's
+        cache. The attention layer is `blk.attn` (a `_FlaWrapper`); we
+        use its `.layer` directly so the kernel can write into the
+        cache. This matches `_block_with_cache` in decode_bench.py.
+
+        Caller decides whether `past` is from a prefill (full T) or a
+        single-token forward_step (T=1). For the FLA DeltaNet family,
+        the chunk kernel handles full sequences with use_cache=True,
+        AND the fused_recurrent kernel handles T=1 — we pick which by
+        x.shape[1].
+        """
+        attn_in = blk.attn_norm(x)
+        # T==1 → use forward_step (fused_recurrent kernel; correct for
+        #         incremental decoding with a populated cache).
+        # T>1  → run the full chunk kernel with use_cache=True so the
+        #         cache slot is initialized from the whole prompt.
+        if x.shape[1] == 1 and past is not None:
+            attn_out, _ = blk.attn.forward_step(attn_in, past, layer_idx)
+        else:
+            with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+                layer = blk.attn.layer
+                saved_layer_idx = getattr(layer, "layer_idx", None)
+                layer.layer_idx = int(layer_idx)
+                try:
+                    out = layer(
+                        hidden_states=attn_in,
+                        past_key_values=past,
+                        use_cache=(past is not None),
+                    )
+                finally:
+                    if saved_layer_idx is not None:
+                        layer.layer_idx = saved_layer_idx
+            if isinstance(out, tuple):
+                attn_out = out[0]
+            else:
+                attn_out = out
+            attn_out = attn_out.to(x.dtype)
+        x = x + attn_out
+        x = x + blk.mlp(blk.mlp_norm(x))
+        return x
+
+    def _wm_init_buffer_from_prompt(self, h_normed: torch.Tensor,
+                                     input_ids: torch.Tensor) -> dict:
+        """Compute the per-position WM write contributions for the
+        prompt and stash them in the growing-buffer dict.
+
+        We don't trim to top-K here — the buffer is the FULL list of
+        (gate, value, pos) for every position seen so far. The
+        `forward_step` read path takes top-K from this buffer at READ
+        time (same semantics as WorkingMemory.forward, just with the
+        topk applied lazily over the growing list).
+        """
+        mem = self.memory
+        B, T, _ = h_normed.shape
+        device = h_normed.device
+
+        write_logits = mem.W_write(h_normed).squeeze(-1)   # (B, T)
+        g = torch.sigmoid(write_logits)                     # (B, T)
+        v = mem.W_v(h_normed)                               # (B, T, d_mem)
+
+        if mem.pad_token_id is not None:
+            is_pad = input_ids == int(mem.pad_token_id)
+            g = g.masked_fill(is_pad, 0.0)
+        if mem.write_only_at_think:
+            is_think_pos = input_ids == mem.thinking_token_id
+            g = torch.where(is_think_pos, g, torch.full_like(g, -1.0))
+
+        pos = torch.arange(T, device=device).unsqueeze(0).expand(B, T).contiguous()
+        return {
+            "gate": g.detach(),       # (B, T)
+            "value": v.detach(),      # (B, T, d_mem)
+            "pos": pos,                # (B, T)
+            "tok": input_ids.clone(),  # (B, T)
+        }
+
+    def _wm_append_one(self, buf: dict, h_normed_new: torch.Tensor,
+                       input_ids_new: torch.Tensor) -> None:
+        """Append ONE new position's (gate, value, pos, tok) to the
+        growing WM buffer in-place.
+
+        h_normed_new: (B, 1, d_model)
+        input_ids_new: (B, 1)
+        """
+        mem = self.memory
+        write_logit = mem.W_write(h_normed_new).squeeze(-1)   # (B, 1)
+        g_new = torch.sigmoid(write_logit)
+        v_new = mem.W_v(h_normed_new)                          # (B, 1, d_mem)
+
+        if mem.pad_token_id is not None:
+            is_pad = input_ids_new == int(mem.pad_token_id)
+            g_new = g_new.masked_fill(is_pad, 0.0)
+        if mem.write_only_at_think:
+            is_think_pos = input_ids_new == mem.thinking_token_id
+            g_new = torch.where(is_think_pos, g_new, torch.full_like(g_new, -1.0))
+
+        B = h_normed_new.shape[0]
+        cur_T = int(buf["gate"].shape[1])
+        new_pos = torch.full((B, 1), cur_T, dtype=buf["pos"].dtype,
+                              device=h_normed_new.device)
+
+        buf["gate"]  = torch.cat([buf["gate"],  g_new.detach()],   dim=1)
+        buf["value"] = torch.cat([buf["value"], v_new.detach()],   dim=1)
+        buf["pos"]   = torch.cat([buf["pos"],   new_pos],          dim=1)
+        buf["tok"]   = torch.cat([buf["tok"],   input_ids_new],    dim=1)
+
+    def _wm_read_one(self, buf: dict, h_normed_new: torch.Tensor,
+                     read_mask_new: torch.Tensor | None,
+                     input_ids_new: torch.Tensor) -> torch.Tensor:
+        """Compute the WM injection at the NEW (single) position.
+
+        Returns (B, 1, d_model) — the per-position post-memory hidden
+        state (residual already added).
+
+        Semantics match WorkingMemory.forward but for a single read
+        position: topk over the entire current buffer's write-gates,
+        then soft-attention with causal+pad masking.
+
+        Cheap-skip: if the read is masked out (the default-think-mask
+        case: input_ids_new != thinking_token_id, AND read_mask_new is
+        None or 0), we return h_normed_new unchanged — no read compute.
+        """
+        import math
+        mem = self.memory
+        B, _, d_model = h_normed_new.shape
+        device = h_normed_new.device
+
+        # Decide read activation mask FIRST and skip work entirely if no
+        # row needs to read.
+        if read_mask_new is None:
+            inj_mask = (input_ids_new == mem.thinking_token_id).to(h_normed_new.dtype)
+        else:
+            inj_mask = read_mask_new.to(h_normed_new.dtype)
+        if bool((inj_mask <= 0).all().item()):
+            # No row reads here — short-circuit. Still stash a zero
+            # injection for any caller that reads `_last_injection`.
+            mem._last_injection = torch.zeros_like(h_normed_new)
+            return h_normed_new
+
+        gate_full  = buf["gate"]                    # (B, t_cur)
+        value_full = buf["value"]                   # (B, t_cur, d_mem)
+        pos_full   = buf["pos"]                     # (B, t_cur)
+        t_cur = gate_full.shape[1]
+        K_eff = min(t_cur, mem.mem_size)
+
+        _, top_idx = torch.topk(gate_full, k=K_eff, dim=-1)    # (B, K)
+        gather_idx_v = top_idx.unsqueeze(-1).expand(-1, -1, mem.d_mem)
+        buf_v = torch.gather(value_full, dim=1, index=gather_idx_v)  # (B, K, d_mem)
+        buf_g = torch.gather(gate_full, dim=1, index=top_idx)        # (B, K)
+        buf_pos = torch.gather(pos_full, dim=1, index=top_idx)       # (B, K)
+
+        # Query at the single new position.
+        q = mem.W_q(h_normed_new)                                    # (B, 1, d_mem)
+        scale = 1.0 / math.sqrt(mem.d_mem)
+        scores = torch.einsum("btd,bkd->btk", q, buf_v) * scale       # (B, 1, K)
+        scores = scores + torch.log(buf_g.clamp_min(1e-6)).unsqueeze(1)
+
+        # Causal mask: the new position is at index t_cur (we've ALREADY
+        # appended this token to the buffer before reading — see
+        # forward_step ordering). So allow buffer slot k iff
+        # buf_pos[k] < t_cur (strict). Equivalently: top_idx[k] != the
+        # new token's position index.
+        new_pos_val = t_cur - 1   # we appended first; the read happens
+                                   # AFTER append, so the new token is at
+                                   # index t_cur - 1.
+        src_pos = buf_pos.unsqueeze(1)                                # (B, 1, K)
+        causal_mask = src_pos >= new_pos_val                          # (B, 1, K)
+        scores = scores.masked_fill(causal_mask, float("-inf"))
+
+        all_masked = causal_mask.all(dim=-1, keepdim=True)
+        attn = torch.softmax(scores, dim=-1)
+        attn = torch.where(all_masked, torch.zeros_like(attn), attn)
+        read = torch.einsum("btk,bkd->btd", attn, buf_v)              # (B, 1, d_mem)
+        injection = mem.W_proj(read)                                   # (B, 1, d_model)
+        mem._last_injection = injection.detach()
+
+        return h_normed_new + injection * inj_mask.unsqueeze(-1)
+
+    @torch.no_grad()
+    def forward_step(self, input_id: torch.Tensor, cache: dict, *,
+                     return_hidden: bool = False,
+                     inputs_embeds: torch.Tensor | None = None,
+                     mem_read_mask: torch.Tensor | None = None,
+                     ) -> tuple:
+        """Incremental one-token forward.
+
+        input_id: (B, 1) — the next token to process. (For inputs_embeds
+            substitution at think positions, pass `inputs_embeds=...` and
+            input_id is still used for the WM think-position mask.)
+
+        cache: the dict returned by `prefill(...)` (or a previous
+            `forward_step` call). MUTATED in place.
+
+        Returns `(logits, cache)` where `logits` is (B, 1, V) — the
+        next-token distribution for the position just processed.
+
+        Honors the same `self._last_gate / _last_gate_logits` stashes as
+        the full forward so callers that read them keep working.
+
+        Limitations: see the IncrementalCache docstring above.
+        """
+        if input_id.dim() == 1:
+            input_id = input_id.unsqueeze(-1)
+        assert input_id.shape[1] == 1, \
+            f"forward_step expects (B, 1) input, got {tuple(input_id.shape)}"
+        B = input_id.shape[0]
+        device = input_id.device
+
+        if self.feedback_xattn_pairs:
+            raise NotImplementedError(
+                "forward_step does not support cross-layer-attention "
+                "feedback (use the full-forward fallback)")
+
+        # Embedding (or substitute).
+        if inputs_embeds is not None:
+            assert inputs_embeds.shape[:2] == (B, 1), \
+                f"inputs_embeds must be (B, 1, d); got {tuple(inputs_embeds.shape)}"
+            x = inputs_embeds
+        else:
+            x = self.embed(input_id)
+
+        if self.max_T > 0:
+            pos = torch.tensor([cache["seen"]], device=device, dtype=torch.long)
+            x = x + self.pos_embed(pos)
+
+        fla_cache = cache["fla_cache"]
+        use_film_at_decode = (self.feedback_pairs
+                              and not self._film_bypass
+                              and not self.feedback_xattn_pairs
+                              and cache.get("lagged_sources") is not None)
+        source_layers = set(s for _, s in self.feedback_pairs) \
+            if use_film_at_decode else set()
+
+        if use_film_at_decode:
+            h = x
+            new_lagged: dict = {}
+            for L, blk in enumerate(self.blocks):
+                if L in self.sparse_target_to_source and self.feedback_position == "pre":
+                    src = self.sparse_target_to_source[L]
+                    h = self.sparse_feedback[str(L)](
+                        h, cache["lagged_sources"][src])
+                h = self._step_block(blk, h, past=fla_cache, layer_idx=L)
+                if L in self.sparse_target_to_source and self.feedback_position == "post":
+                    src = self.sparse_target_to_source[L]
+                    h = self.sparse_feedback[str(L)](
+                        h, cache["lagged_sources"][src])
+                h = self._maybe_pkm(h, L)
+                if L in source_layers:
+                    new_lagged[L] = h.clone()
+            cache["lagged_sources"] = new_lagged
+        else:
+            h = x
+            for L, blk in enumerate(self.blocks):
+                h = self._step_block(blk, h, past=fla_cache, layer_idx=L)
+                h = self._maybe_pkm(h, L)
+
+        # Gate + memory + lm_head (mirror _finalize).
+        h_normed = self.out_norm(h)
+        if self.use_memory:
+            # Append THIS token to the WM buffer first, then read (the
+            # read mask is causal anyway — strict < t_cur).
+            self._wm_append_one(cache["wm_buf"], h_normed, input_id)
+            h_normed = self._wm_read_one(cache["wm_buf"], h_normed,
+                                          mem_read_mask, input_id)
+
+        lm_logits = self.lm_head(h_normed)
+
+        if self.output_gate:
+            gate_logits = self.gate_head(h_normed).squeeze(-1)
+            g = torch.sigmoid(gate_logits)
+            self._last_gate_logits = gate_logits
+            self._last_gate = g
+
+        cache["seen"] = int(cache["seen"]) + 1
+
+        if return_hidden:
+            return lm_logits, h_normed, cache
+        return lm_logits, cache
 
     def feedback_alphas(self) -> list:
         """Return current α values. Format depends on mode:

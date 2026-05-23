@@ -113,6 +113,15 @@ def generate(model, prompt_ids: torch.Tensor, max_gen: int = 256,
             "use_thinking=True requires thinking_token_id"
         if total_think_budget is None:
             total_think_budget = 2 * max_gen
+    # SPEEDUP: at decode time we feed the whole prefix each step, so the
+    # FiLM K=3 self-feed has nothing to iterate over (K-pass is for
+    # gradient quality during training). Force the single-pass FiLM
+    # path for the whole decode loop — measured ~2x faster on the
+    # generate path with identical outputs at the K-warmup deploy
+    # convention. Restore on exit so we don't leak state to training.
+    _orig_film_bypass = getattr(model, "_film_bypass", False)
+    if hasattr(model, "_film_bypass"):
+        model._film_bypass = True
     out = prompt_ids.clone()
     emit_count = 0
     think_total = 0
@@ -178,6 +187,8 @@ def generate(model, prompt_ids: torch.Tensor, max_gen: int = 256,
             gate_emit_values.append(gate_val)
         if eos_token_id is not None and (next_tok == eos_token_id).all():
             break
+    if hasattr(model, "_film_bypass"):
+        model._film_bypass = _orig_film_bypass
     diag = {
         "emit_count": emit_count,
         "think_total": think_total,
@@ -189,6 +200,177 @@ def generate(model, prompt_ids: torch.Tensor, max_gen: int = 256,
     return out, diag
 
 
+@torch.no_grad()
+def generate_with_retrieval_as_input(
+    model, prompt_ids: torch.Tensor, max_gen: int = 256,
+    temperature: float = 0.0, eos_token_id: int | None = None,
+    thinking_token_id: int | None = None,
+    max_think_per_step: int = 8,
+    total_think_budget: int | None = None,
+    emit_threshold: float = 0.5,
+    min_emit_before_eos: int = 0,
+    gate_floor: float = 0.0,
+    additive: bool = True,
+) -> tuple[torch.Tensor, dict]:
+    """Retrieval-as-input thinking-token generation (2026-05-19).
+
+    DIFFERENCE FROM `generate`:
+      In the standard `generate`, when the gate decides to think we
+      append a discrete [THINKING] token. Its input embedding is the
+      SAME on every think step (since [THINKING] is one vocab entry),
+      so successive think positions are highly correlated (median
+      pairwise cos 0.146 vs 0.060 at emit — see diag_think_position_
+      diversity.py).
+
+      Here, when the gate decides to think we INSTEAD inject the
+      WorkingMemory retrieval result at that position as the input
+      embedding for the next forward — bypassing the [THINKING] token's
+      embedding lookup. The retrieval depends on the current hidden
+      state, so each think step gets a unique input signal and the
+      think-position hidden states become diverse.
+
+      Concretely:
+        forward(input_ids → embed table) → h, gate, WM injection stash
+        if think:
+          next_input_emb = model.memory._last_injection[0, -1, :]
+                           (the WM read at the last position)
+          input_ids = cat(input_ids, [THINKING_ID])
+          inputs_embeds = cat(prior_embeds, next_input_emb)
+                          ← passed to next forward instead of input_ids embed
+        else:
+          emit as usual
+
+    Requires the loaded model to have memory + the new _last_injection
+    stash (added 2026-05-19).
+    """
+    if total_think_budget is None:
+        total_think_budget = 2 * max_gen
+    if thinking_token_id is None:
+        raise ValueError("generate_with_retrieval_as_input requires "
+                         "thinking_token_id")
+    if not hasattr(model, "memory"):
+        raise ValueError("model lacks .memory — this generator needs "
+                         "WorkingMemory to provide the retrieval.")
+    # SPEEDUP: force single-pass FiLM at decode (see generate() above).
+    _orig_film_bypass = getattr(model, "_film_bypass", False)
+    if hasattr(model, "_film_bypass"):
+        model._film_bypass = True
+
+    device = prompt_ids.device
+    out = prompt_ids.clone()
+    # inputs_embeds is the per-position model input; starts as the
+    # embedding lookup of the prompt and grows with each gen step.
+    inputs_embeds = model.embed(out).clone()    # (B, prompt_len, d)
+    # v7 additive α-gated injection: at a think step the next input is
+    # think_embed + α·retrieval (α = model.retrieval_input_alpha),
+    # instead of v5/v6's destructive `next input = retrieval`. `additive`
+    # is set from cfg['retrieval_input_additive'] by the caller — True
+    # for v7 ckpts, False for v5/v6.
+    _alpha_p = getattr(model, "retrieval_input_alpha", None)
+    alpha = float(_alpha_p.detach()) if _alpha_p is not None else 0.1
+
+    emit_count = 0
+    think_total = 0
+    think_steps_used: list[int] = []
+    gate_emit_values: list[float] = []
+    while emit_count < max_gen:
+        thinks_this_step = 0
+        # Inner think loop: keep retrieving until gate flips to emit or
+        # we hit a cap.
+        while True:
+            logits = model(out, inputs_embeds=inputs_embeds)
+            next_logits = logits[:, -1, :]
+            gate_t = getattr(model, "_last_gate", None)
+            gate_val = (1.0 if gate_t is None
+                        else float(gate_t[0, -1].item()))
+            if gate_floor > 0.0:
+                gate_val = max(gate_val, gate_floor)
+            force_emit = (
+                thinks_this_step >= max_think_per_step
+                or think_total >= total_think_budget
+            )
+            if gate_val >= emit_threshold or force_emit:
+                break
+            # THINK STEP: replace the next input embedding with the WM
+            # read at the current last position. _last_injection has
+            # shape (B, T_current, d); we want the read AT the last
+            # position (it's the query computed from h_t which depended
+            # on the full context).
+            inj = getattr(model.memory, "_last_injection", None)
+            if inj is None:
+                raise RuntimeError(
+                    "memory._last_injection missing — model.memory.forward "
+                    "must stash injection (added 2026-05-19).")
+            retrieved = inj[:, -1:, :].to(inputs_embeds.dtype)   # (B, 1, d)
+            think_tok = torch.full((out.shape[0], 1), int(thinking_token_id),
+                                    dtype=out.dtype, device=device)
+            out = torch.cat([out, think_tok], dim=1)
+            if additive:
+                # v7: think_embed + α·retrieval — the think token keeps
+                # its own signal; the retrieval is a gated addition.
+                think_emb = model.embed(think_tok).to(inputs_embeds.dtype)
+                inj_input = think_emb + alpha * retrieved
+            else:
+                # v5/v6: destructive replacement (kept for those ckpts).
+                inj_input = retrieved
+            inputs_embeds = torch.cat([inputs_embeds, inj_input], dim=1)
+            thinks_this_step += 1
+            think_total += 1
+        # EMIT STEP: same as standard generate.
+        if thinking_token_id is not None:
+            next_logits = next_logits.clone()
+            next_logits[..., int(thinking_token_id)] = -float("inf")
+        if (eos_token_id is not None
+                and min_emit_before_eos > 0
+                and emit_count < min_emit_before_eos):
+            next_logits[..., int(eos_token_id)] = -float("inf")
+        if temperature == 0.0:
+            next_tok = next_logits.argmax(dim=-1, keepdim=True)
+        else:
+            probs = torch.softmax(next_logits / temperature, dim=-1)
+            next_tok = torch.multinomial(probs, num_samples=1)
+        out = torch.cat([out, next_tok], dim=1)
+        # For an emit step we use the regular embedding-table lookup.
+        emit_emb = model.embed(next_tok).to(inputs_embeds.dtype)
+        inputs_embeds = torch.cat([inputs_embeds, emit_emb], dim=1)
+        emit_count += 1
+        think_steps_used.append(thinks_this_step)
+        gate_emit_values.append(gate_val)
+        if eos_token_id is not None and (next_tok == eos_token_id).all():
+            break
+    if hasattr(model, "_film_bypass"):
+        model._film_bypass = _orig_film_bypass
+    diag = {
+        "emit_count": emit_count,
+        "think_total": think_total,
+        "think_steps_used": think_steps_used,
+        "gate_emit_values": gate_emit_values,
+        "think_rate": (think_total / max(1, think_total + emit_count)),
+        "mode": "retrieval_as_input",
+    }
+    return out, diag
+
+
+_FENCE_PY = __import__("re").compile(
+    r"```python\s*\n(.*?)\n?```", __import__("re").DOTALL)
+_FENCE_ANY = __import__("re").compile(
+    r"```[a-zA-Z]*\s*\n(.*?)\n?```", __import__("re").DOTALL)
+
+
+def _extract_code_block(text: str) -> str | None:
+    """Pull a python fenced block out of `text`; returns None if no
+    fence is present. Matches the helper in distill_solutions.py so
+    Qwen-distilled student output is parsed the same way as the
+    training data was emitted."""
+    m = _FENCE_PY.search(text)
+    if m:
+        return m.group(1).strip()
+    m = _FENCE_ANY.search(text)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
 def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
              max_gen: int = 256, max_problems: int | None = None,
              use_thinking: bool = False,
@@ -196,7 +378,25 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
              total_think_budget: int | None = None,
              emit_threshold: float = 0.5,
              min_emit_before_eos: int = 0,
-             gate_floor: float = 0.0):
+             gate_floor: float = 0.0,
+             prompt_style: str = "humaneval",
+             extract_code_block: bool = False,
+             generator: str = "standard"):
+    """
+    prompt_style:
+      "humaneval"   — use the original HumanEval prompt verbatim (default).
+      "sft_comment" — prepend "# Complete the following Python function.\\n"
+                      to match the # <problem>\\n<solution> format that
+                      sft_code.py builds for training. Required when the
+                      ckpt was SFT'd on distilled JSONL (Qwen-style
+                      problem→completion).
+
+    extract_code_block:
+      If True, look for a ```python ... ``` fence in the model output and
+      use the EXTRACTED CODE as the full submission for grading (rather
+      than prompt + raw model text). Required for Qwen-distilled ckpts
+      that emit CoT prose around their code block.
+    """
     print(f"Loading checkpoint: {ckpt_path}")
     model, cfg = build_model_from_ckpt(ckpt_path)
     print(f"  feedback={cfg.get('feedback_mode')}  n_layers={cfg['n_layers']}")
@@ -241,7 +441,12 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
     for i, problem in enumerate(ds):
         if max_problems is not None and i >= max_problems:
             break
-        prompt = problem["prompt"]
+        raw_prompt = problem["prompt"]
+        if prompt_style == "sft_comment":
+            prompt = ("# Complete the following Python function.\n"
+                      + raw_prompt)
+        else:
+            prompt = raw_prompt
         # Tokenise; check fits in model's max_T.
         prompt_ids = tok.encode(prompt, add_special_tokens=False)
         # max_T==0 means "no positional embedding limit" — the model has no
@@ -260,17 +465,34 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
         any_passed = False
         last_diag: dict = {}
         for _ in range(n_samples):
-            gen, diag = generate(
-                model, prompt_t, max_gen=max_gen,
-                temperature=temperature, eos_token_id=tok.eos_token_id,
-                use_thinking=use_thinking,
-                thinking_token_id=thinking_token_id,
-                max_think_per_step=max_think_per_step,
-                total_think_budget=total_think_budget,
-                emit_threshold=emit_threshold,
-                min_emit_before_eos=min_emit_before_eos,
-                gate_floor=gate_floor,
-            )
+            if generator == "retrieval_as_input":
+                # v5+ models trained with --retrieval_as_input_thinking
+                # must be evaluated with the matching generator (the
+                # think-position input is the WM retrieval, not the
+                # [THINKING] embedding).
+                gen, diag = generate_with_retrieval_as_input(
+                    model, prompt_t, max_gen=max_gen,
+                    temperature=temperature, eos_token_id=tok.eos_token_id,
+                    thinking_token_id=thinking_token_id,
+                    max_think_per_step=max_think_per_step,
+                    total_think_budget=total_think_budget,
+                    emit_threshold=emit_threshold,
+                    min_emit_before_eos=min_emit_before_eos,
+                    gate_floor=gate_floor,
+                    additive=cfg.get("retrieval_input_additive", False),
+                )
+            else:
+                gen, diag = generate(
+                    model, prompt_t, max_gen=max_gen,
+                    temperature=temperature, eos_token_id=tok.eos_token_id,
+                    use_thinking=use_thinking,
+                    thinking_token_id=thinking_token_id,
+                    max_think_per_step=max_think_per_step,
+                    total_think_budget=total_think_budget,
+                    emit_threshold=emit_threshold,
+                    min_emit_before_eos=min_emit_before_eos,
+                    gate_floor=gate_floor,
+                )
             last_diag = diag
             gen_only_full = gen[0, len(prompt_ids):].tolist()
             # Strip think tokens before decoding (they're internal control
@@ -281,8 +503,20 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
             else:
                 gen_only = gen_only_full
             gen_text = tok.decode(gen_only, skip_special_tokens=True)
-            gen_text = _truncate_at_stop(gen_text)
-            full_code = prompt + gen_text
+            if extract_code_block:
+                # Qwen-distilled student emits CoT + ```python ... ```
+                # — pull the code block out and use IT as the full
+                # submission (replaces prompt+gen concat).
+                code = _extract_code_block(gen_text)
+                if code is not None:
+                    full_code = code
+                else:
+                    # No fence found — fall back to raw text (will likely
+                    # syntax_error, but keeps the loop honest).
+                    full_code = gen_text
+            else:
+                gen_text = _truncate_at_stop(gen_text)
+                full_code = raw_prompt + gen_text
             if _run_test_in_subprocess(full_code, problem["test"],
                                         problem["entry_point"]):
                 any_passed = True
@@ -363,6 +597,28 @@ def main():
                         "made the model indifferent to gate values < floor. "
                         "Use the same value as --gate_floor_min was during "
                         "pretrain (e.g. 0.5).")
+    p.add_argument("--prompt_style", type=str, default="humaneval",
+                   choices=["humaneval", "sft_comment"],
+                   help="'humaneval' (default): original prompt verbatim. "
+                        "'sft_comment': prepend '# Complete the following "
+                        "Python function.\\n' to match the # <problem>\\n"
+                        "<solution> format the sft_code.py distilled trainer "
+                        "uses. Required for Qwen-distilled ckpts.")
+    p.add_argument("--extract_code_block", action="store_true",
+                   help="Parse a ```python ... ``` fence out of the model "
+                        "output and use ONLY that as the submission. "
+                        "Required for Qwen-distilled ckpts that emit CoT + "
+                        "code block (otherwise the CoT prose would be exec'd "
+                        "as Python and syntax-error every time).")
+    p.add_argument("--generator", type=str, default="standard",
+                   choices=["standard", "retrieval_as_input"],
+                   help="'standard' (default): append [THINKING] tokens. "
+                        "'retrieval_as_input': at think positions inject "
+                        "the WM retrieval as the next input embedding. "
+                        "REQUIRED for ckpts SFT'd with "
+                        "--retrieval_as_input_thinking (v5+) — evaluating "
+                        "those with the standard generator is a "
+                        "train/inference mismatch.")
     args = p.parse_args()
 
     all_results = {}
@@ -377,6 +633,9 @@ def main():
             emit_threshold=args.emit_threshold,
             min_emit_before_eos=args.min_emit_before_eos,
             gate_floor=args.gate_floor,
+            prompt_style=args.prompt_style,
+            extract_code_block=args.extract_code_block,
+            generator=args.generator,
         )
 
     print("\n" + "=" * 70)

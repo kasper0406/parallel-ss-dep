@@ -72,6 +72,16 @@ def build_model_from_ckpt(ckpt_path: str):
             mem_size=int(cfg.get("mem_size", 1024)),
             thinking_token_id=int(cfg.get("thinking_token_id",
                                           cfg["vocab_size"] - 1)),
+            # FIX A (added 2026-05-18): the write-only-at-think flag isn't
+            # in state_dict (it's a plain bool attribute), so when a
+            # WorkingMemory is reconstructed for eval/inference we must
+            # read the flag from cfg and pass it to __init__. Without
+            # this, a model trained with mem_write_only_at_think=True
+            # gets evaluated with write_only_at_think=False, silently
+            # losing the architectural mask. Default False = backward
+            # compat for older ckpts.
+            mem_write_only_at_think=bool(cfg.get("mem_write_only_at_think",
+                                                  False)),
         )
     pkm_kwargs = {}
     if has_pkm:

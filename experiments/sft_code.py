@@ -34,6 +34,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 import torch.nn.functional as F
 
+from experiments.gist_loss import (
+    build_gist_heads, trunk_gist_loss, parse_horizons,
+)
+
 
 def _flatten_to_oneline(s: str) -> str:
     """Squash multi-line problem text into a one-line `# ...` comment-safe string."""
@@ -79,6 +83,60 @@ def load_pairs(max_codealpaca: int | None = None) -> list[tuple[str, str]]:
         pairs.append((prompt, out))
         n_added += 1
     print(f"  added {n_added} CodeAlpaca examples")
+    return pairs
+
+
+def load_distilled_jsonl(path: str, *,
+                          prefer_full_completion: bool = True,
+                          require_extracted_code: bool = True,
+                          keep_only_passing: bool = False,
+                          ) -> list[tuple[str, str]]:
+    """Load (problem, solution) pairs from a distill_solutions.py JSONL.
+
+    Each JSONL row has {task_id, problem_prompt, qwen_completion,
+    extracted_code, has_tests, tier, score, sample_idx}.
+
+      prefer_full_completion:
+        True  (default) → solution = qwen_completion (CoT + code block).
+                          Student learns to reason before emitting code,
+                          which exercises the thinking gate during SFT.
+        False → solution = extracted_code only (cleaner but no reasoning
+                signal).
+
+      require_extracted_code:
+        Drop rows where Qwen ran out of tokens before producing a
+        ```python``` block. Default True — those rows are noisy.
+
+      keep_only_passing:
+        If True, drop rows where has_tests and tier != "pass" (rejection
+        sampling: train only on solutions known to work). Distillation-
+        only sources (no tests) are kept regardless.
+    """
+    import json
+    pairs: list[tuple[str, str]] = []
+    n_total = n_dropped_no_code = n_dropped_failed = 0
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            n_total += 1
+            if require_extracted_code and not r.get("extracted_code"):
+                n_dropped_no_code += 1
+                continue
+            if keep_only_passing and r.get("has_tests") and r.get("tier") != "pass":
+                n_dropped_failed += 1
+                continue
+            problem = r["problem_prompt"]
+            solution = (r["qwen_completion"] if prefer_full_completion
+                        else r["extracted_code"])
+            if not solution:
+                continue
+            pairs.append((problem, solution))
+    print(f"  loaded {len(pairs)} pairs from {path} "
+          f"(total rows={n_total}, dropped no-code={n_dropped_no_code}, "
+          f"dropped failed={n_dropped_failed})")
     return pairs
 
 
@@ -191,6 +249,20 @@ def main() -> int:
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--max_codealpaca", type=int, default=10000,
                    help="Cap on CodeAlpaca samples (full set is 20k).")
+    p.add_argument("--distilled_jsonl", type=str, default=None,
+                   help="If set, load (problem, solution) pairs from a "
+                        "distill_solutions.py JSONL output INSTEAD OF "
+                        "MBPP+CodeAlpaca. Each row contributes one pair where "
+                        "the solution is Qwen's full completion (CoT + code).")
+    p.add_argument("--distilled_keep_only_passing", action="store_true",
+                   help="If set with --distilled_jsonl, drop rows where the "
+                        "problem had tests and Qwen's sample didn't pass "
+                        "(rejection sampling). Distillation-only rows "
+                        "(magicoder/codefeedback, no tests) are always kept.")
+    p.add_argument("--distilled_code_only", action="store_true",
+                   help="If set with --distilled_jsonl, use ONLY the extracted "
+                        "code block as the solution target (drop Qwen's "
+                        "reasoning prose). Default keeps the full completion.")
     p.add_argument("--seed", type=int, default=0)
     # --- Thinking-during-SFT: forces the model to handle think tokens ---
     p.add_argument("--with_thinking", action="store_true",
@@ -207,6 +279,61 @@ def main() -> int:
                    help="Max depth per inserted burst.")
     p.add_argument("--mem_size", type=int, default=1024)
     p.add_argument("--mem_dim", type=int, default=0)
+    p.add_argument("--mem_write_only_at_think", action="store_true",
+                   help="FIX A: force WorkingMemory writes to come only "
+                        "from think positions. See train_lm_args.py for "
+                        "full rationale. When the loaded ckpt was trained "
+                        "without this flag, retraining a few epochs with "
+                        "it on lets the model adapt its write-gate to "
+                        "actually be selective at think positions.")
+    p.add_argument("--retrieval_as_input_thinking", action="store_true",
+                   help="Replace the discrete [THINKING] token's input "
+                        "embedding with the WorkingMemory retrieval at the "
+                        "previous position. Solves the think-position "
+                        "homogeneity that caused FIX A to fail (the "
+                        "[THINKING] token has one embedding so successive "
+                        "thinks are highly correlated). With this flag, "
+                        "each think step's input is the model's own "
+                        "retrieval → diverse per-step → diverse buffer → "
+                        "useful sharp reads. See GEMINI.md "
+                        "'retrieval-as-input' for the architectural "
+                        "rationale.")
+    p.add_argument("--disable_wm_during_sft", action="store_true",
+                   help="Zero WorkingMemory.W_proj weight and freeze it, "
+                        "so WM injections are always zero during this SFT "
+                        "run. Diagnostic flag — not currently used in "
+                        "production; the milestone calls for fixing WM, "
+                        "not removing it.")
+    # --- v7 trunk multi-horizon GIST loss (Fix C, 2026-05-20) ----------
+    # The trunk's job is "high-level direction": at position t each head
+    # predicts the GIST of the upcoming window — the mean-pooled hidden
+    # state over h[t+1 : t+1+K], stop-grad'd. The trunk is causal so
+    # each h[t] is a running contextualised summary; the windowed mean
+    # is a genuine "where this is going" vector. Multi-horizon (K in
+    # {16,64,256}) gives local tactic + mid plan + global direction.
+    #
+    # History: v5 supervised the WM read to predict embed(input_ids[t+4])
+    # (context-free lexical). v6 supervised the WM read to predict this
+    # gist — but routing a blurry gist through WM broke precise recall
+    # (longctx eval 2026-05-20: 99%→61%). v7 supervises the TRUNK with
+    # the gist and leaves WM free to learn precise retrieval.
+    p.add_argument("--future_emb_loss_weight", type=float, default=0.0,
+                   help="Weight for the v7 trunk multi-horizon gist "
+                        "loss. 0 = disabled. Recommended 0.1.")
+    p.add_argument("--wm_gist_horizons", type=str, default="16,64,256",
+                   help="Comma-separated future-window sizes K for the "
+                        "trunk gist loss (one head per horizon).")
+    # Deprecated flags — kept so older launchers still parse.
+    p.add_argument("--wm_future_pred_weight", type=float, default=0.0,
+                   help="DEPRECATED since v7 (WM gist supervision "
+                        "removed). Ignored.")
+    p.add_argument("--wm_future_pred_T", type=int, default=4,
+                   help="DEPRECATED (v5 single-offset embed target). "
+                        "Ignored.")
+    p.add_argument("--future_emb_T_max", type=int, default=8,
+                   help="DEPRECATED (v5 lexical-target ramp). Ignored.")
+    p.add_argument("--future_emb_T_ramp_frac", type=float, default=0.3,
+                   help="DEPRECATED (v5 lexical-target ramp). Ignored.")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -235,6 +362,13 @@ def main() -> int:
             if thinking_token_id is None:
                 # Fall back to "last vocab slot" if cfg didn't store it.
                 thinking_token_id = int(cfg["vocab_size"]) - 1
+            # FIX A: honour the new flag even on a pre-built model — flip
+            # the bit on the already-constructed WorkingMemory module.
+            if bool(args.mem_write_only_at_think):
+                model.memory.write_only_at_think = True
+                cfg["mem_write_only_at_think"] = True
+                print(f"  FIX A enabled: WorkingMemory.write_only_at_think = True "
+                      "(non-think positions masked to -1.0 before topk)")
             print(f"  with-thinking + ckpt-already-has-thinking: loaded as-is "
                   f"(memory + gate {'+ pkm ' if any(k.startswith('pkm_layer.') for k in sd_keys) else ''}"
                   f"think_id={thinking_token_id})")
@@ -248,7 +382,14 @@ def main() -> int:
     else:
         args_with_thinking_done = False
 
-    if args.with_thinking and not args_with_thinking_done:
+    # Three branches: modern (already done above), legacy (build fresh +
+    # expand vocab), or original (no thinking).
+    if args_with_thinking_done:
+        # Modern path already loaded `model` and `cfg` above and applied
+        # FIX A if requested. Don't re-load here — that would silently
+        # overwrite the FIX A flag and any other modern-path setup.
+        pass
+    elif args.with_thinking and not args_with_thinking_done:
         # Legacy path: ckpt has no memory + gate. Build the model directly
         # with thinking + memory ON, then load the ckpt state with
         # strict=False so memory + gate heads stay freshly-initialised. The
@@ -286,6 +427,7 @@ def main() -> int:
             mem_size=int(args.mem_size),
             mem_dim=int(args.mem_dim) if args.mem_dim > 0 else int(cfg["d_model"]),
             thinking_token_id=thinking_token_id,
+            mem_write_only_at_think=bool(args.mem_write_only_at_think),
             attention_cls=DeltaNetAttention,
         ).cuda()
         missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -297,12 +439,29 @@ def main() -> int:
         cfg["vocab_size"] = new_vocab
         cfg["mem_size"] = int(args.mem_size)
         cfg["mem_dim"] = int(args.mem_dim) if args.mem_dim > 0 else int(cfg["d_model"])
+        cfg["mem_write_only_at_think"] = bool(args.mem_write_only_at_think)
         cfg["sft_with_thinking"] = True
     else:
         # Original path: load whatever was saved, leave memory inert if present.
         from experiments.eval_bracket_structure import build_model_from_ckpt
         model, cfg = build_model_from_ckpt(args.load_ckpt)
         thinking_token_id = cfg.get("thinking_token_id")
+    # --- Optional: disable WorkingMemory injection for this run ----------
+    # Motivated by the 2026-05-19 ablation on v1: wm_off scored 12/164 vs
+    # baseline 11/164, suggesting WM is at best neutral, slightly hurting.
+    # Zero W_proj.weight (the output projection) and freeze it — every
+    # injection becomes 0, so WM is structurally inert. The gate still
+    # fires and think tokens are still inserted (so the rest of the
+    # think-burst infrastructure works), but the WM-read path contributes
+    # nothing to h.
+    if (getattr(args, "disable_wm_during_sft", False)
+            and hasattr(model, "memory")):
+        with torch.no_grad():
+            model.memory.W_proj.weight.zero_()
+        model.memory.W_proj.weight.requires_grad_(False)
+        cfg["disable_wm_during_sft"] = True
+        print("  disable_wm_during_sft: WM.W_proj zeroed + frozen "
+              "(injection = 0 for all positions)")
     model.train()
     # base_vocab_for_loss = index BELOW which targets are valid emit tokens.
     # Slicing logits[..., :base_vocab_for_loss] removes the thinking-token
@@ -323,7 +482,15 @@ def main() -> int:
     print(f"  tokenizer: {cfg.get('tokenizer')}  vocab={tok.vocab_size}")
 
     # --- 3. Data ----------------------------------------------------------
-    pairs = load_pairs(max_codealpaca=args.max_codealpaca)
+    if args.distilled_jsonl:
+        pairs = load_distilled_jsonl(
+            args.distilled_jsonl,
+            prefer_full_completion=not args.distilled_code_only,
+            require_extracted_code=True,
+            keep_only_passing=args.distilled_keep_only_passing,
+        )
+    else:
+        pairs = load_pairs(max_codealpaca=args.max_codealpaca)
     print(f"  total pairs: {len(pairs)}")
     print(f"  tokenizing...")
     encoded: list[tuple[list[int], list[int]]] = []
@@ -350,8 +517,51 @@ def main() -> int:
         return x, y
 
     # --- 4. Optim + train loop -------------------------------------------
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
-                            weight_decay=0.1)
+    # v7 trunk multi-horizon gist heads (Fix C, 2026-05-20). The trunk's
+    # job is "high-level direction": at position t each head predicts the
+    # mean-pooled future hidden state over h[t+1:t+1+K] (the windowed
+    # gist), one head per horizon K. This REPLACES both the old lexical
+    # future-emb target (embed(input_ids[t+T]) — context-free) and the
+    # v6 WM-injection gist supervision (which forced WM to emit blurry
+    # gists and broke precise recall). WM is now left to learn precise
+    # retrieval via the LM loss alone; "direction" lives in the trunk.
+    d_model = int(cfg["d_model"])
+    gist_horizons = parse_horizons(args.wm_gist_horizons)
+    future_gist_heads = None
+    if args.future_emb_loss_weight > 0:
+        future_gist_heads = build_gist_heads(d_model, gist_horizons).cuda()
+        _ck = locals().get("raw_ckpt")
+        if _ck is None:
+            _ck = torch.load(args.load_ckpt, map_location="cpu",
+                              weights_only=False)
+        if "future_gist_heads_state_dict" in _ck:
+            try:
+                future_gist_heads.load_state_dict(
+                    _ck["future_gist_heads_state_dict"])
+                print("  trunk-gist heads: restored from ckpt")
+            except (RuntimeError, KeyError):
+                print("  trunk-gist heads: ckpt horizons differ — fresh")
+        print(f"  trunk-gist heads (v7 Fix C): d_model={d_model}, "
+              f"horizons={gist_horizons}, "
+              f"weight={args.future_emb_loss_weight}")
+    if args.wm_future_pred_weight > 0:
+        print("  NOTE: --wm_future_pred_weight is deprecated since v7 "
+              "(WM gist supervision removed) — ignored.")
+
+    # Optimizer: retrieval_input_alpha gets NO weight decay (the FiLM-α
+    # lesson — WD on a gate scalar manufactures a false low equilibrium).
+    alpha_params, decay_params = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (alpha_params if n.endswith("retrieval_input_alpha")
+         else decay_params).append(p)
+    head_params = (list(future_gist_heads.parameters())
+                   if future_gist_heads is not None else [])
+    opt = torch.optim.AdamW(
+        [{"params": decay_params + head_params, "weight_decay": 0.1},
+         {"params": alpha_params, "weight_decay": 0.0}],
+        lr=args.lr, betas=(0.9, 0.95))
     n_steps = (len(encoded) // args.batch) * args.epochs
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=max(1, n_steps), eta_min=args.lr * 0.1,
@@ -380,7 +590,54 @@ def main() -> int:
                 ]
             x, y = make_batch(rows)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(x)
+                # Need hidden states for the trunk gist aux loss.
+                want_hidden = future_gist_heads is not None
+                # --- Retrieval-as-input thinking (v7 additive, Fix B) ---
+                # 2-pass forward:
+                #   pass 1 (no_grad): capture the WM injection at every
+                #           position (model.memory._last_injection).
+                #   build inputs_embeds: at think positions ADD the
+                #           previous position's WM retrieval, scaled by
+                #           the learned scalar α (model.retrieval_input_
+                #           alpha), to the think-token embedding.
+                #   pass 2: forward with inputs_embeds.
+                # v5/v6 REPLACED the think embedding with the retrieval
+                # — destructive: a blurry retrieval overwrote the precise
+                # binding the trunk carried (v6 longctx: 99%→61% recall).
+                # v7 ADDS instead: input[think] = think_embed + α·retr.
+                # A useless retrieval contributes ≈0 (gradient shrinks
+                # α); the think_embed baseline always survives. WM still
+                # gets gradient via the residual _inject_memory path
+                # inside pass 2, so pass 1 can stay no_grad.
+                if (args.retrieval_as_input_thinking
+                        and args.with_thinking
+                        and thinking_token_id is not None):
+                    with torch.no_grad():
+                        _ = model(x)
+                    inj = model.memory._last_injection  # (B, T, d) detached
+                    base_emb = model.embed(x)               # (B, T, d)
+                    is_think = (x == int(thinking_token_id)).unsqueeze(-1)
+                    # Think at t consumes the retrieval from t-1.
+                    shifted_inj = torch.cat(
+                        [torch.zeros_like(inj[:, :1]), inj[:, :-1]],
+                        dim=1,
+                    )
+                    alpha = model.retrieval_input_alpha
+                    inputs_embeds = (
+                        base_emb
+                        + is_think.to(base_emb.dtype)
+                        * alpha
+                        * shifted_inj.to(base_emb.dtype)
+                    )
+                    if want_hidden:
+                        logits, h = model(x, inputs_embeds=inputs_embeds,
+                                          return_hidden=True)
+                    else:
+                        logits = model(x, inputs_embeds=inputs_embeds)
+                elif want_hidden:
+                    logits, h = model(x, return_hidden=True)
+                else:
+                    logits = model(x)
                 # Slice off the +1 thinking-token slot before CE so the
                 # think token is never a valid target (label space ==
                 # base_vocab_for_loss). The slice is a no-op when not
@@ -392,11 +649,27 @@ def main() -> int:
                 shift_labels = y[:, 1:].contiguous()
                 # ignore_index=-100 masks the comment tokens AND the
                 # inserted think tokens.
-                loss = F.cross_entropy(
+                lm_loss = F.cross_entropy(
                     shift_logits.reshape(-1, shift_logits.size(-1)),
                     shift_labels.reshape(-1),
                     ignore_index=-100,
                 )
+                loss = lm_loss
+                # ----- v7 trunk multi-horizon gist loss (Fix C) -----
+                # Each head predicts, from the trunk hidden state h[t],
+                # the GIST of the upcoming window — the mean-pooled
+                # hidden state over h[t+1 : t+1+K], stop-grad'd. The
+                # trunk is causal so each h[t] is a running
+                # contextualised summary; the windowed mean is a
+                # genuine "where this is going" vector. Multi-horizon K
+                # gives local tactic + mid plan + global direction.
+                # This is the v6 gist target, but supervising the TRUNK
+                # rather than the WM read — so "direction" lives in the
+                # trunk and WM is left free to learn precise retrieval
+                # (v6 put the blurry gist into WM and broke recall).
+                if future_gist_heads is not None:
+                    loss = loss + args.future_emb_loss_weight * (
+                        trunk_gist_loss(h, future_gist_heads, gist_horizons))
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -418,8 +691,18 @@ def main() -> int:
     new_cfg = dict(cfg)
     new_cfg["sft_source"] = "MBPP+CodeAlpaca"
     new_cfg["sft_epochs"] = args.epochs
-    torch.save({"state_dict": model.state_dict(), "config": new_cfg},
-               args.save_ckpt)
+    # v7: record that retrieval-as-input used the additive α-gated form
+    # so the eval generator picks the matching injection mode.
+    new_cfg["retrieval_input_additive"] = bool(
+        args.retrieval_as_input_thinking)
+    if future_gist_heads is not None:
+        new_cfg["future_emb_loss_weight"] = float(args.future_emb_loss_weight)
+        new_cfg["wm_gist_horizons"] = list(gist_horizons)
+    ckpt_dict = {"state_dict": model.state_dict(), "config": new_cfg}
+    if future_gist_heads is not None:
+        ckpt_dict["future_gist_heads_state_dict"] = \
+            future_gist_heads.state_dict()
+    torch.save(ckpt_dict, args.save_ckpt)
     print(f"saved: {args.save_ckpt}")
     return 0
 

@@ -206,10 +206,16 @@ def _exec_target(code: str, test: str, entry_point: str, q: mp.Queue):
                 q.put(("exec_error", type(exc).__name__, 0, 0,
                        traceback.format_exc(limit=4)[:_ERROR_TEXT_CAP]))
                 return
-            if entry_point not in ns:
+            # Resolve entry_point. For simple names (HumanEval/MBPP:
+            # "two_sum") it's a dict lookup. For expressions (LeetCode:
+            # "Solution().twoSum") we eval it so the Solution class can
+            # be instantiated and the bound method extracted.
+            try:
+                entry_callable = eval(entry_point, ns)
+            except Exception as exc:
                 q.put(("exec_error", "entry-point-undefined", 0, 0,
-                       f"the generated code never defined `{entry_point}` "
-                       f"(the function the tests call)"))
+                       f"could not resolve entry_point `{entry_point}`: "
+                       f"{type(exc).__name__}: {exc}"))
                 return
             # 3) Exec the dataset's test block to define check(). A failure
             # here is the dataset's fault, not the model's.
@@ -231,7 +237,7 @@ def _exec_target(code: str, test: str, entry_point: str, q: mp.Queue):
                        "dataset test block defined no check() function"))
                 return
             # 4) Granular run.
-            q.put(_run_check_granular(check_fn, ns, ns[entry_point]))
+            q.put(_run_check_granular(check_fn, ns, entry_callable))
     except TimeoutError:
         q.put(("timeout", "timeout", 0, 0,
                "execution exceeded the time limit (possible infinite loop)"))
@@ -313,13 +319,59 @@ def load_humaneval() -> list[Problem]:
     return out
 
 
-def load_mbpp() -> list[Problem]:
-    """MBPP — Microsoft's 974 short Python problems with assert tests.
+def _mbpp_problem_from_row(x: dict, source_tag: str) -> Problem:
+    """Build a Problem from an MBPP-style row (works for mbpp + mbppplus)."""
+    asserts = "\n    ".join(x["test_list"])
+    test_block = f"def check(candidate):\n    {asserts}\n"
+    first = x["test_list"][0]
+    try:
+        fn_name = first.split("assert", 1)[1].split("(", 1)[0].strip()
+    except IndexError:
+        fn_name = "candidate"
+    prompt = f"{x['text'] if 'text' in x else x['prompt']}\n"
+    return Problem(
+        task_id=f"{source_tag}/{x['task_id']}",
+        prompt=prompt,
+        tests=test_block,
+        entry_point=fn_name,
+        prompt_is_code=False,
+        gold_solution=x.get("code"),
+    )
 
-    MBPP problems look like: `Write a function to ...`. We construct a
-    HumanEval-style `check(candidate)` block from the assert list so the
-    grader subprocess interface is uniform.
+
+def load_mbpp(splits: tuple[str, ...] = ("train",)) -> list[Problem]:
+    """MBPP. Default: 374-problem train split (backwards-compat).
+    Pass splits=("train","validation","test","prompt") for the full 974.
     """
+    from datasets import load_dataset
+    out: list[Problem] = []
+    for split in splits:
+        ds = load_dataset("mbpp", split=split)
+        for x in ds:
+            out.append(_mbpp_problem_from_row(x, source_tag=f"mbpp_{split}"))
+    return out
+
+
+def load_mbpp_all() -> list[Problem]:
+    """All 974 MBPP problems (train+validation+test+prompt). Use as the
+    expanded RL training set — the test split was NEVER used by us for
+    eval (we evaluate on HumanEval), so it's safe to train on.
+    """
+    return load_mbpp(splits=("train", "validation", "test", "prompt"))
+
+
+def load_mbpp_plus() -> list[Problem]:
+    """MBPP+ (evalplus/mbppplus): 378 MBPP problems with more rigorous
+    test_list (the "+" augmentation). Disjoint task_id namespace from
+    plain MBPP — fine to mix during training.
+    """
+    from datasets import load_dataset
+    ds = load_dataset("evalplus/mbppplus", split="test")
+    return [_mbpp_problem_from_row(x, source_tag="mbppplus") for x in ds]
+
+
+def _legacy_load_mbpp() -> list[Problem]:
+    """Kept for the body that used to live here, for reference only."""
     from datasets import load_dataset
     ds = load_dataset("mbpp", split="train")
     out: list[Problem] = []
@@ -353,9 +405,131 @@ def load_mbpp() -> list[Problem]:
     return out
 
 
+def load_mbpp_combined() -> list[Problem]:
+    """Expanded RL training set: all MBPP splits + MBPP+. ~1352 problems,
+    3.6x the legacy load_mbpp. Disjoint task_id namespaces so duplicates
+    in the underlying corpus don't matter for sampling.
+    """
+    return load_mbpp_all() + load_mbpp_plus()
+
+
+def load_leetcode() -> list[Problem]:
+    """LeetCode (newfacade/LeetCodeDataset): 2641 train problems with
+    HumanEval-style `check(candidate)` test blocks. Entry-point format is
+    `Solution().method_name` (LeetCode's class-based wrapper). Drop-in
+    compatible with our existing grade() — the test block does the
+    instantiation for us, the entry_point string is what `check(candidate)`
+    receives as `candidate`.
+    """
+    from datasets import load_dataset
+    ds = load_dataset("newfacade/LeetCodeDataset", split="train")
+    out: list[Problem] = []
+    for x in ds:
+        # `prompt` already contains the imports + starter signature; we
+        # use it as-is. Note: prompt_is_code=True because the prompt IS
+        # code (imports + Solution class scaffold + signature), unlike
+        # MBPP where the prompt is natural language.
+        out.append(Problem(
+            task_id=f"leetcode/{x['task_id']}",
+            prompt=x["prompt"],
+            tests=x["test"],
+            entry_point=x["entry_point"],
+            prompt_is_code=True,
+            gold_solution=x.get("completion"),
+        ))
+    return out
+
+
+def load_super_combined() -> list[Problem]:
+    """Biggest pool: all MBPP splits + MBPP+ + LeetCode. ~3993 problems,
+    10.7x the legacy load_mbpp.
+    """
+    return load_mbpp_combined() + load_leetcode()
+
+
+def load_magicoder_oss_python(max_n: int | None = None) -> list[Problem]:
+    """Magicoder-OSS-Instruct-75K, filtered to Python.
+
+    Each row has (problem, solution) — a natural-language problem
+    statement and the gold Python solution. There are NO executable
+    tests, so these problems are for DISTILLATION ONLY (teacher
+    generates solutions, student imitates) — they cannot be used as the
+    RL-grader dataset. Returned with `tests=""` as a sentinel.
+
+    ~22k Python problems after filtering.
+    """
+    from datasets import load_dataset
+    ds = load_dataset("ise-uiuc/Magicoder-OSS-Instruct-75K", split="train")
+    out: list[Problem] = []
+    for x in ds:
+        if x.get("lang") != "python":
+            continue
+        out.append(Problem(
+            task_id=f"magicoder/{x['raw_index']}",
+            prompt=x["problem"],
+            tests="",                  # no tests → cannot grade
+            entry_point="",
+            prompt_is_code=False,
+            gold_solution=x.get("solution"),
+        ))
+        if max_n is not None and len(out) >= max_n:
+            break
+    return out
+
+
+def load_codefeedback_python(max_n: int | None = None) -> list[Problem]:
+    """CodeFeedback-Filtered-Instruction, filtered to Python.
+
+    Each row has (query, answer). Like Magicoder above, NO executable
+    tests — distillation only.
+
+    ~50k+ Python rows after filtering.
+    """
+    from datasets import load_dataset
+    ds = load_dataset("m-a-p/CodeFeedback-Filtered-Instruction", split="train")
+    out: list[Problem] = []
+    for i, x in enumerate(ds):
+        if x.get("lang") != "python":
+            continue
+        out.append(Problem(
+            task_id=f"codefeedback/{i}",
+            prompt=x["query"],
+            tests="",
+            entry_point="",
+            prompt_is_code=False,
+            gold_solution=x.get("answer"),
+        ))
+        if max_n is not None and len(out) >= max_n:
+            break
+    return out
+
+
+def load_distill_corpus(
+    max_magicoder: int | None = None,
+    max_codefeedback: int | None = None,
+) -> list[Problem]:
+    """Full distillation problem pool: all gradeable problems +
+    Magicoder + CodeFeedback (the latter two are distillation-only since
+    they lack executable tests).
+    """
+    return (load_mbpp_combined()
+            + load_leetcode()
+            + load_magicoder_oss_python(max_n=max_magicoder)
+            + load_codefeedback_python(max_n=max_codefeedback))
+
+
 LOADERS: dict[str, Callable[[], list[Problem]]] = {
     "humaneval": load_humaneval,
-    "mbpp": load_mbpp,
+    "mbpp": load_mbpp,            # legacy: train split only (374)
+    "mbpp_all": load_mbpp_all,    # full 974
+    "mbpp_plus": load_mbpp_plus,  # 378 EvalPlus
+    "mbpp_combined": load_mbpp_combined,  # 1352
+    "leetcode": load_leetcode,    # 2641 LeetCode
+    "super_combined": load_super_combined,  # 3993 = mbpp_combined + leetcode
+    # Distillation-only (no executable tests; cannot RL-train):
+    "magicoder_oss": load_magicoder_oss_python,
+    "codefeedback": load_codefeedback_python,
+    "distill_corpus": load_distill_corpus,
 }
 
 

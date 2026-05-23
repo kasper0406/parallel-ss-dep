@@ -151,7 +151,8 @@ def test_error_text_partial_lists_failed_asserts():
 def test_error_text_entry_point_undefined():
     res = grade(_problem(_FOUR_ASSERT_CHECK), "g = 1\n")
     assert res.error_text is not None
-    assert "f" in res.error_text and "never defined" in res.error_text
+    # Message is "could not resolve entry_point `f`: NameError ..."
+    assert "f" in res.error_text and "NameError" in res.error_text
 
 
 def test_error_text_runtime_error_shows_statement():
@@ -165,3 +166,105 @@ def test_error_text_runtime_error_shows_statement():
     assert res.error_text is not None
     assert "ZeroDivisionError" in res.error_text
     assert "1 / 0" in res.error_text
+
+
+# ---------------------------------------------------------------------------
+# Expression-style entry_point (LeetCode "Solution().method" pattern)
+# ---------------------------------------------------------------------------
+
+def test_expression_entry_point_class_instantiation():
+    """LeetCode-style: entry_point is `Solution().twoSum`, an expression
+    that instantiates a class and extracts a bound method. The fix in
+    _exec_target uses `eval(entry_point, ns)` instead of `ns[entry_point]`
+    so this resolves correctly.
+    """
+    code = (
+        "class Solution:\n"
+        "    def twoSum(self, nums, target):\n"
+        "        d = {}\n"
+        "        for i, x in enumerate(nums):\n"
+        "            if (y := target - x) in d:\n"
+        "                return [d[y], i]\n"
+        "            d[x] = i\n"
+    )
+    tests = (
+        "def check(candidate):\n"
+        "    assert candidate(nums=[2, 7, 11, 15], target=9) == [0, 1]\n"
+        "    assert candidate(nums=[3, 2, 4], target=6) == [1, 2]\n"
+        "    assert candidate(nums=[3, 3], target=6) == [0, 1]\n"
+    )
+    p = Problem(task_id="t", prompt="", tests=tests,
+                entry_point="Solution().twoSum", prompt_is_code=True)
+    res = grade(p, code)
+    assert res.tier == "pass", f"expected pass, got {res.tier}: {res.error_text}"
+    assert res.n_passed == 3 and res.n_tests == 3
+    assert res.score == 1.0
+
+
+def test_expression_entry_point_resolution_failure():
+    """Expression entry_point that references an undefined class still
+    surfaces a clean exec_error / NameError, not a KeyError or crash."""
+    tests = "def check(candidate):\n    assert candidate(1) == 1\n"
+    p = Problem(task_id="t", prompt="", tests=tests,
+                entry_point="DoesNotExist().method", prompt_is_code=True)
+    res = grade(p, "x = 1\n")
+    assert res.tier == "exec_error"
+    assert res.error_text is not None
+    assert "DoesNotExist" in res.error_text
+
+
+# ---------------------------------------------------------------------------
+# Expanded-corpus loaders (MBPP variants + LeetCode)
+# ---------------------------------------------------------------------------
+
+def test_load_mbpp_all_full_size():
+    """The expanded MBPP loader should return all 974 problems
+    (train 374 + validation 90 + test 500 + prompt 10).
+    """
+    from experiments.code_grader import load_mbpp_all
+    probs = load_mbpp_all()
+    assert len(probs) == 974
+    # Every problem should have natural-language prompt + assert-style tests
+    sample = probs[0]
+    assert sample.task_id.startswith("mbpp_")
+    assert sample.prompt_is_code is False
+    assert "def check" in sample.tests
+    assert sample.entry_point  # parsed function name
+
+
+def test_load_mbpp_plus_full_size():
+    from experiments.code_grader import load_mbpp_plus
+    probs = load_mbpp_plus()
+    assert len(probs) == 378
+    sample = probs[0]
+    assert sample.task_id.startswith("mbppplus/")
+
+
+def test_load_leetcode_loads_problems():
+    """LeetCode loader gets ≥2000 problems with expression entry_points
+    and HumanEval-style test blocks (`def check(candidate)`).
+    """
+    from experiments.code_grader import load_leetcode
+    probs = load_leetcode()
+    assert len(probs) >= 2000
+    sample = probs[0]
+    assert sample.task_id.startswith("leetcode/")
+    assert sample.prompt_is_code is True
+    # LeetCode entry_points are expressions like "Solution().method"
+    assert "Solution" in sample.entry_point and "." in sample.entry_point
+    assert "def check(candidate)" in sample.tests
+
+
+def test_load_super_combined_size():
+    """super_combined = mbpp_all + mbpp_plus + leetcode."""
+    from experiments.code_grader import load_super_combined
+    probs = load_super_combined()
+    # mbpp_all (974) + mbpp_plus (378) + leetcode (≥2000) → at least 3352
+    assert len(probs) >= 3352
+
+
+def test_loader_registry_has_new_keys():
+    from experiments.code_grader import LOADERS
+    for k in ("mbpp", "mbpp_all", "mbpp_plus", "mbpp_combined",
+              "leetcode", "super_combined"):
+        assert k in LOADERS, f"LOADERS missing key {k!r}"

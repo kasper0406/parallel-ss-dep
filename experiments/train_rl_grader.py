@@ -33,8 +33,9 @@ import torch
 import torch.nn.functional as F
 
 from experiments.code_grader import (
-    Problem, grade, load_mbpp, truncate_at_stop, _STOP_SEQUENCES,
+    Problem, grade, load_mbpp, truncate_at_stop, _STOP_SEQUENCES, LOADERS,
 )
+from experiments.distill_solutions import extract_code_block
 from experiments.eval_bracket_structure import build_model_from_ckpt
 
 
@@ -89,6 +90,10 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
     ids = prompt_ids.expand(N, -1).contiguous()
     prompt_len = ids.shape[1]
     pad_id = int(eos_token_id) if eos_token_id is not None else 0
+    # SPEEDUP: force single-pass FiLM at decode (T=1 makes K=3 pointless).
+    _orig_film_bypass = getattr(model, "_film_bypass", False)
+    if hasattr(model, "_film_bypass"):
+        model._film_bypass = True
 
     emit_counts = torch.zeros(N, dtype=torch.long, device=device)
     think_counts_this_step = torch.zeros(N, dtype=torch.long, device=device)
@@ -179,6 +184,8 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
                     think_counts_this_step[i] = think_counts_this_step[i] + 1
                     think_totals[i] = think_totals[i] + 1
 
+    if hasattr(model, "_film_bypass"):
+        model._film_bypass = _orig_film_bypass
     # Build Rollout objects.
     out_rollouts = []
     full_ids_host = ids.cpu().tolist()
@@ -379,7 +386,8 @@ def policy_loss_for_rollouts_batched(
     rollouts: list[Rollout], advantages: list[float], model,
     *, clip_eps: float, thinking_token_id: int, temperature: float,
     pad_id: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    ref_model=None, kl_coef: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute PPO clipped loss for a list of rollouts in ONE batched forward.
 
     Pads all rollout sequences to the max length, then runs a single forward
@@ -387,14 +395,20 @@ def policy_loss_for_rollouts_batched(
     rollout's `emit_positions`, computes new log-probs, forms the PPO ratio,
     and adds to the total loss.
 
-    Returns (loss, mean_ratio) — mean ratio averaged across all emit
-    positions across all rollouts.
+    When `ref_model` and `kl_coef > 0` are set, also computes the KL
+    penalty E[new_lp − ref_lp] at the same emit positions (single batched
+    no_grad forward on the reference policy) and adds `kl_coef * KL` to
+    the loss. This is the principled stability mechanism missing from
+    the original implementation.
+
+    Returns (loss, mean_ratio, mean_kl) — mean ratio and KL averaged
+    across all emit positions across all rollouts.
     """
     device = next(model.parameters()).device
     R = len(rollouts)
     if R == 0:
         return (torch.zeros((), device=device, requires_grad=True),
-                torch.tensor(1.0))
+                torch.tensor(1.0), torch.tensor(0.0))
     T_max = max(len(r.full_ids) for r in rollouts)
     padded = torch.full((R, T_max), int(pad_id), dtype=torch.long, device=device)
     for i, r in enumerate(rollouts):
@@ -404,9 +418,15 @@ def policy_loss_for_rollouts_batched(
     autocast = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
     with autocast:
         logits = model(padded).float()              # (R, T_max, V)
+    # KL-to-reference: one extra forward through the frozen ref model.
+    ref_logits = None
+    if ref_model is not None and kl_coef > 0.0:
+        with torch.no_grad(), autocast:
+            ref_logits = ref_model(padded).float()
     # Per-rollout, extract log-probs at emit positions.
     all_surrs = []
     all_ratios = []
+    all_kls = []
     for i, r in enumerate(rollouts):
         if not r.emit_token_ids:
             continue
@@ -429,10 +449,25 @@ def policy_loss_for_rollouts_batched(
         surr = -torch.minimum(ratio * adv, clipped * adv).mean()
         all_surrs.append(surr)
         all_ratios.append(ratio.detach().mean())
+        if ref_logits is not None:
+            ref_pred_logits = ref_logits[i, pred_idx, :].clone()
+            ref_pred_logits[:, thinking_token_id] = -float("inf")
+            ref_log_probs = F.log_softmax(
+                ref_pred_logits / max(temperature, 1e-8), dim=-1)
+            ref_lp = ref_log_probs.gather(
+                1, tok_ids.unsqueeze(1)).squeeze(1)
+            # Unbiased KL(new||ref) estimator at the sampled tokens.
+            all_kls.append((new_lp - ref_lp).mean())
     if not all_surrs:
         return (torch.zeros((), device=device, requires_grad=True),
-                torch.tensor(1.0))
-    return torch.stack(all_surrs).mean(), torch.stack(all_ratios).mean()
+                torch.tensor(1.0), torch.tensor(0.0))
+    surr_loss = torch.stack(all_surrs).mean()
+    mean_ratio = torch.stack(all_ratios).mean()
+    if all_kls:
+        mean_kl = torch.stack(all_kls).mean()
+        total_loss = surr_loss + kl_coef * mean_kl
+        return total_loss, mean_ratio, mean_kl.detach()
+    return surr_loss, mean_ratio, torch.tensor(0.0, device=device)
 
 
 def policy_loss_for_rollout(
@@ -505,6 +540,15 @@ def main():
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--min_emit_before_eos", type=int, default=30)
     p.add_argument("--clip_eps", type=float, default=0.2)
+    p.add_argument("--kl_coef", type=float, default=0.0,
+                   help="KL-to-reference penalty coefficient (KL between "
+                        "the current policy and a frozen reference policy "
+                        "= the starting --load_ckpt). 0 = disabled. The "
+                        "principled stability mechanism for grader-RL — "
+                        "without it the policy can drift arbitrarily far "
+                        "from the SFT base and catastrophically collapse "
+                        "(observed at v1 step ~350, see GEMINI.md). "
+                        "Recommended 0.05.")
     p.add_argument("--ponder_cost", type=float, default=0.005)
     p.add_argument("--ponder_shape", type=str, default="quadratic",
                     choices=["linear", "quadratic"])
@@ -516,6 +560,16 @@ def main():
     p.add_argument("--log_every", type=int, default=1)
     p.add_argument("--save_every", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--dataset", type=str, default="mbpp",
+                    help="Code-grader dataset: mbpp (374, legacy), "
+                         "mbpp_all (974), mbpp_plus (378), "
+                         "mbpp_combined (1352 = all+plus).")
+    p.add_argument("--extract_code_block", action="store_true",
+                    help="For distilled-SFT students that emit CoT + "
+                         "```python ... ``` blocks: extract the python "
+                         "fence and grade ONLY the extracted code "
+                         "(otherwise the CoT prose breaks exec). Required "
+                         "when --load_ckpt is a Qwen-distilled SFT ckpt.")
     p.add_argument("--smoke", action="store_true",
                     help="Run a tiny end-to-end smoke (2 steps, B=N=2, max_gen=32).")
     args = p.parse_args()
@@ -536,6 +590,18 @@ def main():
     model.train()  # we'll switch to eval for rollouts then back for updates.
     thinking_token_id = int(cfg.get("thinking_token_id"))
 
+    # Frozen reference policy for KL penalty (the principled stability
+    # mechanism — without it, GRPO can drift arbitrarily far from the SFT
+    # base and catastrophically collapse). Lazy-loaded only when needed.
+    ref_model = None
+    if args.kl_coef > 0.0:
+        print(f"[rl-grader] loading reference policy from {args.load_ckpt}"
+              f" (frozen, kl_coef={args.kl_coef})")
+        ref_model, _ = build_model_from_ckpt(args.load_ckpt)
+        ref_model = ref_model.to("cuda").eval()
+        for _p in ref_model.parameters():
+            _p.requires_grad = False
+
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(
         cfg.get("tokenizer", "HuggingFaceTB/SmolLM2-135M"))
@@ -545,8 +611,11 @@ def main():
           f"params={sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
     # ---- Load problems
-    print("[rl-grader] loading MBPP")
-    problems = load_mbpp()
+    print(f"[rl-grader] loading dataset: {args.dataset}")
+    if args.dataset not in LOADERS:
+        raise SystemExit(
+            f"unknown --dataset {args.dataset!r}; choose from {list(LOADERS)}")
+    problems = LOADERS[args.dataset]()
     print(f"  loaded {len(problems)} problems; will sample {args.batch} per step")
 
     # ---- Optimizer
@@ -588,9 +657,17 @@ def main():
         tier_hist = {}
         for prob, group in zip(batch_problems, all_rollouts):
             for r in group:
-                # For MBPP, the completion is everything after the prompt
-                # text. Truncate at the next top-level def/class etc.
-                code = build_mbpp_prompt(prob) + r.text
+                if args.extract_code_block:
+                    # Distilled-student path: model emits CoT + ```python
+                    # ... ```. Pull the code out of the fence; if no
+                    # fence, fall back to raw text (will likely
+                    # syntax_error).
+                    extracted = extract_code_block(r.text)
+                    code = extracted if extracted is not None else r.text
+                else:
+                    # Legacy / non-distilled path: model emits raw code
+                    # continuation of the comment-style prompt header.
+                    code = build_mbpp_prompt(prob) + r.text
                 g_res = grade(prob, code, timeout_s=5)
                 r.reward = float(g_res.score)
                 r.tier = g_res.tier
@@ -628,12 +705,14 @@ def main():
                 flat_rollouts.append(r)
                 flat_advantages.append(float(adv.item()))
         if flat_rollouts:
-            loss, mean_ratio = policy_loss_for_rollouts_batched(
+            loss, mean_ratio, mean_kl = policy_loss_for_rollouts_batched(
                 flat_rollouts, flat_advantages, model,
                 clip_eps=args.clip_eps,
                 thinking_token_id=thinking_token_id,
                 temperature=args.temperature,
                 pad_id=int(tok.eos_token_id) if tok.eos_token_id is not None else 0,
+                ref_model=ref_model,
+                kl_coef=args.kl_coef,
             )
             loss.backward()
             if args.grad_clip > 0:
@@ -641,8 +720,9 @@ def main():
             opt.step()
             loss_val = float(loss.item())
             ratio_val = float(mean_ratio.item())
+            kl_val = float(mean_kl.item())
         else:
-            loss_val, ratio_val = float("nan"), float("nan")
+            loss_val, ratio_val, kl_val = float("nan"), float("nan"), float("nan")
 
         # Logging.
         if step % args.log_every == 0:
@@ -653,6 +733,7 @@ def main():
                   f"{rewards.max():>10.4f}  {depths.mean():>10.2f}  "
                   f"{think_rate:>10.3f}  {pass_n:>6d}  "
                   f"{ratio_val:>6.3f}  {loss_val:>8.4f}  "
+                  f"kl={kl_val:+.4f}  "
                   f"{tier_str:>30}")
 
         if args.save_ckpt and step % args.save_every == 0:

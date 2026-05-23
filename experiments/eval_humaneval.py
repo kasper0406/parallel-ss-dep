@@ -114,134 +114,120 @@ def generate(model, prompt_ids: torch.Tensor, max_gen: int = 256,
             "use_thinking=True requires thinking_token_id"
         if total_think_budget is None:
             total_think_budget = 2 * max_gen
-    # SPEEDUP: at decode time we feed the whole prefix each step, so the
-    # FiLM K=3 self-feed has nothing to iterate over (K-pass is for
-    # gradient quality during training). Force the single-pass FiLM
-    # path for the whole decode loop — measured ~2x faster on the
-    # generate path with identical outputs at the K-warmup deploy
-    # convention. Restore on exit so we don't leak state to training.
-    _orig_film_bypass = getattr(model, "_film_bypass", False)
-    if hasattr(model, "_film_bypass"):
-        model._film_bypass = True
-    try:
+    # Note: do NOT set `model._film_bypass = True`. The v2 model is
+    # trained WITH FiLM and degenerates badly at temperature sampling
+    # without it. See train_rl_grader.rollout_group_batched for the
+    # full diagnosis (2026-05-23 root-cause).
+    # STATE-PASSING INCREMENTAL DECODE (2026-05-23). Replaces the
+    # per-step full-forward `model(out)` with `prefill(prompt)` + one
+    # `forward_step(next_tok)` per generated token. Constant per-token
+    # cost (~6.5 ms) vs the previous T-linear cost (~30 ms/tok at
+    # T=512). Falls back to the full-forward path when
+    # `use_incremental=False` (sanity flag) or when the loaded model
+    # lacks `forward_step` (older ckpts not affected, since the method
+    # was added to TinyLM and ALL ckpts use TinyLM).
+    can_incremental = (use_incremental
+                       and hasattr(model, "forward_step")
+                       and hasattr(model, "prefill"))
+    if can_incremental:
+        cache, last_logits = model.prefill(prompt_ids)
+        # `last_logits` at [:, -1] predicts the FIRST emitted/thought
+        # token; cache the "current next-logits" for the inner loop.
+        pending_logits = last_logits[:, -1:, :]
+        cache_pending_valid = True
+    else:
+        cache = None
+        pending_logits = None
+        cache_pending_valid = False
 
-        # STATE-PASSING INCREMENTAL DECODE (2026-05-23). Replaces the
-        # per-step full-forward `model(out)` with `prefill(prompt)` + one
-        # `forward_step(next_tok)` per generated token. Constant per-token
-        # cost (~6.5 ms) vs the previous T-linear cost (~30 ms/tok at
-        # T=512). Falls back to the full-forward path when
-        # `use_incremental=False` (sanity flag) or when the loaded model
-        # lacks `forward_step` (older ckpts not affected, since the method
-        # was added to TinyLM and ALL ckpts use TinyLM).
-        can_incremental = (use_incremental
-                           and hasattr(model, "forward_step")
-                           and hasattr(model, "prefill"))
-        if can_incremental:
-            cache, last_logits = model.prefill(prompt_ids)
-            # `last_logits` at [:, -1] predicts the FIRST emitted/thought
-            # token; cache the "current next-logits" for the inner loop.
-            pending_logits = last_logits[:, -1:, :]
-            cache_pending_valid = True
-        else:
-            cache = None
-            pending_logits = None
-            cache_pending_valid = False
-
-        out = prompt_ids.clone()
-        emit_count = 0
-        think_total = 0
-        think_steps_used = []      # length = emit_count; thinks before each emit
-        gate_emit_values = []      # gate values at each emit step
-        while emit_count < max_gen:
-            # Inner think loop: try to coax the gate above emit_threshold.
-            thinks_this_step = 0
-            while True:
-                if can_incremental:
-                    # The first time through the loop after either a prior
-                    # forward_step or prefill, `pending_logits` already
-                    # holds the next-token distribution conditioned on the
-                    # tokens currently in the cache. No extra forward
-                    # needed — but we still need _last_gate to have been
-                    # populated for the gate decision (it was set inside
-                    # forward_step / prefill).
-                    if not cache_pending_valid:
-                        # Shouldn't reach here in steady state.
-                        raise RuntimeError("incremental: pending_logits invalid")
-                    next_logits = pending_logits[:, -1, :]
-                else:
-                    logits = model(out)
-                    next_logits = logits[:, -1, :]
-                if not use_thinking:
-                    gate_val = 1.0  # force emit
-                    break
-                # σ(gate_head(h)) at last position; >threshold ⇒ emit.
-                # Mirror training's clamp: during pretrain the loss used
-                # g.clamp(min=gate_floor_min), so the gate is indifferent to raw
-                # values below the floor. Apply the same clamp at inference
-                # to keep the train/inference gate distributions aligned.
-                gate_t = getattr(model, "_last_gate", None)
-                if gate_t is None:
-                    gate_val = 1.0
-                else:
-                    gate_val = float(gate_t[0, -1].item())
-                    if gate_floor > 0.0:
-                        gate_val = max(gate_val, gate_floor)
-                force_emit = (
-                    thinks_this_step >= max_think_per_step
-                    or think_total >= total_think_budget
-                )
-                if gate_val >= emit_threshold or force_emit:
-                    break
-                # Else: append a think token and loop.
-                think_tok = torch.full((out.shape[0], 1), int(thinking_token_id),
-                                        dtype=out.dtype, device=out.device)
-                out = torch.cat([out, think_tok], dim=1)
-                if can_incremental:
-                    pending_logits, cache = model.forward_step(think_tok, cache)
-                    cache_pending_valid = True
-                thinks_this_step += 1
-                think_total += 1
-            # Emit step: mask thinking_token_id from sampled output.
-            if use_thinking and thinking_token_id is not None:
-                next_logits = next_logits.clone()
-                next_logits[..., int(thinking_token_id)] = -float("inf")
-            # Suppress EOS for the first `min_emit_before_eos` emitted tokens.
-            # Works around the well-known pretrain "halt-after-docstring" trap
-            # where small documents in the training data place EOS right after a
-            # closing `"""`, biasing the model to stop at HumanEval's
-            # prompt-final docstring.
-            if (eos_token_id is not None
-                    and min_emit_before_eos > 0
-                    and emit_count < min_emit_before_eos):
-                if not (use_thinking and thinking_token_id is not None):
-                    next_logits = next_logits.clone()
-                next_logits[..., int(eos_token_id)] = -float("inf")
-            if temperature == 0.0:
-                next_tok = next_logits.argmax(dim=-1, keepdim=True)
-            else:
-                probs = torch.softmax(next_logits / temperature, dim=-1)
-                next_tok = torch.multinomial(probs, num_samples=1)
-            out = torch.cat([out, next_tok], dim=1)
-            # Advance the incremental cache by the emitted token. If we're
-            # about to break (max_gen reached or EOS), we still advance for
-            # symmetry — cheap, and it keeps `pending_logits` consistent if
-            # the caller resumes generation (unlikely but harmless).
+    out = prompt_ids.clone()
+    emit_count = 0
+    think_total = 0
+    think_steps_used = []      # length = emit_count; thinks before each emit
+    gate_emit_values = []      # gate values at each emit step
+    while emit_count < max_gen:
+        # Inner think loop: try to coax the gate above emit_threshold.
+        thinks_this_step = 0
+        while True:
             if can_incremental:
-                pending_logits, cache = model.forward_step(next_tok, cache)
-                cache_pending_valid = True
-            emit_count += 1
-            if use_thinking:
-                think_steps_used.append(thinks_this_step)
-                gate_emit_values.append(gate_val)
-            if eos_token_id is not None and (next_tok == eos_token_id).all():
+                # The first time through the loop after either a prior
+                # forward_step or prefill, `pending_logits` already
+                # holds the next-token distribution conditioned on the
+                # tokens currently in the cache. No extra forward
+                # needed — but we still need _last_gate to have been
+                # populated for the gate decision (it was set inside
+                # forward_step / prefill).
+                if not cache_pending_valid:
+                    # Shouldn't reach here in steady state.
+                    raise RuntimeError("incremental: pending_logits invalid")
+                next_logits = pending_logits[:, -1, :]
+            else:
+                logits = model(out)
+                next_logits = logits[:, -1, :]
+            if not use_thinking:
+                gate_val = 1.0  # force emit
                 break
-    finally:
-        # Idempotent restore: runs whether or not the body raised.
-        # Without try/finally a mid-loop exception would leave the
-        # model stuck in bypass mode, silently corrupting the next
-        # gradient step (in train_rl_grader) or evaluation.
-        if hasattr(model, "_film_bypass"):
-            model._film_bypass = _orig_film_bypass
+            # σ(gate_head(h)) at last position; >threshold ⇒ emit.
+            # Mirror training's clamp: during pretrain the loss used
+            # g.clamp(min=gate_floor_min), so the gate is indifferent to raw
+            # values below the floor. Apply the same clamp at inference
+            # to keep the train/inference gate distributions aligned.
+            gate_t = getattr(model, "_last_gate", None)
+            if gate_t is None:
+                gate_val = 1.0
+            else:
+                gate_val = float(gate_t[0, -1].item())
+                if gate_floor > 0.0:
+                    gate_val = max(gate_val, gate_floor)
+            force_emit = (
+                thinks_this_step >= max_think_per_step
+                or think_total >= total_think_budget
+            )
+            if gate_val >= emit_threshold or force_emit:
+                break
+            # Else: append a think token and loop.
+            think_tok = torch.full((out.shape[0], 1), int(thinking_token_id),
+                                    dtype=out.dtype, device=out.device)
+            out = torch.cat([out, think_tok], dim=1)
+            if can_incremental:
+                pending_logits, cache = model.forward_step(think_tok, cache)
+                cache_pending_valid = True
+            thinks_this_step += 1
+            think_total += 1
+        # Emit step: mask thinking_token_id from sampled output.
+        if use_thinking and thinking_token_id is not None:
+            next_logits = next_logits.clone()
+            next_logits[..., int(thinking_token_id)] = -float("inf")
+        # Suppress EOS for the first `min_emit_before_eos` emitted tokens.
+        # Works around the well-known pretrain "halt-after-docstring" trap
+        # where small documents in the training data place EOS right after a
+        # closing `"""`, biasing the model to stop at HumanEval's
+        # prompt-final docstring.
+        if (eos_token_id is not None
+                and min_emit_before_eos > 0
+                and emit_count < min_emit_before_eos):
+            if not (use_thinking and thinking_token_id is not None):
+                next_logits = next_logits.clone()
+            next_logits[..., int(eos_token_id)] = -float("inf")
+        if temperature == 0.0:
+            next_tok = next_logits.argmax(dim=-1, keepdim=True)
+        else:
+            probs = torch.softmax(next_logits / temperature, dim=-1)
+            next_tok = torch.multinomial(probs, num_samples=1)
+        out = torch.cat([out, next_tok], dim=1)
+        # Advance the incremental cache by the emitted token. If we're
+        # about to break (max_gen reached or EOS), we still advance for
+        # symmetry — cheap, and it keeps `pending_logits` consistent if
+        # the caller resumes generation (unlikely but harmless).
+        if can_incremental:
+            pending_logits, cache = model.forward_step(next_tok, cache)
+            cache_pending_valid = True
+        emit_count += 1
+        if use_thinking:
+            think_steps_used.append(thinks_this_step)
+            gate_emit_values.append(gate_val)
+        if eos_token_id is not None and (next_tok == eos_token_id).all():
+            break
     diag = {
         "emit_count": emit_count,
         "think_total": think_total,
@@ -306,141 +292,131 @@ def generate_with_retrieval_as_input(
     if not hasattr(model, "memory"):
         raise ValueError("model lacks .memory — this generator needs "
                          "WorkingMemory to provide the retrieval.")
-    # SPEEDUP: force single-pass FiLM at decode (see generate() above).
-    _orig_film_bypass = getattr(model, "_film_bypass", False)
-    if hasattr(model, "_film_bypass"):
-        model._film_bypass = True
-    try:
+    # Note: do NOT set `model._film_bypass = True`. See the comment in
+    # `generate()` above — the v2 model degenerates at temperature
+    # sampling without FiLM. Diagnosed 2026-05-23.
+    device = prompt_ids.device
+    out = prompt_ids.clone()
+    # inputs_embeds is the per-position model input; starts as the
+    # embedding lookup of the prompt and grows with each gen step.
+    # In the INCREMENTAL path we only track the LAST position's
+    # `next_input_emb`; in the FULL-FORWARD fallback we grow the full
+    # tensor as before.
+    inputs_embeds = model.embed(out).clone()    # (B, prompt_len, d)
+    # v7 additive α-gated injection: at a think step the next input is
+    # think_embed + α·retrieval (α = model.retrieval_input_alpha),
+    # instead of v5/v6's destructive `next input = retrieval`. `additive`
+    # is set from cfg['retrieval_input_additive'] by the caller — True
+    # for v7 ckpts, False for v5/v6.
+    _alpha_p = getattr(model, "retrieval_input_alpha", None)
+    alpha = float(_alpha_p.detach()) if _alpha_p is not None else 0.1
 
-        device = prompt_ids.device
-        out = prompt_ids.clone()
-        # inputs_embeds is the per-position model input; starts as the
-        # embedding lookup of the prompt and grows with each gen step.
-        # In the INCREMENTAL path we only track the LAST position's
-        # `next_input_emb`; in the FULL-FORWARD fallback we grow the full
-        # tensor as before.
-        inputs_embeds = model.embed(out).clone()    # (B, prompt_len, d)
-        # v7 additive α-gated injection: at a think step the next input is
-        # think_embed + α·retrieval (α = model.retrieval_input_alpha),
-        # instead of v5/v6's destructive `next input = retrieval`. `additive`
-        # is set from cfg['retrieval_input_additive'] by the caller — True
-        # for v7 ckpts, False for v5/v6.
-        _alpha_p = getattr(model, "retrieval_input_alpha", None)
-        alpha = float(_alpha_p.detach()) if _alpha_p is not None else 0.1
+    # STATE-PASSING INCREMENTAL DECODE (2026-05-23). For the retrieval-
+    # as-input generator the per-step input is `inputs_embeds[:, -1:]`,
+    # so we maintain it as the single-position tensor we'll pass to
+    # forward_step. The prefill runs once over the whole prompt.
+    can_incremental = (use_incremental
+                       and hasattr(model, "forward_step")
+                       and hasattr(model, "prefill"))
+    if can_incremental:
+        cache, last_logits = model.prefill(out, inputs_embeds=inputs_embeds)
+        pending_logits = last_logits[:, -1:, :]
+    else:
+        cache = None
+        pending_logits = None
 
-        # STATE-PASSING INCREMENTAL DECODE (2026-05-23). For the retrieval-
-        # as-input generator the per-step input is `inputs_embeds[:, -1:]`,
-        # so we maintain it as the single-position tensor we'll pass to
-        # forward_step. The prefill runs once over the whole prompt.
-        can_incremental = (use_incremental
-                           and hasattr(model, "forward_step")
-                           and hasattr(model, "prefill"))
-        if can_incremental:
-            cache, last_logits = model.prefill(out, inputs_embeds=inputs_embeds)
-            pending_logits = last_logits[:, -1:, :]
-        else:
-            cache = None
-            pending_logits = None
-
-        emit_count = 0
-        think_total = 0
-        think_steps_used: list[int] = []
-        gate_emit_values: list[float] = []
-        while emit_count < max_gen:
-            thinks_this_step = 0
-            # Inner think loop: keep retrieving until gate flips to emit or
-            # we hit a cap.
-            while True:
-                if can_incremental:
-                    next_logits = pending_logits[:, -1, :]
-                else:
-                    logits = model(out, inputs_embeds=inputs_embeds)
-                    next_logits = logits[:, -1, :]
-                gate_t = getattr(model, "_last_gate", None)
-                gate_val = (1.0 if gate_t is None
-                            else float(gate_t[0, -1].item()))
-                if gate_floor > 0.0:
-                    gate_val = max(gate_val, gate_floor)
-                force_emit = (
-                    thinks_this_step >= max_think_per_step
-                    or think_total >= total_think_budget
-                )
-                if gate_val >= emit_threshold or force_emit:
-                    break
-                # THINK STEP: replace the next input embedding with the WM
-                # read at the current last position. _last_injection has
-                # shape (B, T_current, d); we want the read AT the last
-                # position (it's the query computed from h_t which depended
-                # on the full context).
-                inj = getattr(model.memory, "_last_injection", None)
-                if inj is None:
-                    raise RuntimeError(
-                        "memory._last_injection missing — model.memory.forward "
-                        "must stash injection (added 2026-05-19).")
-                retrieved = inj[:, -1:, :].to(inputs_embeds.dtype)   # (B, 1, d)
-                think_tok = torch.full((out.shape[0], 1), int(thinking_token_id),
-                                        dtype=out.dtype, device=device)
-                out = torch.cat([out, think_tok], dim=1)
-                if additive:
-                    # v7: think_embed + α·retrieval — the think token keeps
-                    # its own signal; the retrieval is a gated addition.
-                    think_emb = model.embed(think_tok).to(inputs_embeds.dtype)
-                    inj_input = think_emb + alpha * retrieved
-                else:
-                    # v5/v6: destructive replacement (kept for those ckpts).
-                    inj_input = retrieved
-                if can_incremental:
-                    pending_logits, cache = model.forward_step(
-                        think_tok, cache, inputs_embeds=inj_input,
-                        # Force the WM read at this position (regardless of
-                        # whether the appended token is the thinking token —
-                        # we want injection stashed so the NEXT iteration
-                        # can read `_last_injection`).
-                        mem_read_mask=torch.ones_like(think_tok, dtype=inj_input.dtype),
-                    )
-                else:
-                    inputs_embeds = torch.cat([inputs_embeds, inj_input], dim=1)
-                thinks_this_step += 1
-                think_total += 1
-            # EMIT STEP: same as standard generate.
-            if thinking_token_id is not None:
-                next_logits = next_logits.clone()
-                next_logits[..., int(thinking_token_id)] = -float("inf")
-            if (eos_token_id is not None
-                    and min_emit_before_eos > 0
-                    and emit_count < min_emit_before_eos):
-                next_logits[..., int(eos_token_id)] = -float("inf")
-            if temperature == 0.0:
-                next_tok = next_logits.argmax(dim=-1, keepdim=True)
-            else:
-                probs = torch.softmax(next_logits / temperature, dim=-1)
-                next_tok = torch.multinomial(probs, num_samples=1)
-            out = torch.cat([out, next_tok], dim=1)
-            # For an emit step we use the regular embedding-table lookup.
-            emit_emb = model.embed(next_tok).to(inputs_embeds.dtype)
+    emit_count = 0
+    think_total = 0
+    think_steps_used: list[int] = []
+    gate_emit_values: list[float] = []
+    while emit_count < max_gen:
+        thinks_this_step = 0
+        # Inner think loop: keep retrieving until gate flips to emit or
+        # we hit a cap.
+        while True:
             if can_incremental:
-                # Advance cache with the emit token. inputs_embeds is the
-                # regular embedding-table lookup of the emitted token.
+                next_logits = pending_logits[:, -1, :]
+            else:
+                logits = model(out, inputs_embeds=inputs_embeds)
+                next_logits = logits[:, -1, :]
+            gate_t = getattr(model, "_last_gate", None)
+            gate_val = (1.0 if gate_t is None
+                        else float(gate_t[0, -1].item()))
+            if gate_floor > 0.0:
+                gate_val = max(gate_val, gate_floor)
+            force_emit = (
+                thinks_this_step >= max_think_per_step
+                or think_total >= total_think_budget
+            )
+            if gate_val >= emit_threshold or force_emit:
+                break
+            # THINK STEP: replace the next input embedding with the WM
+            # read at the current last position. _last_injection has
+            # shape (B, T_current, d); we want the read AT the last
+            # position (it's the query computed from h_t which depended
+            # on the full context).
+            inj = getattr(model.memory, "_last_injection", None)
+            if inj is None:
+                raise RuntimeError(
+                    "memory._last_injection missing — model.memory.forward "
+                    "must stash injection (added 2026-05-19).")
+            retrieved = inj[:, -1:, :].to(inputs_embeds.dtype)   # (B, 1, d)
+            think_tok = torch.full((out.shape[0], 1), int(thinking_token_id),
+                                    dtype=out.dtype, device=device)
+            out = torch.cat([out, think_tok], dim=1)
+            if additive:
+                # v7: think_embed + α·retrieval — the think token keeps
+                # its own signal; the retrieval is a gated addition.
+                think_emb = model.embed(think_tok).to(inputs_embeds.dtype)
+                inj_input = think_emb + alpha * retrieved
+            else:
+                # v5/v6: destructive replacement (kept for those ckpts).
+                inj_input = retrieved
+            if can_incremental:
                 pending_logits, cache = model.forward_step(
-                    next_tok, cache, inputs_embeds=emit_emb,
-                    # Same as above: force the WM read so _last_injection
-                    # is populated for the next think iteration to consume.
-                    mem_read_mask=torch.ones_like(next_tok, dtype=emit_emb.dtype),
+                    think_tok, cache, inputs_embeds=inj_input,
+                    # Force the WM read at this position (regardless of
+                    # whether the appended token is the thinking token —
+                    # we want injection stashed so the NEXT iteration
+                    # can read `_last_injection`).
+                    mem_read_mask=torch.ones_like(think_tok, dtype=inj_input.dtype),
                 )
             else:
-                inputs_embeds = torch.cat([inputs_embeds, emit_emb], dim=1)
-            emit_count += 1
-            think_steps_used.append(thinks_this_step)
-            gate_emit_values.append(gate_val)
-            if eos_token_id is not None and (next_tok == eos_token_id).all():
-                break
-    finally:
-        # Idempotent restore: runs whether or not the body raised.
-        # Without try/finally a mid-loop exception would leave the
-        # model stuck in bypass mode, silently corrupting the next
-        # gradient step (in train_rl_grader) or evaluation.
-        if hasattr(model, "_film_bypass"):
-            model._film_bypass = _orig_film_bypass
+                inputs_embeds = torch.cat([inputs_embeds, inj_input], dim=1)
+            thinks_this_step += 1
+            think_total += 1
+        # EMIT STEP: same as standard generate.
+        if thinking_token_id is not None:
+            next_logits = next_logits.clone()
+            next_logits[..., int(thinking_token_id)] = -float("inf")
+        if (eos_token_id is not None
+                and min_emit_before_eos > 0
+                and emit_count < min_emit_before_eos):
+            next_logits[..., int(eos_token_id)] = -float("inf")
+        if temperature == 0.0:
+            next_tok = next_logits.argmax(dim=-1, keepdim=True)
+        else:
+            probs = torch.softmax(next_logits / temperature, dim=-1)
+            next_tok = torch.multinomial(probs, num_samples=1)
+        out = torch.cat([out, next_tok], dim=1)
+        # For an emit step we use the regular embedding-table lookup.
+        emit_emb = model.embed(next_tok).to(inputs_embeds.dtype)
+        if can_incremental:
+            # Advance cache with the emit token. inputs_embeds is the
+            # regular embedding-table lookup of the emitted token.
+            pending_logits, cache = model.forward_step(
+                next_tok, cache, inputs_embeds=emit_emb,
+                # Same as above: force the WM read so _last_injection
+                # is populated for the next think iteration to consume.
+                mem_read_mask=torch.ones_like(next_tok, dtype=emit_emb.dtype),
+            )
+        else:
+            inputs_embeds = torch.cat([inputs_embeds, emit_emb], dim=1)
+        emit_count += 1
+        think_steps_used.append(thinks_this_step)
+        gate_emit_values.append(gate_val)
+        if eos_token_id is not None and (next_tok == eos_token_id).all():
+            break
     diag = {
         "emit_count": emit_count,
         "think_total": think_total,

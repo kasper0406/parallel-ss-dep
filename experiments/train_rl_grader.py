@@ -90,134 +90,131 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
     ids = prompt_ids.expand(N, -1).contiguous()
     prompt_len = ids.shape[1]
     pad_id = int(eos_token_id) if eos_token_id is not None else 0
-    # SPEEDUP: force single-pass FiLM at decode (T=1 makes K=3 pointless).
-    _orig_film_bypass = getattr(model, "_film_bypass", False)
-    if hasattr(model, "_film_bypass"):
-        model._film_bypass = True
-    try:
+    # DO NOT set `_film_bypass = True`. The supposed "decode speedup"
+    # (single-pass FiLM at T=1) catastrophically breaks the model at
+    # temperature sampling. Diagnosed 2026-05-23: with bypass=True at
+    # T=0.9 the model produces mode-collapsed garbage tokens
+    # (`(24, 24)(24, 24)...`) on every prompt → ~0 % pass rate vs
+    # ~6 % with FiLM ON. v2 was trained WITH FiLM ON, so removing it
+    # at inference removes a load-bearing architectural component.
+    # Greedy decode (HumanEval default) happens to work without it
+    # because there's no entropy to amplify; the bug is invisible at
+    # T=0 and ruinous at T=0.9. See the doc-fix note in this commit.
+    emit_counts = torch.zeros(N, dtype=torch.long, device=device)
+    think_counts_this_step = torch.zeros(N, dtype=torch.long, device=device)
+    think_totals = torch.zeros(N, dtype=torch.long, device=device)
+    finished = torch.zeros(N, dtype=torch.bool, device=device)
 
-        emit_counts = torch.zeros(N, dtype=torch.long, device=device)
-        think_counts_this_step = torch.zeros(N, dtype=torch.long, device=device)
-        think_totals = torch.zeros(N, dtype=torch.long, device=device)
-        finished = torch.zeros(N, dtype=torch.bool, device=device)
+    emit_token_ids_per_row: list[list[int]] = [[] for _ in range(N)]
+    emit_log_probs_per_row: list[list[float]] = [[] for _ in range(N)]
+    emit_positions_per_row: list[list[int]] = [[] for _ in range(N)]
 
-        emit_token_ids_per_row: list[list[int]] = [[] for _ in range(N)]
-        emit_log_probs_per_row: list[list[float]] = [[] for _ in range(N)]
-        emit_positions_per_row: list[list[int]] = [[] for _ in range(N)]
+    # STATE-PASSING INCREMENTAL DECODE (2026-05-23). At T=prompt + 96
+    # gen steps, the full-forward path's per-step cost grows linearly
+    # while the incremental path is constant ~6 ms/tok. The cache is
+    # batched naturally (FLA Cache + our WM buffer both have a batch
+    # dimension), so all N rollout rows advance in lockstep.
+    can_incremental = (hasattr(model, "forward_step")
+                       and hasattr(model, "prefill"))
+    if can_incremental:
+        cache, last_logits = model.prefill(ids)
+        pending_logits = last_logits[:, -1:, :]
+    else:
+        cache = None
+        pending_logits = None
 
-        # STATE-PASSING INCREMENTAL DECODE (2026-05-23). At T=prompt + 96
-        # gen steps, the full-forward path's per-step cost grows linearly
-        # while the incremental path is constant ~6 ms/tok. The cache is
-        # batched naturally (FLA Cache + our WM buffer both have a batch
-        # dimension), so all N rollout rows advance in lockstep.
-        can_incremental = (hasattr(model, "forward_step")
-                           and hasattr(model, "prefill"))
-        if can_incremental:
-            cache, last_logits = model.prefill(ids)
-            pending_logits = last_logits[:, -1:, :]
-        else:
-            cache = None
-            pending_logits = None
+    autocast = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    # Cap total iterations: even worst case, N*(max_gen + total_think_budget)
+    # bounded by max_gen + total_think_budget (each iteration adds 1 token).
+    max_iter = max_gen + total_think_budget + 4
+    with autocast:
+        for _ in range(max_iter):
+            if bool(finished.all().item()):
+                break
+            if can_incremental:
+                next_logits = pending_logits[:, -1, :].float()
+            else:
+                logits = model(ids)
+                next_logits = logits[:, -1, :].float()    # (N, V)
 
-        autocast = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-        # Cap total iterations: even worst case, N*(max_gen + total_think_budget)
-        # bounded by max_gen + total_think_budget (each iteration adds 1 token).
-        max_iter = max_gen + total_think_budget + 4
-        with autocast:
-            for _ in range(max_iter):
-                if bool(finished.all().item()):
-                    break
-                if can_incremental:
-                    next_logits = pending_logits[:, -1, :].float()
-                else:
-                    logits = model(ids)
-                    next_logits = logits[:, -1, :].float()    # (N, V)
+            gate_t = getattr(model, "_last_gate", None)
+            if gate_t is None:
+                gate = torch.ones(N, device=device)
+            else:
+                gate = gate_t[:, -1]
+            gate_clamped = (gate if gate_floor <= 0
+                            else gate.clamp_min(gate_floor))
+            force_emit = (
+                (think_counts_this_step >= max_think_per_step)
+                | (think_totals >= total_think_budget)
+                | finished  # finished rows always "emit" pad
+            )
+            want_emit = (gate_clamped >= emit_threshold) | force_emit
 
-                gate_t = getattr(model, "_last_gate", None)
-                if gate_t is None:
-                    gate = torch.ones(N, device=device)
-                else:
-                    gate = gate_t[:, -1]
-                gate_clamped = (gate if gate_floor <= 0
-                                else gate.clamp_min(gate_floor))
-                force_emit = (
-                    (think_counts_this_step >= max_think_per_step)
-                    | (think_totals >= total_think_budget)
-                    | finished  # finished rows always "emit" pad
-                )
-                want_emit = (gate_clamped >= emit_threshold) | force_emit
+            # Sample emit tokens. Mask think token from softmax.
+            next_logits[:, thinking_token_id] = -float("inf")
+            # Per-row min_emit_before_eos.
+            if min_emit_before_eos > 0 and eos_token_id is not None:
+                mask = emit_counts < min_emit_before_eos
+                if mask.any():
+                    next_logits_clone = next_logits.clone()
+                    next_logits_clone[mask, int(eos_token_id)] = -float("inf")
+                    next_logits = next_logits_clone
 
-                # Sample emit tokens. Mask think token from softmax.
-                next_logits[:, thinking_token_id] = -float("inf")
-                # Per-row min_emit_before_eos.
-                if min_emit_before_eos > 0 and eos_token_id is not None:
-                    mask = emit_counts < min_emit_before_eos
-                    if mask.any():
-                        next_logits_clone = next_logits.clone()
-                        next_logits_clone[mask, int(eos_token_id)] = -float("inf")
-                        next_logits = next_logits_clone
+            if temperature <= 0.0:
+                emit_toks = next_logits.argmax(dim=-1)
+            else:
+                probs = F.softmax(next_logits / temperature, dim=-1)
+                emit_toks = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            log_probs_full = F.log_softmax(
+                next_logits / max(temperature, 1e-8), dim=-1)
+            emit_lp = log_probs_full.gather(
+                1, emit_toks.unsqueeze(1)).squeeze(1)        # (N,)
 
-                if temperature <= 0.0:
-                    emit_toks = next_logits.argmax(dim=-1)
-                else:
-                    probs = F.softmax(next_logits / temperature, dim=-1)
-                    emit_toks = torch.multinomial(probs, num_samples=1).squeeze(-1)
-                log_probs_full = F.log_softmax(
-                    next_logits / max(temperature, 1e-8), dim=-1)
-                emit_lp = log_probs_full.gather(
-                    1, emit_toks.unsqueeze(1)).squeeze(1)        # (N,)
+            # Per row append: think token or emit token.
+            think_tok_t = torch.full_like(emit_toks, int(thinking_token_id))
+            appended = torch.where(want_emit, emit_toks, think_tok_t)
+            ids = torch.cat([ids, appended.unsqueeze(1)], dim=1)
+            new_pos = ids.shape[1] - 1   # position of the just-appended token
 
-                # Per row append: think token or emit token.
-                think_tok_t = torch.full_like(emit_toks, int(thinking_token_id))
-                appended = torch.where(want_emit, emit_toks, think_tok_t)
-                ids = torch.cat([ids, appended.unsqueeze(1)], dim=1)
-                new_pos = ids.shape[1] - 1   # position of the just-appended token
+            if can_incremental:
+                # Advance the cache by the just-appended row of tokens.
+                # Finished rows feed garbage (their `appended` is whatever
+                # `emit_toks` happened to be on this iter, since
+                # want_emit is True for finished rows); we don't read
+                # their downstream logits so the garbage state is fine.
+                pending_logits, cache = model.forward_step(
+                    appended.unsqueeze(1), cache)
 
-                if can_incremental:
-                    # Advance the cache by the just-appended row of tokens.
-                    # Finished rows feed garbage (their `appended` is whatever
-                    # `emit_toks` happened to be on this iter, since
-                    # want_emit is True for finished rows); we don't read
-                    # their downstream logits so the garbage state is fine.
-                    pending_logits, cache = model.forward_step(
-                        appended.unsqueeze(1), cache)
-
-                # Update per-row bookkeeping (host loop — small N).
-                for i in range(N):
-                    if bool(finished[i].item()):
+            # Update per-row bookkeeping (host loop — small N).
+            for i in range(N):
+                if bool(finished[i].item()):
+                    continue
+                if bool(want_emit[i].item()):
+                    tok = int(emit_toks[i].item())
+                    is_eos = (eos_token_id is not None
+                              and tok == int(eos_token_id))
+                    if is_eos:
+                        # Finish without recording the EOS token (avoids the
+                        # "<|endoftext|>" -> syntax_error bug we hit before).
+                        # Roll back: replace the appended EOS with a pad
+                        # token so the batch stays clean — but actually,
+                        # we're going to keep appending pad on finished rows
+                        # anyway, and the appended token at this position is
+                        # not used downstream for this row, so leave as-is.
+                        finished[i] = True
                         continue
-                    if bool(want_emit[i].item()):
-                        tok = int(emit_toks[i].item())
-                        is_eos = (eos_token_id is not None
-                                  and tok == int(eos_token_id))
-                        if is_eos:
-                            # Finish without recording the EOS token (avoids the
-                            # "<|endoftext|>" -> syntax_error bug we hit before).
-                            # Roll back: replace the appended EOS with a pad
-                            # token so the batch stays clean — but actually,
-                            # we're going to keep appending pad on finished rows
-                            # anyway, and the appended token at this position is
-                            # not used downstream for this row, so leave as-is.
-                            finished[i] = True
-                            continue
-                        emit_token_ids_per_row[i].append(tok)
-                        emit_log_probs_per_row[i].append(float(emit_lp[i].item()))
-                        emit_positions_per_row[i].append(int(new_pos))
-                        emit_counts[i] = emit_counts[i] + 1
-                        think_counts_this_step[i] = 0
-                        if int(emit_counts[i].item()) >= max_gen:
-                            finished[i] = True
-                    else:
-                        think_counts_this_step[i] = think_counts_this_step[i] + 1
-                        think_totals[i] = think_totals[i] + 1
+                    emit_token_ids_per_row[i].append(tok)
+                    emit_log_probs_per_row[i].append(float(emit_lp[i].item()))
+                    emit_positions_per_row[i].append(int(new_pos))
+                    emit_counts[i] = emit_counts[i] + 1
+                    think_counts_this_step[i] = 0
+                    if int(emit_counts[i].item()) >= max_gen:
+                        finished[i] = True
+                else:
+                    think_counts_this_step[i] = think_counts_this_step[i] + 1
+                    think_totals[i] = think_totals[i] + 1
 
-    finally:
-        # Idempotent restore: runs whether or not the body raised.
-        # Without try/finally a mid-loop exception would leave the
-        # model stuck in bypass mode, silently corrupting the next
-        # gradient step (in train_rl_grader) or evaluation.
-        if hasattr(model, "_film_bypass"):
-            model._film_bypass = _orig_film_bypass
     # Build Rollout objects.
     out_rollouts = []
     full_ids_host = ids.cpu().tolist()

@@ -559,7 +559,11 @@ def main() -> int:
     head_params = (list(future_gist_heads.parameters())
                    if future_gist_heads is not None else [])
     opt = torch.optim.AdamW(
-        [{"params": decay_params + head_params, "weight_decay": 0.1},
+        # WD=0.01 is the project default since 2026-05-14 (the v3a
+        # residual-stream-collapse finding — see GEMINI.md). WD=0.1
+        # was a Moonlight-scale (5.7 T-token) setting; at our
+        # ~10 tok/param it acts as pure brake on the residual stream.
+        [{"params": decay_params + head_params, "weight_decay": 0.01},
          {"params": alpha_params, "weight_decay": 0.0}],
         lr=args.lr, betas=(0.9, 0.95))
     n_steps = (len(encoded) // args.batch) * args.epochs

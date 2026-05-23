@@ -191,8 +191,11 @@ def main() -> int:
         encoded.append((ch_ids, ch_pl, rj_ids, rj_pl, c_s, r_s))
     print(f"[dpo] {len(encoded)} tokenised pairs ready")
 
+    # WD=0.01 is the project default (GEMINI.md, 2026-05-14). DPO
+    # runs are short so impact is small, but matches sft_code +
+    # train_rl_grader for consistency across the post-training stack.
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                             betas=(0.9, 0.95), weight_decay=0.1)
+                             betas=(0.9, 0.95), weight_decay=0.01)
     n_steps = len(encoded) * args.epochs
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=max(1, n_steps), eta_min=args.lr * 0.1)

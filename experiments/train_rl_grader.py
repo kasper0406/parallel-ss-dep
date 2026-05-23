@@ -456,8 +456,16 @@ def policy_loss_for_rollouts_batched(
                 ref_pred_logits / max(temperature, 1e-8), dim=-1)
             ref_lp = ref_log_probs.gather(
                 1, tok_ids.unsqueeze(1)).squeeze(1)
-            # Unbiased KL(new||ref) estimator at the sampled tokens.
-            all_kls.append((new_lp - ref_lp).mean())
+            # Schulman k3 KL estimator: (r - 1) - log r where
+            # r = π_ref / π_new (so log r = ref_lp - new_lp). Always
+            # non-negative, low-variance, unbiased for KL(new||ref)
+            # under samples from π_new. The earlier k1 form
+            # `(new_lp - ref_lp).mean()` is biased and can go negative
+            # (turning the stability penalty into a small reward).
+            # http://joschu.net/blog/kl-approx.html
+            log_r = ref_lp - new_lp
+            kl_k3 = (torch.exp(log_r) - 1.0) - log_r
+            all_kls.append(kl_k3.mean())
     if not all_surrs:
         return (torch.zeros((), device=device, requires_grad=True),
                 torch.tensor(1.0), torch.tensor(0.0))

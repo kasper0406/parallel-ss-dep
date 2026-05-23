@@ -2197,17 +2197,18 @@ class TinyLM(nn.Module):
         B, _, d_model = h_normed_new.shape
         device = h_normed_new.device
 
-        # Decide read activation mask FIRST and skip work entirely if no
-        # row needs to read.
+        # Decide read activation mask FIRST.
+        # NOTE: we always compute the injection unconditionally — the
+        # retrieval-as-input generator reads `mem._last_injection` at
+        # every emit step (not just think positions) to feed back as
+        # the next think-token's input embedding. The original
+        # `WorkingMemory.forward` also stashes the injection PRE-mask,
+        # so we must too. The mask only gates whether the injection is
+        # ADDED back to h.
         if read_mask_new is None:
             inj_mask = (input_ids_new == mem.thinking_token_id).to(h_normed_new.dtype)
         else:
             inj_mask = read_mask_new.to(h_normed_new.dtype)
-        if bool((inj_mask <= 0).all().item()):
-            # No row reads here — short-circuit. Still stash a zero
-            # injection for any caller that reads `_last_injection`.
-            mem._last_injection = torch.zeros_like(h_normed_new)
-            return h_normed_new
 
         gate_full  = buf["gate"]                    # (B, t_cur)
         value_full = buf["value"]                   # (B, t_cur, d_mem)

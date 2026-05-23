@@ -103,6 +103,26 @@ def apply_speed_knobs(model: nn.Module, bf16: bool = True, tf32: bool = True,
         # When the caller asks for compile, treat any compile error as a
         # hard failure so we notice immediately.
         torch._dynamo.config.suppress_errors = False
+        # WORKAROUND (2026-05-21) for a torch.compile / AOTAutograd bug:
+        # reconstructing aliased graph outputs by replaying ViewMeta
+        # sequences corrupts SymInt view-metadata under dynamic shapes
+        # (matches pytorch/pytorch issue #124382), causing a
+        # non-deterministic backward-pass segfault / garbage-shape
+        # RuntimeError. In this repo it is triggered by the trunk gist
+        # loss (cumsum + slice over a dynamic sequence dim) feeding
+        # autograd.Function (FLA) nodes under activation checkpointing.
+        # Forcing as_strided reconstruction instead of ViewMeta replay
+        # dodges it — no correctness impact, negligible cost. Verified
+        # 3x against the real pretrain trainer.
+        try:
+            import torch._functorch.config as _ffc
+            _ffc.view_replay_for_aliased_outputs = False
+            if verbose:
+                print("torch._functorch view_replay_for_aliased_outputs"
+                      "=False (ViewMeta-replay segfault workaround)")
+        except Exception as _e:  # pragma: no cover
+            if verbose:
+                print(f"WARNING: view_replay workaround not applied: {_e}")
         # Compile the (possibly bf16-wrapped) forward. The FLA Triton
         # kernels are opaque to Dynamo, so each is a graph break — compile
         # still fuses the PyTorch glue between them (RMSNorm, GLU MLP,

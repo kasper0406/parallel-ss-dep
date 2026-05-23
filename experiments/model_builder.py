@@ -92,6 +92,8 @@ def build_model_from_args(args, *, vocab_size: int,
             mem_size=int(args.mem_size),
             mem_dim=int(args.mem_dim) if args.mem_dim > 0 else int(args.d_model),
             thinking_token_id=int(thinking_token_id),
+            mem_write_only_at_think=bool(
+                getattr(args, "mem_write_only_at_think", False)),
         )
 
     pkm_kwargs: dict = {}

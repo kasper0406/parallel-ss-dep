@@ -404,6 +404,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Enable WorkingMemory module. Requires a thinking-token "
                         "id; auto-set when --data_mix is used.")
     p.add_argument("--mem_size", type=int, default=1024)
+    p.add_argument("--mem_write_only_at_think", action="store_true",
+                   help="FIX A (2026-05-18): force the WorkingMemory buffer "
+                        "to be filled ONLY from think-position writes. "
+                        "Diagnostic showed the write gate fires uniformly "
+                        "across think/emit, so reads (which ARE sharp at "
+                        "think positions) hit a buffer of noise. This "
+                        "mechanically forces think-content into the buffer.")
     p.add_argument("--mem_dim", type=int, default=0,
                    help="Memory projection dim. 0 = match d_model.")
     # ----- Persistent learned-RAG (Product-Key Memory) -----
@@ -587,6 +594,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Weight on the z-loss regulariser "
                         "mean(logsumexp(logits)^2), which keeps output "
                         "logits from drifting. Default 1e-4; 0 disables.")
+    # Trunk multi-horizon gist loss (v7, see experiments/gist_loss.py).
+    p.add_argument("--gist_loss_weight", type=float, default=0.0,
+                   help="Weight on the trunk multi-horizon gist loss: "
+                        "per-horizon heads predict the mean-pooled future "
+                        "hidden state (windowed gist) from h[t]. A "
+                        "'high-level direction' representation objective. "
+                        "0 disables (default). Recommended 0.1.")
+    p.add_argument("--gist_horizons", type=str, default="16,64,256",
+                   help="Comma-separated future-window sizes K for the "
+                        "gist loss (one prediction head per horizon).")
     p.add_argument("--bf16_optim_state", action="store_true",
                    help="Store optimizer state (AdamW exp_avg/exp_avg_sq, "
                         "Muon momentum_buffer) in bf16 instead of fp32. "

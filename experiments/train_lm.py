@@ -32,6 +32,7 @@ from experiments.layers import (
 )
 from experiments.model import TinyLM
 from experiments.aux_brackets import compute_bracket_deltas, bracket_depth
+from experiments.gist_loss import build_gist_heads, parse_horizons
 from experiments.thinking import (
     ThinkContinuation,
     ThinkContinuationQueue,
@@ -98,13 +99,18 @@ def _block_update_ratios(model, snapshot) -> list[float]:
 
 
 def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
-                           doc_ids=None):
+                           doc_ids=None, gist_horizons=None):
     """Forward + LM loss for the non-thinking-token (pretrain) path.
 
-    Returns (logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss).
-    Factored out of the step loop so gradient accumulation can run it once
-    per microbatch. Mirrors the inline forward + gate/plain-loss branches
-    exactly.
+    Returns (logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss,
+    gist_loss). Factored out of the step loop so gradient accumulation
+    can run it once per microbatch. Mirrors the inline forward +
+    gate/plain-loss branches exactly.
+
+    When `gist_horizons` is set and --gist_loss_weight > 0, the model
+    computes the multi-horizon trunk gist loss INSIDE its forward and
+    returns it as a scalar (model._gist_loss_enabled gates it). Not
+    supported together with --aux_brackets.
 
     When --gate_entropy_aux_weight > 0, the gate logit gets an auxiliary
     BCE target derived from the SAME forward's per-position next-token
@@ -112,16 +118,29 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
     ⇒ gate trained to close (think). Costs nothing extra — no second
     forward, just turns the gate into a free predictive-uncertainty head.
     """
+    want_gist = (gist_horizons is not None
+                 and getattr(args, "gist_loss_weight", 0.0) > 0.0)
     if args.aux_brackets:
+        if want_gist:
+            raise SystemExit("--gist_loss_weight is not supported "
+                             "together with --aux_brackets.")
         logits, aux_logits = model(x, return_aux=True, doc_ids=doc_ids)
         depth = bracket_depth(x, bracket_deltas).clamp(0, args.aux_max_depth)
         aux_loss = F.cross_entropy(
             aux_logits.reshape(-1, args.aux_max_depth + 1),
             depth.reshape(-1),
         )
+        gist_loss = logits.new_zeros(())
+    elif want_gist:
+        # The model computes the gist loss inside the (compiled) forward
+        # and returns it as a scalar — see TinyLM._finalize. This keeps
+        # the hidden state from ever crossing the compile boundary.
+        logits, gist_loss = model(x, doc_ids=doc_ids)
+        aux_loss = logits.new_zeros(())
     else:
         logits = model(x, doc_ids=doc_ids)
         aux_loss = logits.new_zeros(())
+        gist_loss = logits.new_zeros(())
     V = logits.shape[-1]
     ce_per_token = F.cross_entropy(
         logits.reshape(-1, V), y.reshape(-1), reduction="none",
@@ -166,7 +185,7 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
         )
         denom = valid.sum().clamp(min=1.0)
         gate_aux_loss = (bce * valid).sum() / denom
-    return logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss
+    return logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss, gist_loss
 
 
 def _z_loss_term(logits, weight):
@@ -449,6 +468,38 @@ def main():
               f"non-zero count: {(bracket_deltas != 0).sum().item()}")
     else:
         bracket_deltas = None
+
+    # Trunk multi-horizon gist heads (v7, see experiments/gist_loss.py).
+    # Attached as a model submodule so they ride the existing optimizer,
+    # state_dict and resume paths with no special handling. Must be
+    # attached BEFORE build_optimizer so the optimizer picks them up.
+    gist_horizons = None
+    if args.gist_loss_weight > 0.0:
+        gist_horizons = parse_horizons(args.gist_horizons)
+        model.gist_heads = build_gist_heads(args.d_model,
+                                            gist_horizons).cuda()
+        # The model computes the gist loss inside its own forward (see
+        # TinyLM._finalize) — it reads these two attributes.
+        model._gist_horizons = gist_horizons
+        model._gist_loss_enabled = True
+        # build_model_from_args loaded --load_ckpt BEFORE gist_heads
+        # existed, so its gist_heads.* keys (if any) were dropped as
+        # "unexpected". Re-load just those now. The v7.1 pretrain ckpt
+        # has none → fresh heads, which is correct for Phase C.
+        if args.load_ckpt is not None:
+            _ck = torch.load(args.load_ckpt, map_location="cuda",
+                             weights_only=False)
+            _sd = (_ck["state_dict"] if isinstance(_ck, dict)
+                   and "state_dict" in _ck else _ck)
+            _gh = {k[len("gist_heads."):]: v for k, v in _sd.items()
+                   if k.startswith("gist_heads.")}
+            if _gh:
+                model.gist_heads.load_state_dict(_gh)
+                print(f"  gist_heads: restored from {args.load_ckpt!r}")
+            else:
+                print("  gist_heads: fresh (absent from loaded ckpt)")
+        print(f"  trunk gist loss ON: horizons={gist_horizons} "
+              f"weight={args.gist_loss_weight}")
 
     # Optimizer construction — see experiments/optim_utils.py.
     from experiments.optim_utils import build_optimizer
@@ -1258,14 +1309,16 @@ def main():
                     x, y, *_rest = batch
                     x, y = x.to("cuda"), y.to("cuda")
                     doc_ids = _rest[0].to("cuda") if _rest else None
-                logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss = \
-                    _nonthink_forward_loss(
+                logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss, \
+                    gist_loss = _nonthink_forward_loss(
                         model, x, y, args, step, bracket_deltas,
-                        doc_ids=doc_ids)
+                        doc_ids=doc_ids, gist_horizons=gist_horizons)
                 loss = lm_loss + args.aux_weight * aux_loss
                 loss = loss + _z_loss_term(logits, args.z_loss)
                 if args.output_gate and args.gate_entropy_aux_weight > 0.0:
                     loss = loss + args.gate_entropy_aux_weight * gate_aux_loss
+                if args.gist_loss_weight > 0.0:
+                    loss = loss + args.gist_loss_weight * gist_loss
                 # PKM diversity-bonus: -H(slot-selection distribution) per
                 # head, averaged across batch and heads. We MAXIMISE entropy
                 # so the auxiliary loss is NEGATIVE entropy. This is the
@@ -1315,6 +1368,8 @@ def main():
             line = (f"{step:>6d}  {tok_per_sec:>8.0f}  "
                     f"{tloss_avg:>8.4f}  "
                     f"{scheduler.get_last_lr()[0]:>9.2e}")
+            if args.gist_loss_weight > 0.0:
+                line += f"  gist={gist_loss.item():.4f}"
             if args.feedback != "none" or fb_xattn_pairs:
                 alphas = model.feedback_alphas()
                 if not alphas:

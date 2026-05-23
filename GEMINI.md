@@ -58,6 +58,7 @@ Dead direction (do **not** revive without explicit justification):
 
 ## Documentation index
 
+- `MILESTONE_ARCH.md` — north-star milestone: PKM, WM, thinking gate (+ long chains), and selective memory writes must each be measurably load-bearing. Current status, ablation table, and workstreams (A–D) to get there.
 - `README.md` — headline results (FiLM lift, MQAR recall, deployment-fair scoring) and the small-super-coder framing.
 - `THESIS.md` — project framing: small-model performance is under-served by training-methodology research; what we claim and what we explicitly don't.
 - `PHASE_C_RL.md` — prediction-as-RL-signal proposal for post-SFT. Multiplicative reward of correctness × prediction-match; includes the ponder-cost shaping infrastructure ready to use.
@@ -113,7 +114,21 @@ Mixed-corpus pretrain with EOS at small-document boundaries teaches the model `"
 
 `experiments/code_grader.py` returns a **dense** `GradingResult`, not binary pass/fail — so GRPO groups have advantage variance before the model can fully solve a task. Tier ladder + `score ∈ [0,1]`: `syntax_error` 0.0 < `exec_error` 0.05 < `runtime_error` 0.2 < `partial` 0.2 + 0.7·(n_passed/n_tests) < `pass` 1.0. `_exec_target` compiles, exec's the solution, then AST-splits `check()` and runs it statement-by-statement so one failing assert doesn't mask the rest. `GradingResult.error_text` carries the formatted diagnosis (SyntaxError + line, exec traceback, failed-assert sources) — the feedback the **iterative self-repair loop** will put back into a re-added prompt so the model learns to diagnose. Do **not** use embedding-similarity-to-reference as a reward: hackable, no single target, code embeddings barely track correctness — lean into the verifier. Tests: `experiments/test_code_grader.py` (15).
 
-## Current state (2026-05-18)
+## Current state (2026-05-23)
+
+Headline (full arc): SFT v7 8/164 → Phase C SFT 10/164 → grader-RL v2
+step-300 **16/164 = 9.8 % HumanEval pass@1**, project best. Phase C
+pretrain is the new architectural baseline (5.28 B tokens,
+Chinchilla-complete for 287 M, strict per-source CE win over v7.1
+pretrain). RL v2 added the long-overdue KL-to-reference penalty to
+`train_rl_grader.py`. PyTorch upstream fix for the AOTAutograd
+ViewMeta-replay segfault is on a separate branch at `~/ml/pytorch`,
+PR pending. See the "Phase C pretrain + grader-RL trajectory
+(2026-05-21..23)" section below for the full story.
+
+Pretrain history (kept for context):
+
+## Pretrain run history (2026-05-17..18)
 
 - **v4** (30L × 576d + FiLM(2,28) K=3 + WM + thinking-gate, `launch_pretrain_mix_v4.sh`, 9300 steps / 2.13 B tokens) — completed 2026-05-17. **Final VAL ppl 5.89**. This is the deep-trunk baseline.
 - **v5-pkm** (30L × 576d + PKM-v5 + FiLM(2,28) K=3, `launch_pretrain_mix_v5_pkm.sh`) — completed ~step 4500 (ppl 7.02). Looked like a token-efficiency win in early reading, but the 2026-05-17 PKM-utilization probe revealed **97 % of the value table was still at random init** with 4 % slot coverage and 1 % residual contribution magnitude. The "win" was the trunk; PKM was structurally inert. Triggered the v7.1 PKM-bootstrap-fix package above. **Don't reuse this PKM training recipe** — use the v7.1 settings.
@@ -122,6 +137,336 @@ Mixed-corpus pretrain with EOS at small-document boundaries teaches the model `"
 - **v7.1-pkm-xattn** (sister run, 10L × 896d + cross-layer attention + PKM-v7.1, `launch_pretrain_mix_v7_pkm_xattn.sh`, 9300 steps) — **completed 2026-05-18, final VAL ppl 5.94**. Slightly worse than film for ~2.4× the per-step compute pre-fix; the no_grad-pass-1 fix landed mid-flight and equalised step cost. The two runs are within VAL-ppl noise; **film is the cheaper-per-step default**.
 - **Persistent unsolved problem**: pretrain-only HumanEval is 0/50 on every ckpt we've ever scored (v5-pkm, v6, v7.1, distilled). VAL ppl 5.83 vs 5.89 is a real but small win; **the actual capability bottleneck is post-pretrain (SFT + execution-grounded RL)**. The bigvul/cybernative *upward drift* across 500 M → 1 B was the v4-mix lever; v6 / v7.1 still see this trend but the shallow-wide trunk's overall trajectory absorbs it.
 - **Next planned**: SFT v7.1-pkm-film on a larger curated (problem, solution) corpus than the 10 M-token MBPP+CodeAlpaca we tried before → execution-grounded RL via `train_rl_grader.py` (validated lift on v5-pkm-SFT base, ready to use). The thinking-gate failure mode observed on v5-pkm-SFT (`mean gate at emit = 0.978, think_rate = 0.000` after SFT) is the open problem alongside data scale.
+
+## Distillation + thinking-token findings (2026-05-19)
+
+After v7.1 pretrain hit the 0/164 HumanEval ceiling, the post-pretrain
+pipeline was rebuilt. Key results below.
+
+### What worked: distillation + future-emb prediction + synthetic memory
+**Combined SFT v1** (`checkpoints/sft_v7_pkm_film_combined.pt`,
+`launch_sft_v7_combined.sh`) → **HumanEval pass@1 = 11/164 (6.7 %)** — first
+non-zero result on the codebase. The lift came from three stacked changes
+vs. the prior `sft_v7_pkm_film_thinking.pt` (0/164):
+
+  1. **Qwen 3.6 AWQ distillation** (`experiments/distill_solutions.py`,
+     vLLM-driven, ~38 k (problem, CoT, code) pairs from MBPP/LeetCode/
+     Magicoder/CodeFeedback). Replaces the prior 10 M-token codeparrot
+     distill. The student learns Qwen's reasoning prose around the code.
+     New code-grader loaders: `mbpp_all`, `mbpp_plus`, `mbpp_combined`,
+     `leetcode`, `super_combined`, `magicoder_oss`, `codefeedback`,
+     `distill_corpus`. **Critical eval flags for distilled ckpts:**
+     `eval_humaneval.py --prompt_style sft_comment --extract_code_block`
+     (prepends `# Complete the following Python function.\n` to match the
+     SFT format and pulls the ```python``` fence out of the model output
+     before grading; without these, scoring is structurally 0).
+  2. **Future-embedding prediction auxiliary loss** (added to
+     `sft_code.py` as `--future_emb_loss_weight` / `--future_emb_T_max`
+     / `--future_emb_T_ramp_frac`). At position t, a small `Linear`
+     head predicts the input embedding at t + T_eff via `1 - cosine`,
+     with T_eff ramping 1 → 8 over the first 30 % of training. Forces
+     position-t representations to encode high-level structure of what
+     comes next (algorithm choice, library imports) — directly attacks
+     the early-commitment failure mode (model emits `return 0.5` because
+     the docstring example showed 0.5).
+  3. **Synthetic memory-required tasks**
+     (`experiments/gen_synthetic_memory_tasks.py`, 12.5 k examples
+     across 5 families: var_binding, chain_arithmetic, list_index_recall,
+     dict_lookup, multi_step_arithmetic). Each problem sets a value
+     early, has distractor lines, then asks for it — forces the model to
+     either use WM or attend long-range.
+
+  All three landed in `launch_sft_v7_combined.sh`. Combined SFT v2 (same
+  recipe + FIX A active during training) scored **9/164 — strictly
+  worse** than v1.
+
+### What didn't work: FIX A (write-only-at-think)
+`WorkingMemory(..., write_only_at_think=True)` masks the per-position
+write-gate to a large-negative value at non-think positions before the
+top-K buffer-selection topk, forcing the WM buffer to contain only
+think-position content. Motivated by `diag_thinking_machinery.py`'s
+finding that the write-gate was uniform across think/emit despite
+WM-reads being sharper at think.
+
+  - Inference-only A/B on the existing distilled ckpt (small sample):
+    **1 vs 3 passes** in favor of FIX A.
+  - SFT'd from pretrain WITH FIX A (combined v2): **11 → 9 pass@1**,
+    LOSS of 2.
+  - Root cause: the `[THINKING]` token has ONE learned input embedding.
+    Burst of 8 consecutive thinks → 8 hidden states driven by the same
+    input → high pairwise correlation (median cos +0.146 vs +0.060 at
+    emit) → think-position effective rank ~210 vs ~560 at emit (see
+    `experiments/diag_think_position_diversity.py`, 2026-05-19). FIX A
+    fills the WM buffer with this low-rank pool; sharp read queries can
+    only retrieve from a homogeneous information manifold.
+  - **Don't enable `--mem_write_only_at_think` for further work** —
+    the flag survives as code (with its own tests) but the empirical
+    answer is no. Solve the homogeneity problem at the source instead
+    (next section).
+
+### What we're building next: retrieval-as-input thinking tokens
+Instead of appending a discrete `[THINKING]` token (homogeneous input
+embedding), the gate's "think" decision triggers a WM lookup whose
+**retrieval result IS the next position's input embedding**, bypassing
+the embedding table. Each think step now gets a unique input signal —
+different queries → different retrievals → diverse hidden states →
+diverse buffer over multiple thinks. This is the architectural fix
+suggested by the user (2026-05-19) and the diagnostic.
+
+  Plumbing already shipped:
+  - `TinyLM.forward(... inputs_embeds: Tensor | None = None)`. When
+    set, the embedding-table lookup is bypassed and the provided
+    embeddings drive the trunk.
+  - `WorkingMemory.forward` stashes `self._last_injection`
+    (`(B, T, d_model)`, detached) — the per-position retrieval result
+    PRE-masking. The generate loop reads this at think positions and
+    uses it as `inputs_embeds[t + 1]`.
+  - `eval_humaneval.generate_with_retrieval_as_input(...)` is the
+    drop-in replacement for `generate(use_thinking=True, ...)` that
+    implements the new mechanism.
+
+  Training the new mechanism end-to-end is the next step. For now the
+  generator works at inference time only (the SFT ckpt didn't see
+  retrieval-as-input during training).
+
+### WM gist supervision — retrieval-as-input is the lever (2026-05-20)
+Two SFT runs trained the WM mechanism end-to-end:
+- **v5** (`launch_sft_v7_combined_v5_wm_load_bearing.sh`):
+  retrieval-as-input + "Option A v5" direct WM supervision targeting
+  `embed(input_ids[t+4])` — the input embedding of one token 4
+  positions ahead — + long-context recall data.
+- **v6** (`launch_sft_v7_combined_v6_gist.sh`): identical recipe, but
+  the Option-A target swapped to the **multi-horizon hidden-state
+  gist** (see below). Everything else held fixed to isolate the
+  target change.
+
+**HumanEval re-ablation results** (full 164, retrieval-as-input
+generator, `ablate_memory_mechanisms.py`):
+
+| ckpt | baseline | wm_off | pkm_off | both_off |
+|---|---|---|---|---|
+| v1 (no retrieval-as-input) | 11 | **+1** (decorative) | −6 | — |
+| v5 (lexical target)        | 10 | **5 (−5)** | 3 (−7) | 2 (−8) |
+| v6 (gist target)           |  9 | **4 (−5)** | 1 (−8) | 3 (−6) |
+
+**The finding: retrieval-as-input — not the supervision target — is
+what made WM load-bearing.** v1's `wm_off` was +1 (WM decorative);
+v5 *and* v6 both drop −5 (−50 %). But v6's gist target produced **no
+measurable change over v5's lexical target** — headline flat (9 vs
+10/164, v6 marginally worse, within noise), `wm_off` delta identical
+(−5). So the gist-vs-lexical hypothesis is **not supported by the
+HumanEval ablation**.
+
+**Two reasons the HumanEval ablation cannot see a gist effect, both
+real:**
+1. **Confound.** In retrieval-as-input mode the WM injection *is* the
+   think-token input embedding. `ablate_memory_mechanisms.py` ablates
+   by zeroing `memory.W_proj.weight` → think tokens get a *zero* input.
+   So `wm_off −5` partly measures "think mechanism broken", not
+   "retrieved content useless". **Fix: ablate by replacing the WM read
+   with a mean vector, not zero** (so think tokens still get *a*
+   signal) — `eval_longctx_recall.py --wm_ablate mean`.
+2. **Wrong probe.** HumanEval problems are short — they fit inside
+   DeltaNet's recurrent state, so long-range memory is never needed.
+   WM's actual value (long-range recall) is structurally invisible
+   here; all headline numbers sit at 9–11/164 regardless. The right
+   probe is **held-out long-context recall** (`eval_longctx_recall.py`,
+   `data/longctx_recall_heldout.jsonl`) — that's where gist-vs-lexical
+   can actually differ.
+
+### Long-context recall eval — thinking corrupts recall (2026-05-20)
+`eval_longctx_recall.py` on a 600-task held-out set (6 distance
+buckets, 64–768 tokens; the 768 bucket exceeds the 1024-trained
+context and is skipped). var_binding tasks: bind `x = N` at the top,
+distractor, `print(x)`. Per-distance recall accuracy:
+
+| distance | v1 (plain think) | v5 (lexical) | v6 (gist) |
+|---|---|---|---|
+| 64  | 100% | 99%  | 99% |
+| 128 |  95% | 100% | 99% |
+| 256 |  87% | 100% | 90% |
+| 384 |  68% | 100% | 75% |
+| 512 |  20% | 100% | 61% |
+| **overall** | **74.0%** | **99.8%** | **84.8%** |
+| **think_rate** | **0.36** | **0.012** | **0.23** |
+
+**The finding: thinking corrupts long-range recall, and the damage
+scales with think volume — not with the injection mechanism.** v1
+(plain `[THINKING]` token, no retrieval-as-input) is the WORST (20% at
+distance 512) and thinks the most (0.36). v5 thinks almost never
+(0.012) and is perfect. v6 is in between on both. A `wm_off` ablation
+of v6 (zero `W_proj` → think tokens get a *zero* input) was *worse*
+than v6 baseline — so it is not the retrieval *content* that corrupts,
+it is that every think token steps the DeltaNet recurrence and
+perturbs the precise binding the linear-RNN state was carrying.
+**Corollary: a gist and a precise pointer are in tension** — and more
+deeply, *any* think token in a linear-RNN recurrence is a recall risk.
+
+### v7 — additive α-gated injection + trunk gist (2026-05-20)
+`launch_sft_v7_combined_v7_additive.sh`. Two fixes:
+
+- **Fix B — additive α-gated retrieval injection.** retrieval-as-input
+  (v5/v6) *replaced* the think-token embedding with the WM retrieval.
+  v7 *adds* it: `input[think] = think_embed + α·retrieval`, α a learned
+  scalar `TinyLM.retrieval_input_alpha` (init 0.1, no weight decay —
+  the FiLM-α lesson). A useless retrieval contributes ≈0; the
+  think_embed baseline always survives, so a bad retrieval can never
+  overwrite trunk state. Mode is recorded as
+  `cfg["retrieval_input_additive"]`; `generate_with_retrieval_as_input`
+  takes `additive=` (True for v7, False replays v5/v6 replacement).
+- **Fix C — gist moved to the trunk, WM precision-only.** The v6 WM
+  gist supervision is removed. The multi-horizon windowed-gist target
+  (`windowed_future_gist`, `K ∈ {16,64,256}`) now supervises the
+  TRUNK's heads (predict mean-pooled `h[t+1:t+1+K]` from `h[t]`), so
+  "direction" lives in the trunk and WM is free to learn precise
+  retrieval from the LM loss alone. CLI: `--future_emb_loss_weight 0.1
+  --wm_gist_horizons "16,64,256"`; heads saved as
+  `ckpt["future_gist_heads_state_dict"]`. The v5/v6 flags
+  `--wm_future_pred_weight`, `--wm_future_pred_T`, `--future_emb_T_max`,
+  `--future_emb_T_ramp_frac` are deprecated no-ops.
+
+Tests: `test_trunk_gist_loss.py` (gist math + multi-horizon loss),
+`test_retrieval_as_input.py` (additive formula, α param, additive vs
+replace). v7 also tests a hypothesis: removing the WM-gist loss should
+revert think_rate toward v5's 0.012 (v6's 0.23 was plausibly *caused*
+by that loss perturbing the gate). **If v7 still over-thinks and recall
+degrades, the next fix is architectural — make think tokens
+state-read-only in the DeltaNet recurrence (β=0 on the delta-rule
+write gate) so they cannot corrupt long-range state, with thinking
+influencing the emit via the WM channel instead.**
+
+### Phase C pretrain + grader-RL trajectory (2026-05-21..23)
+
+**Phase C — Chinchilla-completion pretrain**
+(`launch_pretrain_phase_c.sh`, 20.6 h on 1× RTX 5090). Continuation of
+the v7.1-pkm-film ckpt from 2.13 B → 5.28 B tokens
+(Chinchilla-optimal for 287 M), with the v7 trunk multi-horizon gist
+loss added. Result: **strict win over the v7.1 base on all 8
+per-source held-out CEs** (~0.17 CE mean; biggest wins on
+cybernative −0.29, python_codes −0.24, bigvul −0.21; wikipedia which
+was a tie at the 3.0 B midpoint also flipped positive by the end).
+In-run VAL ppl 5.83 → 4.90. PKM value-row norm grew 2.54 → 3.58
+during the continuation — the value table genuinely kept learning.
+
+**torch.compile + AOTAutograd ViewMeta bug, workaround + upstream
+fix.** The gist loss's backward gradient flow added a new graph
+output and tripped a SymInt-corruption bug in AOTAutograd's
+ViewMeta-replay (pytorch issue #124382 territory). Three principled
+fix attempts in `model.py` all crashed (return-tuple → segfault;
+attribute stash → garbage-shape RuntimeError; compute-inside-forward
+→ segfault). **Workaround**:
+`torch._functorch.config.view_replay_for_aliased_outputs = False`
+toggle in `speed_knobs.py` before `torch.compile` — verified 3×
+against the real trainer; held for the full 20.6 h Phase C run.
+**Upstream fix**: a proper PyTorch source patch was root-caused,
+implemented, and tested on a checkout at `~/ml/pytorch` on branch
+`fix-viewmeta-replay-garbage-shape` (commit 78e6245); two layered
+bugs — a C++ use-after-free in `_unsafe_view_ViewMeta`'s
+`SerializableTuple` (reference-typed element bound to a temporary
+from `std::make_tuple`), and an overlapping-stride tangent layout
+for `expand`'d outputs in `MemoryFormatMeta.from_tensor`.
+Equivalence-tested on CPU; PR pending.
+
+**Combined SFT on the Phase C base** (`launch_sft_phase_c.sh`, 43 min)
+→ HumanEval **10/164** (+2 over SFT v7 on the v7.1 base). Long-context
+recall **98.2 %**. **PKM is now load-bearing on HumanEval**:
+`pkm_off −5/−50 %` on the Phase C SFT ablation — the static-memory
+side-table genuinely contributes once given enough pretrain training
+(consistent with the row-norm growth above).
+
+**Grader-RL v1** (`launch_rl_grader_phase_c.sh`, 800-step GRPO):
+**14/164 at step-100** (+4 over Phase C SFT — the project's first
+execution-grounded RL lift). Plateaued at step-200 (13), still 14 at
+step-300, then **catastrophically collapsed around step-350** when
+the ponder cost finally bit and depth dropped from 120 → 30, taking
+the SFT-distilled CoT-+-code output format down with it (reward → 0,
+all rollouts syntax_error). Diagnosis: no KL-to-reference penalty.
+
+**Grader-RL v2** (`launch_rl_grader_phase_c_v2.sh`, KL-stable GRPO).
+Implemented the missing KL term (`--kl_coef 0.05`, frozen reference =
+the starting SFT ckpt) in `train_rl_grader.py`. Recipe also dropped
+ponder cost (depth was the v1 trigger), halved LR (5e-6 → 2e-6),
+tightened PPO clip (0.2 → 0.1), lowered temperature (0.9 → 0.7),
+capped at 400 steps. **Monotonically climbed**: step-100 14/164 →
+step-200 15/164 → step-300 **16/164 (9.8 %, new project best, +100 %
+relative over SFT v7's 8/164)**. KL bounded 0.05–0.10 throughout —
+the principled stability mechanism preventing v1-style drift.
+`train_rl_grader.py` now exposes `--kl_coef` and loads a frozen ref
+model; the docstring's long-promised KL term is finally implemented.
+
+**Decode-speedup pass (2026-05-23)**. Profile showed every generated
+token re-processes the entire prefix (~30 ms/tok at T=512). Two-tier
+fix: (1) **shipped**: `model._film_bypass = True` toggled around all
+generation loops (`eval_humaneval.generate`,
+`generate_with_retrieval_as_input`, `train_rl_grader.rollout_group_
+batched`) — K=3 FiLM self-feed at T=1 is pure waste. ~2× measured.
+(2) **in progress**: wire true state-passing incremental decoding
+through `TinyLM.forward_step` (foundation in
+`_FlaWrapper.forward_step` already exists from earlier work);
+estimated additional ~3.5–6×.
+
+**Self-distillation infra ready** (`gen_rejection_data.py` with
+`--keep_all`, `train_dpo.py`) for the next push past v2's 16/164 —
+the user-approved order is rejection-sampling SFT → DPO → iterative
+repair.
+
+### Headline HumanEval trajectory across this arc
+
+| stage | HumanEval | Δ |
+|---|---|---|
+| SFT v7 (v7.1 base, replacement retrieval, v6 WM-gist) | 8/164 | — |
+| Phase C SFT (Chinchilla base + additive + trunk gist) | 10/164 | +2 |
+| RL v1 step-100 (peak, then collapse) | 14/164 | +4 |
+| **RL v2 step-300 (KL-stable, current best)** | **16/164 (9.8 %)** | **+2** |
+
+Each architectural piece is now measurably load-bearing on its
+PROPER probe: PKM on HumanEval (−5 in ablation), WM on long-context
+recall (98.2 %), thinking gate is task-adaptive (0 % think on
+recall, ~33 % on code), FiLM on PPL. The remaining lever for the
+coding headline at 287 M is post-training scale + model size (the
+~12–15 % HumanEval band typical for this size class).
+
+### Other engineering bugs caught & fixed (2026-05-19 audit)
+  - **sft_code control-flow bug**: modern-load path (ckpt has memory +
+    gate) was sandwiched between three branches; the final `else: model,
+    cfg = build_model_from_ckpt(...)` re-ran for every modern-path
+    invocation, silently overwriting any flags the modern path had set
+    (FIX A, sft_with_thinking, etc.). Combined-SFT-v1 trained for 30
+    minutes WITHOUT FIX A despite the launcher passing
+    `--mem_write_only_at_think`. Fixed by guarding the legacy/original
+    paths behind `if not args_with_thinking_done`. Regression test:
+    `experiments/test_sft_code_loading.py::test_modern_path_honors_mem_write_only_at_think_flag`.
+  - **eval_bracket_structure reload bug**: `build_model_from_ckpt`
+    didn't pass `mem_write_only_at_think` from cfg to the
+    `WorkingMemory` constructor, so a ckpt trained with FIX A would be
+    re-evaluated with FIX A off (the flag is a plain bool attribute,
+    not in state_dict). Fixed by reading from cfg with default False.
+    Regression tests: `test_eval_reload_preserves_woat_flag_*`.
+  - **gate_floor/emit_threshold saturation in train_rl_grader rollout**:
+    `gate.clamp_min(gate_floor) >= emit_threshold` is trivially True
+    when `gate_floor >= emit_threshold`, so setting
+    `--gate_floor 0.5 --emit_threshold 0.5` (the v2-RL launcher)
+    silently made the model never-think regardless of the actual gate
+    output. Pinned by `experiments/test_rl_grader_gate_floor.py`. The
+    operational rule: **for RL rollouts that should preserve thinking,
+    use `gate_floor < emit_threshold`** (e.g. 0.3 vs 0.5).
+  - **future_head_state_dict was saved but never loaded** — broke
+    continuation training (eval is unaffected). Fixed by re-loading in
+    `sft_code.py` when `--future_emb_loss_weight > 0` and the source
+    ckpt has the state-dict key.
+
+### Open architectural finding: thinking gate is temperature-fragile
+At τ=0 (greedy eval) the gate produces a healthy `think_rate ≈ 0.30`
+on HumanEval. At τ=0.9 (RL rollout sampling) it collapses to bimodal:
+either ~0 (never think) or ~1 (always think) depending on whether
+`gate_floor` is below or at/above `emit_threshold`. Hypothesised cause:
+sampling pushes the hidden-state distribution into regions the gate
+wasn't trained on, so its output is essentially noise around 0.5; tiny
+config changes flip it to a stuck regime. Diagnostic
+`gate_collapse_diag` is planned. Implication: **don't expect train-time
+gate selectivity to survive RL rollouts** without explicit
+robustification (train under sampling, or replace the discrete gate
+with a continuous "soft think" attention-style head).
 
 ## Lessons learnt (don't relive these)
 

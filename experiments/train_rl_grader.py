@@ -620,11 +620,12 @@ def main():
                     default="checkpoints/rl_grader_v5_pkm.pt")
     p.add_argument("--steps", type=int, default=200,
                     help="Number of GRPO updates.")
-    p.add_argument("--batch", type=int, default=2,
-                    help="Problems per step per rank (B). 2 is the robust "
-                         "memory budget on 32 GiB once all features (PKM, "
-                         "WM, KL ref) are active — v6/v7 OOMed at batch=4 "
-                         "across MBPP prompt-length variance.")
+    p.add_argument("--batch", type=int, default=4,
+                    help="Problems per step per rank (B). 4 fits on 32 GiB "
+                         "with --activation_checkpointing ON (default). "
+                         "Earlier OOMs at batch=4 were without AC — every "
+                         "block's full activations were kept. AC reduces "
+                         "activation memory ~Nlayers× at ~30% compute cost.")
     p.add_argument("--grpo_n_group", type=int, default=4,
                     help="Rollouts per problem (N). v5 crashed at 8 → 4 is "
                          "the validated upper bound.")
@@ -747,6 +748,24 @@ def main():
     p.add_argument("--repair_temperature", type=float, default=-1.0,
                     help="Sampling temperature for repair rollouts. -1 → "
                          "reuse --temperature.")
+    p.add_argument("--activation_checkpointing",
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help="Wrap each Block's loss-bearing forward in "
+                         "torch.utils.checkpoint during the policy update. "
+                         "Trades ~30% extra compute for ~Nlayers× activation "
+                         "memory reduction → enables higher --batch. Rollouts "
+                         "use torch.no_grad so they're unaffected.")
+    p.add_argument("--policy_film_bypass",
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help="During the policy-update forward, skip FiLM K=3 "
+                         "self-feed (run as K=1 single pass). Tested but "
+                         "produces a log-prob mismatch with rollouts (which "
+                         "use K=3) → PPO ratio drops to ~0.5 → all gradients "
+                         "are clipped. NOT USEFUL as-is. Kept as a flag for "
+                         "future experiments where rollouts also use K=1 "
+                         "(currently blocked by the CLAUDE.md note that "
+                         "_film_bypass at decode catastrophically breaks "
+                         "T>0 sampling, commit 0d29d94).")
     args = p.parse_args()
 
     if args.smoke:
@@ -771,7 +790,9 @@ def main():
         print(f"[rl-grader] loading {args.load_ckpt}")
     model, cfg = build_model_from_ckpt(args.load_ckpt)
     model = model.to(device)
-    model.train()  # we'll switch to eval for rollouts then back for updates.
+    model.train()
+    if args.activation_checkpointing and hasattr(model, "activation_checkpointing"):
+        model.activation_checkpointing = True
     thinking_token_id = int(cfg.get("thinking_token_id"))
 
     # Frozen reference policy for KL penalty (the principled stability
@@ -1065,16 +1086,29 @@ def main():
         has_rollouts = 1 if flat_rollouts else 0
         any_has_rollouts = all_reduce_sum_int(has_rollouts, world_size) > 0
         if flat_rollouts:
-            loss, mean_ratio, mean_kl = policy_loss_for_rollouts_batched(
-                flat_rollouts, flat_advantages, model,
-                clip_eps=args.clip_eps,
-                thinking_token_id=thinking_token_id,
-                temperature=args.temperature,
-                pad_id=int(tok.eos_token_id) if tok.eos_token_id is not None else 0,
-                ref_model=ref_model,
-                kl_coef=args.kl_coef,
-            )
-            loss.backward()
+            prev_film_bypass_policy = getattr(model_module, "_film_bypass", False)
+            prev_film_bypass_ref = (getattr(ref_model, "_film_bypass", False)
+                                     if ref_model is not None else False)
+            if args.policy_film_bypass:
+                model_module._film_bypass = True
+                if ref_model is not None:
+                    ref_model._film_bypass = True
+            try:
+                loss, mean_ratio, mean_kl = policy_loss_for_rollouts_batched(
+                    flat_rollouts, flat_advantages, model,
+                    clip_eps=args.clip_eps,
+                    thinking_token_id=thinking_token_id,
+                    temperature=args.temperature,
+                    pad_id=int(tok.eos_token_id) if tok.eos_token_id is not None else 0,
+                    ref_model=ref_model,
+                    kl_coef=args.kl_coef,
+                )
+                loss.backward()
+            finally:
+                if args.policy_film_bypass:
+                    model_module._film_bypass = prev_film_bypass_policy
+                    if ref_model is not None:
+                        ref_model._film_bypass = prev_film_bypass_ref
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()

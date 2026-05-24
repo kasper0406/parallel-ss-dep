@@ -620,29 +620,51 @@ def main():
                     default="checkpoints/rl_grader_v5_pkm.pt")
     p.add_argument("--steps", type=int, default=200,
                     help="Number of GRPO updates.")
-    p.add_argument("--batch", type=int, default=4,
-                    help="Problems per step (B).")
+    p.add_argument("--batch", type=int, default=2,
+                    help="Problems per step per rank (B). 2 is the robust "
+                         "memory budget on 32 GiB once all features (PKM, "
+                         "WM, KL ref) are active — v6/v7 OOMed at batch=4 "
+                         "across MBPP prompt-length variance.")
     p.add_argument("--grpo_n_group", type=int, default=4,
-                    help="Rollouts per problem (N).")
-    p.add_argument("--lr", type=float, default=5e-6)
-    p.add_argument("--max_gen", type=int, default=80)
+                    help="Rollouts per problem (N). v5 crashed at 8 → 4 is "
+                         "the validated upper bound.")
+    p.add_argument("--lr", type=float, default=1.5e-6,
+                    help="Learning rate. v3 used 2e-6 (peak 17/164); v8 "
+                         "ran 500 steps stably at 1e-6. 1.5e-6 is the "
+                         "compromise default; lower for very long runs.")
+    p.add_argument("--max_gen", type=int, default=384,
+                    help="Max generated tokens per rollout (excl. thinks). "
+                         "Below ~256 truncates valid MBPP solutions.")
     p.add_argument("--max_think_per_step", type=int, default=4)
     p.add_argument("--total_think_budget", type=int, default=120)
     p.add_argument("--emit_threshold", type=float, default=0.5)
-    p.add_argument("--gate_floor", type=float, default=0.5)
+    p.add_argument("--gate_floor", type=float, default=0.0,
+                    help="Gate output floor before emit threshold compare. "
+                         "MUST be < --emit_threshold or thinking is silently "
+                         "disabled (test_rl_grader_gate_floor pins this). "
+                         "0.0 = let the trained gate decide freely.")
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--min_emit_before_eos", type=int, default=30)
-    p.add_argument("--clip_eps", type=float, default=0.2)
-    p.add_argument("--kl_coef", type=float, default=0.0,
+    p.add_argument("--clip_eps", type=float, default=0.1,
+                    help="PPO clip range. v2/v3/v8 stable at 0.1; 0.2 was "
+                         "the original GRPO paper value but our small "
+                         "batches favor tighter clipping.")
+    p.add_argument("--kl_coef", type=float, default=0.05,
                    help="KL-to-reference penalty coefficient (KL between "
                         "the current policy and a frozen reference policy "
-                        "= the starting --load_ckpt). 0 = disabled. The "
-                        "principled stability mechanism for grader-RL — "
-                        "without it the policy can drift arbitrarily far "
-                        "from the SFT base and catastrophically collapse "
-                        "(observed at v1 step ~350, see GEMINI.md). "
-                        "Recommended 0.05.")
-    p.add_argument("--ponder_cost", type=float, default=0.005)
+                        "= the starting --load_ckpt). The mandatory "
+                        "stability mechanism for grader-RL — without it "
+                        "the policy can drift arbitrarily far from the SFT "
+                        "base and catastrophically collapse (v1 step ~350). "
+                        "0.05 is v2/v3's validated value for ~200-step "
+                        "runs. For 500+ step runs, increase to 0.15 (v7b "
+                        "showed 0.08 was outrun at 500 steps; v8 with "
+                        "0.15 stayed bounded).")
+    p.add_argument("--ponder_cost", type=float, default=0.001,
+                    help="Per-thinking-token penalty. 0 = always-think gate "
+                         "collapse (v7b). 0.005 = catastrophic shutdown of "
+                         "gate (v1 step 350). 0.001 = gentle pressure that "
+                         "preserves selectivity (validated in v8).")
     p.add_argument("--ponder_shape", type=str, default="quadratic",
                     choices=["linear", "quadratic"])
     p.add_argument("--counterfactual", action="store_true", default=True)
@@ -651,18 +673,24 @@ def main():
     p.add_argument("--ponder_warmup_steps", type=int, default=50)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--log_every", type=int, default=1)
-    p.add_argument("--save_every", type=int, default=50)
+    p.add_argument("--save_every", type=int, default=25,
+                    help="Milestone ckpt cadence. Fine granularity helps "
+                         "identify the HumanEval peak post-hoc since RL "
+                         "trajectories are often noisy near the optimum.")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--dataset", type=str, default="mbpp",
+    p.add_argument("--dataset", type=str, default="mbpp_combined",
                     help="Code-grader dataset: mbpp (374, legacy), "
                          "mbpp_all (974), mbpp_plus (378), "
-                         "mbpp_combined (1352 = all+plus).")
-    p.add_argument("--extract_code_block", action="store_true",
+                         "mbpp_combined (1352 = all+plus, validated for "
+                         "curriculum coverage).")
+    p.add_argument("--extract_code_block", action=argparse.BooleanOptionalAction,
+                    default=True,
                     help="For distilled-SFT students that emit CoT + "
                          "```python ... ``` blocks: extract the python "
                          "fence and grade ONLY the extracted code "
                          "(otherwise the CoT prose breaks exec). Required "
-                         "when --load_ckpt is a Qwen-distilled SFT ckpt.")
+                         "when --load_ckpt is a Qwen-distilled SFT ckpt — "
+                         "without it HumanEval is structurally 0/164.")
     p.add_argument("--smoke", action="store_true",
                     help="Run a tiny end-to-end smoke (2 steps, B=N=2, max_gen=32).")
     p.add_argument("--curriculum_filter", action=argparse.BooleanOptionalAction,
@@ -693,11 +721,15 @@ def main():
                     help="Gaussian width of the target band. Wider = more spread "
                          "across difficulties at each step.")
     p.add_argument("--adaptive_curriculum", action=argparse.BooleanOptionalAction,
-                    default=False,
+                    default=True,
                     help="Closed-loop curriculum: target_p = max(adaptive_floor, "
                          "1 - mean_p_seen). Parameter-free except the floor; "
                          "tracks the model's capability frontier automatically. "
-                         "Mutually exclusive with --progressive_curriculum.")
+                         "Mutually exclusive with --progressive_curriculum. "
+                         "Default on — strictly better than the variance-only "
+                         "fallback (v7b drifted into a narrow band of lucky "
+                         "middle-difficulty problems; v8 progressive over-shot "
+                         "the model's actual capability).")
     p.add_argument("--curriculum_adaptive_floor", type=float, default=0.3,
                     help="Lower bound on the adaptive target_p — prevents the "
                          "curriculum from sampling impossibly-hard problems even "

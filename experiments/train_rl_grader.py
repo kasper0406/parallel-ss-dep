@@ -25,12 +25,56 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import pathlib
 import time
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# Distributed (torchrun) helpers
+# ---------------------------------------------------------------------------
+def setup_distributed() -> tuple[int, int, int]:
+    """Initialize torch.distributed from torchrun env vars if present.
+
+    Returns `(rank, world_size, local_rank)`. When not launched under
+    torchrun, returns `(0, 1, 0)` and skips init_process_group so the
+    script runs identically to the single-GPU path.
+    """
+    if "RANK" not in os.environ or int(os.environ.get("WORLD_SIZE", "1")) <= 1:
+        return 0, 1, 0
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return rank, world_size, local_rank
+
+
+def is_main(rank: int) -> bool:
+    return rank == 0
+
+
+def all_reduce_mean(x: float, world_size: int) -> float:
+    """Average a Python float across ranks (no-op if world_size == 1)."""
+    if world_size <= 1:
+        return x
+    t = torch.tensor([x], device="cuda")
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return float(t.item()) / world_size
+
+
+def all_reduce_sum_int(x: int, world_size: int) -> int:
+    """Sum an integer across ranks (no-op if world_size == 1)."""
+    if world_size <= 1:
+        return x
+    t = torch.tensor([x], device="cuda", dtype=torch.long)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return int(t.item())
 
 from experiments.code_grader import (
     Problem, grade, load_mbpp, truncate_at_stop, _STOP_SEQUENCES, LOADERS,
@@ -618,12 +662,21 @@ def main():
         args.max_gen = 32
         args.save_ckpt = ""  # don't pollute checkpoints/
 
-    torch.manual_seed(args.seed)
+    # ---- Distributed setup (torchrun) ----
+    rank, world_size, local_rank = setup_distributed()
+    device = torch.device(f"cuda:{local_rank}" if world_size > 1 else "cuda")
+    # Per-rank seed so each rank samples a DIFFERENT slice of problems
+    # → effective batch = world_size × args.batch unique problems/step.
+    torch.manual_seed(args.seed + rank)
+    if is_main(rank):
+        print(f"[rl-grader] world_size={world_size}  rank={rank}  "
+              f"local_rank={local_rank}")
 
     # ---- Load model + tokenizer
-    print(f"[rl-grader] loading {args.load_ckpt}")
+    if is_main(rank):
+        print(f"[rl-grader] loading {args.load_ckpt}")
     model, cfg = build_model_from_ckpt(args.load_ckpt)
-    model = model.to("cuda")
+    model = model.to(device)
     model.train()  # we'll switch to eval for rollouts then back for updates.
     thinking_token_id = int(cfg.get("thinking_token_id"))
 
@@ -632,52 +685,77 @@ def main():
     # base and catastrophically collapse). Lazy-loaded only when needed.
     ref_model = None
     if args.kl_coef > 0.0:
-        print(f"[rl-grader] loading reference policy from {args.load_ckpt}"
-              f" (frozen, kl_coef={args.kl_coef})")
+        if is_main(rank):
+            print(f"[rl-grader] loading reference policy from {args.load_ckpt}"
+                  f" (frozen, kl_coef={args.kl_coef})")
         ref_model, _ = build_model_from_ckpt(args.load_ckpt)
-        ref_model = ref_model.to("cuda").eval()
+        ref_model = ref_model.to(device).eval()
         for _p in ref_model.parameters():
             _p.requires_grad = False
+
+    # Wrap policy in DDP if multi-rank. Reference stays unwrapped (frozen,
+    # no grads). Rollouts call `model_module` directly (no DDP overhead
+    # under no_grad); the policy-update forward calls `model` (DDP-wrapped)
+    # so `.backward()` triggers automatic gradient all-reduce.
+    model_module = model
+    if world_size > 1:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        # `static_graph=False` because the model has data-dependent control
+        # flow (FiLM bypass toggling, etc.). `find_unused_parameters=True`
+        # is a safety net for the same reason — most params do receive
+        # gradient on every step, but the FiLM α / PKM α / retrieval α
+        # paths might not on every microbatch.
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=True)
 
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(
         cfg.get("tokenizer", "HuggingFaceTB/SmolLM2-135M"))
 
-    print(f"  thinking_token_id={thinking_token_id}  "
-          f"vocab={cfg['vocab_size']}  "
-          f"params={sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+    if is_main(rank):
+        print(f"  thinking_token_id={thinking_token_id}  "
+              f"vocab={cfg['vocab_size']}  "
+              f"params={sum(p.numel() for p in model_module.parameters())/1e6:.1f}M")
 
     # ---- Load problems
-    print(f"[rl-grader] loading dataset: {args.dataset}")
+    if is_main(rank):
+        print(f"[rl-grader] loading dataset: {args.dataset}")
     if args.dataset not in LOADERS:
         raise SystemExit(
             f"unknown --dataset {args.dataset!r}; choose from {list(LOADERS)}")
     problems = LOADERS[args.dataset]()
-    print(f"  loaded {len(problems)} problems; will sample {args.batch} per step")
+    if is_main(rank):
+        print(f"  loaded {len(problems)} problems; will sample "
+              f"{args.batch} per step per rank "
+              f"({args.batch * world_size} effective)")
 
     # ---- Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                              weight_decay=0.01)
 
     # ---- Loop
-    rng = torch.Generator().manual_seed(args.seed)
+    rng = torch.Generator().manual_seed(args.seed + rank)
     t0 = time.time()
-    print(f"\n{'step':>5}  {'reward_mean':>10}  {'reward_max':>10}  "
-          f"{'depth_mean':>10}  {'think_rate':>10}  {'pass_n':>6}  "
-          f"{'ratio':>6}  {'loss':>8}  {'tier_hist':>30}")
+    if is_main(rank):
+        print(f"\n{'step':>5}  {'reward_mean':>10}  {'reward_max':>10}  "
+              f"{'depth_mean':>10}  {'think_rate':>10}  {'pass_n':>6}  "
+              f"{'ratio':>6}  {'loss':>8}  {'tier_hist':>30}")
     for step in range(1, args.steps + 1):
         # Sample B problems.
         idx = torch.randint(0, len(problems), (args.batch,), generator=rng).tolist()
         batch_problems = [problems[i] for i in idx]
 
         # Generate N rollouts per problem in ONE batched forward per iter.
-        model.eval()
+        # Use the UNWRAPPED `model_module` so DDP doesn't try to manage the
+        # backward pass for no_grad rollouts (and so `prefill` /
+        # `forward_step` attribute lookups work — DDP wrap masks them).
+        model_module.eval()
         all_rollouts: list[list[Rollout]] = []
         for prob in batch_problems:
             prompt_text = build_mbpp_prompt(prob)
-            prompt_ids = tok(prompt_text, return_tensors="pt").input_ids.cuda()
+            prompt_ids = tok(prompt_text, return_tensors="pt").input_ids.to(device)
             group = rollout_group_batched(
-                model, tok, prompt_ids,
+                model_module, tok, prompt_ids,
                 n_rollouts=args.grpo_n_group,
                 thinking_token_id=thinking_token_id,
                 eos_token_id=tok.eos_token_id,
@@ -741,6 +819,12 @@ def main():
                     continue
                 flat_rollouts.append(r)
                 flat_advantages.append(float(adv.item()))
+        # DDP requires the SAME number of forward passes on every rank or
+        # the all-reduce will hang. Synchronise "do we have rollouts this
+        # step" across ranks: skip the policy update only if NO rank has
+        # any rollouts to update on.
+        has_rollouts = 1 if flat_rollouts else 0
+        any_has_rollouts = all_reduce_sum_int(has_rollouts, world_size) > 0
         if flat_rollouts:
             loss, mean_ratio, mean_kl = policy_loss_for_rollouts_batched(
                 flat_rollouts, flat_advantages, model,
@@ -758,6 +842,17 @@ def main():
             loss_val = float(loss.item())
             ratio_val = float(mean_ratio.item())
             kl_val = float(mean_kl.item())
+        elif any_has_rollouts and world_size > 1:
+            # Some other rank has rollouts; we must still participate in
+            # the all-reduce. Do a trivial forward+backward that produces
+            # zero-norm gradients on all params, then take an
+            # opt.step() that's a no-op for this rank.
+            dummy = torch.zeros(
+                1, device=device, requires_grad=True
+            ) * sum(p.sum() for p in model.parameters() if p.requires_grad)
+            dummy.backward()
+            opt.zero_grad(set_to_none=True)
+            loss_val, ratio_val, kl_val = float("nan"), float("nan"), float("nan")
         else:
             loss_val, ratio_val, kl_val = float("nan"), float("nan"), float("nan")
 
@@ -765,15 +860,24 @@ def main():
         if step % args.log_every == 0:
             think_rate = (depths > 0).float().mean().item()
             pass_n = sum(1 for g in all_rollouts for r in g if r.tier == "pass")
+            # Aggregate across ranks for the headline numbers.
+            reward_mean_g = all_reduce_mean(rewards.mean().item(), world_size)
+            reward_max_g = all_reduce_mean(rewards.max().item(), world_size)
+            depth_mean_g = all_reduce_mean(depths.mean().item(), world_size)
+            think_rate_g = all_reduce_mean(think_rate, world_size)
+            pass_n_g = all_reduce_sum_int(pass_n, world_size)
+            # Tier histogram aggregation: only main rank prints, so it
+            # reflects rank-0 only (sufficient for trend monitoring).
             tier_str = "  ".join(f"{k}={v}" for k, v in sorted(tier_hist.items()))
-            print(f"{step:>5}  {rewards.mean():>10.4f}  "
-                  f"{rewards.max():>10.4f}  {depths.mean():>10.2f}  "
-                  f"{think_rate:>10.3f}  {pass_n:>6d}  "
-                  f"{ratio_val:>6.3f}  {loss_val:>8.4f}  "
-                  f"kl={kl_val:+.4f}  "
-                  f"{tier_str:>30}")
+            if is_main(rank):
+                print(f"{step:>5}  {reward_mean_g:>10.4f}  "
+                      f"{reward_max_g:>10.4f}  {depth_mean_g:>10.2f}  "
+                      f"{think_rate_g:>10.3f}  {pass_n_g:>6d}  "
+                      f"{ratio_val:>6.3f}  {loss_val:>8.4f}  "
+                      f"kl={kl_val:+.4f}  "
+                      f"{tier_str:>30}")
 
-        if args.save_ckpt and step % args.save_every == 0:
+        if args.save_ckpt and step % args.save_every == 0 and is_main(rank):
             pathlib.Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)
             # Save with `_step{N}` suffix so we keep every milestone
             # ckpt — RL peaks before collapse have happened before
@@ -784,16 +888,20 @@ def main():
                 step_path = f"{base[:-3]}_step{step}.pt"
             else:
                 step_path = f"{base}_step{step}"
-            torch.save({"state_dict": model.state_dict(),
+            torch.save({"state_dict": model_module.state_dict(),
                         "step": step, "config": cfg},
                         step_path)
             print(f"  [saved {step_path}]")
 
-    print(f"\n[rl-grader] done in {time.time() - t0:.0f}s")
-    if args.save_ckpt:
-        torch.save({"state_dict": model.state_dict(),
-                    "step": args.steps, "config": cfg}, args.save_ckpt)
-        print(f"final ckpt → {args.save_ckpt}")
+    if is_main(rank):
+        print(f"\n[rl-grader] done in {time.time() - t0:.0f}s")
+        if args.save_ckpt:
+            torch.save({"state_dict": model_module.state_dict(),
+                        "step": args.steps, "config": cfg}, args.save_ckpt)
+            print(f"final ckpt → {args.save_ckpt}")
+    if world_size > 1:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

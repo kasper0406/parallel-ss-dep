@@ -224,3 +224,67 @@ def test_progressive_stats_includes_target():
     s = cur.stats(step=50)
     assert "target_p" in s
     assert s["target_p"] == pytest.approx(0.45)
+
+
+def test_adaptive_and_progressive_are_mutually_exclusive():
+    with pytest.raises(ValueError):
+        ProblemDifficultyEMA(
+            ["a"], progressive=True, adaptive=True, total_steps=100)
+
+
+def test_adaptive_target_at_cold_start():
+    cur = ProblemDifficultyEMA(
+        ["a"], adaptive=True, init_pass_rate=0.25, adaptive_floor=0.3)
+    # No problems seen yet: mean_p = init_pass_rate = 0.25
+    # target = max(0.3, 1 - 0.25) = max(0.3, 0.75) = 0.75
+    assert cur.target_at(step=0) == pytest.approx(0.75)
+
+
+def test_adaptive_target_lowers_as_model_improves():
+    cur = ProblemDifficultyEMA(
+        ["a"], adaptive=True, alpha=1.0, adaptive_floor=0.3)
+    cur.update("a", [1.0])  # mean_p_seen = 1.0
+    # target = max(0.3, 1 - 1.0) = max(0.3, 0.0) = 0.3 (floor)
+    assert cur.target_at(step=0) == pytest.approx(0.3)
+
+
+def test_adaptive_target_clamps_at_floor():
+    cur = ProblemDifficultyEMA(
+        ["a", "b"], adaptive=True, alpha=1.0, adaptive_floor=0.4)
+    cur.update("a", [1.0])
+    cur.update("b", [1.0])
+    # mean_p = 1.0 → 1 - mean_p = 0.0 → clamped to floor 0.4
+    assert cur.target_at(step=0) == pytest.approx(0.4)
+
+
+def test_adaptive_weight_peaks_at_dynamic_target():
+    cur = ProblemDifficultyEMA(
+        ["easy", "mid", "hard"], adaptive=True, alpha=1.0,
+        adaptive_floor=0.2, target_sigma=0.1, eps=0.0)
+    cur.ema["easy"] = 0.8
+    cur.ema["mid"] = 0.5
+    cur.ema["hard"] = 0.2
+    # Update once with all-fail so seen set is populated; mean_p_seen still
+    # tracks current EMA values
+    cur.seen.add("easy")
+    cur.seen.add("mid")
+    cur.seen.add("hard")
+    # mean_p = (0.8+0.5+0.2)/3 = 0.5 → target = max(0.2, 0.5) = 0.5
+    assert cur.target_at(step=0) == pytest.approx(0.5)
+    ws = cur.sampling_weights(["easy", "mid", "hard"], step=0)
+    # mid (p=0.5) is at target, should weigh highest
+    assert ws[1] > ws[0]
+    assert ws[1] > ws[2]
+
+
+def test_adaptive_state_dict_roundtrip():
+    cur1 = ProblemDifficultyEMA(
+        ["a"], adaptive=True, adaptive_floor=0.25, target_sigma=0.2)
+    cur1.update("a", [1.0, 0.0])
+    state = cur1.state_dict()
+
+    cur2 = ProblemDifficultyEMA([])
+    cur2.load_state_dict(state)
+    assert cur2.adaptive is True
+    assert cur2.adaptive_floor == 0.25
+    assert cur2.target_at(step=0) == cur1.target_at(step=0)

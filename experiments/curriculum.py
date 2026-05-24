@@ -1,19 +1,23 @@
 """Difficulty-weighted curriculum for GRPO problem sampling.
 
-Per-problem pass-rate exponential moving average. Two sampling modes:
+Per-problem pass-rate exponential moving average. Three sampling modes:
 
 1. Variance-weighted (default): weight = 4·p·(1-p) + eps. Peaks at p=0.5
    (max GRPO advantage variance), down-weights saturated p=0 and p=1
    problems equally. Time-invariant.
 
-2. Progressive (opt-in): weight = exp(-(p - target(step))² / (2σ²)) + eps.
-   The target pass-rate decays linearly from target_start (default 0.7,
-   "easy") to target_end (default 0.2, "hard") across total_steps. Lets
-   the model consolidate on achievable problems first, then progressively
-   takes on harder ones — classical Bengio-style curriculum learning.
-   Addresses the v7b failure mode where the variance-weighted sampler
-   converged to a narrow band of "lucky" middle-difficulty problems
-   from step 1 onward, with no foundation-building phase.
+2. Progressive (opt-in, open-loop): weight = exp(-(p - target(step))²
+   / 2σ²) + eps. target_p decays linearly from target_start (0.7,
+   "easy") to target_end (0.2, "hard") over total_steps. Fixed schedule,
+   no feedback from model performance.
+
+3. Adaptive (opt-in, closed-loop): same Gaussian weighting but
+   target_p = max(target_floor, 1.0 - mean_p_over_seen), where mean_p
+   is the running EMA average. When model is weak (mean_p low), target
+   is high (sample easy problems where success is possible). As model
+   strengthens (mean_p rises), target lowers toward target_floor (keeping
+   us in the productive variance zone). Parameter-free except for the
+   floor. Tracks the capability frontier automatically.
 
 The EMA is a stable rolling estimate of the model's unprompted pass rate
 on each problem; iterative repair rollouts MUST NOT update it (they
@@ -36,18 +40,24 @@ class ProblemDifficultyEMA:
         target_end: float = 0.2,
         target_sigma: float = 0.15,
         total_steps: int | None = None,
+        adaptive: bool = False,
+        adaptive_floor: float = 0.3,
     ):
         self.alpha = float(alpha)
         self.eps = float(eps)
         self.init_pass_rate = float(init_pass_rate)
         self.progressive = bool(progressive)
+        self.adaptive = bool(adaptive)
         self.target_start = float(target_start)
         self.target_end = float(target_end)
         self.target_sigma = float(target_sigma)
+        self.adaptive_floor = float(adaptive_floor)
         self.total_steps = (None if total_steps is None
                             else max(1, int(total_steps)))
         if self.progressive and self.total_steps is None:
             raise ValueError("progressive=True requires total_steps")
+        if self.progressive and self.adaptive:
+            raise ValueError("progressive and adaptive are mutually exclusive")
         self.ema: dict[str, float] = {
             str(pid): float(init_pass_rate) for pid in problem_ids
         }
@@ -68,7 +78,15 @@ class ProblemDifficultyEMA:
         self.ema[pid] = (1.0 - self.alpha) * self.ema[pid] + self.alpha * pass_rate
         self.seen.add(pid)
 
+    def _mean_p_seen(self) -> float:
+        if not self.seen:
+            return self.init_pass_rate
+        vals = [self.ema[pid] for pid in self.seen]
+        return sum(vals) / len(vals)
+
     def target_at(self, step: int) -> float:
+        if self.adaptive:
+            return max(self.adaptive_floor, 1.0 - self._mean_p_seen())
         if not self.progressive:
             return float("nan")
         frac = min(1.0, max(0.0, step / self.total_steps))
@@ -77,8 +95,8 @@ class ProblemDifficultyEMA:
     def sampling_weight(self, problem_id: str, step: int | None = None) -> float:
         pid = str(problem_id)
         p = self.ema.get(pid, self.init_pass_rate)
-        if self.progressive and step is not None:
-            target = self.target_at(step)
+        if self.adaptive or (self.progressive and step is not None):
+            target = self.target_at(step or 0)
             return math.exp(-((p - target) ** 2) /
                             (2.0 * self.target_sigma ** 2)) + self.eps
         return 4.0 * p * (1.0 - p) + self.eps
@@ -97,8 +115,8 @@ class ProblemDifficultyEMA:
             out["mean_p"] = sum(seen_vals) / len(seen_vals)
             out["pct_in_band"] = sum(
                 1 for p in seen_vals if 0.1 <= p <= 0.9) / n_seen
-        if self.progressive and step is not None:
-            out["target_p"] = self.target_at(step)
+        if self.adaptive or (self.progressive and step is not None):
+            out["target_p"] = self.target_at(step or 0)
         return out
 
     def state_dict(self) -> dict:
@@ -113,6 +131,8 @@ class ProblemDifficultyEMA:
             "target_end": self.target_end,
             "target_sigma": self.target_sigma,
             "total_steps": self.total_steps,
+            "adaptive": self.adaptive,
+            "adaptive_floor": self.adaptive_floor,
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -127,6 +147,9 @@ class ProblemDifficultyEMA:
             self.target_end = float(state["target_end"])
             self.target_sigma = float(state["target_sigma"])
             self.total_steps = state["total_steps"]
+        if "adaptive" in state:
+            self.adaptive = bool(state["adaptive"])
+            self.adaptive_floor = float(state["adaptive_floor"])
 
 
 def merge_rank_updates(

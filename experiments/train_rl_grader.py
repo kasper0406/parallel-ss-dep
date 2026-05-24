@@ -692,6 +692,16 @@ def main():
     p.add_argument("--curriculum_target_sigma", type=float, default=0.15,
                     help="Gaussian width of the target band. Wider = more spread "
                          "across difficulties at each step.")
+    p.add_argument("--adaptive_curriculum", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="Closed-loop curriculum: target_p = max(adaptive_floor, "
+                         "1 - mean_p_seen). Parameter-free except the floor; "
+                         "tracks the model's capability frontier automatically. "
+                         "Mutually exclusive with --progressive_curriculum.")
+    p.add_argument("--curriculum_adaptive_floor", type=float, default=0.3,
+                    help="Lower bound on the adaptive target_p — prevents the "
+                         "curriculum from sampling impossibly-hard problems even "
+                         "when the model becomes strong (mean_p high).")
     p.add_argument("--iterative_repair", action=argparse.BooleanOptionalAction,
                     default=False,
                     help="After grading, do a second rollout on failed attempts "
@@ -797,6 +807,8 @@ def main():
         target_end=args.curriculum_target_end,
         target_sigma=args.curriculum_target_sigma,
         total_steps=args.steps if args.progressive_curriculum else None,
+        adaptive=args.adaptive_curriculum,
+        adaptive_floor=args.curriculum_adaptive_floor,
     )
     try:
         _ckpt_blob = torch.load(args.load_ckpt, map_location="cpu",

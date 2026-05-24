@@ -24,6 +24,7 @@ should complete in <2 minutes on a 5090.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as _cf
 import math
 import os
 import pathlib
@@ -93,6 +94,30 @@ def all_gather_object_list(obj, world_size: int) -> list:
         return [obj]
     out = [None for _ in range(world_size)]
     dist.all_gather_object(out, obj)
+    return out
+
+
+def grade_in_parallel(jobs, *, timeout_s: int = 5, max_workers: int = 8):
+    """Grade a list of (Problem, code) pairs in parallel via ThreadPoolExecutor.
+
+    Each grade() call spawns its own Python subprocess for execution — the
+    GIL is irrelevant, so threads give real parallelism on the subprocess
+    fork/wait. Results are returned in the SAME ORDER as `jobs`.
+    """
+    n = len(jobs)
+    if n == 0:
+        return []
+    if max_workers <= 1 or n == 1:
+        return [grade(prob, code, timeout_s=timeout_s) for prob, code in jobs]
+    workers = min(max_workers, n)
+    out: list = [None] * n
+    with _cf.ThreadPoolExecutor(max_workers=workers) as pool:
+        fut_to_idx = {
+            pool.submit(grade, prob, code, timeout_s): i
+            for i, (prob, code) in enumerate(jobs)
+        }
+        for fut in _cf.as_completed(fut_to_idx):
+            out[fut_to_idx[fut]] = fut.result()
     return out
 
 
@@ -750,6 +775,11 @@ def main():
     p.add_argument("--repair_temperature", type=float, default=-1.0,
                     help="Sampling temperature for repair rollouts. -1 → "
                          "reuse --temperature.")
+    p.add_argument("--grade_workers", type=int, default=8,
+                    help="ThreadPoolExecutor size for code grading. Each "
+                         "grade() spawns a subprocess (GIL irrelevant); "
+                         "values above 8-12 don't help and risk fork "
+                         "pressure on the host. 1 = sequential (legacy).")
     p.add_argument("--activation_checkpointing",
                     action=argparse.BooleanOptionalAction, default=True,
                     help="Wrap each Block's loss-bearing forward in "
@@ -928,25 +958,31 @@ def main():
                 min_emit_before_eos=args.min_emit_before_eos,
             )
             all_rollouts.append(group)
-        # Grade first-pass rollouts.
         tier_hist = {}
-        first_pass_error_texts: list[list[str | None]] = []
-        for prob, group in zip(batch_problems, all_rollouts):
-            errs = []
-            for r in group:
+        first_pass_error_texts: list[list[str | None]] = [
+            [None] * len(group) for group in all_rollouts
+        ]
+        flat_jobs: list[tuple] = []
+        flat_index: list[tuple[int, int]] = []
+        for gi, (prob, group) in enumerate(zip(batch_problems, all_rollouts)):
+            for ri, r in enumerate(group):
                 if args.extract_code_block:
                     extracted = extract_code_block(r.text)
                     code = extracted if extracted is not None else r.text
                 else:
                     code = build_mbpp_prompt(prob) + r.text
-                g_res = grade(prob, code, timeout_s=5)
-                r.reward = float(g_res.score)
-                r.tier = g_res.tier
-                r.n_passed = g_res.n_passed
-                r.n_tests = g_res.n_tests
-                tier_hist[g_res.tier] = tier_hist.get(g_res.tier, 0) + 1
-                errs.append(g_res.error_text)
-            first_pass_error_texts.append(errs)
+                flat_jobs.append((prob, code))
+                flat_index.append((gi, ri))
+        grade_results = grade_in_parallel(
+            flat_jobs, timeout_s=5, max_workers=args.grade_workers)
+        for (gi, ri), g_res in zip(flat_index, grade_results):
+            r = all_rollouts[gi][ri]
+            r.reward = float(g_res.score)
+            r.tier = g_res.tier
+            r.n_passed = g_res.n_passed
+            r.n_tests = g_res.n_tests
+            tier_hist[g_res.tier] = tier_hist.get(g_res.tier, 0) + 1
+            first_pass_error_texts[gi][ri] = g_res.error_text
 
         # Snapshot first-pass rewards BEFORE running repair — these are
         # what feeds the curriculum EMA (the model's unprompted pass-rate;
@@ -965,6 +1001,9 @@ def main():
         if args.iterative_repair:
             rep_temp = (args.temperature if args.repair_temperature < 0
                         else args.repair_temperature)
+            repair_jobs: list[tuple] = []
+            repair_meta: list[tuple[int, str, Rollout]] = []
+            zero_var_per_group: list[bool] = [False] * len(batch_problems)
             for gi, (prob, group) in enumerate(zip(batch_problems, all_rollouts)):
                 rewards_here = [float(r.reward) for r in group]
                 targets = select_repair_targets(
@@ -976,15 +1015,15 @@ def main():
                     continue
                 orig_passes = sum(1 for r in rewards_here if r >= 0.5)
                 orig_zero_var = orig_passes == 0 or orig_passes == len(group)
+                zero_var_per_group[gi] = orig_zero_var
                 if orig_zero_var:
                     n_zero_var_before += 1
-                repair_rewards_this_group: list[float] = []
+                orig_prompt = build_mbpp_prompt(prob)
                 for ti in targets:
                     failed_code = (extract_code_block(group[ti].text)
                                    if args.extract_code_block
                                    else group[ti].text) or group[ti].text
                     err_text = first_pass_error_texts[gi][ti] or ""
-                    orig_prompt = build_mbpp_prompt(prob)
                     repair_prompt = build_repair_prompt(
                         orig_prompt, failed_code, err_text)
                     repair_ids = tok(repair_prompt,
@@ -1008,19 +1047,31 @@ def main():
                         code = extracted if extracted is not None else rr.text
                     else:
                         code = repair_prompt + rr.text
-                    g_res = grade(prob, code, timeout_s=5)
+                    repair_jobs.append((prob, code))
+                    repair_meta.append((gi, repair_prompt, rr))
+            if repair_jobs:
+                rep_grade_results = grade_in_parallel(
+                    repair_jobs, timeout_s=5,
+                    max_workers=args.grade_workers)
+                per_group_repair_rewards: list[list[float]] = [
+                    [] for _ in batch_problems]
+                for (gi, _, rr), g_res in zip(repair_meta, rep_grade_results):
                     rr.reward = float(g_res.score)
                     rr.tier = g_res.tier
                     rr.n_passed = g_res.n_passed
                     rr.n_tests = g_res.n_tests
-                    repair_rewards_this_group.append(rr.reward)
+                    per_group_repair_rewards[gi].append(rr.reward)
                     repair_n += 1
                     if g_res.tier == "pass":
                         repair_pass_n += 1
                     repair_groups[gi].append(rr)
-                if orig_zero_var and group_became_variance_bearing(
-                        rewards_here, repair_rewards_this_group):
-                    n_lift_to_var += 1
+                for gi, group in enumerate(all_rollouts):
+                    if not zero_var_per_group[gi]:
+                        continue
+                    rewards_here = [float(r.reward) for r in group]
+                    if group_became_variance_bearing(
+                            rewards_here, per_group_repair_rewards[gi]):
+                        n_lift_to_var += 1
 
         # Combined (per-group ragged) rollout sets for advantage computation.
         combined_groups: list[list[Rollout]] = [

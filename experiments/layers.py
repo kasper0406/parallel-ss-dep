@@ -157,25 +157,112 @@ class _FlaWrapper(nn.Module):
     fla's chunked kernels (chunk_delta_rule, etc.) assert non-fp32 inputs.
     We cast hidden_states to bf16 on entry and back to the caller's dtype
     on exit so the rest of the (fp32) model is unaffected.
+
+    `accepts_cu_seqlens`: FLA's recurrent kernels take a `cu_seqlens` ragged
+    index for packed variable-length sequences (cross-document isolation).
+    When `Block.forward` passes one, we flatten (B, T, d) -> (1, B*T, d) so
+    the kernel sees a single ragged batch, then reshape back. Default False
+    (conservative — an unverified fla layer could choke on the kwarg);
+    subclasses whose underlying fla layer is verified to accept `cu_seqlens`
+    opt in by setting this True.
     """
+
+    accepts_cu_seqlens = False
 
     def __init__(self, fla_layer: nn.Module):
         super().__init__()
         self.layer = fla_layer
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # fla's chunked kernels assert non-fp32 inputs. Use mixed-precision
-        # autocast so weights stay fp32 (master copy) and the kernel sees bf16.
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None
+                ) -> torch.Tensor:
+        # fla's chunked kernels assert non-fp32 inputs. The trainer wraps
+        # model.forward in bf16 autocast via apply_speed_knobs, but eval
+        # callers (eval_humaneval.py, diag_ckpt.py, ...) don't — we keep
+        # the explicit autocast here as a safety net so any caller works.
         in_dtype = x.dtype
+        if cu_seqlens is not None and self.accepts_cu_seqlens:
+            B, T, d = x.shape
+            x_flat = x.reshape(1, B * T, d)
+            with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+                out = self.layer(x_flat, cu_seqlens=cu_seqlens)
+            if isinstance(out, tuple):
+                out = out[0]
+            return out.reshape(B, T, d).to(in_dtype)
         with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
             out = self.layer(x)
         if isinstance(out, tuple):
             out = out[0]
         return out.to(in_dtype)
 
+    def forward_step(self, x: torch.Tensor, past_key_values, layer_idx: int):
+        """Incremental-decoding forward for one timestep.
+
+        `x`: (B, 1, d_model) — typically one new token's hidden state.
+        `past_key_values`: an `fla.models.utils.Cache` (or None for the
+            first step). Provides this layer's recurrent state from the
+            previous step; the FLA kernel reads it via `layer_idx`.
+        `layer_idx`: which entry of `past_key_values` this wrapper's
+            inner FLA layer owns. Must be unique per attention layer in
+            the model.
+
+        Returns `(out, past_key_values)` — `out` is (B, 1, d_model);
+        `past_key_values` is the updated cache (same object, mutated
+        in-place by FLA).
+
+        Implementation notes:
+        - FLA's DeltaNet (and family) reads `self.layer.layer_idx` and
+          `self.layer.mode` at forward time. We monkey-patch both for
+          the duration of this call so the SAME instance can serve both
+          full-sequence training (`mode="chunk"`) and single-step
+          incremental decoding (`mode="fused_recurrent"`). The original
+          mode is restored on the way out so subsequent training-path
+          forwards behave identically.
+        - The cache is bit-identical to having run the chunked kernel
+          on the full sequence so far (verified in
+          `experiments/test_incremental_decode.py`).
+        """
+        # Lazy-initialise a Cache the first time we're called.
+        if past_key_values is None:
+            from fla.models.utils import Cache
+            past_key_values = Cache()
+        in_dtype = x.dtype
+        layer = self.layer
+        saved_mode = getattr(layer, "mode", None)
+        saved_layer_idx = getattr(layer, "layer_idx", None)
+        try:
+            layer.layer_idx = int(layer_idx)
+            # Switch this instance to the incremental kernel for the call.
+            if saved_mode is not None and saved_mode != "fused_recurrent":
+                layer.mode = "fused_recurrent"
+            with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+                out = layer(x, past_key_values=past_key_values, use_cache=True)
+        finally:
+            # Restore — never leave the model in a non-training-friendly state.
+            if saved_mode is not None:
+                layer.mode = saved_mode
+            if saved_layer_idx is None:
+                # Best effort: leave it set; FLA tolerates a stale layer_idx
+                # as long as we keep calling with the same Cache.
+                pass
+            else:
+                layer.layer_idx = saved_layer_idx
+        # FLA's DeltaNet returns (hidden, attentions, past_key_values).
+        if isinstance(out, tuple):
+            new_pkvs = out[-1] if len(out) >= 3 else past_key_values
+            out_t = out[0]
+        else:
+            new_pkvs = past_key_values
+            out_t = out
+        return out_t.to(in_dtype), new_pkvs
+
 
 class DeltaNetAttention(_FlaWrapper):
     """fla DeltaNet — same KV-state size as our linear_attn, plus delta updates."""
+
+    # fla's DeltaNet.forward reads cu_seqlens from kwargs and threads it into
+    # chunk_delta_rule + all three ShortConvolutions (fwd + bwd). Verified in
+    # the local fork — see CROSS_DOC_ISOLATION_PLAN.md.
+    accepts_cu_seqlens = True
 
     def __init__(self, d_model: int, n_heads: int, d_head: int):
         from fla.layers import DeltaNet

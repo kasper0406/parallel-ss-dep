@@ -1,5 +1,33 @@
 # state-dep-parallel
 
+## Current direction — "Small super-coder"
+
+The active goal of this repo is to build a **small, efficient code model that competes with much larger models on coding benchmarks** under tight compute (2× RTX 5090). The architectural research below feeds into that target.
+
+Stack as of 2026-05-18:
+- **DeltaNet** backbone (`--arch deltanet`) — bounded-state linear RNN, no KV-cache cost. *Note: `gated_deltanet` is broken on sm_120 RTX 5090 (FLA Triton kernel bug); plain `deltanet` works.*
+- **Shallow-wide trunk (v7.1, validated 2026-05-18)** — **10 layers × 896 d_model + 5 dense reverse FiLM pairs (0,5)(1,6)(2,7)(3,8)(4,9) + K=3 self-feed**. Iso-param swap of the 30L × 576d production trunk inspired by the "shallow + heavy feedback" structure of biological cortex. Trains **18 % faster wall-clock** at the same step budget and beats the deep baseline on final VAL ppl (5.83 vs 5.89 at 9300 steps / 2.13 B tokens). Cross-layer-attention sister run available (`--feedback_xattn`, `film_sigmoid` form with per-token gates and no_grad pass-1).
+- **Working memory** ([`experiments/model.py::WorkingMemory`](experiments/model.py)) — write-gated bounded buffer of past hidden states, read via soft attention at "think" positions. **+11.1 pp recall** on saturated MQAR (T=512 / K=128) vs DeltaNet alone.
+- **Product-Key Memory side-table (v7.1, validated 2026-05-18)** ([`experiments/memory_layer.py::PKMLayer`](experiments/memory_layer.py)) — 4 heads × 256² = 262 k learned KV slots dropped in after one block, sub-linear lookup via factorised sub-keys (Lample 2019). Original v5-pkm training was structurally broken (post-hoc probe: 97 % of value rows still at random init after 2.13 B tokens, only 4 % of slots ever used). **The v7.1 5-fix bootstrap package makes PKM actually learn**: output gate α with sign-preserving floor, ε-greedy slot exploration warmup, value-init at residual scale, LayerNorm-on-scores, slot-diversity bonus + 100× value-LR. Per-source PKM-toggle Δ on the final ckpt is **always positive** — wikipedia +0.099 CE, cybernative +0.063, bigvul +0.044 (fact-heavy wins largest, as Lample predicted). Full design: [`PKM_PLAN.md`](PKM_PLAN.md); fixes documented in [`CLAUDE.md`](CLAUDE.md).
+- **Output / thinking gate** with **entropy-grounded auxiliary target** (`--gate_entropy_aux_weight 0.1`) — supervises the gate logit with `target = exp(-H_t / T)` derived from the same forward's logits (detached). Confident position → emit, uncertain → think. Free signal, single forward.
+- **Mixed-corpus pretrain** (`experiments/data_mix.py`, `configs/pretrain_mix_v*.yaml`) — 11 weighted HuggingFace streams (code, instruct, CS textbooks, Wikipedia, BigVul + CyberNative CVE data). Cross-document state isolation via `cu_seqlens` from the per-position `doc_ids` (no recurrent-state leak across packed documents).
+- **Speed knobs**: `--bf16 --tf32 --compile` (strict-mode dynamo, no silent fallback — added 2026-05-18); `--bf16_optim_state` stores AdamW/Muon state in bf16; `BF16StateAdamW(compile_step=True)` fuses the optim-step Python loop into a torch-compiled kernel; `--activation_checkpointing` lets `--batch 14` fit at T=2048; FiLM K-self-feed K=3 warmup curriculum (`--feedback_self_k_warmup_steps`); xattn pass-1 runs `no_grad` (added 2026-05-18) so cross-layer attention costs the same as FiLM K=3 instead of ~2× more.
+- **Training-methodology fixes** — `--wd 0.01` (was 0.1, fixes residual-stream collapse); `--lr_schedule wsd` (warmup-stable-decay, replaces cosine); Muon for ≥2D hidden matrices + AdamW for tables / 1D / embeddings; FiLM α gets weight_decay = 0. Diagnostic tooling in [`diag_ckpt.py`](experiments/diag_ckpt.py), [`probe_v5_pkm_utilization.py`](experiments/probe_v5_pkm_utilization.py), [`probe_pkm_per_source.py`](experiments/probe_pkm_per_source.py).
+- **Execution-grounded RL** ([`experiments/train_rl_grader.py`](experiments/train_rl_grader.py)) — GRPO with the dense `code_grader` score (tier ladder: `syntax_error` 0.0 → `exec_error` 0.05 → `runtime_error` 0.2 → `partial` 0.2-0.9 → `pass` 1.0) as reward, MBPP problems, PPO clipped policy. First validated lift on v5-pkm-SFT base: gate evolves from "always emit" to selective, pass-rate climbs from 1/16 at step 14 to 14 cumulative passes in 82 steps. **Where future capability lives** — pretrain VAL ppl plateaus around 5.8 at our scale; HumanEval is 0/50 on every pretrain-only ckpt we've measured (v4, v5-pkm, v7.1). RL is the lever, with v7.1-pkm-film as the strongest base to start from.
+
+Recent runs (2026-05-18):
+- **v7.1-pkm-film** (`launch_pretrain_mix_v7_pkm_film.sh`, 287 M params, 13.3 h on 1× RTX 5090) — **final VAL ppl 5.83**. Ckpt: `checkpoints/pretrain_mix_v7_pkm_film.pt`. The current SOTA pretrain base.
+- **v7.1-pkm-xattn** (`launch_pretrain_mix_v7_pkm_xattn.sh`, 287 M params, 13.0 h on 1× RTX 5090) — final VAL ppl 5.94.
+- **v4** (`launch_pretrain_mix_v4.sh`, 217 M params, 16.3 h) — final VAL ppl 5.89. Deep-trunk reference.
+
+Project framing: [`THESIS.md`](THESIS.md).
+Post-pretrain RL plan: [`PHASE_C_RL.md`](PHASE_C_RL.md).
+Architectural write-up: [`WORKING_MEMORY_FINDINGS.md`](WORKING_MEMORY_FINDINGS.md).
+
+---
+
+## Architecture-research background
+
 Mapping the design space of **state-dependent, parallelizable RNN cells**
 — with a specific finding: in a DeltaNet stack, a *single*
 sparse late-to-early FiLM connection (a minimal-form descendant of
@@ -61,6 +89,11 @@ The high-level idea of upper-to-lower-layer feedback in stacked RNNs
 is not new — see *Related work* below — but the **specific minimal
 form, the modern linear-RNN context, and the mechanism analysis are.**
 
+- [`THESIS.md`](THESIS.md) — project framing: why methodology-stacking
+  at small scale is the bet, what the claim is and isn't
+- [`PHASE_C_RL.md`](PHASE_C_RL.md) — prediction-as-RL-signal proposal:
+  reward code that's both correct *and* whose behaviour the model
+  predicted; the RL plan for after Phase A pretrain + Phase B SFT
 - [`RESULTS.md`](RESULTS.md) — full empirical writeup, Phases 1-16
 - [`NEXT_DIRECTIONS.md`](NEXT_DIRECTIONS.md) — current research plan
 - [`HISTORY.md`](HISTORY.md) — earlier hybrid + Lean + Triton-kernel
@@ -120,6 +153,22 @@ Chinchilla-scale or frontier-finetune follow-up*.
                           FiLM α≈−0.054 │
                                          pass-2 input
 ```
+
+## Current Frontier: Execution-grounded RL on the v5-pkm base
+
+### What's working (2026-05-16)
+
+- **PKM is a real token-efficiency win.** v5-pkm pretrain (218 M params, 884 M tokens, FiLM + WM + PKM) beats v3-long (no-PKM, 2.13 B tokens) on **every long-tail factual stream** (wikipedia −0.37 CE, bigvul −0.13, cybernative −0.12, python_codes −0.22) and ties overall CE — at 2.4× fewer tokens. PKM also broke the bigvul/cybernative monotonic upward drift that plagued v2/v3 pretrains. Per-head specialisation is concrete: single 1-in-262 k slots get hit 30-40× across 60-token generations.
+- **The thinking gate did learn an uncertainty signal during pretrain** — even though it was clamped at deploy. Inspection probe ([`experiments/inspect_v5_pkm.py`](experiments/inspect_v5_pkm.py)) on v5-pkm with `gate_floor=0.0` shows think_rate 83% on Wikipedia / Roman Empire prompts vs 7-10% on familiar code. WorkingMemory reads sharply (+53 to +63% below uniform, attending −40 to −200 tokens back into prompt). What pretrain *didn't* teach is using thinking *productively*: bursts increase but outputs degrade. That's an RL question, not a pretrain question.
+- **Execution-grounded RL is producing real capability lift.** [`train_rl_grader.py`](experiments/train_rl_grader.py) on the v5-pkm-SFT base with the dense `code_grader` reward, MBPP problems, ponder-cost shaping (`quadratic`, `counterfactual`, `warmup_steps=50`): pass-rate climbing from 1/16 rollouts at step 14 to 14 cumulative passes by step 82. The gate evolves from "always emit" toward "selective" (`think_rate` 0.69-1.00 in recent steps, `depth_mean` dropping after warmup) — exactly the design hypothesis: the dense reward + ponder cost teaches the model to think less but better.
+
+### Open follow-ups
+
+1. **Bigger SFT data** to cross 0/50 HumanEval baseline (currently the SFT'd v5-pkm scores 0/50; per memory this is a data-scale issue, not architecture).
+2. **Incremental decoding for rollouts** ([`experiments/layers.py::_FlaWrapper.forward_step`](experiments/layers.py) foundation shipped; FiLM K=3 + WorkingMemory buffer integration deferred).
+3. **Intra-document hard-token think-burst injection** at pretrain (currently only chunk boundaries) — the cleanest pretrain lever to teach "thinking should improve outputs" before RL.
+
+See [`PHASE_C_RL.md`](PHASE_C_RL.md) and [`NEXT_DIRECTIONS.md`](NEXT_DIRECTIONS.md).
 
 ## Validation matrix
 

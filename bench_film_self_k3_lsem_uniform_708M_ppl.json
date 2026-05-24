@@ -1,0 +1,49 @@
+{
+  "ckpt": "/home/knielsen/ml/parallel-ss-dep/checkpoints/film_self_k3_lsem_uniform_b10_708M_muon.pt",
+  "T": 512,
+  "n_chunks": 64,
+  "n_eval_tokens": 32768,
+  "config": {
+    "d_model": 1024,
+    "n_layers": 36,
+    "feedback_pairs": [
+      [
+        2,
+        34
+      ]
+    ],
+    "feedback_mode": "film",
+    "feedback_self_k": 3
+  },
+  "training_protocol": {
+    "ce": 3.4614160135388374,
+    "ppl": 31.862061697258472,
+    "n_tokens": 32768,
+    "elapsed_s": 3.2064901110716164
+  },
+  "self_consistency": {
+    "feedback_self_k": 3,
+    "n_batches": 32,
+    "abs_norm_mean": 250.18130207061768,
+    "final_norm_mean": 1996.3071517944336,
+    "rel_norm_mean": 0.12551101896287106
+  },
+  "2pass": {
+    "ce": 3.473834991455078,
+    "ppl": 32.26022319990571,
+    "n_tokens": 32768,
+    "elapsed_s": 1.940685971872881
+  },
+  "lagged_cached": {
+    "ce": 3.460349015891552,
+    "ppl": 31.828083083164156,
+    "n_tokens": 32768,
+    "elapsed_s": 494.28019037889317
+  },
+  "gap": {
+    "lc_vs_training_abs": -0.03397861409431613,
+    "lc_vs_training_rel": -0.0010664286077017976,
+    "lc_vs_2pass_abs": -0.4321401167415537,
+    "lc_vs_2pass_rel": -0.013395447206416625
+  }
+}

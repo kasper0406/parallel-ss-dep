@@ -112,9 +112,26 @@ def main():
     p.add_argument("--feedback_pairs", type=str, default="2,28",
                    help="Sparse FiLM pairs.")
     p.add_argument("--feedback_mode", type=str, default="film")
+    p.add_argument("--feedback_self_k", type=int, default=3,
+                   help="K=3 self-feeding closes the 1-pass deployment gap; "
+                        "default ON for distillation per the validated stack.")
     p.add_argument("--tie_embeddings", action="store_true", default=True)
     p.add_argument("--no_tie_embeddings", action="store_false",
                    dest="tie_embeddings")
+    p.add_argument("--output_gate", action="store_true",
+                   help="Enable per-position emit/think gate. Optional during "
+                        "distillation; useful if a downstream RL pass will use "
+                        "the gate.")
+    # NOTE: --use_memory intentionally removed from this trainer (2026-05-12).
+    # WorkingMemory injects only at positions matching `thinking_token_id`,
+    # which never appears in teacher token streams. We previously enabled it
+    # during distillation; gradient through the memory path was structurally
+    # zero (same failure mode as the old corpus-RAG) so the runs were a no-op.
+    # Memory belongs in RL (or in any setting that explicitly passes
+    # mem_read_mask, e.g. the synthetic recall ablations).
+    p.add_argument("--teacher_tokenizer", type=str,
+                   default="QuantTrio/Qwen3.6-35B-A3B-AWQ",
+                   help="Saved to ckpt config so eval scripts pick the right tokenizer.")
     p.add_argument("--batch", type=int, default=4)
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -167,13 +184,29 @@ def main():
         tuple(int(x) for x in pair.split(","))
         for pair in args.feedback_pairs.split(";") if pair
     )
-    print(f"\nBuilding student: vocab={vocab_size} d_model={args.d_model} "
-          f"n_layers={args.n_layers} sparse={fb_pairs} tie_emb={args.tie_embeddings}")
+    # Reserve a single extra vocab slot for the thinking-token id only when
+    # the output gate is on (the gate may be useful downstream even though
+    # memory is intentionally NOT enabled here — see the use_memory note above).
+    teacher_vocab = vocab_size
+    needs_think_slot = bool(args.output_gate)
+    if needs_think_slot:
+        vocab_size = teacher_vocab + 1
+        thinking_token_id = teacher_vocab  # the new last id
+    else:
+        thinking_token_id = None
+    print(f"\nBuilding student: vocab={vocab_size}"
+          f"{' (+1 think slot)' if needs_think_slot else ''}  "
+          f"d_model={args.d_model} n_layers={args.n_layers} sparse={fb_pairs} "
+          f"self_k={args.feedback_self_k} gate={args.output_gate} "
+          f"tie_emb={args.tie_embeddings}")
     model = TinyLM(
         vocab_size=vocab_size, d_model=args.d_model, n_heads=args.n_heads,
         d_head=args.d_head, n_layers=args.n_layers,
         attention_cls=DeltaNetAttention,
         feedback_mode=args.feedback_mode, feedback_pairs=fb_pairs,
+        feedback_self_k=int(args.feedback_self_k),
+        output_gate=bool(args.output_gate),
+        thinking_token_id=thinking_token_id,
         tie_embeddings=args.tie_embeddings,
     ).cuda()
     print(f"  params: {model.num_params() / 1e6:.1f} M")
@@ -211,6 +244,10 @@ def main():
         x_ids, tk_ids, tk_lps = get_batch(train_idx, step)
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
             logits = model(x_ids)
+            # If we widened the vocab for a thinking slot, slice it off for
+            # the KL/CE losses (teacher never emits the thinking-token).
+            if needs_think_slot:
+                logits = logits[..., :teacher_vocab]
             loss, ce, kl = distill_loss(
                 logits, x_ids, tk_ids, tk_lps,
                 kl_weight=args.kl_weight, ce_weight=args.ce_weight,
@@ -250,6 +287,8 @@ def main():
             tp = top_lps_t[sel].cuda()
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 logits = model(x)
+                if needs_think_slot:
+                    logits = logits[..., :teacher_vocab]
                 loss, ce, kl = distill_loss(
                     logits, x, ti, tp,
                     kl_weight=args.kl_weight, ce_weight=args.ce_weight,
@@ -273,8 +312,13 @@ def main():
                 "n_layers": args.n_layers, "max_T": T,
                 "feedback_mode": args.feedback_mode,
                 "feedback_pairs": fb_pairs,
+                "feedback_self_k": int(args.feedback_self_k),
                 "tie_embeddings": args.tie_embeddings,
+                "output_gate": bool(args.output_gate),
+                "thinking_token_id": thinking_token_id,
                 "teacher_model": teacher_model,
+                "tokenizer": args.teacher_tokenizer,
+                "arch": "deltanet",
                 "shards": args.shards,
             },
         }, args.save_ckpt)

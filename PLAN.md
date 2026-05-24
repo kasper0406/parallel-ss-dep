@@ -1,6 +1,72 @@
 # state-dep-parallel — research plan
 
-## Goal
+## Current direction (as of 2026-05-12) — small super-coder
+
+**Top-level goal:** a DeltaNet-backbone code model that competes with
+much larger Transformer code models on coding benchmarks under tight
+compute (2× RTX 5090). All architectural research below now feeds this
+target.
+
+### Validated this round
+- **Bounded working memory** (`experiments/model.py::WorkingMemory`):
+  write-gated buffer of past hidden states, read at think / query
+  positions via soft attention. **+10–11 pp recall** on saturated
+  MQAR (T=512 / K=64, 128). Cost O(T·K·d), no quadratic attention.
+- **Read-event-density threshold**: induction (1 read/seq) **−28 pp**;
+  dyck (per-position) tied but ~2× faster; MQAR (~256+ reads) +10 pp.
+  Memory only helps when reads happen frequently.
+- **Distillation pipeline end-to-end** with Qwen3.6-35B-A3B-AWQ
+  teacher: 10 M tokens → val PPL 81 → 41. SFT on MBPP + CodeAlpaca
+  pushes loss to ~2; HumanEval pass@1 stays at 0/50 — at this data
+  scale the model is code-shaped but not problem-solving. Bottleneck
+  is data, not architecture.
+
+### Ruled out
+- Corpus-RAG (the old `rag_projection`) — structurally dead. Replaced
+  by `WorkingMemory`.
+- Natural-text RL on the 8.2 M-token SFT base (HumanEval 0/20).
+- 10 M-token Qwen-distill + 10 k-pair SFT — same scale → same outcome.
+
+### Next round (active)
+- **Run the actual RL+memory experiment.** Architecture and pipeline are
+  validated independently, but a real RL run with memory enabled and
+  extended thinking depth (≥16) on the SFT base has not been measured
+  end-to-end. Headline metrics to track: `grpo/avg_depth`,
+  `grpo/think_rate`, `mem/proj_norm`, `mem/write_gate_mean`,
+  `grpo/depth_ce_d{i}` (does deeper thinking lower CE?), and
+  HumanEval/MBPP pass@1 before/after. Memory was only ever trained on
+  the synthetic ablations; RL is its first real-data test.
+- Scale data ≥10× (deferred until the RL run tells us whether the
+  architecture is moving the needle on real text).
+- The eval harness (`experiments/code_grader.py`) is ready.
+
+### Update (2026-05-14) — pretrain is now the active blocker, not RL
+
+Diagnosed why pretrain was undertraining badly (residual-stream collapse
+from WD 0.1) and fixed it. **The plan above is paused** — RL on an
+undertrained base is the cold-start failure mode the docs already warn
+about. Sequence now:
+
+1. **v3-long** (active): `--wd 0.01`, 2.13 B tokens. Clean schedule test.
+2. **v4 pretrain**: re-weighted mix (the `bigvul`/`cybernative` upward CE
+   drift is the one thing still unfixed — mix imbalance) + the staged
+   knobs (`--wd 0.01 --lr_schedule wsd --compile
+   --feedback_self_k_warmup_steps`).
+3. SFT, then GRPO — with the **dense execution-grounded reward** (tier
+   ladder + fractional score, `code_grader.py` rebuilt 2026-05-14) and
+   the **iterative self-repair loop** (re-add failed tasks with the
+   compiler/test `error_text`). See `PHASE_C_RL.md`.
+
+Authoritative current state: `GEMINI.md` "Current state" + the
+2026-05-14 entries in `HANDOFF.md` / `SESSION_FINDINGS.md`.
+
+The formalisation work below is still the *backbone* of why we use
+DeltaNet; the active research is now applying that backbone to the
+super-coder target.
+
+---
+
+## Original goal (formalisation arm)
 
 Find algebraic structures that let state-transition RNN cells be
 **state-dependent** (the step operator depends on input / prior state)
@@ -101,8 +167,24 @@ matrices is unipotent) and inherit `Monoid` / `Group` structure from
 mathlib's `Matrix`. Focus on U_4 concretely, with gestures toward
 general n.
 
-## After (3) are done
+## Current Primary Research Pivot: Reinforcement Learning (GRPO)
 
+Supervised auxiliary losses for the Thinking Head failed in Phase 23 (Maladaptive
+Thinking Trap). The focus has now moved to **Reinforcement Learning**:
+
+- **Active Task:** Transition the Thinking Head to **GRPO-based training**.
+- **Mechanism:** Use detached trajectories (no-grad) to sample thinking depths
+  and reward based on final-token NLL reduction.
+- **RAG Integration:** Design the rollout loop to trigger vector DB lookups during
+  thinking actions.
+- **Immediate Milestone:** Implement `experiments/thinking.py` trajectory
+  sampling for RL.
+- **Evaluation Phase (Active):** Run RL-trained checkpoints on existing benchmarks
+  (HumanEval, Mechanistic Tasks) to verify the reasoning lift.
+
+## After these are done
+
+- **Continuous RAG:** Wire the Thinking Head actions to external vector DBs.
 - Wire imports into `StateDep.lean`, single `lake build` to confirm
   everything still compiles.
 - Reflect on what was easy vs. hard in each, and pick **one** to carry

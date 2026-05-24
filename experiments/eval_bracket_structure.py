@@ -44,9 +44,7 @@ def build_model_from_ckpt(ckpt_path: str):
         cls_list = parse_layers_arg(cfg["layers_spec"])
         attn_kw = dict(attention_cls_per_layer=cls_list)
     elif cfg.get("arch"):
-        attn_kw = build_arch(cfg["arch"], cfg["n_layers"],
-                             vocab_size=cfg["vocab_size"],
-                             n_symbols=cfg.get("n_symbols", 512))
+        attn_kw = build_arch(cfg["arch"], cfg["n_layers"])
     else:
         raise ValueError("checkpoint has neither arch nor layers_spec")
     # Linear-RNN architectures train with max_T=0 (no pos embed); the
@@ -58,6 +56,76 @@ def build_model_from_ckpt(ckpt_path: str):
         max_T_inferred = ckpt["state_dict"]["pos_embed.weight"].shape[0]
     else:
         max_T_inferred = 0
+    # Auto-detect optional heads from the state_dict so we build the model
+    # with the right kwargs and avoid strict-load mismatches.
+    has_gate = any(k.startswith("gate_head.") for k in sd_keys)
+    has_memory = any(k.startswith("memory.") for k in sd_keys)
+    has_pkm = any(k.startswith("pkm_layer.") for k in sd_keys)
+    mem_kwargs = {}
+    if has_memory:
+        # Infer mem_dim from W_proj's input dimension and mem_size has no
+        # state-dict footprint (it's compile-time). Default to 1024.
+        mem_dim_inferred = ckpt["state_dict"]["memory.W_proj.weight"].shape[1]
+        mem_kwargs = dict(
+            use_memory=True,
+            mem_dim=int(mem_dim_inferred),
+            mem_size=int(cfg.get("mem_size", 1024)),
+            thinking_token_id=int(cfg.get("thinking_token_id",
+                                          cfg["vocab_size"] - 1)),
+            # FIX A (added 2026-05-18): the write-only-at-think flag isn't
+            # in state_dict (it's a plain bool attribute), so when a
+            # WorkingMemory is reconstructed for eval/inference we must
+            # read the flag from cfg and pass it to __init__. Without
+            # this, a model trained with mem_write_only_at_think=True
+            # gets evaluated with write_only_at_think=False, silently
+            # losing the architectural mask. Default False = backward
+            # compat for older ckpts.
+            mem_write_only_at_think=bool(cfg.get("mem_write_only_at_think",
+                                                  False)),
+        )
+    pkm_kwargs = {}
+    if has_pkm:
+        # Infer all shape-derived PKM hyperparams from state dict.
+        # subkeys: (n_heads, 2, n_keys, k_dim)
+        sk = ckpt["state_dict"]["pkm_layer.subkeys"]
+        n_heads_pkm, _, n_keys, k_dim = sk.shape
+        # Count value-table heads (one nn.Embedding per head).
+        n_head_tables = sum(
+            1 for k in sd_keys
+            if k.startswith("pkm_layer.values.") and k.endswith(".weight")
+        )
+        assert n_head_tables == n_heads_pkm, (
+            f"PKM subkeys say n_heads={n_heads_pkm} but found "
+            f"{n_head_tables} value tables")
+        # value_bf16 from the dtype of values.0.weight.
+        v0_dtype = ckpt["state_dict"]["pkm_layer.values.0.weight"].dtype
+        # top_k and pkm_after_layer have no state-dict footprint; use cfg or
+        # the canonical defaults (32, 14) the v5-pkm run used.
+        # v7 PKM-bootstrap-fix package: score_norm + value_init_std +
+        # use_output_gate. Auto-detect from state dict for back-compat
+        # with v5/v6 ckpts; cfg overrides the auto-detect when present.
+        if "pkm_layer.out_alpha" in sd_keys:
+            pkm_use_output_gate = True
+        else:
+            pkm_use_output_gate = bool(cfg.get("pkm_use_output_gate", False))
+        if "pkm_layer.bn_s1.weight" in sd_keys:
+            pkm_score_norm = "batch"
+        elif "pkm_layer.ln_s1.weight" in sd_keys:
+            pkm_score_norm = "layer"
+        else:
+            pkm_score_norm = str(cfg.get("pkm_score_norm", "batch"))
+        pkm_kwargs = dict(
+            use_pkm=True,
+            pkm_after_layer=int(cfg.get("pkm_after_layer", 14)),
+            pkm_n_keys=int(n_keys),
+            pkm_n_heads=int(n_heads_pkm),
+            pkm_k_dim=int(k_dim),
+            pkm_top_k=int(cfg.get("pkm_top_k", 32)),
+            pkm_value_bf16=(v0_dtype == torch.bfloat16),
+            pkm_score_norm=pkm_score_norm,
+            pkm_value_init_std=float(cfg.get("pkm_value_init_std", 1.0)),
+            pkm_use_output_gate=pkm_use_output_gate,
+        )
     model = TinyLM(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"],
         n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
@@ -65,6 +133,10 @@ def build_model_from_ckpt(ckpt_path: str):
         feedback_mode=cfg.get("feedback_mode", "none"),
         feedback_distances=tuple(cfg.get("feedback_distances", (1,))),
         feedback_pairs=tuple(cfg.get("feedback_pairs", ()) or ()),
+        feedback_self_k=int(cfg.get("feedback_self_k", 0)),
+        output_gate=bool(has_gate),
+        **mem_kwargs,
+        **pkm_kwargs,
         **attn_kw,
     )
     # Backward-compat: old single-scale film checkpoints saved keys as
@@ -81,7 +153,7 @@ def build_model_from_ckpt(ckpt_path: str):
             else:
                 new_sd[k] = v
         sd = new_sd
-    model.load_state_dict(sd)
+    model.load_state_dict(sd, strict=False)
     model = model.to("cuda").eval()
     return model, cfg
 

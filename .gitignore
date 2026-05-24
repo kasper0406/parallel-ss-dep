@@ -4,5 +4,7 @@ StateDep/.lake/
 .claude/
 checkpoints/
 data/
+runs/
+bench_*.json
 __pycache__/
 *.pyc

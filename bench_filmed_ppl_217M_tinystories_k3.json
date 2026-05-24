@@ -1,0 +1,32 @@
+{
+  "ckpt": "checkpoints/film_self_k3_30L_217M_tinystories_seed0.pt",
+  "T": 512,
+  "n_chunks": 64,
+  "n_eval_tokens": 32768,
+  "config": {
+    "d_model": 576,
+    "n_layers": 30,
+    "feedback_pairs": [
+      [
+        2,
+        28
+      ]
+    ],
+    "feedback_mode": "film",
+    "feedback_self_k": 3,
+    "feedback_alpha_mode": "scalar"
+  },
+  "training_protocol": {
+    "ce": 1.8939206674695015,
+    "ppl": 6.645371966307392,
+    "n_tokens": 32768,
+    "elapsed_s": 1.3078270750120282
+  },
+  "self_consistency": {
+    "feedback_self_k": 3,
+    "n_batches": 16,
+    "abs_norm_mean": 931.2846946716309,
+    "final_norm_mean": 8757.458068847656,
+    "rel_norm_mean": 0.10635201028257489
+  }
+}

@@ -1,0 +1,30 @@
+GPU: NVIDIA GeForce RTX 5090  arch=deltanet
+Loading tokeniser HuggingFaceTB/SmolLM2-135M ...
+  vocab size: 49152
+Loading dataset codeparrot/codeparrot-clean (streaming) ...
+  no val/test split — using shuffled train tail as validation
+  params: 216.9M  aux_dim=0  feedback=film@d=1
+Loading frozen encoder: checkpoints/dn_baseline_30L_217M_for_oracle.pt
+  encoder: 216.3M params (no oracle: uniform/per-token/KL mode)
+  logit_kl_beta = 0.5 (temperature T = 2.0)
+
+  step     tok/s     tloss        ce       lkl         lr
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (93413 > 8192). Running this sequence through the model will result in indexing errors
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (45285 > 8192). Running this sequence through the model will result in indexing errors
+   500     15178    5.4900    5.4900    0.9117   2.93e-04  α=[2<-28:-0.055]
+  1000     15189    4.5590    4.5590    0.4543   2.74e-04  α=[2<-28:-0.067]
+  1500     15199    4.1041    4.1041    0.3513   2.44e-04  α=[2<-28:-0.066]
+  2000     15205    4.1068    4.1068    0.2774   2.07e-04  α=[2<-28:-0.064]
+  2500     15234    3.8777    3.8777    0.2384   1.65e-04  α=[2<-28:-0.060]
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=4.1961  ppl=66.43
+  3000     15076    3.6830    3.6830    0.1987   1.23e-04  α=[2<-28:-0.057]
+  3500     15216    3.5372    3.5372    0.1798   8.56e-05  α=[2<-28:-0.055]
+  4000     15186    3.6229    3.6229    0.1440   5.58e-05  α=[2<-28:-0.052]
+  4500     15218    3.4237    3.4237    0.1387   3.66e-05  α=[2<-28:-0.050]
+  5000     15249    3.5329    3.5329    0.1179   3.00e-05  α=[2<-28:-0.049]
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (23199 > 8192). Running this sequence through the model will result in indexing errors
+        VAL  loss=3.8496  ppl=46.97
+
+Done in 1349s (270 ms/step avg).
+Checkpoint saved to checkpoints/film_self_k3_kl_b05_217M.pt

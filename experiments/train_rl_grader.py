@@ -79,8 +79,21 @@ def all_reduce_sum_int(x: int, world_size: int) -> int:
 from experiments.code_grader import (
     Problem, grade, load_mbpp, truncate_at_stop, _STOP_SEQUENCES, LOADERS,
 )
+from experiments.curriculum import ProblemDifficultyEMA, merge_rank_updates
 from experiments.distill_solutions import extract_code_block
 from experiments.eval_bracket_structure import build_model_from_ckpt
+from experiments.iterative_repair import (
+    build_repair_prompt, group_became_variance_bearing, select_repair_targets,
+)
+
+
+def all_gather_object_list(obj, world_size: int) -> list:
+    """Gather a Python object from every rank into a list of length world_size."""
+    if world_size <= 1:
+        return [obj]
+    out = [None for _ in range(world_size)]
+    dist.all_gather_object(out, obj)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +666,28 @@ def main():
                          "when --load_ckpt is a Qwen-distilled SFT ckpt.")
     p.add_argument("--smoke", action="store_true",
                     help="Run a tiny end-to-end smoke (2 steps, B=N=2, max_gen=32).")
+    p.add_argument("--curriculum_filter", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="Weight problem sampling by a per-problem pass-rate EMA "
+                         "(peaks at p≈0.5 → variance-bearing zone). "
+                         "Use --no-curriculum_filter for the uniform-sampling ablation.")
+    p.add_argument("--curriculum_alpha", type=float, default=0.1)
+    p.add_argument("--curriculum_init_pass_rate", type=float, default=0.25,
+                    help="Pessimistic prior for unseen problems; lower → new "
+                         "problems sampled more often until their EMA converges.")
+    p.add_argument("--iterative_repair", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="After grading, do a second rollout on failed attempts "
+                         "with the grader's error_text as repair context. Both "
+                         "rollouts contribute to the GRPO group → expanded "
+                         "effective group size, fewer zero-variance groups.")
+    p.add_argument("--repair_max_per_group", type=int, default=2)
+    p.add_argument("--repair_min_failed", type=int, default=1,
+                    help="Skip repair when fewer than this many rollouts in the "
+                         "group failed (group is already variance-bearing).")
+    p.add_argument("--repair_temperature", type=float, default=-1.0,
+                    help="Sampling temperature for repair rollouts. -1 → "
+                         "reuse --temperature.")
     args = p.parse_args()
 
     if args.smoke:
@@ -729,6 +764,32 @@ def main():
               f"{args.batch} per step per rank "
               f"({args.batch * world_size} effective)")
 
+    # ---- Curriculum: per-problem pass-rate EMA used to weight sampling
+    # toward the variance-bearing zone. Same `--seed` across ranks so
+    # all ranks start with identical EMA tables; we then sync per-step
+    # updates so they stay identical.
+    import random
+    cur_rng = random.Random(args.seed)
+    problem_ids = [p.task_id for p in problems]
+    curriculum = ProblemDifficultyEMA(
+        problem_ids=problem_ids,
+        alpha=args.curriculum_alpha,
+        init_pass_rate=args.curriculum_init_pass_rate,
+    )
+    try:
+        _ckpt_blob = torch.load(args.load_ckpt, map_location="cpu",
+                                 weights_only=False)
+        if isinstance(_ckpt_blob, dict) and "curriculum_state_dict" in _ckpt_blob:
+            curriculum.load_state_dict(_ckpt_blob["curriculum_state_dict"])
+            if is_main(rank):
+                stats = curriculum.stats()
+                print(f"[rl-grader] resumed curriculum: "
+                      f"n_seen={stats['n_seen']} mean_p={stats['mean_p']:.3f}")
+        del _ckpt_blob
+    except Exception as e:
+        if is_main(rank):
+            print(f"[rl-grader] curriculum: no resume ({e}); starting fresh")
+
     # ---- Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                              weight_decay=0.01)
@@ -741,8 +802,18 @@ def main():
               f"{'depth_mean':>10}  {'think_rate':>10}  {'pass_n':>6}  "
               f"{'ratio':>6}  {'loss':>8}  {'tier_hist':>30}")
     for step in range(1, args.steps + 1):
-        # Sample B problems.
-        idx = torch.randint(0, len(problems), (args.batch,), generator=rng).tolist()
+        # Sample B problems. Weighted by curriculum EMA when enabled
+        # (peaks at p≈0.5); uniform otherwise. Both ranks use the same
+        # cur_rng seed BUT step counter, plus per-rank salt → different
+        # problems on different ranks each step.
+        if args.curriculum_filter:
+            weights = curriculum.sampling_weights(problem_ids)
+            cur_rng.seed(args.seed + step * 1000003 + rank)
+            idx = [problem_ids.index(pid) for pid in
+                   cur_rng.choices(problem_ids, weights=weights, k=args.batch)]
+        else:
+            idx = torch.randint(0, len(problems), (args.batch,),
+                                 generator=rng).tolist()
         batch_problems = [problems[i] for i in idx]
 
         # Generate N rollouts per problem in ONE batched forward per iter.
@@ -768,20 +839,16 @@ def main():
                 min_emit_before_eos=args.min_emit_before_eos,
             )
             all_rollouts.append(group)
-        # Grade.
+        # Grade first-pass rollouts.
         tier_hist = {}
+        first_pass_error_texts: list[list[str | None]] = []
         for prob, group in zip(batch_problems, all_rollouts):
+            errs = []
             for r in group:
                 if args.extract_code_block:
-                    # Distilled-student path: model emits CoT + ```python
-                    # ... ```. Pull the code out of the fence; if no
-                    # fence, fall back to raw text (will likely
-                    # syntax_error).
                     extracted = extract_code_block(r.text)
                     code = extracted if extracted is not None else r.text
                 else:
-                    # Legacy / non-distilled path: model emits raw code
-                    # continuation of the comment-style prompt header.
                     code = build_mbpp_prompt(prob) + r.text
                 g_res = grade(prob, code, timeout_s=5)
                 r.reward = float(g_res.score)
@@ -789,22 +856,128 @@ def main():
                 r.n_passed = g_res.n_passed
                 r.n_tests = g_res.n_tests
                 tier_hist[g_res.tier] = tier_hist.get(g_res.tier, 0) + 1
+                errs.append(g_res.error_text)
+            first_pass_error_texts.append(errs)
 
-        # Build (B, N) reward + depth tensors.
-        B, N = args.batch, args.grpo_n_group
+        # Snapshot first-pass rewards BEFORE running repair — these are
+        # what feeds the curriculum EMA (the model's unprompted pass-rate;
+        # repair would inflate the estimate).
+        first_pass_rewards_per_group = [
+            [float(r.reward) for r in group] for group in all_rollouts]
+
+        # Iterative repair: for failed rollouts, do a second rollout
+        # with the grader's error_text as repair context. Repair rollouts
+        # join the same GRPO group (expanding N for that problem).
+        repair_groups: list[list[Rollout]] = [[] for _ in batch_problems]
+        repair_n = 0
+        repair_pass_n = 0
+        n_zero_var_before = 0
+        n_lift_to_var = 0
+        if args.iterative_repair:
+            rep_temp = (args.temperature if args.repair_temperature < 0
+                        else args.repair_temperature)
+            for gi, (prob, group) in enumerate(zip(batch_problems, all_rollouts)):
+                rewards_here = [float(r.reward) for r in group]
+                targets = select_repair_targets(
+                    rewards_here,
+                    max_per_group=args.repair_max_per_group,
+                    min_failed=args.repair_min_failed,
+                )
+                if not targets:
+                    continue
+                orig_passes = sum(1 for r in rewards_here if r >= 0.5)
+                orig_zero_var = orig_passes == 0 or orig_passes == len(group)
+                if orig_zero_var:
+                    n_zero_var_before += 1
+                repair_rewards_this_group: list[float] = []
+                for ti in targets:
+                    failed_code = (extract_code_block(group[ti].text)
+                                   if args.extract_code_block
+                                   else group[ti].text) or group[ti].text
+                    err_text = first_pass_error_texts[gi][ti] or ""
+                    orig_prompt = build_mbpp_prompt(prob)
+                    repair_prompt = build_repair_prompt(
+                        orig_prompt, failed_code, err_text)
+                    repair_ids = tok(repair_prompt,
+                                      return_tensors="pt").input_ids.to(device)
+                    single = rollout_group_batched(
+                        model_module, tok, repair_ids,
+                        n_rollouts=1,
+                        thinking_token_id=thinking_token_id,
+                        eos_token_id=tok.eos_token_id,
+                        max_gen=args.max_gen,
+                        max_think_per_step=args.max_think_per_step,
+                        total_think_budget=args.total_think_budget,
+                        emit_threshold=args.emit_threshold,
+                        gate_floor=args.gate_floor,
+                        temperature=rep_temp,
+                        min_emit_before_eos=args.min_emit_before_eos,
+                    )
+                    rr = single[0]
+                    if args.extract_code_block:
+                        extracted = extract_code_block(rr.text)
+                        code = extracted if extracted is not None else rr.text
+                    else:
+                        code = repair_prompt + rr.text
+                    g_res = grade(prob, code, timeout_s=5)
+                    rr.reward = float(g_res.score)
+                    rr.tier = g_res.tier
+                    rr.n_passed = g_res.n_passed
+                    rr.n_tests = g_res.n_tests
+                    repair_rewards_this_group.append(rr.reward)
+                    repair_n += 1
+                    if g_res.tier == "pass":
+                        repair_pass_n += 1
+                    repair_groups[gi].append(rr)
+                if orig_zero_var and group_became_variance_bearing(
+                        rewards_here, repair_rewards_this_group):
+                    n_lift_to_var += 1
+
+        # Combined (per-group ragged) rollout sets for advantage computation.
+        combined_groups: list[list[Rollout]] = [
+            list(orig) + list(rep)
+            for orig, rep in zip(all_rollouts, repair_groups)
+        ]
+        warmup_scale = min(1.0, step / max(1, args.ponder_warmup_steps))
+
+        # Per-group advantages: each group may have a different N after
+        # repair, so we compute (1, K) tensors group-by-group.
+        per_group_advantages: list[torch.Tensor] = []
+        for group in combined_groups:
+            if not group:
+                per_group_advantages.append(torch.zeros(0))
+                continue
+            rew = torch.tensor([[r.reward for r in group]])
+            dep = torch.tensor([[float(r.depth) for r in group]])
+            adv = compute_grpo_advantages_from_rewards(
+                rew, dep,
+                ponder_cost=args.ponder_cost,
+                ponder_shape=args.ponder_shape,
+                counterfactual=args.counterfactual,
+                ponder_warmup_scale=warmup_scale,
+            )
+            per_group_advantages.append(adv[0])
+
+        # Flattened (B, N_orig) tensors kept for logging (depth_mean,
+        # think_rate, reward_mean reflect the FIRST-PASS distribution,
+        # i.e. the model's unprompted behaviour — what we care about).
         rewards = torch.tensor(
             [[r.reward for r in group] for group in all_rollouts])
         depths = torch.tensor(
             [[float(r.depth) for r in group] for group in all_rollouts])
-        # Curriculum.
-        warmup_scale = min(1.0, step / max(1, args.ponder_warmup_steps))
-        advantages = compute_grpo_advantages_from_rewards(
-            rewards, depths,
-            ponder_cost=args.ponder_cost,
-            ponder_shape=args.ponder_shape,
-            counterfactual=args.counterfactual,
-            ponder_warmup_scale=warmup_scale,
-        )  # (B, N)
+
+        # ---- Curriculum EMA update (DDP-synced; use FIRST-PASS rewards
+        # only, never repair). Each rank gathers its local
+        # (problem_id, rewards) updates, all_gather_object across ranks,
+        # then everyone applies the merged update — keeping EMA tables
+        # bit-identical across ranks.
+        local_updates: list[tuple[str, list[float]]] = []
+        for prob, fp_rewards in zip(batch_problems, first_pass_rewards_per_group):
+            local_updates.append((prob.task_id, fp_rewards))
+        all_rank_updates = all_gather_object_list(local_updates, world_size)
+        merged_updates = merge_rank_updates(all_rank_updates)
+        for pid, merged_rewards in merged_updates:
+            curriculum.update(pid, merged_rewards)
 
         # Policy update — one batched forward over ALL rollouts (B*N) in
         # the step, padded to the longest sequence. This replaces the prior
@@ -813,7 +986,7 @@ def main():
         opt.zero_grad(set_to_none=True)
         flat_rollouts = []
         flat_advantages = []
-        for group, group_adv in zip(all_rollouts, advantages):
+        for group, group_adv in zip(combined_groups, per_group_advantages):
             for r, adv in zip(group, group_adv):
                 if not r.emit_token_ids:
                     continue
@@ -860,21 +1033,35 @@ def main():
         if step % args.log_every == 0:
             think_rate = (depths > 0).float().mean().item()
             pass_n = sum(1 for g in all_rollouts for r in g if r.tier == "pass")
-            # Aggregate across ranks for the headline numbers.
             reward_mean_g = all_reduce_mean(rewards.mean().item(), world_size)
             reward_max_g = all_reduce_mean(rewards.max().item(), world_size)
             depth_mean_g = all_reduce_mean(depths.mean().item(), world_size)
             think_rate_g = all_reduce_mean(think_rate, world_size)
             pass_n_g = all_reduce_sum_int(pass_n, world_size)
-            # Tier histogram aggregation: only main rank prints, so it
-            # reflects rank-0 only (sufficient for trend monitoring).
             tier_str = "  ".join(f"{k}={v}" for k, v in sorted(tier_hist.items()))
+            cur_stats = curriculum.stats()
+            cur_mean_p_g = cur_stats["mean_p"]
+            cur_pct_in_band_g = cur_stats["pct_in_band"]
+            repair_n_g = all_reduce_sum_int(int(repair_n), world_size)
+            repair_pass_n_g = all_reduce_sum_int(int(repair_pass_n), world_size)
+            n_zero_var_before_g = all_reduce_sum_int(
+                int(n_zero_var_before), world_size)
+            n_lift_to_var_g = all_reduce_sum_int(int(n_lift_to_var), world_size)
+            repair_pass_rate = (repair_pass_n_g / repair_n_g
+                                if repair_n_g > 0 else 0.0)
+            repair_lift = (n_lift_to_var_g / n_zero_var_before_g
+                           if n_zero_var_before_g > 0 else 0.0)
             if is_main(rank):
                 print(f"{step:>5}  {reward_mean_g:>10.4f}  "
                       f"{reward_max_g:>10.4f}  {depth_mean_g:>10.2f}  "
                       f"{think_rate_g:>10.3f}  {pass_n_g:>6d}  "
                       f"{ratio_val:>6.3f}  {loss_val:>8.4f}  "
                       f"kl={kl_val:+.4f}  "
+                      f"cur(n={cur_stats['n_seen']}, "
+                      f"p={cur_mean_p_g:.2f}, "
+                      f"band={cur_pct_in_band_g:.2f})  "
+                      f"rep(n={repair_n_g}, pass={repair_pass_rate:.2f}, "
+                      f"lift={repair_lift:.2f})  "
                       f"{tier_str:>30}")
 
         if args.save_ckpt and step % args.save_every == 0 and is_main(rank):
@@ -889,7 +1076,8 @@ def main():
             else:
                 step_path = f"{base}_step{step}"
             torch.save({"state_dict": model_module.state_dict(),
-                        "step": step, "config": cfg},
+                        "step": step, "config": cfg,
+                        "curriculum_state_dict": curriculum.state_dict()},
                         step_path)
             print(f"  [saved {step_path}]")
 
@@ -897,7 +1085,9 @@ def main():
         print(f"\n[rl-grader] done in {time.time() - t0:.0f}s")
         if args.save_ckpt:
             torch.save({"state_dict": model_module.state_dict(),
-                        "step": args.steps, "config": cfg}, args.save_ckpt)
+                        "step": args.steps, "config": cfg,
+                        "curriculum_state_dict": curriculum.state_dict()},
+                        args.save_ckpt)
             print(f"final ckpt → {args.save_ckpt}")
     if world_size > 1:
         dist.barrier()

@@ -503,12 +503,11 @@ def policy_loss_for_rollouts_batched(
 
     autocast = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
     with autocast:
-        logits = model(padded).float()              # (R, T_max, V)
-    # KL-to-reference: one extra forward through the frozen ref model.
+        logits = model(padded)                      # (R, T_max, V) bf16
     ref_logits = None
     if ref_model is not None and kl_coef > 0.0:
         with torch.no_grad(), autocast:
-            ref_logits = ref_model(padded).float()
+            ref_logits = ref_model(padded)          # bf16; small slices cast to fp32 below
     # Per-rollout, extract log-probs at emit positions.
     all_surrs = []
     all_ratios = []
@@ -521,7 +520,7 @@ def policy_loss_for_rollouts_batched(
                                   device=device)
         # logits that PREDICTED the token at position p are at logits[i, p-1, :].
         pred_idx = positions - 1
-        pred_logits = logits[i, pred_idx, :].clone()   # (n_emit, V)
+        pred_logits = logits[i, pred_idx, :].float()   # (n_emit, V), bf16 → fp32 for softmax
         pred_logits[:, thinking_token_id] = -float("inf")
         new_log_probs = F.log_softmax(
             pred_logits / max(temperature, 1e-8), dim=-1)
@@ -536,7 +535,7 @@ def policy_loss_for_rollouts_batched(
         all_surrs.append(surr)
         all_ratios.append(ratio.detach().mean())
         if ref_logits is not None:
-            ref_pred_logits = ref_logits[i, pred_idx, :].clone()
+            ref_pred_logits = ref_logits[i, pred_idx, :].float()
             ref_pred_logits[:, thinking_token_id] = -float("inf")
             ref_log_probs = F.log_softmax(
                 ref_pred_logits / max(temperature, 1e-8), dim=-1)
@@ -675,6 +674,24 @@ def main():
     p.add_argument("--curriculum_init_pass_rate", type=float, default=0.25,
                     help="Pessimistic prior for unseen problems; lower → new "
                          "problems sampled more often until their EMA converges.")
+    p.add_argument("--progressive_curriculum", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="Progressive (easy→hard) curriculum: weight Gaussian-peaks "
+                         "at target_p(step), where target_p decays linearly from "
+                         "--curriculum_target_start to --curriculum_target_end "
+                         "across --steps. Lets the model consolidate on achievable "
+                         "problems before facing harder ones. Addresses the v7b "
+                         "drift-into-suboptimal-equilibrium failure mode where "
+                         "variance-only sampling converges to a narrow band of "
+                         "lucky middle-difficulty problems from step 1.")
+    p.add_argument("--curriculum_target_start", type=float, default=0.7,
+                    help="Initial target pass-rate (easy problems weighted highest).")
+    p.add_argument("--curriculum_target_end", type=float, default=0.2,
+                    help="Final target pass-rate (hard problems weighted highest "
+                         "by end of training).")
+    p.add_argument("--curriculum_target_sigma", type=float, default=0.15,
+                    help="Gaussian width of the target band. Wider = more spread "
+                         "across difficulties at each step.")
     p.add_argument("--iterative_repair", action=argparse.BooleanOptionalAction,
                     default=False,
                     help="After grading, do a second rollout on failed attempts "
@@ -775,6 +792,11 @@ def main():
         problem_ids=problem_ids,
         alpha=args.curriculum_alpha,
         init_pass_rate=args.curriculum_init_pass_rate,
+        progressive=args.progressive_curriculum,
+        target_start=args.curriculum_target_start,
+        target_end=args.curriculum_target_end,
+        target_sigma=args.curriculum_target_sigma,
+        total_steps=args.steps if args.progressive_curriculum else None,
     )
     try:
         _ckpt_blob = torch.load(args.load_ckpt, map_location="cpu",
@@ -807,7 +829,7 @@ def main():
         # cur_rng seed BUT step counter, plus per-rank salt → different
         # problems on different ranks each step.
         if args.curriculum_filter:
-            weights = curriculum.sampling_weights(problem_ids)
+            weights = curriculum.sampling_weights(problem_ids, step=step)
             cur_rng.seed(args.seed + step * 1000003 + rank)
             idx = [problem_ids.index(pid) for pid in
                    cur_rng.choices(problem_ids, weights=weights, k=args.batch)]
@@ -1039,9 +1061,11 @@ def main():
             think_rate_g = all_reduce_mean(think_rate, world_size)
             pass_n_g = all_reduce_sum_int(pass_n, world_size)
             tier_str = "  ".join(f"{k}={v}" for k, v in sorted(tier_hist.items()))
-            cur_stats = curriculum.stats()
+            cur_stats = curriculum.stats(step=step)
             cur_mean_p_g = cur_stats["mean_p"]
             cur_pct_in_band_g = cur_stats["pct_in_band"]
+            cur_target_p_str = (f" tgt={cur_stats['target_p']:.2f}"
+                                if "target_p" in cur_stats else "")
             repair_n_g = all_reduce_sum_int(int(repair_n), world_size)
             repair_pass_n_g = all_reduce_sum_int(int(repair_pass_n), world_size)
             n_zero_var_before_g = all_reduce_sum_int(
@@ -1059,7 +1083,7 @@ def main():
                       f"kl={kl_val:+.4f}  "
                       f"cur(n={cur_stats['n_seen']}, "
                       f"p={cur_mean_p_g:.2f}, "
-                      f"band={cur_pct_in_band_g:.2f})  "
+                      f"band={cur_pct_in_band_g:.2f}{cur_target_p_str})  "
                       f"rep(n={repair_n_g}, pass={repair_pass_rate:.2f}, "
                       f"lift={repair_lift:.2f})  "
                       f"{tier_str:>30}")

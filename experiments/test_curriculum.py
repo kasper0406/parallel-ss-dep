@@ -155,3 +155,72 @@ def test_unseen_problem_gets_init_weight():
     expected = 4.0 * 0.25 * 0.75 + 0.05
     assert cur.sampling_weight("a") == pytest.approx(expected)
     assert cur.sampling_weight("never_seen") == pytest.approx(expected)
+
+
+def test_progressive_requires_total_steps():
+    with pytest.raises(ValueError):
+        ProblemDifficultyEMA(["a"], progressive=True)
+
+
+def test_progressive_target_linear_schedule():
+    cur = ProblemDifficultyEMA(
+        ["a"], progressive=True, total_steps=100,
+        target_start=0.7, target_end=0.2)
+    assert cur.target_at(0) == pytest.approx(0.7)
+    assert cur.target_at(50) == pytest.approx(0.45)
+    assert cur.target_at(100) == pytest.approx(0.2)
+    assert cur.target_at(200) == pytest.approx(0.2)
+
+
+def test_progressive_weight_peaks_at_target():
+    cur = ProblemDifficultyEMA(
+        ["easy", "mid", "hard"],
+        progressive=True, total_steps=100,
+        target_start=0.7, target_end=0.2, target_sigma=0.1, eps=0.0)
+    cur.ema["easy"] = 0.7
+    cur.ema["mid"] = 0.45
+    cur.ema["hard"] = 0.2
+
+    w_step0 = cur.sampling_weights(["easy", "mid", "hard"], step=0)
+    assert w_step0[0] > w_step0[1] > w_step0[2]
+
+    w_step100 = cur.sampling_weights(["easy", "mid", "hard"], step=100)
+    assert w_step100[2] > w_step100[1] > w_step100[0]
+
+    w_step50 = cur.sampling_weights(["easy", "mid", "hard"], step=50)
+    assert w_step50[1] > w_step50[0]
+    assert w_step50[1] > w_step50[2]
+
+
+def test_progressive_state_dict_roundtrip():
+    cur1 = ProblemDifficultyEMA(
+        ["a"], progressive=True, total_steps=200,
+        target_start=0.6, target_end=0.1, target_sigma=0.2)
+    cur1.update("a", [1.0])
+    state = cur1.state_dict()
+
+    cur2 = ProblemDifficultyEMA([], alpha=0.1, init_pass_rate=0.25)
+    cur2.load_state_dict(state)
+    assert cur2.progressive is True
+    assert cur2.total_steps == 200
+    assert cur2.target_start == 0.6
+    assert cur2.target_end == 0.1
+    assert cur2.target_sigma == 0.2
+    assert cur2.sampling_weight("a", step=100) == cur1.sampling_weight("a", step=100)
+
+
+def test_progressive_off_falls_back_to_variance_weighting():
+    cur = ProblemDifficultyEMA(["a"], progressive=False, eps=0.05)
+    cur.ema["a"] = 0.5
+    assert cur.sampling_weight("a", step=0) == pytest.approx(4*0.5*0.5 + 0.05)
+    assert cur.sampling_weight("a", step=999) == pytest.approx(4*0.5*0.5 + 0.05)
+
+
+def test_progressive_stats_includes_target():
+    cur = ProblemDifficultyEMA(
+        ["a"], progressive=True, total_steps=100,
+        target_start=0.7, target_end=0.2)
+    cur.update("a", [1.0])
+    s = cur.stats(step=50)
+    assert "target_p" in s
+    assert s["target_p"] == pytest.approx(0.45)

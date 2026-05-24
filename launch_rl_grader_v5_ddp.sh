@@ -5,9 +5,18 @@
 # Single-rank v3/v4 used 16 rollouts/step (batch=4 × n_group=4) on
 # ~24 GiB → tiny gradient, LR had to crawl at 2e-6.
 #
-# v5: torchrun --nproc-per-node=2, each rank with batch=4 × n_group=8 =
-# 32 rollouts/step → 64 effective rollouts/step (4× v3). Variance drops
-# as 1/√N, so we can use lr=5e-6 (2.5× v3) at the same stability.
+# v5: torchrun --nproc-per-node=2, each rank with batch=4 × n_group=4 =
+# 16 rollouts/step (same per-rank memory as v3 single-GPU, which fit
+# in 24/32 GiB). Across 2 ranks → 8 unique problems × 4 rollouts =
+# 32 effective rollouts/step (2× v3). lr=3e-6 (√2 × v3) compensates
+# for the variance drop.
+#
+# Initial v5 attempt with per-rank n_group=8 crashed in the Triton
+# autotuner on the policy-update forward — OOM masked as "unspecified
+# launch failure". v3 already used 24/32 GiB; doubling per-rank
+# rollouts would have pushed it past the limit. The fix is to keep
+# per-rank memory at v3 levels and use DDP only for problem diversity,
+# not more rollouts per rank.
 #
 # Other recipe tweaks:
 #   - Resume from rl_grader_phase_c_v3_step25.pt (the new project best,
@@ -42,8 +51,8 @@ nohup .venv/bin/torchrun \
     --extract_code_block \
     --steps 50 \
     --batch 4 \
-    --grpo_n_group 8 \
-    --lr 5e-6 \
+    --grpo_n_group 4 \
+    --lr 3e-6 \
     --max_gen 384 \
     --max_think_per_step 4 \
     --total_think_budget 120 \

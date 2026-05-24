@@ -645,14 +645,14 @@ def main():
                     default="checkpoints/rl_grader_v5_pkm.pt")
     p.add_argument("--steps", type=int, default=200,
                     help="Number of GRPO updates.")
-    p.add_argument("--batch", type=int, default=6,
-                    help="Problems per step per rank (B). 6 is the empirical "
-                         "max on 32 GiB with --activation_checkpointing ON "
-                         "(default) + iterative_repair + KL ref forward. "
-                         "batch=8 OOMs at the PKM per-head fp32 cast "
-                         "(memory_layer.py:292) which is outside the AC-"
-                         "wrapped block path. Earlier OOMs at batch=4 were "
-                         "without AC.")
+    p.add_argument("--batch", type=int, default=4,
+                    help="Problems per step per rank (B). 4 is the robust "
+                         "value for long runs: batch=6 typically fits with "
+                         "AC but v11 still OOMed at step 26 when MBPP drew "
+                         "long-prompt problems (PKM cast at memory_layer.py:"
+                         "294, outside the AC-wrapped block path). batch=4 "
+                         "leaves enough headroom for the long tail. "
+                         "batch=8 OOMs even on typical steps.")
     p.add_argument("--grpo_n_group", type=int, default=4,
                     help="Rollouts per problem (N). v5 crashed at 8 → 4 is "
                          "the validated upper bound.")

@@ -25,10 +25,10 @@ nohup .venv/bin/torchrun \
     --rdzv-backend=c10d \
     --rdzv-endpoint=localhost:29500 \
     experiments/train_rl_grader.py \
-    --load_ckpt checkpoints/rl_grader_phase_c_v11_step25.pt \
-    --save_ckpt checkpoints/rl_grader_phase_c_v11b.pt \
-    --steps 450 \
-    --batch 4 \
+    --load_ckpt checkpoints/rl_grader_phase_c_v11b_step75.pt \
+    --save_ckpt checkpoints/rl_grader_phase_c_v11c.pt \
+    --steps 425 \
+    --batch 3 \
     --kl_coef 0.15 \
     --iterative_repair \
     --seed 0 \

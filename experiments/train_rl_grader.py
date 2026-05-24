@@ -645,14 +645,15 @@ def main():
                     default="checkpoints/rl_grader_v5_pkm.pt")
     p.add_argument("--steps", type=int, default=200,
                     help="Number of GRPO updates.")
-    p.add_argument("--batch", type=int, default=4,
-                    help="Problems per step per rank (B). 4 is the robust "
-                         "value for long runs: batch=6 typically fits with "
-                         "AC but v11 still OOMed at step 26 when MBPP drew "
-                         "long-prompt problems (PKM cast at memory_layer.py:"
-                         "294, outside the AC-wrapped block path). batch=4 "
-                         "leaves enough headroom for the long tail. "
-                         "batch=8 OOMs even on typical steps.")
+    p.add_argument("--batch", type=int, default=3,
+                    help="Problems per step per rank (B). 3 is the long-run-"
+                         "robust value: batch=6 fits on typical steps but "
+                         "OOMed in v11 at step 26 (PKM cast on long-prompt "
+                         "MBPP draw); batch=4 OOMed in v11b at step ~95 "
+                         "(lm_head 5.7 GiB allocation on a long sequence). "
+                         "batch=3 leaves ~5-6 GiB headroom — enough for the "
+                         "longest-tail prompts. Push to 4-6 only for short "
+                         "(<100 step) runs where you can babysit OOMs.")
     p.add_argument("--grpo_n_group", type=int, default=4,
                     help="Rollouts per problem (N). v5 crashed at 8 → 4 is "
                          "the validated upper bound.")

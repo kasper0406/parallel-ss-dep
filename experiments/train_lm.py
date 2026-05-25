@@ -537,6 +537,13 @@ def main():
     mid_eval_controller = None
     tokens_seen = 0
     next_eval_at = 0
+    tokens_at_last_probe = 0
+    if args.probe_humaneval_every_tokens > 0:
+        if not pathlib.Path(args.probe_humaneval_path).exists():
+            print(f"  [probe] {args.probe_humaneval_path} not found; "
+                  f"run experiments/build_probe_dataset.py first. "
+                  f"Disabling probe.")
+            args.probe_humaneval_every_tokens = 0
     if args.mid_eval_every_tokens > 0:
         from experiments.eval_callback import EvalStopController, run_eval
         mid_eval_controller = EvalStopController(
@@ -1644,6 +1651,32 @@ def main():
                 tb.add_scalar("val/loss", val_loss, step)
                 tb.add_scalar("val/ppl", ppl, step)
             model.train()
+            torch.cuda.empty_cache()
+
+        if (args.probe_humaneval_every_tokens > 0
+                and tokens_seen - tokens_at_last_probe
+                    >= args.probe_humaneval_every_tokens):
+            from experiments.probe_humaneval import run_humaneval_probe
+            n_probe = (args.probe_humaneval_n_problems
+                       if args.probe_humaneval_n_problems > 0 else None)
+            try:
+                res = run_humaneval_probe(
+                    model, tok,
+                    probe_path=args.probe_humaneval_path,
+                    max_gen=args.probe_humaneval_max_gen,
+                    n_problems=n_probe,
+                )
+                print(f"        PROBE  pass@1={res['pass_rate']*100:.1f}% "
+                      f"({res['n_passed']}/{res['n_total']})  "
+                      f"emit={res['mean_emit_tokens']:.0f}tok  "
+                      f"t={res['elapsed_s']:.1f}s  "
+                      f"@tok={tokens_seen/1e6:.1f}M")
+                if tb is not None:
+                    tb.add_scalar("probe/pass_rate", res["pass_rate"], step)
+                    tb.add_scalar("probe/n_passed", res["n_passed"], step)
+            except Exception as e:
+                print(f"        PROBE  ERROR: {e}")
+            tokens_at_last_probe = tokens_seen
             torch.cuda.empty_cache()
 
         # ---- Mid-training HumanEval hook (auto_stop). ----

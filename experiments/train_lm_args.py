@@ -381,6 +381,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "(cosine 1->0). Used by --lr_schedule wsd.")
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--val_every", type=int, default=500)
+    p.add_argument("--probe_humaneval_every_tokens", type=int, default=0,
+                   help="Run the small in-process HumanEval probe every N "
+                        "tokens (recommended: 1_000_000_000 = 1B tokens). "
+                        "0 disables. Probe set at --probe_humaneval_path. "
+                        "Tracks actual code-completion capability during "
+                        "pretrain instead of flying blind on LM ppl.")
+    p.add_argument("--probe_humaneval_path", type=str,
+                   default="data/probe_humaneval_50.jsonl",
+                   help="Held-out probe JSONL (built by "
+                        "experiments/build_probe_dataset.py).")
+    p.add_argument("--probe_humaneval_max_gen", type=int, default=192,
+                   help="Max generated tokens per probe problem.")
+    p.add_argument("--probe_humaneval_n_problems", type=int, default=0,
+                   help="Limit probe to first N problems (0 = whole file).")
     p.add_argument("--tokenizer", type=str,
                    default="HuggingFaceTB/SmolLM2-135M")
     p.add_argument("--dataset", type=str, default="roneneldan/TinyStories",

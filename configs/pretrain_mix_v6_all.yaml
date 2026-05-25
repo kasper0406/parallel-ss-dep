@@ -16,7 +16,7 @@
 # Weights re-balanced from v4 to absorb the +12 % of synth+self-debug
 # while keeping CVE/wiki/textbook weights stable (they're the
 # anti-forgetting / out-of-distribution sources):
-#   codeparrot              0.30 -> 0.22  (still dominant code source)
+#   codeparrot              0.30 -> 0.26  (still dominant code source)
 #   python_codes_25k        0.10 -> 0.08
 #   magicoder_oss           0.10 -> 0.08
 #   code_exercises_jinaai   0.03 -> 0.02
@@ -26,8 +26,8 @@
 #   self_debug_triples      NEW  -> 0.02
 #   (others unchanged)
 #
-# Sum = 0.22+0.08+0.08+0.02+0.04+0.04+0.10+0.02 + 0.10+0.05+0.06+0.05+0.10
-#     = 1.00
+# Sum = 0.26+0.08+0.08+0.02+0.04+0.04+0.10+0.02 + 0.10+0.05+0.06+0.05+0.10
+#     = 1.00 (verified: `grep '^    weight:' | awk '{s+=$2}END{print s}'`)
 
 sources:
 
@@ -35,7 +35,7 @@ sources:
     dataset_id: codeparrot/codeparrot-clean
     text_field: content
     split: train
-    weight: 0.22
+    weight: 0.26
     fim_rate: 0.5
     filter:
       name: min_content_len

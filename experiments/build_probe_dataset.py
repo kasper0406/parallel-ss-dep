@@ -1,5 +1,12 @@
 """
-Build a tiny held-out HumanEval probe (first 50 problems).
+Build a tiny HumanEval probe (first 50 problems).
+
+NOT held-out from final eval — these are HumanEval/0..49, a slice of the
+164-problem suite we score the headline pass@1 against. Probe trajectories
+CANNOT be used to claim "we improved on held-out data"; they share
+distribution with the final eval. The probe is for IN-RUN TRACKING ONLY
+(is capability moving up between val intervals?) — final numbers must
+come from the full 164-problem eval (HumanEval/0..163).
 
 Idempotent: re-runs produce byte-identical JSONL. Used by the in-process
 pretrain probe in `probe_humaneval.py`.

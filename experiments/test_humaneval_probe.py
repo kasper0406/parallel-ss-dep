@@ -76,11 +76,12 @@ def _make_fake_generate(continuation_text: str):
     encoded ``continuation_text`` to whatever prompt_ids it receives."""
 
     def fake_generate(model, prompt_ids, max_gen=256, temperature=0.0,
-                      eos_token_id=None):
+                      eos_token_id=None, **kwargs):
         cont = [b for b in continuation_text.encode("utf-8")][:max_gen]
         cont_t = torch.tensor(cont, dtype=prompt_ids.dtype,
                               device=prompt_ids.device).unsqueeze(0)
-        return torch.cat([prompt_ids, cont_t], dim=1)
+        out = torch.cat([prompt_ids, cont_t], dim=1)
+        return out, {"think_total": 0, "emit_count": len(cont)}
     return fake_generate
 
 

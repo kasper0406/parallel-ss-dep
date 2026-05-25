@@ -60,6 +60,13 @@ def run_humaneval_probe(
     n_problems: Optional[int] = None,
     timeout_s: int = 5,
     temperature: float = 0.0,
+    use_thinking: bool = False,
+    thinking_token_id: Optional[int] = None,
+    max_think_per_step: int = 8,
+    total_think_budget: Optional[int] = None,
+    emit_threshold: float = 0.5,
+    gate_floor: float = 0.0,
+    min_emit_before_eos: int = 30,
     verbose: bool = False,
 ) -> dict:
     """Run the small HumanEval-style probe.
@@ -95,11 +102,23 @@ def run_humaneval_probe(
                     prompt_ids, dtype=torch.long, device=device
                 ).unsqueeze(0)
 
-                gen = generate(
+                gen, _diag = generate(
                     model, prompt_t, max_gen=max_gen,
                     temperature=temperature, eos_token_id=eos,
+                    use_thinking=use_thinking,
+                    thinking_token_id=thinking_token_id,
+                    max_think_per_step=max_think_per_step,
+                    total_think_budget=total_think_budget,
+                    emit_threshold=emit_threshold,
+                    gate_floor=gate_floor,
+                    min_emit_before_eos=min_emit_before_eos,
                 )
-                gen_only = gen[0, len(prompt_ids):].tolist()
+                gen_only_full = gen[0, len(prompt_ids):].tolist()
+                if use_thinking and thinking_token_id is not None:
+                    gen_only = [t for t in gen_only_full
+                                if t != int(thinking_token_id)]
+                else:
+                    gen_only = gen_only_full
                 emit_tokens.append(len(gen_only))
                 gen_text = tokenizer.decode(gen_only, skip_special_tokens=True)
                 gen_text = _truncate_at_stop(gen_text)

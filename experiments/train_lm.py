@@ -1665,6 +1665,11 @@ def main():
                     probe_path=args.probe_humaneval_path,
                     max_gen=args.probe_humaneval_max_gen,
                     n_problems=n_probe,
+                    use_thinking=bool(args.output_gate
+                                       and thinking_token_id is not None),
+                    thinking_token_id=thinking_token_id,
+                    gate_floor=float(args.gate_floor_min),
+                    min_emit_before_eos=30,
                 )
                 print(f"        PROBE  pass@1={res['pass_rate']*100:.1f}% "
                       f"({res['n_passed']}/{res['n_total']})  "

@@ -35,6 +35,7 @@ sources:
     text_field: content
     split: train
     weight: 0.30
+    fim_rate: 0.5
     filter:
       name: min_content_len
       args: { min_chars: 200 }
@@ -44,6 +45,7 @@ sources:
     text_field: text
     split: train
     weight: 0.10
+    fim_rate: 0.5
     filter:
       name: min_content_len
       args: { min_chars: 100 }
@@ -55,6 +57,7 @@ sources:
     text_field: [problem, solution]
     split: train
     weight: 0.10
+    fim_rate: 0.5
     filter:
       name: min_content_len
       args: { min_chars: 100 }
@@ -64,6 +67,7 @@ sources:
     text_field: [problem, solution]
     split: train
     weight: 0.03
+    fim_rate: 0.5
     filter: always
 
   - name: python_instr_18k_alpaca

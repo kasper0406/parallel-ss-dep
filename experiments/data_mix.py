@@ -20,6 +20,7 @@ CLI smoke (read 100 chunks, print per-source counts + decoded samples):
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import random
 import sys
@@ -128,7 +129,7 @@ def _build_filter(spec: str | dict | None) -> Callable[[dict], bool]:
 @dataclass
 class SourceConfig:
     name: str
-    dataset_id: str
+    dataset_id: str = ""             # HF dataset id; "" iff jsonl_path is set
     text_field: str | list = "text"  # str: single field; list[str]: join with \n\n
     text_builder: str | None = None  # named builder in TEXT_BUILDER_REGISTRY;
                                       # if set, overrides text_field.
@@ -137,6 +138,45 @@ class SourceConfig:
     hf_extra: dict | None = None     # passed to load_dataset (e.g. {'name': 'python'})
     filter_spec: str | dict | None = None
     skip_first: int = 0              # for shuffled streaming, optional
+    fim_rate: float = 0.0            # PSM Fill-in-the-Middle augmentation rate
+                                      # (per-document); 0.0 disables.
+    jsonl_path: str | None = None    # if set, stream rows from a local JSONL
+                                      # file instead of HF. `text_field`
+                                      # selects which field to extract.
+
+
+# ---------------------------------------------------------------------------
+# Fill-in-the-Middle (PSM variant, per DeepSeek-Coder). Sentinels are
+# plain text strings — the tokenizer will encode them as multi-token
+# sequences and the model learns them as fixed patterns. No vocab change.
+
+_FIM_PREFIX = "<|fim_prefix|>"
+_FIM_SUFFIX = "<|fim_suffix|>"
+_FIM_MIDDLE = "<|fim_middle|>"
+
+
+def maybe_apply_fim(text: str, *, rng: random.Random, fim_rate: float) -> str:
+    """With probability `fim_rate`, reformat `text` as PSM Fill-in-the-Middle:
+
+        <|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>{middle}
+
+    The split picks two distinct char boundaries (0 < a < b < len(text)).
+    Otherwise the text is returned unchanged. Short texts (< 4 chars) are
+    always returned unchanged since there is no room for prefix/middle/suffix.
+    """
+    if fim_rate <= 0.0:
+        return text
+    if rng.random() >= fim_rate:
+        return text
+    n = len(text)
+    if n < 4:
+        return text
+    # Two distinct boundaries in (0, n); sort to get (a, b) with a < b.
+    a, b = sorted(rng.sample(range(1, n), 2))
+    prefix = text[:a]
+    middle = text[a:b]
+    suffix = text[b:]
+    return f"{_FIM_PREFIX}{prefix}{_FIM_SUFFIX}{suffix}{_FIM_MIDDLE}{middle}"
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +268,45 @@ def _extract_text(example: dict, text_field, text_builder: str | None = None
     return "\n\n".join(parts)
 
 
+def _jsonl_stream(path: str, seed: int = 0, skip_first: int = 0):
+    """Stream a local JSONL file as an HF-like iterable. Yields dict
+    rows. Cycles forever so the source doesn't exhaust mid-training;
+    each cycle is shuffled with a different seed (seed + cycle_idx)."""
+    p = pathlib.Path(path)
+    if not p.exists():
+        raise RuntimeError(f"jsonl_path does not exist: {p}")
+    # Load all rows once (synthetic JSONLs are small enough — 50–100k
+    # rows of ~500 chars = ~50 MB). For larger files, stream + reservoir
+    # shuffle would be needed; we don't go there yet.
+    rows: list[dict] = []
+    with open(p) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if not rows:
+        raise RuntimeError(f"jsonl_path is empty: {p}")
+    rng = random.Random(seed)
+    cycle = 0
+    while True:
+        order = list(range(len(rows)))
+        rng_cycle = random.Random(seed + cycle)
+        rng_cycle.shuffle(order)
+        start = skip_first if cycle == 0 else 0
+        for i in order[start:]:
+            yield rows[i]
+        cycle += 1
+
+
 def _open_stream(src: SourceConfig, seed: int = 0):
+    # Local JSONL branch: skip HF entirely.
+    if src.jsonl_path:
+        return _jsonl_stream(src.jsonl_path, seed=seed,
+                             skip_first=src.skip_first)
     from datasets import load_dataset
     kw = dict(streaming=True)
     if src.hf_extra:
@@ -334,6 +412,7 @@ class MixedSourceStream(IterableDataset):
             src = self.sources[idx]
             text_field = src.text_field
             text_builder = src.text_builder
+            fim_rate = float(src.fim_rate)
             while len(buffers[idx]) < target:
                 try:
                     ex = next(iters[idx])
@@ -344,6 +423,8 @@ class MixedSourceStream(IterableDataset):
                 text = _extract_text(ex, text_field, text_builder=text_builder)
                 if text is None:
                     continue
+                if fim_rate > 0.0:
+                    text = maybe_apply_fim(text, rng=rng, fim_rate=fim_rate)
                 ids = tok.encode(text, add_special_tokens=False)
                 buffers[idx].extend(ids)
                 buffers[idx].append(eos)
@@ -453,9 +534,15 @@ def load_sources_from_yaml(path: str) -> list[SourceConfig]:
     for src in cfg["sources"]:
         if not src.get("enabled", True):
             continue
+        jsonl_path = src.get("jsonl_path")
+        dataset_id = src.get("dataset_id", "")
+        if not jsonl_path and not dataset_id:
+            raise ValueError(
+                f"source {src.get('name')!r}: must set either dataset_id "
+                f"(HF) or jsonl_path (local JSONL)")
         out.append(SourceConfig(
             name=src["name"],
-            dataset_id=src["dataset_id"],
+            dataset_id=dataset_id,
             text_field=src.get("text_field", "text"),
             text_builder=src.get("text_builder"),
             weight=float(src.get("weight", 1.0)),
@@ -463,6 +550,8 @@ def load_sources_from_yaml(path: str) -> list[SourceConfig]:
             hf_extra=src.get("hf_extra"),
             filter_spec=src.get("filter"),
             skip_first=int(src.get("skip_first", 0)),
+            fim_rate=float(src.get("fim_rate", 0.0)),
+            jsonl_path=jsonl_path,
         ))
     if not out:
         raise ValueError(f"YAML at {path} has no enabled sources")

@@ -119,16 +119,36 @@ DEFAULT_TOPICS: list[str] = [
 # ---------------------------------------------------------------------------
 
 _PROMPT_TEMPLATE = """\
-Generate a Python function exercise in the same style as HumanEval problems:
-- A function signature with type hints
-- A clear docstring describing what the function should do, including at \
-least one example (using >>> notation)
-- A clean implementation
+Write ONE complete, working Python function on the following topic. The \
+function must be fully implemented (no `pass`, no `...`, no `# TODO`, \
+no placeholder text) and must be the kind of small focused problem \
+typical of HumanEval / MBPP.
 
 Topic: {topic}
 Difficulty: {difficulty}
 
-Output ONLY the function (signature, docstring, body) in a ```python``` block.
+Requirements:
+- Function signature WITH type hints (use `from typing import ...` if needed).
+- Docstring describing the problem, with at least one `>>> example()` line \
+showing input → output.
+- A real, working implementation in the body.
+
+Example of the format I want (different topic, just for shape):
+```python
+def count_vowels(s: str) -> int:
+    \"\"\"Return the number of vowels (a, e, i, o, u, case-insensitive) in `s`.
+
+    >>> count_vowels("hello")
+    2
+    >>> count_vowels("XYZ")
+    0
+    \"\"\"
+    return sum(1 for ch in s.lower() if ch in "aeiou")
+```
+
+Now write ONE function on topic "{topic}" at {difficulty} difficulty. \
+Output ONLY the function in a ```python``` block — no explanation, no \
+multiple alternatives.
 """
 
 
@@ -178,18 +198,38 @@ def write_jsonl_record(f: IO[str], *,
 # ---------------------------------------------------------------------------
 
 def looks_like_function(code: str) -> bool:
-    """Cheap filter: must parse as Python AND contain at least one
-    top-level `def` with a docstring. We don't try to grade the body
-    here — Phi-1 lesson is that even noisy synthetic exercises help."""
+    """Filter: must parse, contain a top-level def with a docstring,
+    AND have a non-trivial body (more than just `pass`, `...`, or
+    a single comment-placeholder). Early Qwen runs were emitting
+    template stubs at 84% rate — without this check the synthetic
+    corpus is mostly "# implementation goes here" boilerplate.
+    """
     import ast
     try:
         tree = ast.parse(code)
     except SyntaxError:
         return False
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if ast.get_docstring(node):
-                return True
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not ast.get_docstring(node):
+            continue
+        non_doc_body = [s for s in node.body
+                        if not (isinstance(s, ast.Expr)
+                                 and isinstance(s.value, ast.Constant)
+                                 and isinstance(s.value.value, str))]
+        if not non_doc_body:
+            continue
+        if len(non_doc_body) == 1 and isinstance(non_doc_body[0],
+                                                  (ast.Pass, ast.Expr)):
+            stmt = non_doc_body[0]
+            if isinstance(stmt, ast.Pass):
+                continue
+            if (isinstance(stmt, ast.Expr)
+                    and isinstance(stmt.value, ast.Constant)
+                    and stmt.value.value is Ellipsis):
+                continue
+        return True
     return False
 
 
@@ -234,7 +274,7 @@ def main():
     p.add_argument("--shard_id", type=int, default=0)
     p.add_argument("--num_shards", type=int, default=1)
     p.add_argument("--temperature", type=float, default=0.9)
-    p.add_argument("--max_new_tokens", type=int, default=512)
+    p.add_argument("--max_new_tokens", type=int, default=1024)
     p.add_argument("--max_model_len", type=int, default=2048)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--gpu_mem_fraction", type=float, default=0.92)
@@ -257,7 +297,7 @@ def main():
     if args.smoke:
         topics = topics[:5]
         args.n_per_topic = 5
-        args.max_new_tokens = 256
+        args.max_new_tokens = 1024
         args.batch_size = 8
 
     # Shard across machines (round-robin over topics).

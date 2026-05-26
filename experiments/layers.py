@@ -165,34 +165,113 @@ class _FlaWrapper(nn.Module):
     (conservative — an unverified fla layer could choke on the kwarg);
     subclasses whose underlying fla layer is verified to accept `cu_seqlens`
     opt in by setting this True.
+
+    `state_readonly_at_think` (default False): when True, the per-token
+    delta-rule write gate β is forced to 0 at think positions. The think
+    token still PROCESSES its query against the existing recurrent state
+    (so the local hidden h_t carries information), but it does NOT WRITE
+    its content into the state. This preserves long-range bindings across
+    multi-think bursts. The masking is installed by wrapping the inner
+    FLA layer's `b_proj` Linear so that its post-sigmoid output is
+    multiplied by `(1 - think_mask)` at think positions. See
+    `enable_state_readonly_at_think()`.
+
+    NOTE: state-readonly is implemented for plain DeltaNet only. Other
+    FLA variants (GatedDeltaNet, GatedDeltaProduct, Mamba2, ...) have
+    different per-token gating internals and would need their own wiring.
     """
 
     accepts_cu_seqlens = False
+    accepts_think_mask = False
+    state_readonly_at_think = False
 
     def __init__(self, fla_layer: nn.Module):
         super().__init__()
         self.layer = fla_layer
+        # Per-forward stash for the b_proj wrapper to read. Set in
+        # `forward` and cleared after. Not a Parameter, not in state_dict.
+        self._current_think_mask: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None
+    def enable_state_readonly_at_think(self) -> None:
+        """Install a forward-hook on the inner `b_proj` so β is forced
+        to 0 at think positions. We hook (not wrap) so the parameter
+        names on the inner Linear are unchanged → state_dict keys and
+        existing checkpoints remain compatible.
+
+        Only supported for plain DeltaNet (the inner `self.layer` must
+        own an `nn.Linear` attribute named `b_proj`). For other FLA
+        variants this raises `RuntimeError` — extend per-variant if you
+        need them.
+        """
+        if not hasattr(self.layer, "b_proj"):
+            raise RuntimeError(
+                "state_readonly_at_think only supports plain DeltaNet "
+                "(inner FLA layer must own `b_proj`). Got "
+                f"{type(self.layer).__name__}."
+            )
+        if getattr(self, "_b_proj_hook_handle", None) is not None:
+            return  # idempotent
+        wrapper_owner = self
+
+        def _mask_beta_logits(_module: nn.Module, _inputs: tuple,
+                              logits: torch.Tensor) -> torch.Tensor:
+            tm = wrapper_owner._current_think_mask
+            if tm is None or not wrapper_owner.state_readonly_at_think:
+                return logits
+            # `logits` is the pre-sigmoid output of b_proj, shape
+            # (..., num_heads). The leading dims are (B, T) for the
+            # plain path or (1, B*T) for the cross-doc-flattened path
+            # (see _FlaWrapper.forward). β = sigmoid(logits); we replace
+            # logits at think positions with -1e4 so sigmoid → ~0. Using
+            # a large-neg additive is bf16-safe (1e4 << 3e38 range).
+            NEG = torch.tensor(-1e4, dtype=logits.dtype,
+                               device=logits.device)
+            if logits.dim() == 3 and logits.shape[0] == 1 \
+                    and logits.shape[1] == tm.numel():
+                mask = tm.reshape(1, -1, 1)
+            elif (logits.dim() == 3
+                    and logits.shape[:2] == tm.shape):
+                mask = tm.view(tm.shape[0], tm.shape[1], 1)
+            else:
+                # Shape didn't match the expected (B, T) or (1, B*T)
+                # layout — skip masking to avoid corrupting the forward.
+                return logits
+            return torch.where(mask, NEG.expand_as(logits), logits)
+
+        self._b_proj_hook_handle = self.layer.b_proj.register_forward_hook(
+            _mask_beta_logits
+        )
+        self.state_readonly_at_think = True
+        self.accepts_think_mask = True
+
+    def forward(self, x: torch.Tensor,
+                cu_seqlens: torch.Tensor | None = None,
+                think_mask: torch.Tensor | None = None,
                 ) -> torch.Tensor:
         # fla's chunked kernels assert non-fp32 inputs. The trainer wraps
         # model.forward in bf16 autocast via apply_speed_knobs, but eval
         # callers (eval_humaneval.py, diag_ckpt.py, ...) don't — we keep
         # the explicit autocast here as a safety net so any caller works.
         in_dtype = x.dtype
-        if cu_seqlens is not None and self.accepts_cu_seqlens:
-            B, T, d = x.shape
-            x_flat = x.reshape(1, B * T, d)
+        # Stash the think_mask for the b_proj wrapper to read. Cleared
+        # in `finally` so a leaked attribute can't affect a later forward.
+        self._current_think_mask = think_mask if self.state_readonly_at_think else None
+        try:
+            if cu_seqlens is not None and self.accepts_cu_seqlens:
+                B, T, d = x.shape
+                x_flat = x.reshape(1, B * T, d)
+                with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+                    out = self.layer(x_flat, cu_seqlens=cu_seqlens)
+                if isinstance(out, tuple):
+                    out = out[0]
+                return out.reshape(B, T, d).to(in_dtype)
             with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
-                out = self.layer(x_flat, cu_seqlens=cu_seqlens)
+                out = self.layer(x)
             if isinstance(out, tuple):
                 out = out[0]
-            return out.reshape(B, T, d).to(in_dtype)
-        with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
-            out = self.layer(x)
-        if isinstance(out, tuple):
-            out = out[0]
-        return out.to(in_dtype)
+            return out.to(in_dtype)
+        finally:
+            self._current_think_mask = None
 
     def forward_step(self, x: torch.Tensor, past_key_values, layer_idx: int):
         """Incremental-decoding forward for one timestep.

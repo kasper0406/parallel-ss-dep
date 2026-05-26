@@ -131,6 +131,8 @@ def build_model_from_args(args, *, vocab_size: int,
                          and args.think_decision == "gate")),
         activation_checkpointing=args.activation_checkpointing,
         layer_drop_max=float(getattr(args, "layer_drop_max", 0.0)),
+        state_readonly_at_think=bool(
+            getattr(args, "state_readonly_at_think", False)),
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,

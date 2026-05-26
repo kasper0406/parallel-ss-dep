@@ -57,18 +57,26 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 input_ids: torch.Tensor | None = None,
-                cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
+                cu_seqlens: torch.Tensor | None = None,
+                think_mask: torch.Tensor | None = None,
+                ) -> torch.Tensor:
         # Symbol-grounded attention needs the raw token IDs to key its
         # sparse table. Other attentions ignore input_ids.
         # cu_seqlens (cross-document isolation) is passed only to attentions
         # that advertise `accepts_cu_seqlens` — FLA recurrent kernels.
-        if getattr(self.attn, "needs_input_ids", False):
-            x = x + self.attn(self.attn_norm(x), input_ids=input_ids)
-        elif cu_seqlens is not None and getattr(
-                self.attn, "accepts_cu_seqlens", False):
-            x = x + self.attn(self.attn_norm(x), cu_seqlens=cu_seqlens)
+        # think_mask (state-readonly-at-think, Phase 2 / 2026-05-26) is
+        # passed only to attentions that advertise `accepts_think_mask` —
+        # currently the DeltaNet _FlaWrapper with state_readonly enabled.
+        attn = self.attn
+        if getattr(attn, "needs_input_ids", False):
+            x = x + attn(self.attn_norm(x), input_ids=input_ids)
         else:
-            x = x + self.attn(self.attn_norm(x))
+            kw: dict = {}
+            if cu_seqlens is not None and getattr(attn, "accepts_cu_seqlens", False):
+                kw["cu_seqlens"] = cu_seqlens
+            if think_mask is not None and getattr(attn, "accepts_think_mask", False):
+                kw["think_mask"] = think_mask
+            x = x + attn(self.attn_norm(x), **kw)
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
@@ -98,18 +106,21 @@ class Block(nn.Module):
 
 def _run_block(blk: nn.Module, h: torch.Tensor,
                input_ids: torch.Tensor | None,
-               cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
+               cu_seqlens: torch.Tensor | None = None,
+               think_mask: torch.Tensor | None = None) -> torch.Tensor:
     """Free function so torch.utils.checkpoint can pickle / re-run it
     cleanly (closures over `self` cause occasional issues with the
     non-reentrant checkpoint implementation)."""
-    return blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
+    return blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens,
+               think_mask=think_mask)
 
 
 def _ckpt_run_block(blk: nn.Module, h: torch.Tensor,
                     input_ids: torch.Tensor | None,
-                    cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
+                    cu_seqlens: torch.Tensor | None = None,
+                    think_mask: torch.Tensor | None = None) -> torch.Tensor:
     from torch.utils.checkpoint import checkpoint
-    return checkpoint(_run_block, blk, h, input_ids, cu_seqlens,
+    return checkpoint(_run_block, blk, h, input_ids, cu_seqlens, think_mask,
                       use_reentrant=False)
 
 
@@ -1145,6 +1156,13 @@ class TinyLM(nn.Module):
         pkm_score_norm: str = "layer",
         pkm_value_init_std: float = 1.0,
         pkm_use_output_gate: bool = True,
+        # Phase 2 thinking fix (2026-05-26): force DeltaNet β=0 at think
+        # positions so think tokens can read the recurrent state but never
+        # write to it. Preserves long-range bindings across multi-think
+        # bursts (the documented 100% → 20% recall-at-512 drop). Only
+        # applies to plain DeltaNet attention blocks. Default OFF (every
+        # existing ckpt behaves byte-identically without the flag).
+        state_readonly_at_think: bool = False,
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1173,6 +1191,18 @@ class TinyLM(nn.Module):
                   d_ff=d_ff, attention_cls=cls)
             for cls in cls_list
         ])
+        # Phase-2 state-readonly thinking (2026-05-26). Install β-mask
+        # wrapping on every plain-DeltaNet block. Other FLA variants
+        # (GatedDeltaNet, etc.) and non-FLA blocks (Symbol-grounded,
+        # OrthogonalScan, ...) silently skip — we only have the recipe
+        # for plain DeltaNet's `b_proj`.
+        self.state_readonly_at_think = bool(state_readonly_at_think)
+        if self.state_readonly_at_think:
+            from experiments.layers import _FlaWrapper
+            for blk in self.blocks:
+                attn = blk.attn
+                if isinstance(attn, _FlaWrapper) and hasattr(attn.layer, "b_proj"):
+                    attn.enable_state_readonly_at_think()
         self.out_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         if tie_embeddings:
@@ -1423,6 +1453,7 @@ class TinyLM(nn.Module):
                                       input_ids: torch.Tensor | None,
                                       surprise: torch.Tensor | None = None,
                                       cu_seqlens: torch.Tensor | None = None,
+                                      think_mask: torch.Tensor | None = None,
                                       ) -> dict:
         """One sparse-FiLM forward pass — collect source-layer outputs for
         use as next iteration's FiLM input.
@@ -1448,7 +1479,8 @@ class TinyLM(nn.Module):
                 src = self.sparse_target_to_source[L]
                 h = self.sparse_feedback[str(L)](h, film_sources_lagged[src],
                                                   surprise=surprise)
-            h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
+            h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens,
+                    think_mask=think_mask)
             if (film_sources_lagged is not None
                     and L in self.sparse_target_to_source
                     and self.feedback_position == "post"):
@@ -1463,7 +1495,8 @@ class TinyLM(nn.Module):
     def _block_fwd(self, blk: nn.Module, h: torch.Tensor,
                    input_ids: torch.Tensor | None,
                    L: int = -1,
-                   cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
+                   cu_seqlens: torch.Tensor | None = None,
+                   think_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Run one Block; optionally checkpoint and/or stochastically drop.
 
         Activation checkpointing trades ~30% extra compute for a large
@@ -1481,9 +1514,10 @@ class TinyLM(nn.Module):
             if torch.rand((), device=h.device).item() < p_L:
                 return h
         if self.activation_checkpointing and torch.is_grad_enabled():
-            h = _ckpt_run_block(blk, h, input_ids, cu_seqlens)
+            h = _ckpt_run_block(blk, h, input_ids, cu_seqlens, think_mask)
         else:
-            h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
+            h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens,
+                    think_mask=think_mask)
         return self._maybe_pkm(h, L)
 
     def _apply_memory(self, h_normed: torch.Tensor,
@@ -1581,6 +1615,19 @@ class TinyLM(nn.Module):
         # plain batched path (each row already an independent sequence).
         cu_seqlens = _build_cu_seqlens(doc_ids)
 
+        # State-readonly-at-think (Phase 2, 2026-05-26). Precompute a
+        # boolean mask once per forward; threaded into Block → _FlaWrapper
+        # so DeltaNet's β is forced to 0 at think positions. Only built
+        # when both the flag is set AND we know the thinking_token_id.
+        # The thread is a no-op on every other attention kind (Block
+        # checks `accepts_think_mask`).
+        if (self.state_readonly_at_think
+                and self.thinking_token_id is not None
+                and input_ids is not None):
+            think_mask = (input_ids == int(self.thinking_token_id))
+        else:
+            think_mask = None
+
         if self.max_T > 0:
             T = input_ids.shape[1]
             pos = torch.arange(T, device=input_ids.device)
@@ -1605,7 +1652,8 @@ class TinyLM(nn.Module):
             # noise; the K-self-feed tax isn't worth paying yet).
             for L, blk in enumerate(self.blocks):
                 x = self._block_fwd(blk, x, input_ids, L=L,
-                                    cu_seqlens=cu_seqlens)
+                                    cu_seqlens=cu_seqlens,
+                                    think_mask=think_mask)
             return self._finalize(x, input_ids, mem_read_mask,
                                    return_aux, return_hidden, return_gate,
                                    _maybe_gate, doc_ids=doc_ids)
@@ -1638,7 +1686,8 @@ class TinyLM(nn.Module):
                 h1 = x
                 for L, blk in enumerate(self.blocks):
                     h1 = self._block_fwd(blk, h1, input_ids, L=L,
-                                         cu_seqlens=cu_seqlens)
+                                         cu_seqlens=cu_seqlens,
+                                         think_mask=think_mask)
                     if L in needed_sources:
                         pass1_at_sources[L] = h1
             # Pass 2: at each target layer, gather lagged source states and
@@ -1658,7 +1707,8 @@ class TinyLM(nn.Module):
                         src_states = [lagged_pass1[s] for s in srcs]
                         h = self.xattn_feedback[str(L)](h, src_states)
                 h = self._block_fwd(blk, h, input_ids, L=L,
-                                    cu_seqlens=cu_seqlens)
+                                    cu_seqlens=cu_seqlens,
+                                    think_mask=think_mask)
             return self._finalize(h, input_ids, mem_read_mask,
                                    return_aux, return_hidden, return_gate,
                                    _maybe_gate, doc_ids=doc_ids)
@@ -1689,6 +1739,7 @@ class TinyLM(nn.Module):
                     src_states = self._sparse_pass_collect_sources(
                         x, source_layers, film_sources_lagged=None,
                         input_ids=input_ids, cu_seqlens=cu_seqlens,
+                        think_mask=think_mask,
                     )
                 # Iterations 1 .. K-2 (if K>2): self-feed. Detached so backward
                 # never reaches them.
@@ -1715,6 +1766,7 @@ class TinyLM(nn.Module):
                         src_states = self._sparse_pass_collect_sources(
                             x, source_layers, film_sources_lagged=film_in,
                             input_ids=input_ids, cu_seqlens=cu_seqlens,
+                            think_mask=think_mask,
                         )
                 # Final iteration K-1: this is the loss-bearing pass. Backprop
                 # flows through this forward only. FiLM inputs come from the
@@ -1760,7 +1812,8 @@ class TinyLM(nn.Module):
                         sup = surprise_per_target.get(L) if surprise_per_target else None
                         h = self.sparse_feedback[str(L)](h, film_in[src], surprise=sup)
                     h = self._block_fwd(blk, h, input_ids, L=L,
-                                    cu_seqlens=cu_seqlens)
+                                    cu_seqlens=cu_seqlens,
+                                    think_mask=think_mask)
                     if L in self.sparse_target_to_source and self.feedback_position == "post":
                         src = self.sparse_target_to_source[L]
                         sup = surprise_per_target.get(L) if surprise_per_target else None
@@ -1799,7 +1852,8 @@ class TinyLM(nn.Module):
             pass1_at_sources: dict = {}
             h1 = x
             for L, blk in enumerate(self.blocks):
-                h1 = blk(h1, input_ids=input_ids, cu_seqlens=cu_seqlens)
+                h1 = blk(h1, input_ids=input_ids, cu_seqlens=cu_seqlens,
+                         think_mask=think_mask)
                 h1 = self._maybe_pkm(h1, L)
                 if L in source_layers:
                     pass1_at_sources[L] = h1
@@ -1814,7 +1868,8 @@ class TinyLM(nn.Module):
                                                             self.feedback_lag)
                     h = self.sparse_feedback[str(L)](h, state_above_lagged)
                 h = self._block_fwd(blk, h, input_ids, L=L,
-                                    cu_seqlens=cu_seqlens)
+                                    cu_seqlens=cu_seqlens,
+                                    think_mask=think_mask)
                 if L in self.sparse_target_to_source and self.feedback_position == "post":
                     src = self.sparse_target_to_source[L]
                     state_above_lagged = _shift_right_by_k(pass1_at_sources[src],
@@ -1827,7 +1882,7 @@ class TinyLM(nn.Module):
         pass1_outs: list[torch.Tensor] = []
         h = x
         for L, blk in enumerate(self.blocks):
-            h = blk(h, input_ids=input_ids)
+            h = blk(h, input_ids=input_ids, think_mask=think_mask)
             h = self._maybe_pkm(h, L)
             pass1_outs.append(h)
 
@@ -1838,7 +1893,8 @@ class TinyLM(nn.Module):
         N = len(self.blocks)
         for L, blk in enumerate(self.blocks):
             if self.feedback_mode == "none":
-                h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens)
+                h = blk(h, input_ids=input_ids, cu_seqlens=cu_seqlens,
+                        think_mask=think_mask)
                 h = self._maybe_pkm(h, L)
                 continue
             # Gather multi-scale lagged states for layer L.
@@ -1850,7 +1906,8 @@ class TinyLM(nn.Module):
                 else:
                     states_above.append(None)
             h_input = self.feedback[L](h, states_above)
-            h = blk(h_input, input_ids=input_ids, cu_seqlens=cu_seqlens)
+            h = blk(h_input, input_ids=input_ids, cu_seqlens=cu_seqlens,
+                    think_mask=think_mask)
             h = self._maybe_pkm(h, L)
 
         return self._finalize(h, input_ids, mem_read_mask,

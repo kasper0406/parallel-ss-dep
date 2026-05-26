@@ -425,6 +425,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "across think/emit, so reads (which ARE sharp at "
                         "think positions) hit a buffer of noise. This "
                         "mechanically forces think-content into the buffer.")
+    p.add_argument("--state_readonly_at_think", action="store_true",
+                   help="Phase 2 thinking fix (2026-05-26): force the "
+                        "DeltaNet per-token write gate β to 0 at think "
+                        "positions, so think tokens can READ the recurrent "
+                        "state but never WRITE to it. Preserves long-range "
+                        "bindings across multi-think bursts (the documented "
+                        "100% -> 20% recall-at-512 drop). Only applies to "
+                        "plain DeltaNet attention blocks; other variants "
+                        "silently skip. Default OFF (every existing ckpt "
+                        "behaves byte-identically without the flag).")
     p.add_argument("--mem_dim", type=int, default=0,
                    help="Memory projection dim. 0 = match d_model.")
     # ----- Persistent learned-RAG (Product-Key Memory) -----

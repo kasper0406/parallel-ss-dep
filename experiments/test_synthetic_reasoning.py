@@ -21,7 +21,10 @@ import tempfile
 import pytest
 
 from experiments.code_grader import (
-    LOADERS, Problem, grade, load_synth_reasoning,
+    LOADERS, Problem, grade,
+    load_synth_reasoning,
+    load_synth_reasoning_heldout,
+    load_synth_reasoning_train,
 )
 from experiments.gen_synthetic_reasoning_tasks import (
     _FAMILIES, generate, problem_to_record, record_to_problem,
@@ -127,6 +130,51 @@ def test_loader_is_registered():
     # not crash with a JSON decode somewhere downstream.
     with pytest.raises(FileNotFoundError, match="not found"):
         LOADERS["synth_reasoning"](path="/tmp/does_not_exist_synth.jsonl")
+
+
+def test_train_and_heldout_loaders_are_registered():
+    """The stochastic-gate discovery RL experiment depends on the
+    `synth_reasoning_train` and `synth_reasoning_heldout` LOADERS keys.
+    Lock the contract."""
+    assert "synth_reasoning_train" in LOADERS
+    assert "synth_reasoning_heldout" in LOADERS
+    # Both raise a clear FileNotFoundError when pointed at a missing
+    # path, mirroring the legacy loader.
+    with pytest.raises(FileNotFoundError, match="not found"):
+        load_synth_reasoning_train(path="/tmp/does_not_exist_train.jsonl")
+    with pytest.raises(FileNotFoundError, match="not found"):
+        load_synth_reasoning_heldout(
+            path="/tmp/does_not_exist_heldout.jsonl"
+        )
+
+
+def test_train_and_heldout_loaders_smoke(tmp_path: pathlib.Path):
+    """Generate tiny train + heldout JSONLs with disjoint seeds and
+    verify both loaders read them back as Problems. Mirrors the
+    pipeline used by the stochastic-gate discovery experiment."""
+    train_problems = generate(
+        families=list(_FAMILIES), n_per_family=2, seed=0, validate=True,
+    )
+    held_problems = generate(
+        families=list(_FAMILIES), n_per_family=2, seed=1000, validate=True,
+    )
+    train_path = tmp_path / "synth_reasoning_train.jsonl"
+    held_path = tmp_path / "synth_reasoning_heldout.jsonl"
+    for path, probs in [(train_path, train_problems),
+                        (held_path, held_problems)]:
+        with open(path, "w") as f:
+            for p in probs:
+                f.write(json.dumps(problem_to_record(p)) + "\n")
+
+    train_loaded = load_synth_reasoning_train(path=str(train_path))
+    held_loaded = load_synth_reasoning_heldout(path=str(held_path))
+
+    assert len(train_loaded) == len(train_problems) == 2 * len(_FAMILIES)
+    assert len(held_loaded) == len(held_problems) == 2 * len(_FAMILIES)
+    for prob in train_loaded + held_loaded:
+        assert isinstance(prob, Problem)
+        assert prob.task_id.startswith("synth_reason/")
+        assert prob.gold_solution is not None
 
 
 def test_record_to_problem_inverts_to_record():

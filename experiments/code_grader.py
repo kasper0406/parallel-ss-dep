@@ -506,6 +506,8 @@ def load_codefeedback_python(max_n: int | None = None) -> list[Problem]:
 
 
 _SYNTH_REASONING_DEFAULT_PATH = "data/synth_reasoning_tasks_small.jsonl"
+_SYNTH_REASONING_TRAIN_PATH = "data/synth_reasoning_train.jsonl"
+_SYNTH_REASONING_HELDOUT_PATH = "data/synth_reasoning_heldout.jsonl"
 
 
 def load_synth_reasoning(path: str | None = None) -> list[Problem]:
@@ -515,6 +517,11 @@ def load_synth_reasoning(path: str | None = None) -> list[Problem]:
     where each line is a serialised `Problem`. By default looks at
     `data/synth_reasoning_tasks_small.jsonl`; override via the
     `SYNTH_REASONING_PATH` env var or the `path` arg.
+
+    For the larger train/held-out splits used by the stochastic-gate
+    discovery RL experiment, use `load_synth_reasoning_train` /
+    `load_synth_reasoning_heldout` (registered under
+    `"synth_reasoning_train"` / `"synth_reasoning_heldout"` in LOADERS).
     """
     import os
     p = (path
@@ -548,6 +555,25 @@ def load_synth_reasoning(path: str | None = None) -> list[Problem]:
     return out
 
 
+def load_synth_reasoning_train(path: str | None = None) -> list[Problem]:
+    """Larger synth_reasoning train split (3000 tasks, seed=0).
+
+    Used by the stochastic-gate discovery RL experiment as the
+    RL-training pool. Same JSONL format as `load_synth_reasoning`;
+    only the default path differs.
+    """
+    return load_synth_reasoning(path=path or _SYNTH_REASONING_TRAIN_PATH)
+
+
+def load_synth_reasoning_heldout(path: str | None = None) -> list[Problem]:
+    """Held-out synth_reasoning eval split (300 tasks, seed=1000).
+
+    Disjoint-seed sibling of `load_synth_reasoning_train`. Used to
+    measure generalisation of the stochastic-gate discovery RL run.
+    """
+    return load_synth_reasoning(path=path or _SYNTH_REASONING_HELDOUT_PATH)
+
+
 def load_distill_corpus(
     max_magicoder: int | None = None,
     max_codefeedback: int | None = None,
@@ -575,7 +601,9 @@ LOADERS: dict[str, Callable[[], list[Problem]]] = {
     "codefeedback": load_codefeedback_python,
     "distill_corpus": load_distill_corpus,
     # Synthetic reasoning-required tasks (gen_synthetic_reasoning_tasks.py).
-    "synth_reasoning": load_synth_reasoning,
+    "synth_reasoning": load_synth_reasoning,             # legacy small (504)
+    "synth_reasoning_train": load_synth_reasoning_train,   # 3000 train pool
+    "synth_reasoning_heldout": load_synth_reasoning_heldout,  # 300 held-out
 }
 
 

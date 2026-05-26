@@ -168,4 +168,51 @@ is doing exactly the right work.
 Phase 5 is worth building. If still negative → architectural rethink
 needed (current mechanism is fundamentally broken at this scale).
 
+## 2026-05-26 — PIVOT: efficient-thinking plan replaces gate-training plan
+
+**Decision**: rewrote `THINKING_PLAN.md` end-to-end. The previous plan
+was "train the gate to fire correctly + give it process reward". The
+user pointed out — and Phase 0 result confirmed — that nothing in
+that plan actually tested the architecture's CORE PROMISE
+(N_think << N_cot via compression of CoT into denser representations).
+
+**Old plan failure mode**: Design A SFT taught the model to spend N
+thinks (= N CoT tokens) as loss-masked padding before emitting code.
+Think positions had no gradient signal → no way to learn what to
+compute there. The gate-firing was decorative; the architectural
+"1 think ≈ K CoT tokens" claim was never exercised.
+
+**New plan core**: Phase 1 introduces a gist-loss target at think
+positions — predict the CoT teacher's hidden state K steps ahead per
+think. THIS gives think positions explicit gradient and EXPLICITLY
+trains compression (K=5 means N_think = N_cot / 5).
+
+**Decision gates**:
+- Phase 0 (text-CoT baseline): if pass@1 < 5/164, scale issue not
+  thinking issue; pivot away from the mechanism.
+- Phase 1a (gist supervision K=5): if HumanEval matches Phase 0
+  baseline with 5× fewer thinks, efficient thinking works. Ship.
+- Phase 1b (retrieval-as-input from CoT, deeper plumbing): fallback
+  if 1a doesn't deliver.
+- If neither: architecture can't support compression at this scale;
+  pivot to scale-up.
+
+**What's still useful from the old plan**:
+- Phase 2 (state-readonly): shipped, validated +0.465 recall lift.
+  Keep ON for all new runs.
+- Phase 3 (think index embedding): shipped. Keep ON.
+- Phase 6 (synthetic reasoning curriculum): shipped, 504 tasks. Use
+  as RL data in the new Phase 3.
+
+**What's dropped from the old plan**:
+- Design A as the primary SFT approach (loss-masked think padding).
+  Its only remaining use is as a "gate ramp-up" warmup before
+  swapping in gist-at-think.
+
+**Currently running**: the in-flight `run_thinking_pipeline.sh` is on
+step 6 (long-context recall) of the OLD plan's pipeline. Let it
+finish for the data, but the Phase D + mixed-SFT (Phase 0 of new
+plan) is the actual next move — already queued via
+`launch_sft_phase_d_mixed.sh`.
+
 ## (Future entries appended below as decisions are made)

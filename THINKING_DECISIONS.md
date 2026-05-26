@@ -378,4 +378,38 @@ difference between success and failure.
 2. Scale synth_reasoning to 3000+ train + 300 held-out
 3. (This file + THINKING_PLAN.md rewrite — done in-line)
 
+## 2026-05-26 — First discovery-RL run: synth_reasoning too OOD, pivoting to mbpp
+
+**Result on synth_reasoning_train** (100 steps):
+  - reward: 0.08 → 0.02 → 0.004 → 0.000 (full collapse)
+  - tier_hist: all syntax_error by step 100
+  - gate(fire) stable ~0.25-0.37 (entropy reg working as designed)
+
+**Diagnosis**: synth_reasoning prompts are too OOD from the model's
+SFT distribution. The base scored ZERO on these tasks → no reward
+gradient → PPO destabilized to junk output.
+
+**Stochastic-gate mechanism IS validated mechanically**:
+- Gate fire rate stayed in [0.25, 0.37] across 100 steps (didn't
+  collapse to 0 or 1 despite policy noise)
+- Gate entropy ~0.30 (model has preferences but not deterministic)
+- PPO ratio ~1.000 (numerically stable)
+
+What we CAN'T tell from this run: whether the gate would converge
+to a useful pattern, because there was no reward gradient to drive
+convergence.
+
+**Pivot launched**: same recipe but `--dataset mbpp_combined`.
+Reasoning:
+- SFT base has working partial-credit signal on MBPP (8/164 historical)
+- v6→v11c's "gate seldom fires on MBPP" finding was on the
+  DETERMINISTIC gate; the stochastic gate forces ~30% exploration
+  regardless
+- If gate fire converges to a different value than its random init,
+  reward signal IS reaching the gate decisions
+
+**Open question for next run**: does gate fire EVOLVE (sign that
+reward gradient reaches the gate) or stay at its entropy-regularized
+value (sign that reward only flows through emit tokens)?
+
 ## (Future entries appended below as decisions are made)

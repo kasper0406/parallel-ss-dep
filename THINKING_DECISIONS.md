@@ -302,4 +302,43 @@ should start from Phase C and use mix_v4 (no FIM, no synth pyfunc,
 no self-debug fold-in until each can be ablated individually to find
 which one regressed).
 
+## 2026-05-26 — Phase 1a result + diagnosis
+
+**Result**: Phase 1a (gist supervision on top of 8/164 historical-repro
+base) = **0/164**. Same pattern as Phase 0 — ANY SFT route that
+includes the new CoT-thinking dispatch (build_example_with_cot_thinking
+OR build_example_with_cot_compression) drops the model to 0/164.
+
+**What we know empirically**:
+  | run                                    | HumanEval |
+  |----------------------------------------|-----------|
+  | historical ckpt (May 22, eval'd today) | 7/164     |
+  | historical recipe + historical data    | 8/164     |
+  | historical recipe + mixed (Qwen + CoT) | 0/164     |
+  | Phase 1a (gist supervision on CoT)     | 0/164     |
+  | Phase D base + same mixed              | 2/164     |
+
+  Gist supervision DOES learn (load-bearing test: 1.05 → 0.0002 over
+  50 steps). The mechanism works in isolation.
+
+**Hypothesis**: the CoT-only / CoT-mixed-narrow SFT distribution is
+too narrow / out-of-distribution for the trained-on-diverse-mix model.
+The model needs the synth_memory + longctx_recall anti-forgetting
+sources alongside ANY new data added.
+
+**Honest assessment**: today's burn was significant compute (Phase D
+pretrain 20h + ~5 SFT runs + ~10 HumanEval evals). We confirmed the
+architecture (Phase 2 state-readonly +0.465, Phase 1a gist trainable),
+but no run validates the end-to-end efficiency claim because the SFT
+data setup keeps breaking the model.
+
+**Pivot proposal (NOT executed without user sign-off)**:
+1. Retry Phase 1a with the FULL historical mix + CoT-via-gist rows
+   together (distill + synth_memory + longctx_recall + 961 CoT-with-
+   gist). Tests whether the issue was MISSING anti-forgetting sources
+   or CoT-format toxicity.
+2. If that also fails → the new CoT path is structurally broken; need
+   to debug the SFT code path or the data format.
+3. If that works → ship; we have efficient thinking.
+
 ## (Future entries appended below as decisions are made)

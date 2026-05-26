@@ -33,22 +33,26 @@ if [[ ! -e "$MIXED_DATA" ]]; then
 fi
 
 CUDA_VISIBLE_DEVICES=${GPU:-0} nohup .venv/bin/python -u experiments/sft_code.py \
-    --load_ckpt checkpoints/sft_phase_d_mixed.pt \
+    --load_ckpt checkpoints/sft_phase_c_repro_historical.pt \
     --save_ckpt checkpoints/sft_phase_1a_gist.pt \
-    --distilled_jsonl "$MIXED_DATA" \
+    --distilled_jsonl data/sft_cot_thinking_v1.jsonl \
     --distilled_keep_only_passing \
     --with_thinking \
+    --retrieval_as_input_thinking \
+    --future_emb_loss_weight 0.1 \
+    --wm_gist_horizons "16,64,256" \
+    --think_max_bursts 3 --think_max_depth 8 \
+    --mem_size 1024 \
     --state_readonly_at_think \
-    --think_index_emb_size 8 \
     --cot_compression_k 5 \
     --cot_min_thinks 4 \
     --think_gist_weight 0.1 \
     --think_gist_loss_type cosine \
     --max_codealpaca 0 \
-    --epochs 1 \
+    --epochs 2 \
     --batch 4 \
     --lr 3e-6 \
-    --max_len 1536 \
+    --max_len 1024 \
     --log_every 50 \
     --seed 0 \
     > runs/sft_phase_1a_gist.log 2>&1 &

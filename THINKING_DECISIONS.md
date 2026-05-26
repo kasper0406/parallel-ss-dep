@@ -491,4 +491,32 @@ sampled vs decisive, so we can see what's actually happening.
 diagnostics) and Phase B (entropy curriculum). Both modify
 train_rl_grader.py with non-conflicting changes.
 
+## 2026-05-26 — v4 mid-run (step 150/200): Phase A+B underperforming
+
+**Observation**: gate fire bouncing 0.30-0.41 with no trend, reward
+essentially 0 throughout. samp=0.55-0.68 (sampling fires plenty),
+H=0.50-0.53 (entropy stays high), kl=0.023 (very stable). PPO ratio
+0.986-1.001 → update magnitude tiny.
+
+**Decision**: let v4 complete (50 steps remaining), then escalate to
+Phase C (stochastic-aware mini-SFT) per plan. Don't add more flags
+mid-run.
+
+**Diagnosis**: the problem looks like reward sparsity, not the gate
+mechanism. With batch=3, n_group=4 → 12 rollouts/step and pass_n=0
+on most steps, the GRPO normalized advantage is dominated by noise
+between syntax_error and exec_error. Gate-decision PPO is
+group-relative, so it sees the same noise. Phase C addresses this
+indirectly: an SFT that sees sampled gates will calibrate gate
+predictions to the rollout distribution, hopefully producing more
+on-task rollouts after, which then admit reward learning.
+
+**Alternative considered**: bigger batch + n_group for denser reward
+signal. Rejected for now because it would 2-3× the wall time and the
+core stability issue (PPO ratio close to 1, kl tiny → no learning) is
+unlikely to be fixed by more rollouts alone.
+
+**Review trigger**: step 200 final read. If pass_n trend is also flat,
+proceed to Phase C.
+
 ## (Future entries appended below as decisions are made)

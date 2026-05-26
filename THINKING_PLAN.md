@@ -96,6 +96,21 @@ This is the most data-intensive intervention but the highest expected
 lift. Phi-1 / Phi-2 / Qwen all show that demonstration-style
 distillation works at our scale.
 
+**Implementation choice (2026-05-26): Design A — CoT prose replaced
+with N `[THINKING]` tokens, all loss-masked.** Implemented in
+`experiments/sft_code.py::build_example_with_cot_thinking`. For each
+row tagged `prepare_for_thinking=True` (produced by
+`experiments/build_cot_sft_data.py`), the SFT example is
+`prompt | [THINKING] * N_cot | solution | eos`, where `N_cot` =
+length of the CoT under the tokenizer. Prompt + think positions are
+-100 in the labels; only solution + eos carry gradient. The CoT
+*content* is not modeled — only the temporal "think-budget then emit"
+structure. Re-uses the existing thinking infra; no new plumbing.
+Tests in `experiments/test_sft_cot_thinking.py` (8 tests). If Phase 5
+process-aware reward later shows the gate now fires usefully, escalate
+to Design B (per-step thinks) or Design C (retrieval-as-input from CoT
+embeddings) — both require new trunk wiring.
+
 ### Phase 5 — Process-aware reward in RL
 
 After Phase 4 the model has seen good thinking; RL can now reward

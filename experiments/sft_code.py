@@ -15,6 +15,24 @@ at HumanEval inference time:
 The loss is computed only on the solution tokens (everything from the
 newline after the comment to <eos>). Problem-comment tokens are masked.
 
+Phase-4 CoT-thinking SFT (THINKING_PLAN.md Phase 4, Option A): when an
+input row has `prepare_for_thinking: true` plus a `cot_text` field
+(produced by `experiments/build_cot_sft_data.py`), the example is built
+by `build_example_with_cot_thinking` instead of `build_example`. The CoT
+prose is *replaced* with N consecutive `[THINKING]` tokens (where N =
+the CoT's tokenized length), and those positions are masked (-100) from
+the loss. The model thus learns "given the problem, spend ~N think
+tokens, then emit the solution" — directly teaching the gate to fire on
+hard problems without us needing to assign per-think-step targets.
+
+Why Design A (replace, not interleave): keeps the change to a single
+helper + a per-row dispatch in the main loop. Designs B (per-CoT-token
+interleaving) and C (retrieval-as-input from CoT embeddings) require new
+trunk plumbing; A re-uses everything already in place. The CoT *content*
+is not directly modeled, but the temporal "think-before-emit" structure
+is — which is what we need before Phase 5 can give thinking process
+reward (see THINKING_DECISIONS.md 2026-05-26).
+
 Usage:
     CUDA_VISIBLE_DEVICES=0 python experiments/sft_code.py \\
         --load_ckpt checkpoints/distill_qwen36_dn217_mem.pt \\
@@ -140,13 +158,78 @@ def load_distilled_jsonl(path: str, *,
     return pairs
 
 
+def load_distilled_jsonl_with_cot(
+    path: str,
+    *,
+    prefer_full_completion: bool = True,
+    require_extracted_code: bool = True,
+    keep_only_passing: bool = False,
+) -> list[tuple[str, str, str | None]]:
+    """Like `load_distilled_jsonl` but returns 3-tuples
+    `(problem, solution, cot_text_or_None)` so the SFT main loop can
+    dispatch per row to `build_example_with_cot_thinking` when
+    `prepare_for_thinking=True`.
+
+    `cot_text` is `None` for rows without `prepare_for_thinking=True` —
+    those rows train via the unchanged `build_example` path.
+    """
+    import json
+    rows: list[tuple[str, str, str | None]] = []
+    n_total = n_dropped_no_code = n_dropped_failed = n_cot = 0
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            n_total += 1
+            if require_extracted_code and not r.get("extracted_code"):
+                n_dropped_no_code += 1
+                continue
+            if keep_only_passing and r.get("has_tests") and r.get("tier") != "pass":
+                n_dropped_failed += 1
+                continue
+            problem = r["problem_prompt"]
+            # For CoT-flagged rows, the solution target is just the
+            # extracted code: the CoT is already going to be materialised
+            # as the think span, so including it in qwen_completion would
+            # double-count it (model would emit it as real text after
+            # already having thought it).
+            is_cot = bool(r.get("prepare_for_thinking")) and r.get("cot_text")
+            if is_cot:
+                solution = r.get("extracted_code") or ""
+                cot_text = r["cot_text"]
+            else:
+                solution = (r["qwen_completion"] if prefer_full_completion
+                            else r.get("extracted_code") or "")
+                cot_text = None
+            if not solution:
+                continue
+            rows.append((problem, solution, cot_text))
+            if is_cot:
+                n_cot += 1
+    print(f"  loaded {len(rows)} pairs from {path} "
+          f"(total rows={n_total}, dropped no-code={n_dropped_no_code}, "
+          f"dropped failed={n_dropped_failed}, cot-thinking rows={n_cot})")
+    return rows
+
+
 def build_example(prompt: str, solution: str, tokenizer,
                   max_len: int) -> tuple[list[int], list[int]]:
     """Tokenize one example to (input_ids, labels) where labels are -100 on
     the prompt-comment tokens and the actual token ids on the solution
     tokens (causal LM convention: predict each token given prefix).
+
+    If `prompt` already starts with "# " AND is multi-line (a pre-formatted
+    multi-comment block like the iterative-repair prompt), use it verbatim;
+    otherwise flatten to a single `# {text}\n` line for the legacy
+    one-line-instruction format used by CodeAlpaca / single-line distill
+    problems.
     """
-    comment_line = f"# {_flatten_to_oneline(prompt)}\n"
+    if prompt.startswith("# ") and "\n" in prompt.rstrip("\n"):
+        comment_line = prompt if prompt.endswith("\n") else prompt + "\n"
+    else:
+        comment_line = f"# {_flatten_to_oneline(prompt)}\n"
     comment_ids = tokenizer.encode(comment_line, add_special_tokens=False)
     solution_text = solution + ("\n" if not solution.endswith("\n") else "")
     sol_ids = tokenizer.encode(solution_text, add_special_tokens=False)
@@ -162,6 +245,93 @@ def build_example(prompt: str, solution: str, tokenizer,
         sol_len = len(sol_ids)
     # Labels: -100 on the comment portion, real ids on the solution.
     labels = [-100] * (len(full) - sol_len) + full[len(full) - sol_len:]
+    return full, labels
+
+
+def build_example_with_cot_thinking(
+    prompt: str,
+    cot_text: str,
+    solution: str,
+    tokenizer,
+    thinking_token_id: int,
+    max_len: int,
+    *,
+    min_cot_thinks: int = 1,
+    max_cot_thinks: int | None = None,
+) -> tuple[list[int], list[int]]:
+    """Phase-4 Option-A SFT example builder.
+
+    Layout (prompt | CoT-as-thinks | solution | eos):
+        comment_ids + [THINKING] * N_cot + solution_ids + [eos]
+    where N_cot = len(tokenize(cot_text)) (clamped to
+    [min_cot_thinks, max_cot_thinks]).
+
+    Label mask:
+        comment positions  → -100
+        think positions    → -100
+        solution positions → real token ids
+        eos position       → real eos id
+
+    The CoT content is intentionally NOT taught; only the budget (length
+    of the think span) and the temporal ordering "think-before-emit" are.
+    Per the Option-A rationale in the module docstring.
+
+    Truncation: if the full sequence exceeds `max_len`, the solution
+    tail is preserved (we keep the comment intact and truncate the CoT
+    span, then the solution from the right). If even the
+    comment+solution don't fit, the solution is right-truncated; the
+    comment is preserved up to `max_len`. This mirrors `build_example`'s
+    bias toward keeping the *target* signal (comment + solution) when
+    space is tight.
+    """
+    if prompt.startswith("# ") and "\n" in prompt.rstrip("\n"):
+        comment_line = prompt if prompt.endswith("\n") else prompt + "\n"
+    else:
+        comment_line = f"# {_flatten_to_oneline(prompt)}\n"
+    comment_ids = tokenizer.encode(comment_line, add_special_tokens=False)
+
+    cot_ids = tokenizer.encode(cot_text, add_special_tokens=False)
+    n_cot = len(cot_ids)
+    if min_cot_thinks is not None:
+        n_cot = max(n_cot, int(min_cot_thinks))
+    if max_cot_thinks is not None:
+        n_cot = min(n_cot, int(max_cot_thinks))
+    think_ids = [int(thinking_token_id)] * n_cot
+
+    solution_text = solution + ("\n" if not solution.endswith("\n") else "")
+    sol_ids = tokenizer.encode(solution_text, add_special_tokens=False)
+    eos = tokenizer.eos_token_id
+    if eos is not None:
+        sol_ids = sol_ids + [int(eos)]
+
+    full = comment_ids + think_ids + sol_ids
+    if len(full) <= max_len:
+        sol_len = len(sol_ids)
+        think_len = len(think_ids)
+        comment_len = len(comment_ids)
+    else:
+        # Over budget. Preserve comment + (truncated) solution; trim the
+        # CoT think span first since its content is not graded.
+        comment_len = min(len(comment_ids), max_len)
+        room_after_comment = max_len - comment_len
+        # Always keep at least one solution token so the loss is non-empty.
+        sol_len = min(len(sol_ids), max(1, room_after_comment - 0))
+        think_len = max(0, room_after_comment - sol_len)
+        if think_len > len(think_ids):
+            think_len = len(think_ids)
+            sol_len = min(len(sol_ids), room_after_comment - think_len)
+        full = (
+            comment_ids[:comment_len]
+            + [int(thinking_token_id)] * think_len
+            + sol_ids[:sol_len]
+        )
+
+    labels = (
+        [-100] * comment_len
+        + [-100] * think_len
+        + list(full[comment_len + think_len:])
+    )
+    assert len(labels) == len(full), (len(labels), len(full))
     return full, labels
 
 
@@ -482,21 +652,42 @@ def main() -> int:
     print(f"  tokenizer: {cfg.get('tokenizer')}  vocab={tok.vocab_size}")
 
     # --- 3. Data ----------------------------------------------------------
+    # Rows are 3-tuples (problem, solution, cot_text_or_None); the CoT
+    # field is non-None ONLY for Phase-4 prepare_for_thinking rows
+    # produced by experiments/build_cot_sft_data.py.
     if args.distilled_jsonl:
-        pairs = load_distilled_jsonl(
+        rows_with_cot = load_distilled_jsonl_with_cot(
             args.distilled_jsonl,
             prefer_full_completion=not args.distilled_code_only,
             require_extracted_code=True,
             keep_only_passing=args.distilled_keep_only_passing,
         )
     else:
-        pairs = load_pairs(max_codealpaca=args.max_codealpaca)
-    print(f"  total pairs: {len(pairs)}")
-    print(f"  tokenizing...")
+        rows_with_cot = [(p, s, None)
+                         for p, s in load_pairs(max_codealpaca=args.max_codealpaca)]
+    print(f"  total pairs: {len(rows_with_cot)}")
+    n_cot_rows = sum(1 for _, _, c in rows_with_cot if c)
+    if n_cot_rows > 0 and (not args.with_thinking or thinking_token_id is None):
+        # CoT-thinking rows REQUIRE the thinking machinery — the
+        # think-token id has to exist in the vocab so the materialised
+        # span is interpretable. Refuse to silently drop the CoT span.
+        raise RuntimeError(
+            f"{n_cot_rows} rows have prepare_for_thinking=True but "
+            "--with_thinking is off or the ckpt has no thinking_token_id. "
+            "Pass --with_thinking and use a ckpt that has the thinking "
+            "vocab slot.")
+    print(f"  tokenizing... ({n_cot_rows} cot-thinking rows, "
+          f"{len(rows_with_cot) - n_cot_rows} plain rows)")
     encoded: list[tuple[list[int], list[int]]] = []
     skipped = 0
-    for prompt, sol in pairs:
-        full, labels = build_example(prompt, sol, tok, args.max_len)
+    for prompt, sol, cot_text in rows_with_cot:
+        if cot_text:
+            full, labels = build_example_with_cot_thinking(
+                prompt, cot_text, sol, tok,
+                int(thinking_token_id), args.max_len,
+            )
+        else:
+            full, labels = build_example(prompt, sol, tok, args.max_len)
         if len(full) < 8 or all(l == -100 for l in labels):
             skipped += 1
             continue

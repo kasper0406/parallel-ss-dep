@@ -215,4 +215,35 @@ finish for the data, but the Phase D + mixed-SFT (Phase 0 of new
 plan) is the actual next move — already queued via
 `launch_sft_phase_d_mixed.sh`.
 
+## 2026-05-26 — Phase 0 decision-gate FAILED on Phase D; isolation run launched
+
+**Result**: Phase D + mixed SFT (54k Qwen distill + 961 CoT) = **0/164**
+on HumanEval. Gate fires at 20% rate (healthy), but pass@1 is zero.
+
+**Comparison**: Phase C + Qwen distill historically scored 10/164.
+The pretrain "improvements" in Phase D (FIM augmentation, synth
+pyfunc, self-debug fold-in) may have HURT the base model's
+code-completion ability — possibilities:
+1. FIM training: model learned `<|fim_*|>` patterns; HumanEval
+   prompts are OOD.
+2. Synth pyfunc: Qwen-generated style may not match HumanEval.
+3. Self-debug: model expects errors and produces weird patterns.
+
+**Isolation run launched**: `launch_sft_phase_c_mixed.sh` — same
+SFT recipe but resumes from `pretrain_phase_c.pt` (the validated
+10/164 baseline) instead of Phase D. Tells us whether the
+regression is in Phase D's pretrain or in the SFT recipe itself.
+
+**If Phase C + mixed SFT ≈ 10/164**: Phase D's pretrain regressed
+the base; Phase 1a (gist supervision) should run from Phase C base,
+not Phase D base.
+
+**If Phase C + mixed SFT also = 0/164**: the SFT recipe itself
+broke (CoT-thinking row format or something else). Need to debug.
+
+**Phase 1a (compression gist supervision) build is COMPLETE** — load-
+bearing test passed (gist loss 1.05 → 0.0002 in 50 steps). Just
+needs a known-working base ckpt to launch from. Awaiting the
+isolation result.
+
 ## (Future entries appended below as decisions are made)

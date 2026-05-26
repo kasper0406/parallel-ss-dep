@@ -460,4 +460,35 @@ tested, but a single-day attempt isn't going to land it. The
 finding (stochastic-gate-on-deterministic-base-fails) is itself
 worth knowing.
 
+## 2026-05-27 — v4 plan: stability first, exploration second
+
+**Root cause from yesterday**: SFT base produces decisive σ (cluster
+near 0 / 1). Stochastic sampling at the 5-10% of positions where σ
+wanders into [0.4, 0.6] is OOD relative to trained behavior →
+output quality drops → reward noise → gate distribution doesn't
+evolve.
+
+**v4 stack** (cheapest to most invasive):
+1. **Phase A**: selective stochastic gate — only sample when
+   σ ∈ [low, high]; decisive positions stay deterministic.
+   Preserves trained quality + isolates exploration to uncertain
+   positions where it actually helps.
+2. **Phase B**: entropy curriculum — start with high bonus (push
+   exploration), decay to low (let policy converge). Bypasses the
+   chicken-and-egg of "need exploration to learn but exploration
+   destabilizes".
+3. **Phase C** (held): stochastic-aware mini-SFT if A+B fail.
+   Teaches the base to handle gate sampling at any position.
+4. **Phase D** (research bet, reserved): continuous thought vectors
+   instead of binary gate.
+
+**Decision gates** spelled out in THINKING_PLAN.md.
+
+**Diagnostics added** in Phase A: σ histogram per step, fraction
+sampled vs decisive, so we can see what's actually happening.
+
+**2 parallel agents dispatched**: Phase A (selective sampling +
+diagnostics) and Phase B (entropy curriculum). Both modify
+train_rl_grader.py with non-conflicting changes.
+
 ## (Future entries appended below as decisions are made)

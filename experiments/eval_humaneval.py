@@ -429,6 +429,265 @@ def generate_with_retrieval_as_input(
     return out, diag
 
 
+def _clone_fla_cache(fla_cache):
+    """Deep-clone an FLA Cache so a what-if forward_step on the clone does
+    not mutate the original. Each per-layer state slot holds a
+    `recurrent_state` (Tensor or tuple of Tensors), `attn_state` (tuple),
+    `conv_state`, `ffn_state` — we clone tensors and copy the dict spine.
+    """
+    from fla.models.utils import Cache as FLACache  # noqa: F401  (type hint)
+
+    def _clone_val(v):
+        if v is None:
+            return None
+        if isinstance(v, torch.Tensor):
+            return v.clone()
+        if isinstance(v, (tuple, list)):
+            return type(v)(_clone_val(x) for x in v)
+        return v  # opaque state object — fall through
+
+    cls = type(fla_cache)
+    try:
+        new = cls(seen_tokens=fla_cache._seen_tokens)
+    except TypeError:
+        new = cls()
+        new._seen_tokens = fla_cache._seen_tokens
+    # FLALayer holds .state (a dict) and ._seen_tokens.
+    new.layers = []
+    layer_cls = type(fla_cache.layers[0]) if fla_cache.layers else None
+    for layer in fla_cache.layers:
+        new_layer = layer_cls.__new__(layer_cls)
+        new_layer.__init__()
+        if layer.state is not None:
+            new_layer.state = {
+                k: _clone_val(v) for k, v in layer.state.items()
+            }
+        new_layer._seen_tokens = layer._seen_tokens
+        if hasattr(layer, "device"):
+            new_layer.device = layer.device
+        new.layers.append(new_layer)
+    return new
+
+
+def _clone_cache(cache: dict) -> dict:
+    """Deep-clone the full TinyLM incremental cache returned by
+    `prefill`/`forward_step`. Used by `generate_soft_mixture` so the
+    think-branch forward never touches the emit-branch state.
+    """
+    new = {
+        "fla_cache": _clone_fla_cache(cache["fla_cache"]),
+        "seen": int(cache["seen"]),
+    }
+    lag = cache.get("lagged_sources")
+    if lag is None:
+        new["lagged_sources"] = None
+    else:
+        new["lagged_sources"] = {k: v.clone() for k, v in lag.items()}
+    wm = cache.get("wm_buf")
+    if wm is None:
+        new["wm_buf"] = None
+    else:
+        new["wm_buf"] = {k: v.clone() for k, v in wm.items()}
+    tr = cache.get("think_run_len")
+    new["think_run_len"] = tr.clone() if tr is not None else None
+    return new
+
+
+@torch.no_grad()
+def generate_soft_mixture(
+    model, prompt_ids: torch.Tensor, max_gen: int = 256,
+    temperature: float = 0.0, eos_token_id: int | None = None,
+    thinking_token_id: int | None = None,
+    emit_threshold: float = 0.5,    # unused in soft mode — kept for API parity
+    min_emit_before_eos: int = 0,
+    gate_floor: float = 0.0,
+    additive: bool = True,
+    use_incremental: bool = True,
+    force_sigma: float | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """Soft-mixture decode (Phase C of THINKING_PLAN v5, 2026-05-26).
+
+    Instead of hard-thresholding the output gate:
+        if σ(gate) ≥ τ: emit, else think
+    we run BOTH branches per emit step and mix:
+        logits_emit  = next-token logits from current state (no think)
+        logits_think = next-token logits after inserting ONE think token
+                       (retrieval-as-input substitution for the think input,
+                       matching `generate_with_retrieval_as_input`)
+        final_logits = σ · logits_emit + (1-σ) · logits_think
+        sample from final_logits
+    Costs 2× per step but never makes a hard wrong decision. Useful as a
+    probe of "is the gate's continuous σ output more informative than its
+    thresholded version?"
+
+    STATE COHERENCE:
+      The emit-branch state is canonical. After sampling from the mixture
+      we advance the cache via the emit-branch `forward_step(sampled_tok)`.
+      The think-branch state is computed on a deep-cloned cache and
+      discarded — its purpose was purely to produce `logits_think` for
+      the mixture. This means the model never actually "saw" the think
+      token in the canonical state, but the sampled output reflects the
+      think branch's beliefs through the σ-weighted average.
+
+    `force_sigma`: if set, override the gate's σ with this constant value
+      (used by tests to verify σ=1 → emit-only and σ=0 → think-only).
+    """
+    if thinking_token_id is None:
+        raise ValueError("generate_soft_mixture requires thinking_token_id")
+    if not hasattr(model, "memory"):
+        raise ValueError("model lacks .memory — this generator needs "
+                         "WorkingMemory to provide the retrieval.")
+    if not (hasattr(model, "prefill") and hasattr(model, "forward_step")):
+        raise ValueError("generate_soft_mixture requires incremental "
+                         "decode (prefill / forward_step).")
+
+    device = prompt_ids.device
+    out = prompt_ids.clone()
+    inputs_embeds = model.embed(out).clone()
+    _alpha_p = getattr(model, "retrieval_input_alpha", None)
+    alpha = float(_alpha_p.detach()) if _alpha_p is not None else 0.1
+
+    # Emit-branch prefill (canonical state). `pending_logits` predicts
+    # the FIRST token; `pending_gate` is σ(gate) at that same position.
+    cache, last_logits = model.prefill(out, inputs_embeds=inputs_embeds)
+    pending_logits = last_logits[:, -1:, :]
+    pending_gate_t = getattr(model, "_last_gate", None)
+    if pending_gate_t is None:
+        pending_gate = torch.ones((out.shape[0],), device=device)
+    else:
+        pending_gate = pending_gate_t[:, -1].clone()  # (B,)
+    # The injection used by the think branch is the WM read at the LAST
+    # processed position — model.memory._last_injection survives across
+    # forward_step calls but is OVERWRITTEN, so we snapshot here.
+    pending_injection = getattr(model.memory, "_last_injection", None)
+    if pending_injection is not None:
+        pending_injection = pending_injection[:, -1:, :].clone()
+
+    emit_count = 0
+    think_logits_used = 0
+    sigma_values: list[float] = []
+    mixture_kl: list[float] = []   # KL(emit || think) per step as a diag
+
+    while emit_count < max_gen:
+        # 1. Gate σ at this emit position (from the emit-branch state).
+        if force_sigma is not None:
+            sigma = torch.full_like(pending_gate, float(force_sigma))
+        else:
+            sigma = pending_gate.clone()
+            if gate_floor > 0.0:
+                sigma = sigma.clamp(min=float(gate_floor))
+        # σ = P(emit), so mixing weight on emit-logits is σ, on think-logits is (1-σ).
+        sigma_values.append(float(sigma[0].item()))
+
+        # 2. EMIT-branch logits: already in pending_logits. Strip THINK id.
+        emit_logits = pending_logits[:, -1, :].clone()      # (B, V)
+        emit_logits[..., int(thinking_token_id)] = -float("inf")
+
+        # 3. THINK-branch logits: clone the cache, append one think token
+        #    (retrieval-as-input), get next-token logits.
+        if pending_injection is None:
+            # No WM injection available — fall back to think-token-embed only.
+            think_emb = model.embed(torch.full(
+                (out.shape[0], 1), int(thinking_token_id),
+                dtype=out.dtype, device=device))
+            inj_input = think_emb
+        else:
+            think_tok = torch.full((out.shape[0], 1), int(thinking_token_id),
+                                    dtype=out.dtype, device=device)
+            if additive:
+                think_emb = model.embed(think_tok).to(inputs_embeds.dtype)
+                inj_input = think_emb + alpha * pending_injection.to(inputs_embeds.dtype)
+            else:
+                inj_input = pending_injection.to(inputs_embeds.dtype)
+        think_cache = _clone_cache(cache)
+        think_tok = torch.full((out.shape[0], 1), int(thinking_token_id),
+                                dtype=out.dtype, device=device)
+        think_logits, _ = model.forward_step(
+            think_tok, think_cache, inputs_embeds=inj_input,
+            mem_read_mask=torch.ones_like(think_tok, dtype=inj_input.dtype),
+        )
+        think_logits = think_logits[:, -1, :].clone()        # (B, V)
+        think_logits[..., int(thinking_token_id)] = -float("inf")
+        think_logits_used += 1
+
+        # 4. Mix in PROBABILITY space (mixing logits directly would be
+        #    well-defined but harder to interpret as P(token) — the user-
+        #    facing description says "mix by σ", we read that as mixing
+        #    the two predictive distributions).
+        emit_probs  = torch.softmax(emit_logits.float(),  dim=-1)
+        think_probs = torch.softmax(think_logits.float(), dim=-1)
+        mix_w = sigma.view(-1, 1).to(emit_probs.dtype)
+        mixed_probs = mix_w * emit_probs + (1.0 - mix_w) * think_probs
+        # Numerical safety + diag.
+        mixed_probs = mixed_probs.clamp_min(1e-30)
+        mixed_probs = mixed_probs / mixed_probs.sum(dim=-1, keepdim=True)
+        if emit_count < 10:
+            kl = (emit_probs * (emit_probs.clamp_min(1e-30).log()
+                  - think_probs.clamp_min(1e-30).log())).sum(dim=-1)
+            mixture_kl.append(float(kl[0].item()))
+
+        # 5. Suppress EOS for the first N emitted tokens (halt-after-
+        #    docstring fix, parity with the hard generator).
+        if (eos_token_id is not None
+                and min_emit_before_eos > 0
+                and emit_count < min_emit_before_eos):
+            mixed_probs[..., int(eos_token_id)] = 0.0
+            mixed_probs = mixed_probs / mixed_probs.sum(dim=-1, keepdim=True)
+
+        # 6. Sample from the mixed distribution.
+        if temperature == 0.0:
+            next_tok = mixed_probs.argmax(dim=-1, keepdim=True)
+        else:
+            # T scaling on the MIXED distribution: exponentiate-by-1/T.
+            # For T=1 this is just sampling from mixed_probs.
+            if temperature == 1.0:
+                next_tok = torch.multinomial(mixed_probs, num_samples=1)
+            else:
+                inv = 1.0 / max(temperature, 1e-6)
+                scaled = mixed_probs.clamp_min(1e-30).pow(inv)
+                scaled = scaled / scaled.sum(dim=-1, keepdim=True)
+                next_tok = torch.multinomial(scaled, num_samples=1)
+
+        out = torch.cat([out, next_tok], dim=1)
+
+        # 7. Advance the EMIT-branch (canonical) cache with the sampled
+        #    token. Use the standard embedding lookup (this token is an
+        #    emitted output, not a think).
+        emit_emb = model.embed(next_tok).to(inputs_embeds.dtype)
+        pending_logits, cache = model.forward_step(
+            next_tok, cache, inputs_embeds=emit_emb,
+            mem_read_mask=torch.ones_like(next_tok, dtype=emit_emb.dtype),
+        )
+        # Refresh gate σ and WM injection for the next iteration.
+        pending_gate_t = getattr(model, "_last_gate", None)
+        if pending_gate_t is None:
+            pending_gate = torch.ones((out.shape[0],), device=device)
+        else:
+            pending_gate = pending_gate_t[:, -1].clone()
+        pending_injection = getattr(model.memory, "_last_injection", None)
+        if pending_injection is not None:
+            pending_injection = pending_injection[:, -1:, :].clone()
+
+        emit_count += 1
+        if eos_token_id is not None and (next_tok == eos_token_id).all():
+            break
+
+    diag = {
+        "emit_count": emit_count,
+        "think_total": think_logits_used,
+        "think_steps_used": [1] * emit_count,   # 1 think branch per emit
+        "gate_emit_values": sigma_values,
+        "think_rate": 0.5,           # by construction the soft mixer is
+                                      # 50/50 in COMPUTE; "think_rate" as
+                                      # a behavioral knob is undefined.
+        "mode": "soft_mixture",
+        "decode_path": "incremental",
+        "sigma_mean": (sum(sigma_values) / max(1, len(sigma_values))),
+        "mixture_kl_first10": mixture_kl,
+    }
+    return out, diag
+
+
 _FENCE_PY = __import__("re").compile(
     r"```python\s*\n(.*?)\n?```", __import__("re").DOTALL)
 _FENCE_ANY = __import__("re").compile(
@@ -459,7 +718,8 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
              gate_floor: float = 0.0,
              prompt_style: str = "humaneval",
              extract_code_block: bool = False,
-             generator: str = "standard"):
+             generator: str = "standard",
+             gate_mode: str = "hard"):
     """
     prompt_style:
       "humaneval"   — use the original HumanEval prompt verbatim (default).
@@ -543,7 +803,20 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
         any_passed = False
         last_diag: dict = {}
         for _ in range(n_samples):
-            if generator == "retrieval_as_input":
+            if gate_mode == "soft":
+                # Phase C: σ-weighted mixture of emit and think branches.
+                # Requires WM (retrieval-as-input think branch) and
+                # incremental decode.
+                gen, diag = generate_soft_mixture(
+                    model, prompt_t, max_gen=max_gen,
+                    temperature=temperature, eos_token_id=tok.eos_token_id,
+                    thinking_token_id=thinking_token_id,
+                    emit_threshold=emit_threshold,
+                    min_emit_before_eos=min_emit_before_eos,
+                    gate_floor=gate_floor,
+                    additive=cfg.get("retrieval_input_additive", True),
+                )
+            elif generator == "retrieval_as_input":
                 # v5+ models trained with --retrieval_as_input_thinking
                 # must be evaluated with the matching generator (the
                 # think-position input is the WM retrieval, not the
@@ -688,6 +961,15 @@ def main():
                         "Required for Qwen-distilled ckpts that emit CoT + "
                         "code block (otherwise the CoT prose would be exec'd "
                         "as Python and syntax-error every time).")
+    p.add_argument("--gate_mode", type=str, default="hard",
+                   choices=["hard", "soft"],
+                   help="'hard' (default): existing hard-threshold "
+                        "behaviour (gate ≥ emit_threshold → emit). "
+                        "'soft': Phase C soft-mixture decode — run both "
+                        "branches per step and mix logits by σ. 2× per-step "
+                        "compute, but the threshold can never make a wrong "
+                        "decision. Requires a model with WorkingMemory "
+                        "and incremental decode.")
     p.add_argument("--generator", type=str, default="standard",
                    choices=["standard", "retrieval_as_input"],
                    help="'standard' (default): append [THINKING] tokens. "
@@ -714,6 +996,7 @@ def main():
             prompt_style=args.prompt_style,
             extract_code_block=args.extract_code_block,
             generator=args.generator,
+            gate_mode=args.gate_mode,
         )
 
     print("\n" + "=" * 70)

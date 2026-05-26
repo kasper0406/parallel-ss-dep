@@ -56,6 +56,7 @@ from experiments.gist_loss import (
     build_gist_heads, trunk_gist_loss, parse_horizons,
     build_think_gist_head, think_gist_loss,
 )
+from experiments.process_reward import compute_process_reward_loss
 
 
 def _flatten_to_oneline(s: str) -> str:
@@ -711,6 +712,45 @@ def main() -> int:
                         "homogenization that motivated FIX A). -1 (default) "
                         "= inherit from ckpt cfg; >=0 forces that size "
                         "(0 disables the embedding, >0 builds it).")
+    # Phase B (THINKING_PLAN v5): small MLP that fires only at think
+    # positions, giving the trunk dedicated parameters for thinking-
+    # time computation. Default = inherit from ckpt (auto-detected
+    # from state_dict). Pass --use_think_adapter to ATTACH a fresh
+    # adapter to a ckpt that didn't have one (alpha init 0 →
+    # byte-identical at start, learns during SFT).
+    p.add_argument("--use_think_adapter", action="store_true",
+                   help="Phase B: enable per-Block ThinkAdapter MLP. "
+                        "Omit = inherit from ckpt; pass = force ON.")
+    p.add_argument("--think_adapter_hidden_mult", type=int, default=2,
+                   help="Phase B: hidden width multiplier for the "
+                        "ThinkAdapter MLP (default 2 → d_hidden=2*d_model).")
+    # --- Phase A: process-reward auxiliary loss (THINKING_PLAN.md v5) -----
+    # On a sampled subset of positions where the gate already wants to
+    # think, do a SECOND forward over [prefix, K * THINK] and ask whether
+    # the K-think prediction puts more probability mass on the true
+    # next token than the original (no-think) main-forward prediction.
+    # Loss = mean(log p_before - log p_after); the optimiser is pushed
+    # to make thinks actually reduce next-token error. Default off
+    # → byte-identical training.
+    p.add_argument("--process_reward_weight", type=float, default=0.0,
+                   help="Phase A: weight on the process-reward aux loss. "
+                        "0 disables (default). Try 0.1.")
+    p.add_argument("--process_reward_K", type=int, default=4,
+                   help="Number of think tokens to insert before the "
+                        "sampled position for the 'after' forward.")
+    p.add_argument("--process_reward_apply_min_sigma", type=float,
+                   default=0.3,
+                   help="Only apply the loss at positions where σ(gate) "
+                        "exceeds this threshold (avoids wasting compute "
+                        "on positions the gate clearly didn't want to "
+                        "think at).")
+    p.add_argument("--process_reward_sample_frac", type=float, default=0.1,
+                   help="Fraction of qualifying positions to evaluate "
+                        "per batch (bounds compute).")
+    p.add_argument("--process_reward_max_positions", type=int, default=128,
+                   help="Hard cap on sampled positions per batch — extra "
+                        "guard so the after-forward stays bounded even "
+                        "on a huge batch.")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -734,7 +774,25 @@ def main() -> int:
             # the architecture exactly right. Skip the "expand vocab" code
             # because the thinking-token slot is already in the saved vocab.
             from experiments.eval_bracket_structure import build_model_from_ckpt
-            model, cfg = build_model_from_ckpt(args.load_ckpt)
+            # Phase B: if --use_think_adapter is passed and the ckpt
+            # didn't carry adapter weights, attach a fresh adapter
+            # (alpha init 0 → byte-identical at start). Auto-detect
+            # path still wins if the flag isn't passed.
+            force_adapter = True if args.use_think_adapter else None
+            model, cfg = build_model_from_ckpt(
+                args.load_ckpt,
+                force_use_think_adapter=force_adapter,
+                force_think_adapter_hidden_mult=(
+                    int(args.think_adapter_hidden_mult)
+                    if args.use_think_adapter else None),
+            )
+            if args.use_think_adapter:
+                cfg["use_think_adapter"] = True
+                cfg["think_adapter_hidden_mult"] = int(
+                    args.think_adapter_hidden_mult)
+                print(f"  Phase B: ThinkAdapter ON "
+                      f"(hidden_mult={args.think_adapter_hidden_mult}, "
+                      "alpha init 0).")
             thinking_token_id = cfg.get("thinking_token_id")
             if thinking_token_id is None:
                 # Fall back to "last vocab slot" if cfg didn't store it.
@@ -832,6 +890,8 @@ def main() -> int:
             mem_dim=int(args.mem_dim) if args.mem_dim > 0 else int(cfg["d_model"]),
             thinking_token_id=thinking_token_id,
             mem_write_only_at_think=bool(args.mem_write_only_at_think),
+            use_think_adapter=bool(args.use_think_adapter),
+            think_adapter_hidden_mult=int(args.think_adapter_hidden_mult),
             attention_cls=DeltaNetAttention,
         ).cuda()
         missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -1072,6 +1132,22 @@ def main() -> int:
     # ~hundred steps; a frozen/dead signal stays flat. Printed every
     # log_every steps when use_phase_1a is on.
     last_gist_loss = None
+    # Phase A: most-recent process-reward stats for logging.
+    last_pr_stats = None
+    use_process_reward = (
+        args.process_reward_weight > 0.0
+        and args.with_thinking
+        and thinking_token_id is not None
+    )
+    if args.process_reward_weight > 0.0 and not use_process_reward:
+        print("  [process-reward] requested but disabled: requires "
+              "--with_thinking AND a thinking_token_id in the loaded ckpt.")
+    if use_process_reward:
+        print(f"  [process-reward] ON: weight={args.process_reward_weight}, "
+              f"K={args.process_reward_K}, "
+              f"min_sigma={args.process_reward_apply_min_sigma}, "
+              f"sample_frac={args.process_reward_sample_frac}, "
+              f"max_positions={args.process_reward_max_positions}")
     for epoch in range(args.epochs):
         # Shuffle each epoch.
         idx = torch.randperm(len(encoded), generator=rng).tolist()
@@ -1148,6 +1224,48 @@ def main() -> int:
                     if future_gist_heads is not None:
                         loss = loss + args.future_emb_loss_weight * (
                             trunk_gist_loss(h, future_gist_heads, gist_horizons))
+                    # --- Phase A: process-reward auxiliary loss ----------
+                    # Reads the main-forward gate via `model._last_gate`
+                    # (side-effect populated by TinyLM.forward when
+                    # output_gate=True); reuses the just-computed `logits`
+                    # for the "before" log-probabilities (no extra
+                    # forward). The "after" forward runs over a small
+                    # synthesised batch where K think tokens are inserted
+                    # before each sampled position. Bounded by
+                    # --process_reward_sample_frac and
+                    # --process_reward_max_positions.
+                    main_gate = getattr(model, "_last_gate", None)
+                    if use_process_reward and main_gate is not None:
+                        # PAD must NOT equal thinking_token_id — when
+                        # state_readonly_at_think / mem_write_only_at_think
+                        # are on, pad-as-think silently corrupts the
+                        # after-forward's recurrent state. Use 0 (a
+                        # bytefallback / safe non-think id).
+                        pad_id = 0
+                        pr_loss, pr_stats = compute_process_reward_loss(
+                            model, x, y,
+                            gate=main_gate,
+                            main_logits=logits,
+                            thinking_token_id=int(thinking_token_id),
+                            K=int(args.process_reward_K),
+                            apply_min_sigma=float(
+                                args.process_reward_apply_min_sigma),
+                            sample_frac=float(
+                                args.process_reward_sample_frac),
+                            rng=rng,
+                            pad_token_id=pad_id,
+                            retrieval_as_input=bool(
+                                args.retrieval_as_input_thinking),
+                            base_vocab_for_loss=(
+                                int(base_vocab_for_loss)
+                                if args.with_thinking else None),
+                            max_positions=int(
+                                args.process_reward_max_positions),
+                        )
+                        last_pr_stats = pr_stats
+                        if pr_stats.n_sampled > 0:
+                            loss = loss + (
+                                args.process_reward_weight * pr_loss)
                 # ====== Phase 1a path: gist-at-think supervision ============
                 # Run the student forward over the compressed sequence and
                 # the teacher forward (no_grad) over the full CoT sequence.
@@ -1222,6 +1340,11 @@ def main() -> int:
                 extra = ""
                 if use_phase_1a and last_gist_loss is not None:
                     extra = f"  gist={last_gist_loss:.4f}"
+                if use_process_reward and last_pr_stats is not None:
+                    extra += (f"  pr(n={last_pr_stats.n_sampled}/"
+                              f"{last_pr_stats.n_candidates}, "
+                              f"Δlogp={last_pr_stats.mean_log_ratio:+.3f}, "
+                              f"%pos={100 * last_pr_stats.frac_positive:.0f})")
                 print(f"  step {step:>5}/{n_steps}  loss={loss.item():.4f}  "
                       f"ppl={ppl:.2f}  lr={lr:.2e}  tok/s={tok_s:.0f}{extra}")
 
@@ -1244,6 +1367,13 @@ def main() -> int:
         new_cfg["cot_min_thinks"] = int(args.cot_min_thinks)
         new_cfg["think_gist_weight"] = float(args.think_gist_weight)
         new_cfg["think_gist_loss_type"] = str(args.think_gist_loss_type)
+    if use_process_reward:
+        new_cfg["process_reward_weight"] = float(args.process_reward_weight)
+        new_cfg["process_reward_K"] = int(args.process_reward_K)
+        new_cfg["process_reward_apply_min_sigma"] = float(
+            args.process_reward_apply_min_sigma)
+        new_cfg["process_reward_sample_frac"] = float(
+            args.process_reward_sample_frac)
     ckpt_dict = {"state_dict": model.state_dict(), "config": new_cfg}
     if future_gist_heads is not None:
         ckpt_dict["future_gist_heads_state_dict"] = \

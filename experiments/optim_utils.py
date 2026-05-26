@@ -42,6 +42,17 @@ def _is_pkm_value(name: str) -> bool:
     return name.startswith("pkm_layer.values.") and name.endswith(".weight")
 
 
+def _is_think_adapter(name: str) -> bool:
+    """Phase B ThinkAdapter params (2026-05-26). The adapter lives at
+    `blocks.{L}.think_adapter.{fc1,fc2}.{weight,bias}` plus the learnable
+    scalar `blocks.{L}.think_adapter.alpha`. ALL go to AdamW (NOT Muon —
+    the matrices are small and the dedicated thinking-time function makes
+    Newton-Schulz orthogonalisation conceptually wrong; α is a scalar
+    that Muon would handle as 1D-AdamW anyway).
+    """
+    return ".think_adapter." in name or name.endswith(".think_adapter.alpha")
+
+
 def _wsd_lambda(total_steps: int, warmup_steps: int, decay_frac: float):
     """Warmup-Stable-Decay LR multiplier in [0, 1].
 
@@ -151,12 +162,18 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
         raise ValueError(f"unknown optimizer {optimizer!r}")
 
     # Muon: 2D hidden matrices only. Embeddings, lm_head, 1D, 3D+ → AdamW.
+    # ThinkAdapter (Phase B, 2026-05-26): both the 2D fc weights AND the
+    # 1D α scalar route to AdamW — the adapter is a small specialized
+    # head, not a general d×d hidden matrix Newton-Schulz should normalize.
     muon_params, adamw_regular, adamw_alpha, adamw_pkm_values = [], [], [], []
     seen = set()
     for name, p in model.named_parameters():
         if not p.requires_grad or id(p) in seen:
             continue
         seen.add(id(p))
+        if _is_think_adapter(name):
+            adamw_regular.append(p)
+            continue
         if _is_embedding_like(name) or p.ndim != 2:
             if _is_pkm_value(name) and pkm_value_lr_mult != 1.0:
                 adamw_pkm_values.append(p)

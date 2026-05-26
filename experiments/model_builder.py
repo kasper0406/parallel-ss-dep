@@ -135,6 +135,10 @@ def build_model_from_args(args, *, vocab_size: int,
             getattr(args, "state_readonly_at_think", False)),
         think_index_emb_size=int(
             getattr(args, "think_index_emb_size", 0)),
+        use_think_adapter=bool(
+            getattr(args, "use_think_adapter", False)),
+        think_adapter_hidden_mult=int(
+            getattr(args, "think_adapter_hidden_mult", 2)),
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,

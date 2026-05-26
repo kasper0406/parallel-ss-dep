@@ -37,7 +37,18 @@ from experiments.model import TinyLM
 from experiments.train_lm import build_arch, parse_layers_arg
 
 
-def build_model_from_ckpt(ckpt_path: str):
+def build_model_from_ckpt(ckpt_path: str,
+                          *,
+                          force_use_think_adapter: bool | None = None,
+                          force_think_adapter_hidden_mult: int | None = None):
+    """Construct a TinyLM from a saved ckpt.
+
+    `force_use_think_adapter` (optional) overrides the auto-detect:
+    set True to ATTACH a freshly-initialised Phase-B adapter to a ckpt
+    that didn't have one (e.g. adding the adapter during SFT from a
+    pretrain ckpt). Set False to deliberately drop adapter weights
+    that were saved. Default None = auto-detect.
+    """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
     if cfg.get("layers_spec"):
@@ -136,6 +147,28 @@ def build_model_from_ckpt(ckpt_path: str):
     # ckpts that predate the cfg key but were trained with it on).
     if think_idx_emb == 0 and "think_index_emb.weight" in sd_keys:
         think_idx_emb = int(ckpt["state_dict"]["think_index_emb.weight"].shape[0])
+    # Phase-B (use_think_adapter / think_adapter_hidden_mult). Adapter
+    # weights ARE in the state-dict (blocks.{L}.think_adapter.{fc1,fc2,alpha}),
+    # so auto-detect from any block's fc1.weight shape and override the cfg
+    # default if absent. Hidden mult is inferred as fc1.weight.shape[0] /
+    # d_model. Default off for back-compat with pre-Phase-B ckpts.
+    use_think_adapter = bool(cfg.get("use_think_adapter", False))
+    think_adapter_hidden_mult = int(cfg.get("think_adapter_hidden_mult", 2))
+    has_adapter_key = any(".think_adapter." in k for k in sd_keys)
+    if has_adapter_key:
+        use_think_adapter = True
+        # Infer hidden_mult from any block's fc1.weight shape.
+        for k in sd_keys:
+            if k.endswith(".think_adapter.fc1.weight"):
+                d_hidden = ckpt["state_dict"][k].shape[0]
+                think_adapter_hidden_mult = int(d_hidden // cfg["d_model"])
+                break
+    # Explicit caller override (SFT path adding adapter to a pretrain
+    # ckpt that didn't have one, or vice versa).
+    if force_use_think_adapter is not None:
+        use_think_adapter = bool(force_use_think_adapter)
+    if force_think_adapter_hidden_mult is not None:
+        think_adapter_hidden_mult = int(force_think_adapter_hidden_mult)
     model = TinyLM(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"],
         n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
@@ -147,6 +180,8 @@ def build_model_from_ckpt(ckpt_path: str):
         output_gate=bool(has_gate),
         state_readonly_at_think=sr_at_think,
         think_index_emb_size=think_idx_emb,
+        use_think_adapter=use_think_adapter,
+        think_adapter_hidden_mult=think_adapter_hidden_mult,
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,

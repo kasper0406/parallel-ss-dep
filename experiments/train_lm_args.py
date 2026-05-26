@@ -446,6 +446,24 @@ def build_parser() -> argparse.ArgumentParser:
                         "8 identical inputs -> low-rank hidden states; "
                         "median pairwise cosine +0.146 vs +0.060 at emit). "
                         "0 = disabled (default, byte-identical).")
+    p.add_argument("--use_think_adapter", action="store_true",
+                   help="Phase B thinking-specialized adapter (2026-05-26): "
+                        "every Block grows a small 2-layer MLP "
+                        "(d_model -> hidden_mult*d_model -> d_model, GELU) "
+                        "plus a learnable scalar alpha (init 0). At think "
+                        "positions, the adapter contribution is added to "
+                        "the residual stream after the standard attn + MLP: "
+                        "h += alpha * think_mask * ThinkAdapter(h). With "
+                        "alpha=0 a cold start is byte-identical to no "
+                        "adapter; existing ckpts load with strict=False. "
+                        "Gives the trunk dedicated capacity for "
+                        "think-time-specialized computation (today the "
+                        "trunk runs IDENTICAL ops at think vs emit; only "
+                        "the input embedding differs).")
+    p.add_argument("--think_adapter_hidden_mult", type=int, default=2,
+                   help="Phase B think-adapter hidden width multiplier "
+                        "(default 2 -> d_hidden = 2 * d_model). Only used "
+                        "when --use_think_adapter is set.")
     p.add_argument("--mem_dim", type=int, default=0,
                    help="Memory projection dim. 0 = match d_model.")
     # ----- Persistent learned-RAG (Product-Key Memory) -----

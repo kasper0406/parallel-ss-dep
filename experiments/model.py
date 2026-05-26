@@ -46,14 +46,70 @@ class GLU(nn.Module):
         return self.W_d(F.silu(self.W_g(x)) * self.W_u(x))
 
 
+class ThinkAdapter(nn.Module):
+    """Phase B thinking-specialized adapter (2026-05-26).
+
+    A small 2-layer MLP `d_model → hidden_mult·d_model → d_model` with a
+    learnable scalar α (init 0). At think positions, the adapter's
+    contribution is added to the residual stream:
+
+        h_out = h_in + α · think_mask · ThinkAdapter(h_in)
+
+    α=0 at init means the adapter is byte-identical to "no adapter" at
+    cold start; the optimizer opts in only via gradient as the adapter
+    proves useful. Mirrors the FiLM-α / PKM-α / retrieval-α pattern.
+
+    Why: the trunk runs IDENTICAL computation at think vs emit positions
+    today — the only difference is the input embedding. Dedicated
+    adapter params give the model the capacity for think-time-specialized
+    processing. Routing: adapter weights + α → AdamW (not Muon — α is a
+    scalar, and the dedicated function makes Newton-Schulz orthogonalization
+    of the small Linear matrices conceptually wrong).
+    """
+
+    def __init__(self, d_model: int, hidden_mult: int = 2):
+        super().__init__()
+        d_hidden = int(hidden_mult) * d_model
+        self.fc1 = nn.Linear(d_model, d_hidden, bias=True)
+        self.fc2 = nn.Linear(d_hidden, d_model, bias=True)
+        # α init = 0 so the adapter contributes 0 at cold start. Gradient
+        # on α is non-zero because fc1/fc2 are at their normal init (the
+        # FiLM-α lesson: zero α + zero W = no gradient). Single learnable
+        # scalar; no weight decay (routed via is_film_alpha-style check).
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, h: torch.Tensor, think_mask: torch.Tensor) -> torch.Tensor:
+        """Compute the adapter contribution (NOT added to h here; the caller
+        does the residual add). think_mask is (B, T) bool/float.
+        """
+        # NOTE: we let fc2 run on every position (the matmul cost is the
+        # same as masking afterwards on modern GPUs) and gate the result
+        # by think_mask + α. Output is zero at non-think positions.
+        adapter_out = self.fc2(F.gelu(self.fc1(h)))
+        mask = think_mask.to(adapter_out.dtype).unsqueeze(-1)
+        return self.alpha * mask * adapter_out
+
+
 class Block(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_head: int, d_ff: int,
-                 attention_cls: Callable[..., nn.Module]):
+                 attention_cls: Callable[..., nn.Module],
+                 use_think_adapter: bool = False,
+                 think_adapter_hidden_mult: int = 2):
         super().__init__()
         self.attn_norm = RMSNorm(d_model)
         self.attn = attention_cls(d_model=d_model, n_heads=n_heads, d_head=d_head)
         self.mlp_norm = RMSNorm(d_model)
         self.mlp = GLU(d_model, d_ff)
+        # Phase B thinking-specialized adapter (2026-05-26). Default off —
+        # when off, no parameters are added, so existing ckpts load
+        # byte-identically. When on, applied AFTER the attention + MLP
+        # residual stream, gated by think_mask and α (init 0).
+        self.use_think_adapter = bool(use_think_adapter)
+        if self.use_think_adapter:
+            self.think_adapter = ThinkAdapter(
+                d_model=d_model,
+                hidden_mult=int(think_adapter_hidden_mult),
+            )
 
     def forward(self, x: torch.Tensor,
                 input_ids: torch.Tensor | None = None,
@@ -78,6 +134,14 @@ class Block(nn.Module):
                 kw["think_mask"] = think_mask
             x = x + attn(self.attn_norm(x), **kw)
         x = x + self.mlp(self.mlp_norm(x))
+        # Phase B think adapter (2026-05-26). Applied AFTER the standard
+        # attention + MLP residual updates. The adapter's contribution is
+        # gated by both the think_mask (B, T) and the learnable α scalar
+        # init at 0 — so a cold start is byte-identical to no adapter.
+        # think_mask is None when the caller doesn't have a thinking_token_id
+        # (e.g. plain LM eval / tests with no think tokens); skip silently.
+        if self.use_think_adapter and think_mask is not None:
+            x = x + self.think_adapter(x, think_mask)
         return x
 
 
@@ -1174,6 +1238,15 @@ class TinyLM(nn.Module):
         # table is init to zero so a cold start has no effect; the model
         # opts in only via gradient.
         think_index_emb_size: int = 0,
+        # Phase B thinking-specialized adapter (2026-05-26). When True,
+        # each Block grows a small 2-layer MLP `d_model → hidden_mult·d_model
+        # → d_model` whose contribution is gated by the per-position
+        # think_mask AND a learnable scalar α (init 0). With α=0 a cold
+        # start is byte-identical to "no adapter"; existing ckpts without
+        # adapter weights load with strict=False. Adapter params route to
+        # AdamW (not Muon — see optim_utils._is_think_adapter).
+        use_think_adapter: bool = False,
+        think_adapter_hidden_mult: int = 2,
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1197,9 +1270,16 @@ class TinyLM(nn.Module):
         self.max_T = max_T
         if max_T > 0:
             self.pos_embed = nn.Embedding(max_T, d_model)
+        # Phase B (2026-05-26) — thread `use_think_adapter` into each Block.
+        # Stored here too so TinyLM.forward knows whether to build the
+        # per-position think_mask even when state_readonly_at_think is OFF.
+        self.use_think_adapter = bool(use_think_adapter)
+        self.think_adapter_hidden_mult = int(think_adapter_hidden_mult)
         self.blocks = nn.ModuleList([
             Block(d_model=d_model, n_heads=n_heads, d_head=d_head,
-                  d_ff=d_ff, attention_cls=cls)
+                  d_ff=d_ff, attention_cls=cls,
+                  use_think_adapter=self.use_think_adapter,
+                  think_adapter_hidden_mult=self.think_adapter_hidden_mult)
             for cls in cls_list
         ])
         # Phase-2 state-readonly thinking (2026-05-26). Install β-mask
@@ -1673,9 +1753,14 @@ class TinyLM(nn.Module):
         # when both the flag is set AND we know the thinking_token_id.
         # The thread is a no-op on every other attention kind (Block
         # checks `accepts_think_mask`).
-        if (self.state_readonly_at_think
-                and self.thinking_token_id is not None
-                and input_ids is not None):
+        # Phase B (2026-05-26): the think adapter ALSO needs the mask —
+        # so we build it whenever EITHER mechanism is on.
+        need_think_mask = (
+            (self.state_readonly_at_think or self.use_think_adapter)
+            and self.thinking_token_id is not None
+            and input_ids is not None
+        )
+        if need_think_mask:
             think_mask = (input_ids == int(self.thinking_token_id))
         else:
             think_mask = None
@@ -2067,6 +2152,14 @@ class TinyLM(nn.Module):
                 and self.thinking_token_id is not None):
             x = x + self._compute_think_index_emb(input_ids)
 
+        # Phase B think_mask — fires the ThinkAdapter at think positions
+        # during prefill (mirror of Block.forward path). Built only when
+        # the adapter is enabled and we know the thinking token id.
+        prefill_think_mask = None
+        if (self.use_think_adapter
+                and self.thinking_token_id is not None):
+            prefill_think_mask = (input_ids == int(self.thinking_token_id))
+
         if self.max_T > 0:
             pos = torch.arange(T_prompt, device=input_ids.device)
             x = x + self.pos_embed(pos)
@@ -2094,7 +2187,8 @@ class TinyLM(nn.Module):
             h1 = x
             pass1_at_sources: dict = {}
             for L, blk in enumerate(self.blocks):
-                h1 = self._step_block(blk, h1, past=None, layer_idx=L)
+                h1 = self._step_block(blk, h1, past=None, layer_idx=L,
+                                     think_mask=prefill_think_mask)
                 h1 = self._maybe_pkm(h1, L)
                 if L in source_layers:
                     pass1_at_sources[L] = h1
@@ -2105,7 +2199,8 @@ class TinyLM(nn.Module):
                     state_above_lagged = _shift_right_by_k(
                         pass1_at_sources[src], self.feedback_lag)
                     h = self.sparse_feedback[str(L)](h, state_above_lagged)
-                h = self._step_block(blk, h, past=fla_cache, layer_idx=L)
+                h = self._step_block(blk, h, past=fla_cache, layer_idx=L,
+                                    think_mask=prefill_think_mask)
                 if L in self.sparse_target_to_source and self.feedback_position == "post":
                     src = self.sparse_target_to_source[L]
                     state_above_lagged = _shift_right_by_k(
@@ -2151,7 +2246,8 @@ class TinyLM(nn.Module):
             # Plain block loop (= _film_bypass branch). The single,
             # primary code path for the v7 generator.
             for L, blk in enumerate(self.blocks):
-                h = self._step_block(blk, h, past=fla_cache, layer_idx=L)
+                h = self._step_block(blk, h, past=fla_cache, layer_idx=L,
+                                    think_mask=prefill_think_mask)
                 h = self._maybe_pkm(h, L)
 
         # Gate + memory + lm_head (mirror _finalize).
@@ -2200,7 +2296,8 @@ class TinyLM(nn.Module):
         return cache, lm_logits
 
     def _step_block(self, blk: nn.Module, x: torch.Tensor,
-                    past, layer_idx: int) -> torch.Tensor:
+                    past, layer_idx: int,
+                    think_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Run one Block, threading `past` through the attention layer's
         cache. The attention layer is `blk.attn` (a `_FlaWrapper`); we
         use its `.layer` directly so the kernel can write into the
@@ -2211,6 +2308,13 @@ class TinyLM(nn.Module):
         the chunk kernel handles full sequences with use_cache=True,
         AND the fused_recurrent kernel handles T=1 — we pick which by
         x.shape[1].
+
+        If `think_mask` is provided AND the block has a ThinkAdapter
+        (Phase B), the adapter is applied after the MLP residual — so
+        the adapter ALSO fires during incremental decode, not just
+        during the full-sequence training forward. Without this thread,
+        a ckpt trained with the adapter would have the adapter silently
+        inert at inference (caught by the v5 code review).
         """
         attn_in = blk.attn_norm(x)
         # T==1 → use forward_step (fused_recurrent kernel; correct for
@@ -2240,6 +2344,12 @@ class TinyLM(nn.Module):
             attn_out = attn_out.to(x.dtype)
         x = x + attn_out
         x = x + blk.mlp(blk.mlp_norm(x))
+        # Phase B: apply ThinkAdapter at think positions, mirroring the
+        # Block.forward path. Silent no-op when adapter absent or mask
+        # not provided.
+        if (think_mask is not None
+                and getattr(blk, "use_think_adapter", False)):
+            x = x + blk.think_adapter(x, think_mask)
         return x
 
     def _wm_init_buffer_from_prompt(self, h_normed: torch.Tensor,
@@ -2452,6 +2562,13 @@ class TinyLM(nn.Module):
         source_layers = set(s for _, s in self.feedback_pairs) \
             if use_film_at_decode else set()
 
+        # Phase B think_mask — fires the ThinkAdapter at think positions
+        # during forward_step (mirror of Block.forward path).
+        step_think_mask = None
+        if (self.use_think_adapter
+                and self.thinking_token_id is not None):
+            step_think_mask = (input_id == int(self.thinking_token_id))
+
         if use_film_at_decode:
             h = x
             new_lagged: dict = {}
@@ -2460,7 +2577,8 @@ class TinyLM(nn.Module):
                     src = self.sparse_target_to_source[L]
                     h = self.sparse_feedback[str(L)](
                         h, cache["lagged_sources"][src])
-                h = self._step_block(blk, h, past=fla_cache, layer_idx=L)
+                h = self._step_block(blk, h, past=fla_cache, layer_idx=L,
+                                    think_mask=step_think_mask)
                 if L in self.sparse_target_to_source and self.feedback_position == "post":
                     src = self.sparse_target_to_source[L]
                     h = self.sparse_feedback[str(L)](
@@ -2472,7 +2590,8 @@ class TinyLM(nn.Module):
         else:
             h = x
             for L, blk in enumerate(self.blocks):
-                h = self._step_block(blk, h, past=fla_cache, layer_idx=L)
+                h = self._step_block(blk, h, past=fla_cache, layer_idx=L,
+                                    think_mask=step_think_mask)
                 h = self._maybe_pkm(h, L)
 
         # Gate + memory + lm_head (mirror _finalize).

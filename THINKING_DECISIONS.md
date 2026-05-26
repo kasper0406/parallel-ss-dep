@@ -133,4 +133,39 @@ The SFT wrapper agent added the implementation choice to
 chosen design + file location alongside the original spec. Good
 documentation hygiene.
 
+## 2026-05-26 — CRITICAL: Phase 1 results disprove the "mechanism works" assumption
+
+**Findings on Phase D ckpt** (see `THINKING_PROBE_RESULTS.md` for full
+detail):
+
+- **Probe 1 (per-position CE Δ)**: thinking INCREASES next-token CE by
+  0.19 nats on average (4.45 → 4.64). Only 36% of positions improve
+  with thinking; 64% get WORSE.
+- **Probe 2 (counterfactual HumanEval)**: 0/50 either way (pretrain-only,
+  not discriminative yet).
+- **Probe 3 (RL correlation)**: Spearman ρ = −0.17 between think count
+  and reward. The 9 rollouts that thought scored mean 0.04 vs no-think
+  mean 0.18.
+
+**Implication**: the thinking mechanism is currently HARMFUL, not
+neutral. The model has the architecture but uses it to inject noise
+into its own state.
+
+**Re-prioritization**:
+1. Phase 4 (CoT distill SFT) is now essential — model has no
+   demonstration of useful thinking; without it, no signal.
+2. Phase 5 (process-aware reward) becomes MORE important — explicit
+   gradient that thinking should reduce CE/improve reward.
+3. Phase 2 (state-readonly) partially explains the +0.19 CE penalty
+   (recurrence corruption) — likely a contributing factor.
+
+**Pipeline continues**: the orchestrator is already on step 2 (Qwen
+CoT distill, multi-hour). Plan unchanged; just confirms the SFT step
+is doing exactly the right work.
+
+**Review trigger**: after step 5 (HumanEval on SFT-CoT-thinking ckpt)
++ re-run Phase 1 probes on the SFT'd ckpt. If probes flip positive →
+Phase 5 is worth building. If still negative → architectural rethink
+needed (current mechanism is fundamentally broken at this scale).
+
 ## (Future entries appended below as decisions are made)

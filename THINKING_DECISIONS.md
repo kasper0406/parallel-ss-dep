@@ -341,4 +341,41 @@ data setup keeps breaking the model.
    to debug the SFT code path or the data format.
 3. If that works → ship; we have efficient thinking.
 
+## 2026-05-26 — PIVOT v3: discovery RL instead of CoT imitation
+
+**Decision**: rewrote `THINKING_PLAN.md` again. Both v1 (Design A
+CoT-padding) and v2 (gist supervision) shared the hidden assumption
+that we should TEACH the model a predetermined thinking pattern from
+Qwen. Empirically that destroys the model (0/164 in every variant).
+
+**The user's insight**: the optimal thinking pattern is UNIQUE to our
+architecture (FiLM K=3 + WM + retrieval-as-input). We can't copy it
+from Qwen because Qwen has a different architecture. We have to let
+the model DISCOVER it via exploration.
+
+**v3 mechanism**: stochastic gate.
+- Gate output σ(g_t) becomes a Bernoulli probability over emit-vs-think
+- Rollouts SAMPLE the decision (not threshold)
+- Capture gate log-prob in rollout
+- PPO ratio includes gate decisions alongside emit tokens
+- Reward attribution flows back through the gate
+
+**Why this might work where SFT didn't**:
+- No imitation of Qwen → no architectural mismatch
+- Reward signal: did the FINAL answer pass? Reward what works, regardless of pattern
+- Compression EMERGES — if gate=0 (never think) wins, model converges there; if pattern X wins, model converges to X
+- Entropy regularization (~0.01) keeps exploration alive early
+
+**Training data choice**: NOT mbpp_combined. The v6→v11c data showed
+the gate seldom fires there (231/240 rollouts had 0 thinks) because
+most MBPP problems are single-shot solvable. Use `synth_reasoning`
+(the 6-family curriculum) — multi-step tasks where thinking IS the
+difference between success and failure.
+
+**3 parallel agents dispatched**:
+1. Stochastic gate + log-prob + PPO ratio + entropy bonus in
+   train_rl_grader.py (the big one)
+2. Scale synth_reasoning to 3000+ train + 300 held-out
+3. (This file + THINKING_PLAN.md rewrite — done in-line)
+
 ## (Future entries appended below as decisions are made)

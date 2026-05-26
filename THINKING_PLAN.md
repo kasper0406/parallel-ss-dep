@@ -1,158 +1,126 @@
-# Make EFFICIENT Thinking Work — Pivoted Plan
+# Make EFFICIENT Thinking Work — Discovery-RL Plan (v3)
 
-Top priority. Replaces the previous version of this file, which was a
-plan to "train the gate to fire correctly". Phase 1 probes
-(`THINKING_PROBE_RESULTS.md`) and the user's design critique made clear
-that plan didn't actually deliver on the architecture's promise.
+Top priority. Third iteration of this plan. v1 was "train the gate to
+fire correctly via SFT"; v2 was "compress CoT via gist supervision at
+think positions". Both shared a hidden assumption — that we should
+TEACH the model some predetermined thinking pattern (Qwen's text CoT
+in v1, Qwen's CoT compressed by K in v2). The empirical results say
+both approaches DEGRADE the model (every CoT-thinking SFT route dropped
+HumanEval from 7-8/164 to 0/164).
 
-## The architectural promise (and why the old plan didn't test it)
+v3 turns this on its head: the optimal thinking pattern is UNIQUE to
+our architecture (FiLM K=3 + WM + retrieval-as-input). We don't know
+what it should look like. We must let the model DISCOVER it through
+exploration, rewarded by what actually works.
 
-Our thinking mechanism is supposed to be **more token-efficient than
-text CoT**, because:
+## Root insight
 
-1. Continuous representations (no word-bottleneck round-trip)
-2. WM gives explicit lookback over previous think states
-3. FiLM K=3 self-feed → each forward is effectively 3 trunk passes
-4. So 1 think token should do the work of K text CoT tokens (K≈5-20)
+LM loss and SFT can't teach the gate when to fire because:
+- They have no notion of "thinking helps" — only of "predict the next
+  token correctly"
+- Imitating Qwen's CoT teaches our model to use thinking the way Qwen
+  uses CoT, which destroys the architectural compression promise
 
-**The old plan's Design A** trained the model to replace `N_cot` tokens
-of Qwen's verbose CoT with `N_think = N_cot` think tokens, all
-loss-masked. That's literally "1 think per 1 CoT word" — the opposite
-of compression. And the think positions had NO gradient signal, so
-the model had no way to learn what to compute during a think.
+RL with a STOCHASTIC GATE is the natural fit:
+- Gate output σ(g_t) becomes a Bernoulli probability over emit-vs-think
+- Each rollout SAMPLES different thinking patterns
+- PPO attributes reward back to each gate decision via standard ratio
+- Compression EMERGES — if thinking doesn't help, policy converges to
+  gate=0 (no thinking); if thinking helps, gate=1 at the right
+  positions
+- The model finds its OWN optimal thinking pattern, not Qwen's
 
-**Result of pursuing it**: Phase D + Design-A-only SFT scored 0/164 on
-HumanEval. Phase 1 probes on the Phase D ckpt also showed thinking
-currently INCREASES next-token CE (+0.19 nats) and is anti-correlated
-with RL rollout reward (Spearman −0.17). The mechanism is currently
-**actively harmful** — it injects noise into the recurrence.
+## Phases
 
-## What the pivot has to deliver
+### Phase A — Stochastic gate as policy variable
 
-Three properties the new plan must hit:
+Implementation in `experiments/train_rl_grader.py`:
+1. New CLI flag `--stochastic_gate` (default off, backwards-compat)
+2. In `rollout_group_batched`: when stochastic_gate is on, sample
+   Bernoulli(p=σ(gate)) at each position instead of threshold-deciding
+3. Capture per-position `gate_log_prob = log p(emit_decision_made)`
+   in the `Rollout` dataclass
+4. In `policy_loss_for_rollouts_batched`: extract new-policy gate
+   log-probs from the policy forward, compute PPO ratio
+5. TOTAL surrogate = mean(emit_surr + gate_surr)
+6. Force-emit positions (think budget exhausted etc.) excluded from
+   gate gradient — the model didn't have a choice there
 
-1. **Think positions get rich gradient signal.** Not just "emit nothing
-   here" (loss-masked). The model must learn what to compute during
-   a think.
-2. **N_think << N_cot.** Compression is the architectural promise; if
-   we don't test it, we're not testing the architecture.
-3. **Validated against a text-CoT baseline.** If text CoT doesn't help
-   our model at all, the issue is scale/capacity, not the thinking
-   mechanism, and we should stop investing in it.
+### Phase B — Entropy regularization on gate
 
-## What we have to drop
+PPO with binary actions collapses without entropy reg.
+- Compute per-position gate entropy `H = -(p log p + (1-p) log(1-p))`
+- Subtract `gate_entropy_bonus * mean_entropy` from total loss
+- Default: 0.01. Decay schedule TBD based on empirical run behavior.
 
-- **Design A as currently built** (loss-masked think padding). It
-  doesn't deliver any of the three properties.
-- **"Train the gate to fire correctly"** as the primary objective. Gate
-  firing without content-rich thinks is useless; gate-supervision is a
-  side-quest, not the main lever.
+### Phase C — Train on tasks where thinking IS the difference
 
-## Phases (pivoted)
+Run RL on `synth_reasoning` (the 6-family curriculum we built earlier):
+- Multi-step arithmetic chains
+- Conditional rule application  
+- Counting with offset
+- Binary search trace
+- Stack machine eval
+- Pattern detection (arithmetic / geometric / fibonacci / modular)
 
-### Phase 0 — Establish the text-CoT baseline (1 day, MUST go first)
+These STRUCTURALLY require multi-step reasoning. No-think attempts
+should fail. Thinking has clear room to help. The reward signal is
+clean: "did the answer match the test?".
 
-Run Phase D + standard Qwen distillation SFT (i.e., target =
-`qwen_completion` which IS the CoT prose + code, no think tokens).
-The model emits CoT text then code, exactly like a standard LLM.
+mbpp_combined was the wrong RL target — too many problems are
+single-shot solvable, the gate never had a reason to fire (231/240
+v11c rollouts had 0 thinks).
 
-This answers: **does CoT help our model AT ALL?** If pass@1 ≥ Phase C
-SFT's 10/164, CoT helps. If it's still 0-3/164, the issue is model
-scale and the thinking mechanism cannot save us. Decision gate for
-the rest of the plan.
+### Phase D — Token-level reward attribution (if Phase A-C insufficient)
 
-Infra: existing `launch_sft_phase_d_mixed.sh` (the 54k Qwen distill +
-961 CoT-thinking mix already shipped). Run that. The CoT-thinking rows
-are minor noise vs the 54k Qwen rows. Expect pass@1 = 8-12/164 if
-Qwen CoT helps; 0-3/164 if not.
+If the global episode reward proves too noisy to teach the gate
+properly:
+- Per-position counterfactual: for each gate=think decision, re-roll
+  the rollout WITHOUT that think; measure Δ pass-rate
+- Reward = global pass + α × sum(positive_per_position_deltas)
+- Provides finer-grained gradient than monolithic episode reward
+- Expensive (extra rollouts) — only enable if Phase A-C don't converge
 
-**Output**: `runs/eval_humaneval_sft_phase_d_mixed.log` + decision in
-`THINKING_DECISIONS.md`.
+### Phase E — Stability fixes for known failure modes
 
-### Phase 1 — Compressed CoT via gist supervision at think positions
+Carrying forward from previous plans:
+- **State-readonly thinking** (`--state_readonly_at_think`, shipped):
+  prevents recurrence corruption from multi-think bursts
+- **Think index embedding** (`--think_index_emb_size`, shipped): breaks
+  multi-think homogenization
+- **KL anchor** (`--kl_coef`): prevents drift from SFT base
+- **Adaptive curriculum**: keep on; samples from variance-bearing
+  problems
 
-The real fix for "think positions have no gradient". At each think
-position, ADD a gist loss: predict the hidden state of the CoT teacher
-at position `t · K` (K = compression factor, target 5-10).
+All of these are already-built knobs we keep ON.
 
-Architecture:
-- Existing `gist_loss_weight` infra (multi-horizon trunk gist) already
-  predicts `mean(h[t+1:t+K])` from `h[t]`. Repurpose it at think
-  positions to predict the TEACHER's hidden state at the corresponding
-  CoT chunk.
-- Or simpler: teacher is the SAME model's forward over the full
-  CoT prose (frozen ckpt); student forward inserts thinks at every
-  K-th position and the gist loss targets the teacher's hidden state
-  at position `t · K`.
+## What we are NOT doing anymore
 
-This gives think positions explicit gradient: their job is to "be" a
-compressed version of K CoT tokens. The architectural claim is that
-WM + FiLM K=3 + retrieval-as-input give the student enough capacity
-per think to fit K tokens of compressed reasoning.
-
-Two variants to try:
-- **1a**: hidden-state target (continuous, what gist_loss already does)
-- **1b**: next-CoT-chunk-EMBEDDING target (input-level supervision via
-  retrieval-as-input — Design C from the old plan)
-
-Start with 1a (lighter-weight; reuses shipped infra).
-
-**Validation**: train SFT with compression K=5; if think-position CE
-goes DOWN over training AND HumanEval matches Phase 0 baseline → we
-have efficient thinking. If think-position CE stays high → escalate to
-1b.
-
-### Phase 2 — State-readonly preserved + per-think index embedding
-
-Already shipped (previous Phase 2 + 3). Keep them ON for all new
-training runs:
-- `--state_readonly_at_think`: prevents recurrence corruption (+0.465
-  on synthetic recall probe)
-- `--think_index_emb_size 8`: breaks the multi-think homogenization
-
-These are prerequisites for Phases 1 and 3; they're not the lever.
-
-### Phase 3 — RL with compression-aware reward
-
-After Phase 1 establishes that the model CAN compress CoT into thinks,
-RL can reward COMPRESSED productive thinking:
-- Reward = grader_pass − α · n_think (linear ponder cost on absolute
-  think count)
-- AND a counterfactual-CE bonus: when a think position lowered the
-  next-emit CE more than the no-think baseline, that think gets +reward
-- Bound: total reward stays in [0, 1] so PPO behaves
-
-This is `THINKING_PLAN`'s old Phase 5, now positioned correctly (after
-the model has the capacity to think productively).
-
-### Phase 4 — Synthetic reasoning curriculum (shipped, queued for use)
-
-The 6-family reasoning task set is built (`gen_synthetic_reasoning_
-tasks.py`, 504 tasks). Use it as RL training data IN PHASE 3 (after
-Phase 1) — these tasks structurally require multi-step reasoning, so
-they're the right test for "did efficient thinking work?".
+- **CoT imitation SFT** (v1's Design A or v2's gist supervision):
+  empirically degrades the model regardless of base / mix
+- **Manually-specified think budgets**: budget is a hard upper bound,
+  not a target
+- **Loss-masked think padding**: provides no signal
 
 ## Execution order
 
-1. **Phase 0** (NOW): launch `launch_sft_phase_d_mixed.sh`, wait for
-   HumanEval. Decision gate.
-2. **If Phase 0 pass@1 ≥ 8**: build & run Phase 1a (gist-at-think
-   supervision with K=5). Compare HumanEval against Phase 0.
-3. **If Phase 1a HumanEval ≈ Phase 0 with N_think = N_cot/5**: ship.
-   This means we have efficient thinking. Proceed to Phase 3 RL.
-4. **If Phase 1a HumanEval << Phase 0**: escalate to Phase 1b (CoT
-   retrieval-as-input). If that also fails, the architecture cannot
-   support compression at this scale; pivot to scale-up.
-
-## What we will NOT do
-
-- Lossy-masked think padding with N_think = N_cot (the old Design A).
-  It's been tested — doesn't work.
-- More gate-supervision aux losses without process signal (cycled
-  through this; never moved the needle).
-- Pure thinking-token-count optimization (depth_mean targeting).
+1. Build stochastic gate (Phase A) + entropy reg (Phase B) — landed
+   as `experiments/test_stochastic_gate.py` + `train_rl_grader.py`
+   changes
+2. Scale synth_reasoning data (3000 train + 300 held-out) — landed
+   as `data/synth_reasoning_{train,heldout}.jsonl`
+3. Run first stochastic-gate RL on synth_reasoning — gate_fire_rate
+   should evolve from ~0.5 (entropy-regularized init) toward whatever
+   pattern wins
+4. Eval on synth_reasoning held-out (or HumanEval if applicable) —
+   compare to no-think baseline
+5. Decision gate: if gate converges to non-trivial pattern AND lifts
+   eval pass-rate → efficient thinking discovered. If gate collapses
+   to 0 (never think) AND eval matches no-think → thinking doesn't
+   help even with exploration; pivot away. If gate stays at 0.5 AND
+   eval stable → exploration didn't find a useful pattern; try Phase D
+   counterfactual reward.
 
 ## Decisions log
 
-Important judgment calls during execution are logged to
-`THINKING_DECISIONS.md` for user review.
+See `THINKING_DECISIONS.md` for judgment calls during execution.

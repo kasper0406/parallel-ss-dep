@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import ast
 import dataclasses
+import json
 import multiprocessing as mp
 import pathlib
 import signal
@@ -504,6 +505,49 @@ def load_codefeedback_python(max_n: int | None = None) -> list[Problem]:
     return out
 
 
+_SYNTH_REASONING_DEFAULT_PATH = "data/synth_reasoning_tasks_small.jsonl"
+
+
+def load_synth_reasoning(path: str | None = None) -> list[Problem]:
+    """Synthetic reasoning-required tasks (gen_synthetic_reasoning_tasks.py).
+
+    Reads a JSONL produced by `experiments.gen_synthetic_reasoning_tasks`
+    where each line is a serialised `Problem`. By default looks at
+    `data/synth_reasoning_tasks_small.jsonl`; override via the
+    `SYNTH_REASONING_PATH` env var or the `path` arg.
+    """
+    import os
+    p = (path
+         or os.environ.get("SYNTH_REASONING_PATH")
+         or _SYNTH_REASONING_DEFAULT_PATH)
+    path_obj = pathlib.Path(p)
+    if not path_obj.is_absolute():
+        path_obj = pathlib.Path(__file__).resolve().parents[1] / path_obj
+    if not path_obj.exists():
+        raise FileNotFoundError(
+            f"synth_reasoning JSONL not found at {path_obj}. "
+            f"Generate it with "
+            f"`python experiments/gen_synthetic_reasoning_tasks.py "
+            f"--out {p}`."
+        )
+    out: list[Problem] = []
+    with open(path_obj) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            out.append(Problem(
+                task_id=rec["task_id"],
+                prompt=rec["prompt"],
+                tests=rec["tests"],
+                entry_point=rec["entry_point"],
+                prompt_is_code=rec.get("prompt_is_code", False),
+                gold_solution=rec.get("gold_solution"),
+            ))
+    return out
+
+
 def load_distill_corpus(
     max_magicoder: int | None = None,
     max_codefeedback: int | None = None,
@@ -530,6 +574,8 @@ LOADERS: dict[str, Callable[[], list[Problem]]] = {
     "magicoder_oss": load_magicoder_oss_python,
     "codefeedback": load_codefeedback_python,
     "distill_corpus": load_distill_corpus,
+    # Synthetic reasoning-required tasks (gen_synthetic_reasoning_tasks.py).
+    "synth_reasoning": load_synth_reasoning,
 }
 
 

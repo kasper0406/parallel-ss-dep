@@ -54,6 +54,7 @@ import torch.nn.functional as F
 
 from experiments.gist_loss import (
     build_gist_heads, trunk_gist_loss, parse_horizons,
+    build_think_gist_head, think_gist_loss,
 )
 
 
@@ -335,6 +336,167 @@ def build_example_with_cot_thinking(
     return full, labels
 
 
+def build_example_with_cot_compression(
+    prompt: str,
+    cot_text: str,
+    solution: str,
+    tokenizer,
+    thinking_token_id: int,
+    max_len: int,
+    *,
+    compression_k: int = 5,
+    min_thinks: int = 4,
+):
+    """Phase-1a SFT example builder (THINKING_PLAN.md): build a STUDENT
+    sequence whose CoT span is COMPRESSED into N_think = ceil(N_cot / K)
+    consecutive [THINKING] tokens, plus a parallel TEACHER sequence that
+    keeps the full CoT prose. The trainer runs the teacher in no_grad to
+    extract hidden-state targets for the student's think positions
+    (gist-at-think supervision via experiments.gist_loss.think_gist_loss).
+
+    Compression mapping (think -> teacher CoT position):
+      think i -> teacher position (within the CoT span) of the LAST
+      token of the i-th K-chunk: min((i+1)*K - 1, N_cot - 1). This is
+      the natural "summary point" — at that hidden state the causal
+      teacher has seen every token in chunk i.
+
+    Both sequences share `comment_ids` as prefix and `sol_ids + [eos]`
+    as suffix; ONLY the middle differs.
+
+    Returns:
+      student_input_ids: list[int]
+      student_labels:    list[int]   (-100 on prompt + thinks; real on sol)
+      teacher_input_ids: list[int]
+      gist_meta:         dict with keys
+        "think_positions":         list[int] positions in student_input_ids
+        "teacher_cot_positions":   list[int] positions in teacher_input_ids
+        "comment_len":             int
+        "n_cot":                   int (teacher CoT token count, post-truncation)
+        "n_think":                 int
+
+    Truncation policy: same as `build_example_with_cot_thinking` — keep
+    the comment intact, then keep the solution tail, then fill any
+    remaining budget with think (student) / CoT (teacher) tokens. If
+    teacher truncation drops some CoT positions a think would otherwise
+    point to, those think -> cot pairs are dropped from gist_meta so the
+    loss only sees valid pairs.
+    """
+    if prompt.startswith("# ") and "\n" in prompt.rstrip("\n"):
+        comment_line = prompt if prompt.endswith("\n") else prompt + "\n"
+    else:
+        comment_line = f"# {_flatten_to_oneline(prompt)}\n"
+    comment_ids = tokenizer.encode(comment_line, add_special_tokens=False)
+
+    cot_ids = tokenizer.encode(cot_text, add_special_tokens=False)
+    n_cot_full = len(cot_ids)
+    if n_cot_full == 0:
+        # No CoT tokens — fall back to plain example layout via the same
+        # contract (still produce min_thinks for budget consistency).
+        cot_ids = []
+        n_cot_full = 0
+
+    K = max(1, int(compression_k))
+    # N_think = ceil(N_cot / K), at least `min_thinks`. When n_cot is
+    # zero, force at least min_thinks.
+    if n_cot_full == 0:
+        n_think_full = max(1, int(min_thinks))
+    else:
+        n_think_full = max(int(min_thinks), (n_cot_full + K - 1) // K)
+    think_ids_full = [int(thinking_token_id)] * n_think_full
+
+    solution_text = solution + ("\n" if not solution.endswith("\n") else "")
+    sol_ids = tokenizer.encode(solution_text, add_special_tokens=False)
+    eos = tokenizer.eos_token_id
+    if eos is not None:
+        sol_ids = sol_ids + [int(eos)]
+
+    # --- STUDENT sequence (with think compression) --------------------
+    student_full = comment_ids + think_ids_full + sol_ids
+    if len(student_full) <= max_len:
+        s_comment_len = len(comment_ids)
+        s_think_len = n_think_full
+        s_sol_len = len(sol_ids)
+    else:
+        s_comment_len = min(len(comment_ids), max_len)
+        room = max_len - s_comment_len
+        s_sol_len = min(len(sol_ids), max(1, room))
+        s_think_len = max(0, room - s_sol_len)
+        if s_think_len > n_think_full:
+            s_think_len = n_think_full
+            s_sol_len = min(len(sol_ids), room - s_think_len)
+        student_full = (
+            comment_ids[:s_comment_len]
+            + [int(thinking_token_id)] * s_think_len
+            + sol_ids[:s_sol_len]
+        )
+    student_labels = (
+        [-100] * s_comment_len
+        + [-100] * s_think_len
+        + list(student_full[s_comment_len + s_think_len:])
+    )
+    assert len(student_labels) == len(student_full)
+
+    # --- TEACHER sequence (with full CoT prose) -----------------------
+    teacher_full = comment_ids + cot_ids + sol_ids
+    if len(teacher_full) <= max_len:
+        t_comment_len = len(comment_ids)
+        t_cot_len = n_cot_full
+        t_sol_len = len(sol_ids)
+    else:
+        t_comment_len = min(len(comment_ids), max_len)
+        room = max_len - t_comment_len
+        t_sol_len = min(len(sol_ids), max(1, room))
+        t_cot_len = max(0, room - t_sol_len)
+        if t_cot_len > n_cot_full:
+            t_cot_len = n_cot_full
+            t_sol_len = min(len(sol_ids), room - t_cot_len)
+        teacher_full = (
+            comment_ids[:t_comment_len]
+            + cot_ids[:t_cot_len]
+            + sol_ids[:t_sol_len]
+        )
+
+    # --- Gist mapping: student think i -> teacher CoT position --------
+    # think i represents CoT chunk [i*K, (i+1)*K); supervise on the last
+    # token of that chunk (clamped to the last valid CoT position).
+    # Pairs that fall outside the (post-truncation) teacher CoT window
+    # are dropped — partial supervision is better than wrong.
+    think_positions: list[int] = []
+    teacher_cot_positions: list[int] = []
+    if s_think_len > 0 and t_cot_len > 0:
+        # The COMMON comment prefix has length min(s_comment_len, t_comment_len)
+        # under normal use (both equal len(comment_ids)). When that
+        # invariant holds, student think index i sits at position
+        # s_comment_len + i; teacher CoT chunk i ends at
+        # t_comment_len + min((i+1)*K - 1, t_cot_len - 1).
+        for i in range(s_think_len):
+            target_chunk_end = (i + 1) * K - 1
+            if target_chunk_end >= t_cot_len:
+                # The teacher CoT got truncated past this chunk's end —
+                # clamp to last available CoT position; if that's already
+                # been used, drop the pair (no duplicate supervision).
+                target_chunk_end = t_cot_len - 1
+            if target_chunk_end < 0:
+                break
+            sp = s_comment_len + i
+            tp = t_comment_len + target_chunk_end
+            # Drop duplicate teacher positions (multiple thinks pointing
+            # at the same already-clamped tail token would over-weight it).
+            if teacher_cot_positions and teacher_cot_positions[-1] == tp:
+                continue
+            think_positions.append(sp)
+            teacher_cot_positions.append(tp)
+
+    gist_meta = {
+        "think_positions": think_positions,
+        "teacher_cot_positions": teacher_cot_positions,
+        "comment_len": int(s_comment_len),
+        "n_cot": int(t_cot_len),
+        "n_think": int(s_think_len),
+    }
+    return student_full, student_labels, teacher_full, gist_meta
+
+
 def insert_think_bursts(
     input_ids: list[int], labels: list[int],
     thinking_token_id: int, max_len: int,
@@ -504,6 +666,51 @@ def main() -> int:
                    help="DEPRECATED (v5 lexical-target ramp). Ignored.")
     p.add_argument("--future_emb_T_ramp_frac", type=float, default=0.3,
                    help="DEPRECATED (v5 lexical-target ramp). Ignored.")
+    # --- Phase 1a: gist-at-think compression (THINKING_PLAN.md) -------
+    # CoT-thinking rows route through build_example_with_cot_compression
+    # (instead of build_example_with_cot_thinking) when these are set:
+    # student gets N_think = ceil(N_cot / K) thinks; the trainer also
+    # runs a no_grad teacher forward over the full (prompt + CoT + code)
+    # sequence and supervises each student think against the teacher
+    # hidden state at the corresponding CoT chunk end via
+    # think_gist_loss. This tests the "1 think ≈ K CoT tokens"
+    # compression claim — see THINKING_PROBE_RESULTS.md for why we
+    # pivoted from Design A (loss-masked padding, no gradient signal).
+    p.add_argument("--cot_compression_k", type=int, default=0,
+                   help="Phase 1a compression factor K. >0 enables "
+                        "gist-at-think SFT: CoT-thinking rows produce "
+                        "N_think = ceil(N_cot / K) thinks with a "
+                        "per-think hidden-state target from a no_grad "
+                        "teacher forward over the full CoT. 0 (default) "
+                        "= keep legacy Design A behaviour "
+                        "(build_example_with_cot_thinking).")
+    p.add_argument("--cot_min_thinks", type=int, default=4,
+                   help="Lower bound on N_think per CoT row when "
+                        "--cot_compression_k > 0.")
+    p.add_argument("--think_gist_weight", type=float, default=0.0,
+                   help="Auxiliary loss weight for the Phase 1a "
+                        "gist-at-think supervision. Recommended 0.1. "
+                        "0 disables the gist loss (still routes through "
+                        "the compression builder if --cot_compression_k > 0; "
+                        "useful for ablating the gist signal vs the "
+                        "compressed-think layout alone).")
+    p.add_argument("--think_gist_loss_type", type=str, default="cosine",
+                   choices=["cosine", "mse"],
+                   help="Distance for think_gist_loss.")
+    # Phase-2/3 toggles (defaults inherit from cfg). These flags FORCE
+    # the flag on at SFT time even if the loaded ckpt's cfg had it off
+    # (allows turning the architectural fix on for an SFT continuation).
+    p.add_argument("--state_readonly_at_think", action="store_true",
+                   help="Phase 2: force DeltaNet β=0 at think positions "
+                        "so thinking can't corrupt the recurrent state. "
+                        "Inherits from ckpt cfg when omitted; pass this "
+                        "to flip ON for a continuation SFT.")
+    p.add_argument("--think_index_emb_size", type=int, default=-1,
+                   help="Phase 3: per-position think-index embedding "
+                        "table size (breaks the multi-think input-"
+                        "homogenization that motivated FIX A). -1 (default) "
+                        "= inherit from ckpt cfg; >=0 forces that size "
+                        "(0 disables the embedding, >0 builds it).")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -539,6 +746,33 @@ def main() -> int:
                 cfg["mem_write_only_at_think"] = True
                 print(f"  FIX A enabled: WorkingMemory.write_only_at_think = True "
                       "(non-think positions masked to -1.0 before topk)")
+            # Phase-2 override: force state_readonly_at_think on (safe to
+            # flip post-construction — it's a plain bool the forward
+            # checks each step). The Block-level hook is installed in
+            # TinyLM.__init__ if the flag was on at build time, so we
+            # also walk Blocks here to install the hook for late-on.
+            if bool(getattr(args, "state_readonly_at_think", False)):
+                model.state_readonly_at_think = True
+                cfg["state_readonly_at_think"] = True
+                for block in model.blocks:
+                    attn = getattr(block, "attn", None)
+                    if attn is not None and hasattr(
+                            attn, "enable_state_readonly_at_think"):
+                        attn.enable_state_readonly_at_think()
+                print("  Phase 2 enabled: state_readonly_at_think = True "
+                      "(DeltaNet β forced to 0 at think positions)")
+            # Phase-3 override: think_index_emb_size. -1 (default) =
+            # leave as-built from cfg. A nonzero value mismatching the
+            # existing embedding triggers a hard error rather than a
+            # silent shape mismatch on save/load round-trip.
+            req_size = int(getattr(args, "think_index_emb_size", -1))
+            cur_size = int(model.think_index_emb_size)
+            if req_size >= 0 and req_size != cur_size:
+                raise RuntimeError(
+                    f"Requested --think_index_emb_size={req_size} but "
+                    f"loaded model has think_index_emb_size={cur_size}. "
+                    "Rebuild the ckpt from scratch with the new size "
+                    "instead (live resize would discard learned weights).")
             print(f"  with-thinking + ckpt-already-has-thinking: loaded as-is "
                   f"(memory + gate {'+ pkm ' if any(k.startswith('pkm_layer.') for k in sd_keys) else ''}"
                   f"think_id={thinking_token_id})")
@@ -678,24 +912,53 @@ def main() -> int:
             "vocab slot.")
     print(f"  tokenizing... ({n_cot_rows} cot-thinking rows, "
           f"{len(rows_with_cot) - n_cot_rows} plain rows)")
-    encoded: list[tuple[list[int], list[int]]] = []
+    # Each encoded entry is a 4-tuple
+    #   (student_ids, student_labels, teacher_ids_or_None, gist_meta_or_None)
+    # Phase 1a rows have teacher_ids + gist_meta; everything else has None,
+    # None and the train loop treats them as a single-forward batch (or
+    # mixed with thinking-gate burst insertion as before).
+    encoded: list[tuple] = []
     skipped = 0
+    use_phase_1a = (args.cot_compression_k or 0) > 0
+    if use_phase_1a:
+        print(f"  Phase 1a active: compression_k={args.cot_compression_k}, "
+              f"min_thinks={args.cot_min_thinks}, "
+              f"gist_weight={args.think_gist_weight} "
+              f"({args.think_gist_loss_type})")
     for prompt, sol, cot_text in rows_with_cot:
-        if cot_text:
+        if cot_text and use_phase_1a:
+            student_ids, labels, teacher_ids, gist_meta = (
+                build_example_with_cot_compression(
+                    prompt, cot_text, sol, tok,
+                    int(thinking_token_id), args.max_len,
+                    compression_k=int(args.cot_compression_k),
+                    min_thinks=int(args.cot_min_thinks),
+                )
+            )
+            if len(student_ids) < 8 or all(l == -100 for l in labels):
+                skipped += 1
+                continue
+            encoded.append((student_ids, labels, teacher_ids, gist_meta))
+        elif cot_text:
             full, labels = build_example_with_cot_thinking(
                 prompt, cot_text, sol, tok,
                 int(thinking_token_id), args.max_len,
             )
+            if len(full) < 8 or all(l == -100 for l in labels):
+                skipped += 1
+                continue
+            encoded.append((full, labels, None, None))
         else:
             full, labels = build_example(prompt, sol, tok, args.max_len)
-        if len(full) < 8 or all(l == -100 for l in labels):
-            skipped += 1
-            continue
-        encoded.append((full, labels))
+            if len(full) < 8 or all(l == -100 for l in labels):
+                skipped += 1
+                continue
+            encoded.append((full, labels, None, None))
     print(f"  encoded: {len(encoded)} (skipped {skipped})")
     pad_id = int(tok.eos_token_id) if tok.eos_token_id is not None else 0
 
     def make_batch(rows):
+        """rows: list of (ids, labels) 2-tuples."""
         max_t = max(len(ids) for ids, _ in rows)
         max_t = min(max_t, args.max_len)
         bsz = len(rows)
@@ -706,6 +969,17 @@ def main() -> int:
             x[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
             y[i, :len(labels)] = torch.tensor(labels, dtype=torch.long, device=device)
         return x, y
+
+    def make_teacher_batch(teacher_ids_list):
+        """rows: list[list[int]]. Pads to the max-length teacher sequence."""
+        max_t = max(len(ids) for ids in teacher_ids_list)
+        max_t = min(max_t, args.max_len)
+        bsz = len(teacher_ids_list)
+        x = torch.full((bsz, max_t), pad_id, dtype=torch.long, device=device)
+        for i, ids in enumerate(teacher_ids_list):
+            ids = ids[:max_t]
+            x[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+        return x
 
     # --- 4. Optim + train loop -------------------------------------------
     # v7 trunk multi-horizon gist heads (Fix C, 2026-05-20). The trunk's
@@ -739,6 +1013,29 @@ def main() -> int:
         print("  NOTE: --wm_future_pred_weight is deprecated since v7 "
               "(WM gist supervision removed) — ignored.")
 
+    # Phase 1a: per-think gist head (separate from the v7 trunk gist
+    # heads). Single Linear(d_model, d_model) that projects student
+    # think hidden states into the teacher's hidden-state space. Built
+    # whenever Phase 1a is active (so the head exists for `loss_type`
+    # ablations even if --think_gist_weight is 0 at this run).
+    think_gist_head = None
+    if use_phase_1a:
+        think_gist_head = build_think_gist_head(d_model).cuda()
+        _ck = locals().get("raw_ckpt")
+        if _ck is None:
+            _ck = torch.load(args.load_ckpt, map_location="cpu",
+                              weights_only=False)
+        if "think_gist_head_state_dict" in _ck:
+            try:
+                think_gist_head.load_state_dict(
+                    _ck["think_gist_head_state_dict"])
+                print("  Phase 1a think_gist_head: restored from ckpt")
+            except (RuntimeError, KeyError):
+                print("  Phase 1a think_gist_head: ckpt shape differs — fresh")
+        print(f"  Phase 1a think_gist_head: d_model={d_model}, "
+              f"weight={args.think_gist_weight}, "
+              f"loss_type={args.think_gist_loss_type}")
+
     # Optimizer: retrieval_input_alpha gets NO weight decay (the FiLM-α
     # lesson — WD on a gate scalar manufactures a false low equilibrium).
     alpha_params, decay_params = [], []
@@ -749,6 +1046,8 @@ def main() -> int:
          else decay_params).append(p)
     head_params = (list(future_gist_heads.parameters())
                    if future_gist_heads is not None else [])
+    if think_gist_head is not None:
+        head_params = head_params + list(think_gist_head.parameters())
     opt = torch.optim.AdamW(
         # WD=0.01 is the project default since 2026-05-14 (the v3a
         # residual-stream-collapse finding — see GEMINI.md). WD=0.1
@@ -768,103 +1067,147 @@ def main() -> int:
     t0 = time.time()
     losses: list[float] = []
     step = 0
+    # Phase 1a metric: track how the per-step gist loss trends. A real
+    # signal will show this dropping monotonically over the first
+    # ~hundred steps; a frozen/dead signal stays flat. Printed every
+    # log_every steps when use_phase_1a is on.
+    last_gist_loss = None
     for epoch in range(args.epochs):
         # Shuffle each epoch.
         idx = torch.randperm(len(encoded), generator=rng).tolist()
         for i in range(0, len(encoded) - args.batch + 1, args.batch):
             rows = [encoded[idx[j]] for j in range(i, i + args.batch)]
-            if args.with_thinking and thinking_token_id is not None:
-                # Inject random think bursts per row. Each row independently
-                # samples 0..K bursts; depth ∈ [1, max_burst_depth] per burst.
-                rows = [
+            # Partition into Phase 1a rows (have teacher_ids) and
+            # legacy rows (None). Only legacy rows get
+            # insert_think_bursts (the random-burst augmentation would
+            # corrupt the structured think positions Phase 1a maps to
+            # teacher CoT positions).
+            phase_1a_rows = [(r[0], r[1], r[2], r[3]) for r in rows
+                              if r[2] is not None]
+            legacy_rows = [(r[0], r[1]) for r in rows if r[2] is None]
+
+            if legacy_rows and args.with_thinking and thinking_token_id is not None:
+                legacy_rows = [
                     insert_think_bursts(ids, lbls, int(thinking_token_id),
                                           args.max_len,
                                           args.think_max_bursts,
                                           args.think_max_depth, rng)
-                    for ids, lbls in rows
+                    for ids, lbls in legacy_rows
                 ]
-            x, y = make_batch(rows)
+            # If the whole batch is Phase 1a, skip the legacy forward; if
+            # mixed, both forwards run and contribute additively.
+            x, y = (make_batch(legacy_rows)
+                    if legacy_rows else (None, None))
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # Need hidden states for the trunk gist aux loss.
-                want_hidden = future_gist_heads is not None
-                # --- Retrieval-as-input thinking (v7 additive, Fix B) ---
-                # 2-pass forward:
-                #   pass 1 (no_grad): capture the WM injection at every
-                #           position (model.memory._last_injection).
-                #   build inputs_embeds: at think positions ADD the
-                #           previous position's WM retrieval, scaled by
-                #           the learned scalar α (model.retrieval_input_
-                #           alpha), to the think-token embedding.
-                #   pass 2: forward with inputs_embeds.
-                # v5/v6 REPLACED the think embedding with the retrieval
-                # — destructive: a blurry retrieval overwrote the precise
-                # binding the trunk carried (v6 longctx: 99%→61% recall).
-                # v7 ADDS instead: input[think] = think_embed + α·retr.
-                # A useless retrieval contributes ≈0 (gradient shrinks
-                # α); the think_embed baseline always survives. WM still
-                # gets gradient via the residual _inject_memory path
-                # inside pass 2, so pass 1 can stay no_grad.
-                if (args.retrieval_as_input_thinking
-                        and args.with_thinking
-                        and thinking_token_id is not None):
-                    with torch.no_grad():
-                        _ = model(x)
-                    inj = model.memory._last_injection  # (B, T, d) detached
-                    base_emb = model.embed(x)               # (B, T, d)
-                    is_think = (x == int(thinking_token_id)).unsqueeze(-1)
-                    # Think at t consumes the retrieval from t-1.
-                    shifted_inj = torch.cat(
-                        [torch.zeros_like(inj[:, :1]), inj[:, :-1]],
-                        dim=1,
-                    )
-                    alpha = model.retrieval_input_alpha
-                    inputs_embeds = (
-                        base_emb
-                        + is_think.to(base_emb.dtype)
-                        * alpha
-                        * shifted_inj.to(base_emb.dtype)
-                    )
-                    if want_hidden:
-                        logits, h = model(x, inputs_embeds=inputs_embeds,
-                                          return_hidden=True)
+                # Phase 1a ALSO needs hidden states (for the per-think gist).
+                want_hidden = (future_gist_heads is not None) or bool(
+                    phase_1a_rows)
+                loss = torch.zeros((), device=device)
+                # ====== Legacy path: only runs when there are non-Phase-1a rows
+                if x is not None:
+                    # --- Retrieval-as-input thinking (v7 additive, Fix B) ---
+                    if (args.retrieval_as_input_thinking
+                            and args.with_thinking
+                            and thinking_token_id is not None):
+                        with torch.no_grad():
+                            _ = model(x)
+                        inj = model.memory._last_injection  # (B,T,d) detached
+                        base_emb = model.embed(x)
+                        is_think = (x == int(thinking_token_id)).unsqueeze(-1)
+                        shifted_inj = torch.cat(
+                            [torch.zeros_like(inj[:, :1]), inj[:, :-1]],
+                            dim=1,
+                        )
+                        alpha = model.retrieval_input_alpha
+                        inputs_embeds = (
+                            base_emb
+                            + is_think.to(base_emb.dtype)
+                            * alpha
+                            * shifted_inj.to(base_emb.dtype)
+                        )
+                        if want_hidden:
+                            logits, h = model(x, inputs_embeds=inputs_embeds,
+                                              return_hidden=True)
+                        else:
+                            logits = model(x, inputs_embeds=inputs_embeds)
+                    elif want_hidden:
+                        logits, h = model(x, return_hidden=True)
                     else:
-                        logits = model(x, inputs_embeds=inputs_embeds)
-                elif want_hidden:
-                    logits, h = model(x, return_hidden=True)
-                else:
-                    logits = model(x)
-                # Slice off the +1 thinking-token slot before CE so the
-                # think token is never a valid target (label space ==
-                # base_vocab_for_loss). The slice is a no-op when not
-                # in with_thinking mode (sizes match).
-                if args.with_thinking:
-                    logits = logits[..., :base_vocab_for_loss]
-                # Standard causal-LM shift: logits[:, :-1] predict y[:, 1:].
-                shift_logits = logits[:, :-1].contiguous()
-                shift_labels = y[:, 1:].contiguous()
-                # ignore_index=-100 masks the comment tokens AND the
-                # inserted think tokens.
-                lm_loss = F.cross_entropy(
-                    shift_logits.reshape(-1, shift_logits.size(-1)),
-                    shift_labels.reshape(-1),
-                    ignore_index=-100,
-                )
-                loss = lm_loss
-                # ----- v7 trunk multi-horizon gist loss (Fix C) -----
-                # Each head predicts, from the trunk hidden state h[t],
-                # the GIST of the upcoming window — the mean-pooled
-                # hidden state over h[t+1 : t+1+K], stop-grad'd. The
-                # trunk is causal so each h[t] is a running
-                # contextualised summary; the windowed mean is a
-                # genuine "where this is going" vector. Multi-horizon K
-                # gives local tactic + mid plan + global direction.
-                # This is the v6 gist target, but supervising the TRUNK
-                # rather than the WM read — so "direction" lives in the
-                # trunk and WM is left free to learn precise retrieval
-                # (v6 put the blurry gist into WM and broke recall).
-                if future_gist_heads is not None:
-                    loss = loss + args.future_emb_loss_weight * (
-                        trunk_gist_loss(h, future_gist_heads, gist_horizons))
+                        logits = model(x)
+                    if args.with_thinking:
+                        logits = logits[..., :base_vocab_for_loss]
+                    shift_logits = logits[:, :-1].contiguous()
+                    shift_labels = y[:, 1:].contiguous()
+                    lm_loss = F.cross_entropy(
+                        shift_logits.reshape(-1, shift_logits.size(-1)),
+                        shift_labels.reshape(-1),
+                        ignore_index=-100,
+                    )
+                    loss = loss + lm_loss
+                    if future_gist_heads is not None:
+                        loss = loss + args.future_emb_loss_weight * (
+                            trunk_gist_loss(h, future_gist_heads, gist_horizons))
+                # ====== Phase 1a path: gist-at-think supervision ============
+                # Run the student forward over the compressed sequence and
+                # the teacher forward (no_grad) over the full CoT sequence.
+                # Student hidden states at think positions are projected
+                # via think_gist_head and supervised against teacher hidden
+                # states at the corresponding CoT chunk-end positions.
+                if phase_1a_rows:
+                    student_ids_list = [(r[0], r[1]) for r in phase_1a_rows]
+                    teacher_ids_list = [r[2] for r in phase_1a_rows]
+                    gist_metas = [r[3] for r in phase_1a_rows]
+                    sx, sy = make_batch(student_ids_list)
+                    tx = make_teacher_batch(teacher_ids_list)
+
+                    # Teacher: no_grad forward, capture hidden states.
+                    with torch.no_grad():
+                        _t_logits, t_h = model(tx, return_hidden=True)
+                    # Student: grad-enabled forward.
+                    s_logits, s_h = model(sx, return_hidden=True)
+                    if args.with_thinking:
+                        s_logits = s_logits[..., :base_vocab_for_loss]
+                    s_shift_logits = s_logits[:, :-1].contiguous()
+                    s_shift_labels = sy[:, 1:].contiguous()
+                    student_lm_loss = F.cross_entropy(
+                        s_shift_logits.reshape(-1, s_shift_logits.size(-1)),
+                        s_shift_labels.reshape(-1),
+                        ignore_index=-100,
+                    )
+                    loss = loss + student_lm_loss
+                    # Compose batched think-position / teacher-position
+                    # lists, then call think_gist_loss. Truncate any
+                    # positions that landed past the (post-truncation)
+                    # padded sequence length to be safe.
+                    sT = s_h.shape[1]
+                    tT = t_h.shape[1]
+                    think_positions = []
+                    teacher_cot_positions = []
+                    for gm in gist_metas:
+                        sp = [p for p in gm["think_positions"] if p < sT]
+                        tp = [p for q, p in zip(gm["think_positions"],
+                                                gm["teacher_cot_positions"])
+                              if q < sT and p < tT]
+                        # Keep parallel: clip sp to len(tp) (drop tail
+                        # mismatches caused by truncation).
+                        n = min(len(sp), len(tp))
+                        think_positions.append(sp[:n])
+                        teacher_cot_positions.append(tp[:n])
+                    if any(len(p) > 0 for p in think_positions):
+                        g_loss = think_gist_loss(
+                            s_h, t_h.detach(),
+                            think_positions, teacher_cot_positions,
+                            think_gist_head,
+                            loss_type=args.think_gist_loss_type,
+                        )
+                        last_gist_loss = float(g_loss.detach().item())
+                        if args.think_gist_weight > 0:
+                            loss = loss + args.think_gist_weight * g_loss
+                    if future_gist_heads is not None:
+                        loss = loss + args.future_emb_loss_weight * (
+                            trunk_gist_loss(s_h, future_gist_heads,
+                                             gist_horizons))
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -876,8 +1219,11 @@ def main() -> int:
                 lr = sched.get_last_lr()[0]
                 ppl = math.exp(min(loss.item(), 20))
                 tok_s = (step * args.batch * args.max_len) / max(1, time.time() - t0)
+                extra = ""
+                if use_phase_1a and last_gist_loss is not None:
+                    extra = f"  gist={last_gist_loss:.4f}"
                 print(f"  step {step:>5}/{n_steps}  loss={loss.item():.4f}  "
-                      f"ppl={ppl:.2f}  lr={lr:.2e}  tok/s={tok_s:.0f}")
+                      f"ppl={ppl:.2f}  lr={lr:.2e}  tok/s={tok_s:.0f}{extra}")
 
     print(f"\nDone in {time.time() - t0:.0f}s.  Final loss: {losses[-1]:.4f}")
 
@@ -893,10 +1239,17 @@ def main() -> int:
     if future_gist_heads is not None:
         new_cfg["future_emb_loss_weight"] = float(args.future_emb_loss_weight)
         new_cfg["wm_gist_horizons"] = list(gist_horizons)
+    if think_gist_head is not None:
+        new_cfg["cot_compression_k"] = int(args.cot_compression_k)
+        new_cfg["cot_min_thinks"] = int(args.cot_min_thinks)
+        new_cfg["think_gist_weight"] = float(args.think_gist_weight)
+        new_cfg["think_gist_loss_type"] = str(args.think_gist_loss_type)
     ckpt_dict = {"state_dict": model.state_dict(), "config": new_cfg}
     if future_gist_heads is not None:
         ckpt_dict["future_gist_heads_state_dict"] = \
             future_gist_heads.state_dict()
+    if think_gist_head is not None:
+        ckpt_dict["think_gist_head_state_dict"] = think_gist_head.state_dict()
     torch.save(ckpt_dict, args.save_ckpt)
     print(f"saved: {args.save_ckpt}")
     return 0

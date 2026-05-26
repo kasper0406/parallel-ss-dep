@@ -126,6 +126,16 @@ def build_model_from_ckpt(ckpt_path: str):
             pkm_value_init_std=float(cfg.get("pkm_value_init_std", 1.0)),
             pkm_use_output_gate=pkm_use_output_gate,
         )
+    # Phase-2 (state_readonly_at_think) and Phase-3 (think_index_emb_size)
+    # are plain init kwargs on TinyLM with no state-dict footprint when
+    # zero. Read from cfg so a ckpt trained with them stays consistent
+    # when reloaded for eval/SFT/RL; default off for back-compat.
+    sr_at_think = bool(cfg.get("state_readonly_at_think", False))
+    think_idx_emb = int(cfg.get("think_index_emb_size", 0))
+    # Auto-detect think_index_emb from state dict when not in cfg (older
+    # ckpts that predate the cfg key but were trained with it on).
+    if think_idx_emb == 0 and "think_index_emb.weight" in sd_keys:
+        think_idx_emb = int(ckpt["state_dict"]["think_index_emb.weight"].shape[0])
     model = TinyLM(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"],
         n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
@@ -135,6 +145,8 @@ def build_model_from_ckpt(ckpt_path: str):
         feedback_pairs=tuple(cfg.get("feedback_pairs", ()) or ()),
         feedback_self_k=int(cfg.get("feedback_self_k", 0)),
         output_gate=bool(has_gate),
+        state_readonly_at_think=sr_at_think,
+        think_index_emb_size=think_idx_emb,
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,

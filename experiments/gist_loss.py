@@ -84,3 +84,86 @@ def trunk_gist_loss(h: torch.Tensor, heads: nn.ModuleDict,
     if n_used == 0:
         return h.new_zeros(())
     return acc / n_used
+
+
+# --------------------------------------------------------------------
+# Phase 1a — gist-at-think supervision (THINKING_PLAN.md Phase 1a).
+#
+# A small head projects the student's hidden state at a think position
+# into the teacher's hidden-state space. The teacher is the same model
+# (no_grad) run over the full (prompt + CoT prose + code) sequence. Each
+# student think position is supervised against ONE teacher CoT-position
+# hidden state (the last token of the K-chunk it represents). The
+# architectural claim being tested: WM + FiLM + retrieval-as-input give
+# the student enough capacity per think to fit K tokens of compressed
+# reasoning.
+# --------------------------------------------------------------------
+def build_think_gist_head(d_model: int) -> nn.Linear:
+    """Single bias-free Linear(d_model, d_model) projecting student think
+    hidden states into the teacher's hidden-state space. Small init so
+    the aux loss starts gentle (matches build_gist_heads convention)."""
+    head = nn.Linear(d_model, d_model, bias=False)
+    nn.init.normal_(head.weight, std=0.02 / math.sqrt(2))
+    return head
+
+
+def think_gist_loss(
+    student_h: torch.Tensor,
+    teacher_h: torch.Tensor,
+    think_positions: list[list[int]],
+    teacher_cot_positions: list[list[int]],
+    head: nn.Linear,
+    *,
+    loss_type: str = "cosine",
+) -> torch.Tensor:
+    """Gist supervision at student think positions.
+
+    For each (b, think_pos, cot_pos) pair, compute
+      pred  = head(student_h[b, think_pos])
+      target = teacher_h[b, cot_pos].detach()
+      loss  = 1 - cosine(pred, target)   (or MSE)
+    Mean over all pairs; returns 0 if no pairs were provided.
+
+    Shapes:
+      student_h: (B, T_student, d_model)
+      teacher_h: (B, T_teacher, d_model) — already gathered into the same
+        batch dim (teacher and student share batch & rotation).
+      think_positions[b]: list of positions in student_h for batch b.
+      teacher_cot_positions[b]: parallel list of positions in teacher_h.
+        len(think_positions[b]) MUST equal len(teacher_cot_positions[b]).
+    """
+    if loss_type not in ("cosine", "mse"):
+        raise ValueError(f"unknown loss_type {loss_type!r}")
+    B = student_h.shape[0]
+    if len(think_positions) != B or len(teacher_cot_positions) != B:
+        raise ValueError(
+            f"think_positions/teacher_cot_positions batch mismatch: "
+            f"{len(think_positions)}, {len(teacher_cot_positions)}, B={B}")
+
+    student_vecs = []
+    teacher_vecs = []
+    for b in range(B):
+        sp = think_positions[b]
+        tp = teacher_cot_positions[b]
+        if len(sp) != len(tp):
+            raise ValueError(
+                f"batch {b}: think_positions len {len(sp)} != "
+                f"teacher_cot_positions len {len(tp)}")
+        if len(sp) == 0:
+            continue
+        sp_t = torch.as_tensor(sp, dtype=torch.long, device=student_h.device)
+        tp_t = torch.as_tensor(tp, dtype=torch.long, device=teacher_h.device)
+        student_vecs.append(student_h[b].index_select(0, sp_t))
+        teacher_vecs.append(teacher_h[b].index_select(0, tp_t))
+
+    if not student_vecs:
+        return student_h.new_zeros(())
+
+    s_cat = torch.cat(student_vecs, dim=0)        # (N_pairs, d)
+    t_cat = torch.cat(teacher_vecs, dim=0).detach()
+    pred = head(s_cat)
+    if loss_type == "cosine":
+        cos = F.cosine_similarity(pred.float(), t_cat.float(), dim=-1)
+        return (1.0 - cos).mean()
+    # MSE in fp32 (numerical stability).
+    return F.mse_loss(pred.float(), t_cat.float())

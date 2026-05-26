@@ -246,4 +246,32 @@ bearing test passed (gist loss 1.05 → 0.0002 in 50 steps). Just
 needs a known-working base ckpt to launch from. Awaiting the
 isolation result.
 
+## 2026-05-26 — Isolation: SFT RECIPE was the bug, not Phase D pretrain
+
+**Result**: Phase C + my new mixed-SFT recipe also = **0/164**. Same
+as Phase D. So Phase D's pretrain is NOT the regression — the SFT
+recipe I used is.
+
+**Diff against the proven Phase C SFT recipe (10/164)**:
+  | flag                          | proven (10/164) | mine (0/164) |
+  | epochs                        | 2               | 1            |
+  | lr                            | 3e-5            | 5e-6 (6× lower) |
+  | retrieval_as_input_thinking   | ✓               | ✗            |
+  | future_emb_loss_weight        | 0.1             | (off)        |
+  | wm_gist_horizons              | "16,64,256"     | (off)        |
+  | think_max_bursts / depth      | 3 / 8           | defaults     |
+  | mem_size                      | 1024            | (off)        |
+
+Massive recipe differences. My version was a low-LR, short, no-WM-gist,
+no-retrieval-as-input quickie. The historical recipe is substantial.
+
+**Fix launched**: `launch_sft_phase_d_proper.sh` reruns Phase D SFT
+with the proven Phase C recipe. Expected pass@1 ≥ 8/164 if this just
+reproduces history; ≥ 10 if the Phase D base + the new data mix
+improvements help.
+
+**For Phase 1a (gist supervision)**: update the launcher to use the
+proper recipe as the base too. The compression test only makes sense
+on top of a working SFT.
+
 ## (Future entries appended below as decisions are made)

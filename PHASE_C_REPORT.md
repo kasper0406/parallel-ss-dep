@@ -43,23 +43,69 @@ Common flags (matches prior eval recipe for v7 / Phase C / RL ckpts):
 --emit_threshold 0.5 --gate_floor 0.0 --min_emit_before_eos 30
 --max_gen 256 --temperature 0.0 --generator retrieval_as_input`.
 
-| Checkpoint | Hard pass@1 | Soft pass@1 | Δ | Notes |
-|---|---|---|---|---|
-| `sft_phase_c_combined.pt` (SFT base, project: 10/164) | TBD | TBD | TBD | |
-| `rl_grader_phase_c_step300.pt` (RL v2, project best: 16/164) | TBD | TBD | TBD | mid-eval Phase C ckpt |
-| `rl_discover_v4.pt` (RL v4 final) | TBD | TBD | TBD | |
+| Checkpoint | Hard pass@1 | Soft pass@1 | Δ |
+|---|---|---|---|
+| `sft_phase_c_combined.pt` (Phase C SFT base) | **6/164** (3.7 %) | **7/164** (4.3 %) | **+1** |
+| `rl_grader_phase_c_step300.pt` (RL grader v1, project headline 16/164) | **10/164** (6.1 %) | **11/164** (6.7 %) | **+1** |
+| `rl_discover_v4.pt` (RL discover v4 final) | **12/164** (7.3 %) | **9/164** (5.5 %) | **-3** |
 
-Soft mean σ at emit (sanity):
+Diagnostics (full 164):
 
-| Checkpoint | mean σ (5-problem smoke) | think rate (hard) |
-|---|---|---|
-| sft_phase_c_combined | 0.646 | 0.664 |
-| rl_discover_v4 | 0.761 | TBD |
-| rl_grader_phase_c_step300 | TBD | TBD |
+| Checkpoint | hard think_rate | hard mean σ@emit | soft mean σ |
+|---|---|---|---|
+| sft_phase_c_combined | 0.629 | 0.694 | 0.743 |
+| rl_grader_phase_c_step300 | 0.565 | 0.799 | 0.737 |
+| rl_discover_v4 | 0.621 | 0.715 | 0.774 |
+
+NOTE: the hard scores reproduced here (SFT 6, RL-grader-step300 10) are
+lower than the CLAUDE.md headline numbers (SFT 10, RL-step300 16). I
+used the recipe-pinned flags exactly. The discrepancy is probably down
+to a different SFT ckpt path (`sft_phase_c_combined.pt` vs the one
+CLAUDE.md was referencing), or to changes since the headline was
+recorded. The hard-vs-soft Δ within each row is what's load-bearing for
+the Phase C decision — all three runs use the same model load and the
+same flags except `--gate_mode`.
 
 ## Verdict
 
-(filled in once eval logs land)
+**Soft-mixture decode does NOT reliably beat hard threshold.** Two of
+three ckpts come out +1 (within noise — pass@1 standard deviation at
+164 problems and ~10 % pass rate is roughly ±2), and the third
+regresses by -3. The two "wins" are at low pass-rates where single
+problems swing the number meaningfully.
+
+This fails Phase C's gate ("soft-mixture decode strictly beats hard
+threshold on existing v4 or v2 ckpts"). Three plausible reasons:
+
+1. **The gate was trained against a hard threshold.** The model's gate
+   head was supervised to produce binary-ish decisions (BCE-with-
+   uncertainty target, hard-threshold deploy convention). Querying it
+   in a continuous-mix regime is off-distribution; the σ value carries
+   a little extra information but not enough to beat its own
+   threshold without retraining.
+2. **State divergence at think positions.** In hard mode, when the gate
+   triggers a think, the canonical DeltaNet recurrence genuinely
+   advances through the think — the model is using the think to
+   reshape its state. In soft mode the think branch is what-if only,
+   so the canonical state never gets that reshaping. The mixed
+   distribution sees the *output* of the would-be think but the next
+   step's hidden state never reflects it.
+3. **Blind 50/50 compute waste.** Hard-mode RL-v4 runs think_rate 0.62
+   — the model has a well-calibrated allocation of when to think. Soft
+   mode unconditionally runs the think branch every step (50 % of
+   compute) regardless of whether the model wanted it; the canonical
+   state never benefits from those extra forwards. This may explain
+   the -3 regression on RL-v4 specifically: that ckpt's hard threshold
+   already routes well, and the unconditional mixing dilutes its
+   high-confidence emit logits with a stale think distribution.
+
+A logit-space mix (`σ·logits_emit + (1-σ)·logits_think`) is a cheap
+follow-up: for low-entropy emit logits it would weight emit much
+harder than probability-space mixing does, and might recover the hard
+threshold's behaviour as a limiting case. But the core conclusion
+("the gate's continuous output, threshold-trained, doesn't beat its
+own threshold at inference") is unlikely to change without
+co-training the gate under the new mixing rule.
 
 ## Open questions
 

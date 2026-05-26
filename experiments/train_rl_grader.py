@@ -149,6 +149,17 @@ class Rollout:
     gate_positions: list[int] | None = None   # absolute pos in full_ids of the
                                               # token (think OR emit) whose
                                               # selection was a Bernoulli draw.
+    # --- selective-sampling diagnostics (Phase A, 2026-05-26). Populated
+    # alongside the gate_* fields when stochastic_gate=True. Counts are
+    # accumulated across the rollout's non-force-emit positions. ---
+    # σ buckets: <0.1, [0.1, 0.5), [0.5, 0.9), >=0.9
+    gate_sigma_bucket_counts: list[int] | None = None
+    # Number of positions where Bernoulli was actually sampled (σ in the
+    # configured sample range and not force_emit).
+    gate_n_sampled: int = 0
+    # Number of positions where the deterministic threshold was used
+    # (σ outside the sample range and not force_emit).
+    gate_n_decisive: int = 0
 
 
 @torch.no_grad()
@@ -164,6 +175,8 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
                            temperature: float,
                            min_emit_before_eos: int,
                            stochastic_gate: bool = False,
+                           gate_sample_range_low: float = 0.0,
+                           gate_sample_range_high: float = 1.0,
                            ) -> list[Rollout]:
     """Roll out `n_rollouts` parallel completions of the same prompt in a
     SINGLE batched forward per iteration.
@@ -205,6 +218,12 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
     gate_decisions_per_row: list[list[bool]] = [[] for _ in range(N)]
     gate_log_probs_per_row: list[list[float]] = [[] for _ in range(N)]
     gate_positions_per_row: list[list[int]] = [[] for _ in range(N)]
+    # Selective-sampling diagnostics. Sigma buckets are <0.1, [0.1,0.5),
+    # [0.5,0.9), >=0.9 (4 buckets); n_sampled/decisive count the partition
+    # between "Bernoulli draw" and "deterministic threshold" decisions.
+    gate_sigma_buckets_per_row: list[list[int]] = [[0, 0, 0, 0] for _ in range(N)]
+    gate_n_sampled_per_row: list[int] = [0 for _ in range(N)]
+    gate_n_decisive_per_row: list[int] = [0 for _ in range(N)]
 
     # STATE-PASSING INCREMENTAL DECODE (2026-05-23). At T=prompt + 96
     # gen steps, the full-forward path's per-step cost grows linearly
@@ -253,13 +272,21 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
                 # clamp to floor so exploration above the floor is unconstrained
                 # but we never assign Bernoulli probability below the floor.
                 p_emit = gate_clamped.clamp(1e-6, 1.0 - 1e-6)
-                # Sample Bernoulli(p_emit) → True means emit.
+                # Selective stochastic gate (Phase A, 2026-05-26): only
+                # Bernoulli-sample at uncertain positions; use deterministic
+                # threshold at decisive positions. "Strictly inside" the
+                # range — σ == low or σ == high is OUT (decisive). Default
+                # range [0.0, 1.0] degenerates to sampling-everywhere.
+                in_sample_range = (p_emit > gate_sample_range_low) & \
+                                   (p_emit < gate_sample_range_high)
                 sampled_emit = torch.bernoulli(p_emit).to(torch.bool)
-                want_emit = sampled_emit | force_emit
-                # log-prob of the SAMPLED action (under the stochastic policy).
-                # Computed BEFORE the force_emit override so non-forced rows
-                # get the action they actually chose; forced rows' log-prob
-                # will be discarded downstream (not appended to the rollout).
+                det_emit = gate_clamped >= emit_threshold
+                chosen_emit = torch.where(in_sample_range, sampled_emit, det_emit)
+                want_emit = chosen_emit | force_emit
+                # log-prob of the SAMPLED action — only meaningful at sampled
+                # positions. The downstream record step gates on
+                # `in_sample_range` (AND not force_emit), so log-probs at
+                # decisive / forced positions are never appended.
                 gate_lp_emit = torch.log(p_emit)
                 gate_lp_think = torch.log(1.0 - p_emit)
                 gate_lp = torch.where(sampled_emit, gate_lp_emit, gate_lp_think)
@@ -267,6 +294,8 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
                 want_emit = (gate_clamped >= emit_threshold) | force_emit
                 gate_lp = None
                 sampled_emit = None
+                in_sample_range = None
+                p_emit = None
 
             # Sample emit tokens. Mask think token from softmax.
             next_logits[:, thinking_token_id] = -float("inf")
@@ -310,10 +339,29 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
                 # Record stochastic gate decision BEFORE the EOS-finalize
                 # short-circuit. Only when the model actually had a choice
                 # (force_emit positions are masked out — no gradient there).
+                # Phase A: ALSO mask out decisive positions (σ outside the
+                # sample range) — those used the deterministic threshold,
+                # no policy choice happened there either.
                 if stochastic_gate and not bool(force_emit[i].item()):
-                    gate_decisions_per_row[i].append(bool(sampled_emit[i].item()))
-                    gate_log_probs_per_row[i].append(float(gate_lp[i].item()))
-                    gate_positions_per_row[i].append(int(new_pos))
+                    p_emit_i = float(p_emit[i].item())
+                    # σ histogram bucket (4-bin: <0.1, [0.1,0.5), [0.5,0.9), >=0.9).
+                    if p_emit_i < 0.1:
+                        gate_sigma_buckets_per_row[i][0] += 1
+                    elif p_emit_i < 0.5:
+                        gate_sigma_buckets_per_row[i][1] += 1
+                    elif p_emit_i < 0.9:
+                        gate_sigma_buckets_per_row[i][2] += 1
+                    else:
+                        gate_sigma_buckets_per_row[i][3] += 1
+                    in_range_i = bool(in_sample_range[i].item())
+                    if in_range_i:
+                        gate_decisions_per_row[i].append(
+                            bool(sampled_emit[i].item()))
+                        gate_log_probs_per_row[i].append(float(gate_lp[i].item()))
+                        gate_positions_per_row[i].append(int(new_pos))
+                        gate_n_sampled_per_row[i] += 1
+                    else:
+                        gate_n_decisive_per_row[i] += 1
                 if bool(want_emit[i].item()):
                     tok = int(emit_toks[i].item())
                     is_eos = (eos_token_id is not None
@@ -355,6 +403,12 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
             gate_decisions=(gate_decisions_per_row[i] if stochastic_gate else None),
             gate_log_probs=(gate_log_probs_per_row[i] if stochastic_gate else None),
             gate_positions=(gate_positions_per_row[i] if stochastic_gate else None),
+            gate_sigma_bucket_counts=(
+                list(gate_sigma_buckets_per_row[i]) if stochastic_gate else None),
+            gate_n_sampled=(
+                gate_n_sampled_per_row[i] if stochastic_gate else 0),
+            gate_n_decisive=(
+                gate_n_decisive_per_row[i] if stochastic_gate else 0),
         ))
     return out_rollouts
 
@@ -749,6 +803,18 @@ def policy_loss_for_rollout(
 
 
 # ---------------------------------------------------------------------------
+# Entropy-bonus curriculum (Phase B)
+# ---------------------------------------------------------------------------
+
+def compute_entropy_bonus(step: int, *, static: float, start: float,
+                          end: float, total: int) -> float:
+    if start <= 0:
+        return static
+    frac = min(1.0, step / max(1, total))
+    return start + (end - start) * frac
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -919,6 +985,33 @@ def main():
                         "Prevents collapse to always-think / never-think. "
                         "Subtracted from the loss → higher entropy lowers "
                         "loss. 0 disables.")
+    p.add_argument("--gate_sample_range_low", type=float, default=0.0,
+                   help="Lower bound of the σ(gate) range at which Bernoulli "
+                        "sampling actually fires. σ values STRICTLY between "
+                        "low and high are sampled; values outside use the "
+                        "deterministic emit_threshold. Default 0.0 → "
+                        "samples everywhere (legacy behaviour). v4 "
+                        "recommended setting: 0.1 (with high=0.9).")
+    p.add_argument("--gate_sample_range_high", type=float, default=1.0,
+                   help="Upper bound of the σ(gate) sample range. See "
+                        "--gate_sample_range_low. Default 1.0 → samples "
+                        "everywhere. v4 recommended setting: 0.9.")
+    p.add_argument("--gate_entropy_bonus_start", type=float, default=0.0,
+                   help="Phase B: starting value of the entropy-bonus "
+                        "curriculum (linear schedule). 0 disables the "
+                        "curriculum and the static --gate_entropy_bonus "
+                        "is used instead (backwards-compat). When > 0, "
+                        "the bonus linearly decays from this value at "
+                        "step 0 to --gate_entropy_bonus_end at "
+                        "--gate_entropy_curriculum_steps, then stays at "
+                        "the end value.")
+    p.add_argument("--gate_entropy_bonus_end", type=float, default=0.0,
+                   help="Phase B: final value of the entropy-bonus "
+                        "curriculum. Only used when "
+                        "--gate_entropy_bonus_start > 0.")
+    p.add_argument("--gate_entropy_curriculum_steps", type=int, default=200,
+                   help="Phase B: number of steps over which the entropy "
+                        "bonus linearly decays from start to end.")
     p.add_argument("--policy_film_bypass",
                     action=argparse.BooleanOptionalAction, default=False,
                     help="During the policy-update forward, skip FiLM K=3 "
@@ -1089,6 +1182,8 @@ def main():
                 temperature=args.temperature,
                 min_emit_before_eos=args.min_emit_before_eos,
                 stochastic_gate=args.stochastic_gate,
+                gate_sample_range_low=args.gate_sample_range_low,
+                gate_sample_range_high=args.gate_sample_range_high,
             )
             all_rollouts.append(group)
         tier_hist = {}
@@ -1174,6 +1269,8 @@ def main():
                         temperature=rep_temp,
                         min_emit_before_eos=args.min_emit_before_eos,
                         stochastic_gate=args.stochastic_gate,
+                        gate_sample_range_low=args.gate_sample_range_low,
+                        gate_sample_range_high=args.gate_sample_range_high,
                     )
                     rr = single[0]
                     if args.extract_code_block:
@@ -1272,6 +1369,13 @@ def main():
         # any rollouts to update on.
         has_rollouts = 1 if flat_rollouts else 0
         any_has_rollouts = all_reduce_sum_int(has_rollouts, world_size) > 0
+        effective_entropy_bonus = compute_entropy_bonus(
+            step,
+            static=args.gate_entropy_bonus,
+            start=args.gate_entropy_bonus_start,
+            end=args.gate_entropy_bonus_end,
+            total=args.gate_entropy_curriculum_steps,
+        )
         if flat_rollouts:
             prev_film_bypass_policy = getattr(model_module, "_film_bypass", False)
             prev_film_bypass_ref = (getattr(ref_model, "_film_bypass", False)
@@ -1290,7 +1394,7 @@ def main():
                     ref_model=ref_model,
                     kl_coef=args.kl_coef,
                     stochastic_gate=args.stochastic_gate,
-                    gate_entropy_bonus=args.gate_entropy_bonus,
+                    gate_entropy_bonus=effective_entropy_bonus,
                 )
                 loss.backward()
             finally:
@@ -1349,11 +1453,48 @@ def main():
             repair_lift = (n_lift_to_var_g / n_zero_var_before_g
                            if n_zero_var_before_g > 0 else 0.0)
             gate_str = ""
+            sigma_hist_line = ""
             if args.stochastic_gate:
+                # Phase A diagnostics: aggregate per-step σ-histogram +
+                # sampled-vs-decisive partition across every rollout in the
+                # step. Only meaningful when stochastic_gate is on (other
+                # rollouts have no bucket counts).
+                n_sampled_step = 0
+                n_decisive_step = 0
+                bucket_totals = [0, 0, 0, 0]
+                for grp in all_rollouts:
+                    for r in grp:
+                        n_sampled_step += int(r.gate_n_sampled)
+                        n_decisive_step += int(r.gate_n_decisive)
+                        if r.gate_sigma_bucket_counts is not None:
+                            for bi, c in enumerate(r.gate_sigma_bucket_counts):
+                                bucket_totals[bi] += int(c)
+                total_decisions = n_sampled_step + n_decisive_step
+                if total_decisions > 0:
+                    frac_sampled = n_sampled_step / total_decisions
+                    frac_decisive = n_decisive_step / total_decisions
+                else:
+                    frac_sampled = float("nan")
+                    frac_decisive = float("nan")
                 # Stash log-only floats; nan when no gate decisions this step.
+                ent_bonus_field = ""
+                if args.gate_entropy_bonus_start > 0:
+                    ent_bonus_field = f", ent_bonus={effective_entropy_bonus:.3f}"
                 gate_str = (f"  gate(fire={gate_stats['gate_fire_rate']:.2f}, "
                             f"H={gate_stats['gate_entropy']:.3f}, "
-                            f"ratio={gate_stats['gate_ratio']:.3f})")
+                            f"ratio={gate_stats['gate_ratio']:.3f}, "
+                            f"samp={frac_sampled:.2f}, "
+                            f"dec={frac_decisive:.2f}"
+                            f"{ent_bonus_field})")
+                # Periodic σ-histogram (one extra line every 20 steps).
+                if step % 20 == 0 and sum(bucket_totals) > 0:
+                    total = sum(bucket_totals)
+                    pcts = [100.0 * b / total for b in bucket_totals]
+                    sigma_hist_line = (
+                        f"  sigma_hist: <0.1: {pcts[0]:.0f}%  "
+                        f"[0.1,0.5): {pcts[1]:.0f}%  "
+                        f"[0.5,0.9): {pcts[2]:.0f}%  "
+                        f">=0.9: {pcts[3]:.0f}%")
             if is_main(rank):
                 print(f"{step:>5}  {reward_mean_g:>10.4f}  "
                       f"{reward_max_g:>10.4f}  {depth_mean_g:>10.2f}  "
@@ -1366,6 +1507,8 @@ def main():
                       f"rep(n={repair_n_g}, pass={repair_pass_rate:.2f}, "
                       f"lift={repair_lift:.2f})  "
                       f"{tier_str:>30}")
+                if sigma_hist_line:
+                    print(sigma_hist_line)
 
         if args.save_ckpt and step % args.save_every == 0 and is_main(rank):
             pathlib.Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)

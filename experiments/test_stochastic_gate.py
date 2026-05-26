@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from experiments.train_rl_grader import (
     Rollout,
+    compute_entropy_bonus,
     policy_loss_for_rollouts_batched,
     rollout_group_batched,
 )
@@ -321,6 +322,198 @@ def test_entropy_bonus_subtracts_from_loss():
     assert abs(delta - math.log(2.0)) < 1e-4, (delta, math.log(2.0))
 
 
+# ---------------------------------------------------------------------------
+# Selective stochastic gate tests (Phase A, 2026-05-26).
+# Sample only when σ(gate) is in (low, high); decisive positions use the
+# deterministic threshold and are NOT recorded as policy choices.
+# ---------------------------------------------------------------------------
+
+def test_selective_sampling_excludes_decisive():
+    """At σ ≈ 0.95 with sample range (0.1, 0.9), every position is decisive
+    → threshold-emit AND no gate decisions recorded."""
+    torch.manual_seed(0)
+    vocab = 16
+    thinking_id = 9
+    model = StubLM(vocab, gate_value=0.95)
+    tok = StubTokenizer()
+    prompt = torch.tensor([[2, 3]])
+
+    rollouts = rollout_group_batched(
+        model, tok, prompt,
+        n_rollouts=4,
+        thinking_token_id=thinking_id,
+        eos_token_id=tok.eos_token_id,
+        max_gen=4,
+        max_think_per_step=2,
+        total_think_budget=8,
+        emit_threshold=0.5,
+        gate_floor=0.0,
+        temperature=0.0,
+        min_emit_before_eos=0,
+        stochastic_gate=True,
+        gate_sample_range_low=0.1,
+        gate_sample_range_high=0.9,
+    )
+    for r in rollouts:
+        # Decisive (σ=0.95 > 0.9) → no Bernoulli sample recorded.
+        assert r.gate_decisions == [], (
+            "decisive σ should be excluded from gate_decisions")
+        assert r.gate_positions == []
+        assert r.gate_log_probs == []
+        assert r.gate_n_sampled == 0
+        # Should have AT LEAST one decisive count (every non-force-emit
+        # step contributes one).
+        assert r.gate_n_decisive >= 1, r.gate_n_decisive
+        # The >=0.9 bucket should be the one populated.
+        assert r.gate_sigma_bucket_counts is not None
+        assert r.gate_sigma_bucket_counts[3] >= 1
+
+
+def test_selective_sampling_includes_uncertain():
+    """At σ = 0.5 with sample range (0.1, 0.9), every position is uncertain
+    → Bernoulli-sampled AND recorded as a gate decision; across many
+    rollouts we see both emit and think."""
+    torch.manual_seed(0)
+    vocab = 16
+    thinking_id = 9
+    model = StubLM(vocab, gate_value=0.5)
+    tok = StubTokenizer()
+    prompt = torch.tensor([[2, 3]])
+
+    rollouts = rollout_group_batched(
+        model, tok, prompt,
+        n_rollouts=16,
+        thinking_token_id=thinking_id,
+        eos_token_id=tok.eos_token_id,
+        max_gen=4,
+        max_think_per_step=2,
+        total_think_budget=8,
+        emit_threshold=0.5,
+        gate_floor=0.0,
+        temperature=0.0,
+        min_emit_before_eos=0,
+        stochastic_gate=True,
+        gate_sample_range_low=0.1,
+        gate_sample_range_high=0.9,
+    )
+    all_decisions = [d for r in rollouts for d in (r.gate_decisions or [])]
+    # Sampled at uncertain positions → both branches must appear.
+    assert any(all_decisions), "expected at least one emit decision"
+    assert any(not d for d in all_decisions), "expected at least one think"
+    # Every recorded decision is from a sampled position; sum should match.
+    for r in rollouts:
+        assert len(r.gate_decisions) == r.gate_n_sampled, (
+            len(r.gate_decisions), r.gate_n_sampled)
+        # σ=0.5 → falls into [0.5, 0.9) bucket.
+        assert r.gate_sigma_bucket_counts[2] >= 1
+
+
+def test_range_default_samples_everywhere():
+    """Default range [0.0, 1.0] matches legacy sample-everywhere behavior.
+    Regression test for backwards-compat."""
+    torch.manual_seed(0)
+    vocab = 16
+    thinking_id = 9
+    # σ=0.95 — would be decisive under (0.1, 0.9) but inside default (0.0, 1.0).
+    model = StubLM(vocab, gate_value=0.95)
+    tok = StubTokenizer()
+    prompt = torch.tensor([[2, 3]])
+
+    rollouts = rollout_group_batched(
+        model, tok, prompt,
+        n_rollouts=4,
+        thinking_token_id=thinking_id,
+        eos_token_id=tok.eos_token_id,
+        max_gen=4,
+        max_think_per_step=2,
+        total_think_budget=8,
+        emit_threshold=0.5,
+        gate_floor=0.0,
+        temperature=0.0,
+        min_emit_before_eos=0,
+        stochastic_gate=True,
+        # Defaults — every position is in (0.0, 1.0) → sampled.
+        gate_sample_range_low=0.0,
+        gate_sample_range_high=1.0,
+    )
+    for r in rollouts:
+        # Every non-force-emit position sampled → at least one decision
+        # (and zero decisive positions).
+        assert r.gate_n_decisive == 0
+        assert r.gate_n_sampled >= 1
+        assert len(r.gate_decisions) == r.gate_n_sampled
+
+
+def test_range_boundary_handling():
+    """Convention: σ STRICTLY inside (low, high) is sampled. σ == low or
+    σ == high is OUT (treated decisive)."""
+    torch.manual_seed(0)
+    vocab = 16
+    thinking_id = 9
+    # σ = 0.1 EXACTLY — should be treated decisive when low=0.1.
+    model = StubLM(vocab, gate_value=0.1)
+    tok = StubTokenizer()
+    prompt = torch.tensor([[2, 3]])
+
+    rollouts = rollout_group_batched(
+        model, tok, prompt,
+        n_rollouts=2,
+        thinking_token_id=thinking_id,
+        eos_token_id=tok.eos_token_id,
+        max_gen=3,
+        max_think_per_step=2,
+        total_think_budget=6,
+        emit_threshold=0.5,
+        gate_floor=0.0,
+        temperature=0.0,
+        min_emit_before_eos=0,
+        stochastic_gate=True,
+        gate_sample_range_low=0.1,
+        gate_sample_range_high=0.9,
+    )
+    for r in rollouts:
+        # σ == low → out of range → decisive, no recording.
+        assert r.gate_decisions == [], r.gate_decisions
+        assert r.gate_n_sampled == 0
+        assert r.gate_n_decisive >= 1
+
+
+def test_diagnostics_fields_present_in_rollout():
+    """Phase A diagnostic fields are populated on the Rollout output:
+    gate_sigma_bucket_counts (4 buckets), gate_n_sampled, gate_n_decisive."""
+    torch.manual_seed(0)
+    vocab = 16
+    thinking_id = 9
+    model = StubLM(vocab, gate_value=0.5)  # uncertain → sampled under (0.1, 0.9)
+    tok = StubTokenizer()
+    prompt = torch.tensor([[2, 3]])
+
+    rollouts = rollout_group_batched(
+        model, tok, prompt,
+        n_rollouts=2,
+        thinking_token_id=thinking_id,
+        eos_token_id=tok.eos_token_id,
+        max_gen=3,
+        max_think_per_step=2,
+        total_think_budget=6,
+        emit_threshold=0.5,
+        gate_floor=0.0,
+        temperature=0.0,
+        min_emit_before_eos=0,
+        stochastic_gate=True,
+        gate_sample_range_low=0.1,
+        gate_sample_range_high=0.9,
+    )
+    for r in rollouts:
+        assert r.gate_sigma_bucket_counts is not None
+        assert len(r.gate_sigma_bucket_counts) == 4
+        # Every recorded position is accounted for in exactly one of the
+        # two partitions (sampled or decisive); buckets sum to total.
+        bucket_sum = sum(r.gate_sigma_bucket_counts)
+        assert bucket_sum == r.gate_n_sampled + r.gate_n_decisive, (
+            bucket_sum, r.gate_n_sampled, r.gate_n_decisive)
+
+
 def test_stochastic_off_yields_no_gate_stats():
     """Backwards-compat path: stochastic_gate=False → gate_stats are NaN."""
     vocab = 16
@@ -344,3 +537,33 @@ def test_stochastic_off_yields_no_gate_stats():
     assert math.isnan(gate_stats["gate_fire_rate"])
     # Loss / ratio behave as the prior emit-only path (bf16 autocast ~1 %).
     assert abs(float(ratio.item()) - 1.0) < 0.02
+
+
+# ---------------------------------------------------------------------------
+# Phase B: entropy-bonus curriculum tests.
+# ---------------------------------------------------------------------------
+
+def test_entropy_curriculum_linear_schedule():
+    start, end, total = 0.05, 0.001, 200
+    assert abs(compute_entropy_bonus(
+        0, static=0.01, start=start, end=end, total=total) - start) < 1e-9
+    assert abs(compute_entropy_bonus(
+        total, static=0.01, start=start, end=end, total=total) - end) < 1e-9
+    mid = compute_entropy_bonus(
+        total // 2, static=0.01, start=start, end=end, total=total)
+    assert abs(mid - (start + end) / 2) < 1e-9, mid
+
+
+def test_entropy_curriculum_clamps_after_total():
+    start, end, total = 0.05, 0.001, 100
+    val = compute_entropy_bonus(
+        total * 2, static=0.01, start=start, end=end, total=total)
+    assert abs(val - end) < 1e-9, val
+
+
+def test_entropy_curriculum_off_falls_back_to_static():
+    static = 0.013
+    for step in (0, 10, 100, 10_000):
+        val = compute_entropy_bonus(
+            step, static=static, start=0.0, end=0.5, total=200)
+        assert val == static, (step, val)

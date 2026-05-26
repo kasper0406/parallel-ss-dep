@@ -274,4 +274,32 @@ improvements help.
 proper recipe as the base too. The compression test only makes sense
 on top of a working SFT.
 
+## 2026-05-26 — Phase D pretrain regressed the base (confirmed)
+
+**Result**: Phase D + proper recipe = **2/164** vs Phase C + proper
+recipe (historical) = 10/164. Same recipe, same data, different
+pretrain base → 8-problem regression.
+
+The Phase D pretrain "improvements" (FIM augmentation + synth pyfunc +
+self-debug fold-in) HURT the base for HumanEval-style code completion.
+Hypotheses (didn't investigate further; rerouting around the regression):
+1. FIM sentinel tokens trained but never appear at HumanEval inference.
+2. Qwen-synth-pyfunc style mismatch with HumanEval.
+3. Self-debug rows train the model to expect/emit errors.
+
+**Decision**: route Phase 1a (gist supervision compression test)
+through the Phase C base (validated 10/164 baseline) instead of
+Phase D. The Phase 1a compression test only makes sense on top of a
+working SFT.
+
+**Launched**: `launch_sft_phase_c_proper.sh` — Phase C + proper
+recipe + mixed data (Qwen distill + 961 CoT rows). Expected pass@1
+≥ 8/164 if adding CoT rows doesn't hurt. This becomes the new
+"Phase 0 baseline" for the compression test.
+
+**v6_all pretrain mix is now deprecated.** Future pretrain runs
+should start from Phase C and use mix_v4 (no FIM, no synth pyfunc,
+no self-debug fold-in until each can be ablated individually to find
+which one regressed).
+
 ## (Future entries appended below as decisions are made)

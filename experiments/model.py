@@ -1163,6 +1163,17 @@ class TinyLM(nn.Module):
         # applies to plain DeltaNet attention blocks. Default OFF (every
         # existing ckpt behaves byte-identically without the flag).
         state_readonly_at_think: bool = False,
+        # Phase 3 thinking fix (2026-05-26): per-position think-index
+        # embedding. Each think token in a consecutive burst gets a small
+        # learned positional embedding added on top of the [THINKING]
+        # input embedding (position 0, 1, ..., size-1). Without this, an
+        # 8-think burst feeds the same embedding 8 times → the resulting
+        # hidden states have median pairwise cos +0.146 vs +0.060 at emit
+        # and effective rank ~210 vs ~560 (diag_think_position_diversity).
+        # Default 0 (disabled) keeps existing ckpts byte-identical. The
+        # table is init to zero so a cold start has no effect; the model
+        # opts in only via gradient.
+        think_index_emb_size: int = 0,
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1203,6 +1214,13 @@ class TinyLM(nn.Module):
                 attn = blk.attn
                 if isinstance(attn, _FlaWrapper) and hasattr(attn.layer, "b_proj"):
                     attn.enable_state_readonly_at_think()
+        # Phase 3 think-index embedding (2026-05-26). Created here so
+        # state-dict round-trip preserves it; zero-init so an unused
+        # table contributes 0 at every position.
+        self.think_index_emb_size = int(think_index_emb_size)
+        if self.think_index_emb_size > 0:
+            self.think_index_emb = nn.Embedding(self.think_index_emb_size, d_model)
+            nn.init.zeros_(self.think_index_emb.weight)
         self.out_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         if tie_embeddings:
@@ -1434,6 +1452,28 @@ class TinyLM(nn.Module):
                 use_output_gate=bool(pkm_use_output_gate),
             )
 
+    def _compute_think_index_emb(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Per-position additive think-index embedding (Phase 3).
+
+        Returns a (B, T, d_model) tensor: at think positions the embedding
+        for that token's index within its consecutive-think burst (0 for
+        the first think in a burst, 1 for the second, ...), clamped to
+        `think_index_emb_size - 1`. At non-think positions the contribution
+        is zero. Vectorized via the cumsum-reset trick:
+        let `c = cumsum(think_mask)` and `reset = cummax(c * (1-mask))` —
+        the cumsum value just before the current burst began — then the
+        per-position 0-indexed burst-position is `(c - reset - 1).clamp(0)`.
+        """
+        think_mask = (input_ids == int(self.thinking_token_id))
+        m_int = think_mask.to(torch.int64)
+        c = m_int.cumsum(dim=1)
+        reset = (c * (1 - m_int)).cummax(dim=1).values
+        burst_idx = (c - reset - 1).clamp(min=0)
+        burst_idx = burst_idx.clamp(max=self.think_index_emb_size - 1)
+        idx_emb = self.think_index_emb(burst_idx)
+        # Mask to think positions only (non-think positions contribute 0).
+        return idx_emb * think_mask.unsqueeze(-1).to(idx_emb.dtype)
+
     def _maybe_pkm(self, h: torch.Tensor, L: int) -> torch.Tensor:
         """Apply the PKM residual side-table after layer L iff configured.
 
@@ -1608,6 +1648,18 @@ class TinyLM(nn.Module):
             x = inputs_embeds
         else:
             x = self.embed(input_ids)
+
+        # Phase 3 (2026-05-26): per-position think-index embedding. Adds
+        # a small learned vector to each think token based on its index
+        # within the consecutive-think burst it belongs to, so a burst
+        # of 8 thinks produces 8 distinct inputs instead of 8 identical
+        # ones. Applied AFTER inputs_embeds so retrieval-as-input mode
+        # also benefits (additive — diversifies the think input either
+        # way the embedding was constructed).
+        if (self.think_index_emb_size > 0
+                and self.thinking_token_id is not None
+                and input_ids is not None):
+            x = x + self._compute_think_index_emb(input_ids)
 
         # Cross-document isolation: when `doc_ids` marks multiple documents
         # packed into one T-length row, `cu_seqlens` makes the DeltaNet
@@ -2010,6 +2062,11 @@ class TinyLM(nn.Module):
         else:
             x = self.embed(input_ids)
 
+        # Phase 3 think-index embedding (mirror of full forward).
+        if (self.think_index_emb_size > 0
+                and self.thinking_token_id is not None):
+            x = x + self._compute_think_index_emb(input_ids)
+
         if self.max_T > 0:
             pos = torch.arange(T_prompt, device=input_ids.device)
             x = x + self.pos_embed(pos)
@@ -2118,11 +2175,27 @@ class TinyLM(nn.Module):
             self._last_gate_logits = gate_logits
             self._last_gate = g
 
+        # Phase 3: running consecutive-think count ending at the last
+        # processed position, per row. forward_step needs this to assign
+        # the right think-index embedding to a new think token without
+        # re-seeing the prompt.
+        if self.think_index_emb_size > 0 and self.thinking_token_id is not None:
+            tm_int = (input_ids == int(self.thinking_token_id)).to(torch.int64)
+            c = tm_int.cumsum(dim=1)
+            reset = (c * (1 - tm_int)).cummax(dim=1).values
+            burst_idx = (c - reset - 1).clamp(min=0)  # (B, T)
+            # Run-length at last position: 0 if last token not a think,
+            # else burst_idx[-1] + 1.
+            last_run = (burst_idx[:, -1] + 1) * tm_int[:, -1]  # (B,)
+        else:
+            last_run = None
+
         cache = {
             "fla_cache": fla_cache,
             "seen": int(T_prompt),
             "lagged_sources": lagged_sources if use_film_at_decode else None,
             "wm_buf": wm_buf,
+            "think_run_len": last_run,
         }
         return cache, lm_logits
 
@@ -2348,6 +2421,24 @@ class TinyLM(nn.Module):
             x = inputs_embeds
         else:
             x = self.embed(input_id)
+
+        # Phase 3 think-index embedding: maintain a per-row running
+        # consecutive-think counter across forward_step calls in
+        # cache["think_run_len"]. At a new think token, the index is
+        # the prior run length (clamped to table size); at a non-think
+        # token the counter resets to 0.
+        if (self.think_index_emb_size > 0
+                and self.thinking_token_id is not None):
+            tm = (input_id.squeeze(-1) == int(self.thinking_token_id))  # (B,)
+            prior_run = cache.get("think_run_len")
+            if prior_run is None:
+                prior_run = torch.zeros(B, dtype=torch.int64, device=device)
+            idx = prior_run.clamp(max=self.think_index_emb_size - 1)
+            idx_emb = self.think_index_emb(idx).unsqueeze(1)  # (B, 1, d)
+            x = x + idx_emb * tm.view(B, 1, 1).to(idx_emb.dtype)
+            # Update running counter: increment if think else reset to 0.
+            cache["think_run_len"] = torch.where(
+                tm, prior_run + 1, torch.zeros_like(prior_run))
 
         if self.max_T > 0:
             pos = torch.tensor([cache["seen"]], device=device, dtype=torch.long)

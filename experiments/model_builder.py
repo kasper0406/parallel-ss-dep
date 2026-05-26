@@ -133,6 +133,8 @@ def build_model_from_args(args, *, vocab_size: int,
         layer_drop_max=float(getattr(args, "layer_drop_max", 0.0)),
         state_readonly_at_think=bool(
             getattr(args, "state_readonly_at_think", False)),
+        think_index_emb_size=int(
+            getattr(args, "think_index_emb_size", 0)),
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,

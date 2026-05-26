@@ -435,6 +435,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "plain DeltaNet attention blocks; other variants "
                         "silently skip. Default OFF (every existing ckpt "
                         "behaves byte-identically without the flag).")
+    p.add_argument("--think_index_emb_size", type=int, default=0,
+                   help="Phase 3 thinking fix (2026-05-26): per-position "
+                        "think-index embedding table size. >0 enables a "
+                        "small nn.Embedding(N, d_model), zero-init, added "
+                        "to each think token according to its index within "
+                        "its consecutive-think burst (0, 1, ..., N-1; "
+                        "bursts longer than N share the last embedding). "
+                        "Breaks the homogenization (8 consecutive thinks -> "
+                        "8 identical inputs -> low-rank hidden states; "
+                        "median pairwise cosine +0.146 vs +0.060 at emit). "
+                        "0 = disabled (default, byte-identical).")
     p.add_argument("--mem_dim", type=int, default=0,
                    help="Memory projection dim. 0 = match d_model.")
     # ----- Persistent learned-RAG (Product-Key Memory) -----

@@ -412,4 +412,52 @@ Reasoning:
 reward gradient reaches the gate) or stay at its entropy-regularized
 value (sign that reward only flows through emit tokens)?
 
+## 2026-05-26 — Discovery RL on mbpp_combined: gate doesn't evolve, reward unstable
+
+**Result on mbpp_combined** (100 steps, stopped early):
+  - step 1:   gate(fire=0.36)  reward=0.02  pass=0  partial=1
+  - step 25:  gate(fire=0.36)  reward=0.09  **pass=1**  partial=0 (lucky)
+  - step 50:  gate(fire=0.25)  reward=0.01  pass=0  syntax_error=10
+  - step 75:  ckpt save (no metrics shown)
+  - step 100: gate(fire=0.29)  reward=0.04  pass=0  partial=2
+
+**Pattern**: gate fire rate stable at ~0.29-0.36 across 100 steps —
+the gradient flowing through gate decisions doesn't meaningfully move
+the gate distribution. Reward bounces 0.0-0.09 but doesn't trend up.
+
+**Root cause hypothesis**: the SFT base was trained with DETERMINISTIC
+gate (threshold at emit_threshold=0.5). The gate outputs at inference
+cluster near σ=0 or σ=1 (decisive). Under stochastic sampling, the
+~5-10% of positions where σ is in [0.4, 0.6] get sampled and
+disrupt the model's trained behavior. Output quality drops at those
+positions → reward is noisy → PPO can't drive gate distribution
+improvement.
+
+**What we validated**:
+1. Stochastic gate mechanism is technically correct (PPO ratio ~1.0,
+   entropy bonus works, log-probs flow)
+2. Gate fire rate stays in [0.25, 0.37] without collapsing to 0 or 1
+   (entropy reg working)
+3. Reward signal exists on mbpp (1 rollout passed at step 25)
+
+**What we did NOT validate**: that the gate can DISCOVER useful
+thinking via this mechanism on the current SFT base.
+
+**Three potential paths forward** (all require building):
+1. **Pre-SFT with stochastic gate sampling**: teach the base model to
+   produce good output even when the gate is sampled at uncertain
+   positions. Then RL can move the gate freely without destabilizing
+   outputs.
+2. **Selective sampling**: only sample when σ(gate) ∈ [0.3, 0.7] —
+   keep decisive positions deterministic. Avoids the OOD problem
+   but may not give enough exploration signal.
+3. **Pivot to a different mechanism entirely**: e.g., latent thought
+   vectors (continuous action space) rather than discrete gate
+   decisions; or process-reward modeling.
+
+**Stopping discovery-RL execution for today.** Mechanism is built and
+tested, but a single-day attempt isn't going to land it. The
+finding (stochastic-gate-on-deterministic-base-fails) is itself
+worth knowing.
+
 ## (Future entries appended below as decisions are made)

@@ -140,6 +140,15 @@ class Rollout:
     tier: str = ""
     n_passed: int = 0
     n_tests: int = 0
+    # --- stochastic gate (only populated when --stochastic_gate is set) ---
+    # `gate_decisions[i]` is True for "emit", False for "think". Positions
+    # where `force_emit` was True (budget exhausted / finished row) are
+    # EXCLUDED — the model had no policy choice, so they get no gradient.
+    gate_decisions: list[bool] | None = None
+    gate_log_probs: list[float] | None = None
+    gate_positions: list[int] | None = None   # absolute pos in full_ids of the
+                                              # token (think OR emit) whose
+                                              # selection was a Bernoulli draw.
 
 
 @torch.no_grad()
@@ -154,6 +163,7 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
                            gate_floor: float,
                            temperature: float,
                            min_emit_before_eos: int,
+                           stochastic_gate: bool = False,
                            ) -> list[Rollout]:
     """Roll out `n_rollouts` parallel completions of the same prompt in a
     SINGLE batched forward per iteration.
@@ -190,6 +200,11 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
     emit_token_ids_per_row: list[list[int]] = [[] for _ in range(N)]
     emit_log_probs_per_row: list[list[float]] = [[] for _ in range(N)]
     emit_positions_per_row: list[list[int]] = [[] for _ in range(N)]
+    # Per-row gate-decision record (only populated when stochastic_gate=True;
+    # force_emit positions are excluded — no policy choice was made there).
+    gate_decisions_per_row: list[list[bool]] = [[] for _ in range(N)]
+    gate_log_probs_per_row: list[list[float]] = [[] for _ in range(N)]
+    gate_positions_per_row: list[list[int]] = [[] for _ in range(N)]
 
     # STATE-PASSING INCREMENTAL DECODE (2026-05-23). At T=prompt + 96
     # gen steps, the full-forward path's per-step cost grows linearly
@@ -224,6 +239,8 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
                 gate = torch.ones(N, device=device)
             else:
                 gate = gate_t[:, -1]
+            # Apply gate_floor as a hard floor on p_emit (also used as the
+            # threshold-compare value in the deterministic path).
             gate_clamped = (gate if gate_floor <= 0
                             else gate.clamp_min(gate_floor))
             force_emit = (
@@ -231,7 +248,25 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
                 | (think_totals >= total_think_budget)
                 | finished  # finished rows always "emit" pad
             )
-            want_emit = (gate_clamped >= emit_threshold) | force_emit
+            if stochastic_gate:
+                # p_emit comes from the gate (already sigmoided into _last_gate);
+                # clamp to floor so exploration above the floor is unconstrained
+                # but we never assign Bernoulli probability below the floor.
+                p_emit = gate_clamped.clamp(1e-6, 1.0 - 1e-6)
+                # Sample Bernoulli(p_emit) → True means emit.
+                sampled_emit = torch.bernoulli(p_emit).to(torch.bool)
+                want_emit = sampled_emit | force_emit
+                # log-prob of the SAMPLED action (under the stochastic policy).
+                # Computed BEFORE the force_emit override so non-forced rows
+                # get the action they actually chose; forced rows' log-prob
+                # will be discarded downstream (not appended to the rollout).
+                gate_lp_emit = torch.log(p_emit)
+                gate_lp_think = torch.log(1.0 - p_emit)
+                gate_lp = torch.where(sampled_emit, gate_lp_emit, gate_lp_think)
+            else:
+                want_emit = (gate_clamped >= emit_threshold) | force_emit
+                gate_lp = None
+                sampled_emit = None
 
             # Sample emit tokens. Mask think token from softmax.
             next_logits[:, thinking_token_id] = -float("inf")
@@ -272,6 +307,13 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
             for i in range(N):
                 if bool(finished[i].item()):
                     continue
+                # Record stochastic gate decision BEFORE the EOS-finalize
+                # short-circuit. Only when the model actually had a choice
+                # (force_emit positions are masked out — no gradient there).
+                if stochastic_gate and not bool(force_emit[i].item()):
+                    gate_decisions_per_row[i].append(bool(sampled_emit[i].item()))
+                    gate_log_probs_per_row[i].append(float(gate_lp[i].item()))
+                    gate_positions_per_row[i].append(int(new_pos))
                 if bool(want_emit[i].item()):
                     tok = int(emit_toks[i].item())
                     is_eos = (eos_token_id is not None
@@ -310,6 +352,9 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
             full_ids=full_ids_host[i],
             depth=int(think_totals[i].item()),
             text=text,
+            gate_decisions=(gate_decisions_per_row[i] if stochastic_gate else None),
+            gate_log_probs=(gate_log_probs_per_row[i] if stochastic_gate else None),
+            gate_positions=(gate_positions_per_row[i] if stochastic_gate else None),
         ))
     return out_rollouts
 
@@ -498,7 +543,8 @@ def policy_loss_for_rollouts_batched(
     *, clip_eps: float, thinking_token_id: int, temperature: float,
     pad_id: int,
     ref_model=None, kl_coef: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    stochastic_gate: bool = False, gate_entropy_bonus: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
     """Compute PPO clipped loss for a list of rollouts in ONE batched forward.
 
     Pads all rollout sequences to the max length, then runs a single forward
@@ -512,14 +558,21 @@ def policy_loss_for_rollouts_batched(
     the loss. This is the principled stability mechanism missing from
     the original implementation.
 
-    Returns (loss, mean_ratio, mean_kl) — mean ratio and KL averaged
-    across all emit positions across all rollouts.
+    Returns (loss, mean_ratio, mean_kl, gate_stats) — mean ratio and KL
+    averaged across all emit positions across all rollouts; gate_stats is
+    a dict with `gate_ratio`, `gate_entropy`, `gate_fire_rate` (mean of
+    the BERNOULLI-decision think share — i.e. fraction of stochastic
+    decisions that landed on think). When stochastic_gate=False, the
+    gate_stats entries are NaN.
     """
     device = next(model.parameters()).device
     R = len(rollouts)
+    nan = float("nan")
+    empty_gate_stats = {"gate_ratio": nan, "gate_entropy": nan,
+                         "gate_fire_rate": nan}
     if R == 0:
         return (torch.zeros((), device=device, requires_grad=True),
-                torch.tensor(1.0), torch.tensor(0.0))
+                torch.tensor(1.0), torch.tensor(0.0), empty_gate_stats)
     T_max = max(len(r.full_ids) for r in rollouts)
     padded = torch.full((R, T_max), int(pad_id), dtype=torch.long, device=device)
     for i, r in enumerate(rollouts):
@@ -529,6 +582,10 @@ def policy_loss_for_rollouts_batched(
     autocast = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
     with autocast:
         logits = model(padded)                      # (R, T_max, V) bf16
+    # Grab the per-position gate stash. With DDP, `model._last_gate` is set
+    # on the underlying module, accessed via .module (forward propagates it).
+    inner = getattr(model, "module", model)
+    new_gate = getattr(inner, "_last_gate", None)        # (R, T_max) post-sigmoid
     ref_logits = None
     if ref_model is not None and kl_coef > 0.0:
         with torch.no_grad(), autocast:
@@ -537,6 +594,10 @@ def policy_loss_for_rollouts_batched(
     all_surrs = []
     all_ratios = []
     all_kls = []
+    all_gate_surrs = []
+    all_gate_ratios = []
+    all_gate_entropies = []
+    all_gate_emit_shares = []  # for fire-rate logging
     for i, r in enumerate(rollouts):
         if not r.emit_token_ids:
             continue
@@ -559,6 +620,41 @@ def policy_loss_for_rollouts_batched(
         surr = -torch.minimum(ratio * adv, clipped * adv).mean()
         all_surrs.append(surr)
         all_ratios.append(ratio.detach().mean())
+
+        # --- Stochastic gate policy gradient (when rollout recorded
+        # Bernoulli draws). Same group-relative `adv` rewards the gate's
+        # decisions: if this rollout earned high advantage, push the
+        # probability of WHAT THE GATE CHOSE upward.
+        if (stochastic_gate and new_gate is not None
+                and r.gate_decisions is not None and len(r.gate_decisions) > 0):
+            gate_pos = torch.tensor(r.gate_positions, dtype=torch.long,
+                                     device=device)
+            # The gate value at position p drove the decision for the token
+            # APPENDED at position p (the gate is read from logits[..., -1, :]
+            # of the prefix ending just before p was appended; in the
+            # batched forward, `_last_gate[i, p]` is the gate at position p
+            # which used h[i, p-1] — same prefix). Use index `p-1` to match
+            # the prefix-prediction convention of the emit branch.
+            new_p_at_dec = new_gate[i, gate_pos - 1].float().clamp(1e-6, 1.0 - 1e-6)
+            dec_bool = torch.tensor(r.gate_decisions, dtype=torch.bool,
+                                     device=device)
+            new_gate_lp = torch.where(
+                dec_bool, torch.log(new_p_at_dec),
+                torch.log(1.0 - new_p_at_dec))
+            old_gate_lp = torch.tensor(r.gate_log_probs, dtype=torch.float32,
+                                        device=device)
+            g_ratio = torch.exp(new_gate_lp - old_gate_lp)
+            g_clipped = torch.clamp(g_ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+            g_surr = -torch.minimum(g_ratio * adv, g_clipped * adv).mean()
+            all_gate_surrs.append(g_surr)
+            all_gate_ratios.append(g_ratio.detach().mean())
+            # Bernoulli entropy on the CURRENT policy's probabilities at the
+            # same decision positions (for the entropy bonus + logging).
+            ent = -(new_p_at_dec * torch.log(new_p_at_dec)
+                    + (1.0 - new_p_at_dec) * torch.log(1.0 - new_p_at_dec))
+            all_gate_entropies.append(ent.mean())
+            # Fire rate = fraction of decisions that emitted (decoded; for logging).
+            all_gate_emit_shares.append(dec_bool.float().mean().detach())
         if ref_logits is not None:
             ref_pred_logits = ref_logits[i, pred_idx, :].float()
             ref_pred_logits[:, thinking_token_id] = -float("inf")
@@ -578,14 +674,32 @@ def policy_loss_for_rollouts_batched(
             all_kls.append(kl_k3.mean())
     if not all_surrs:
         return (torch.zeros((), device=device, requires_grad=True),
-                torch.tensor(1.0), torch.tensor(0.0))
+                torch.tensor(1.0), torch.tensor(0.0), empty_gate_stats)
     surr_loss = torch.stack(all_surrs).mean()
     mean_ratio = torch.stack(all_ratios).mean()
+    total_loss = surr_loss
     if all_kls:
         mean_kl = torch.stack(all_kls).mean()
-        total_loss = surr_loss + kl_coef * mean_kl
-        return total_loss, mean_ratio, mean_kl.detach()
-    return surr_loss, mean_ratio, torch.tensor(0.0, device=device)
+        total_loss = total_loss + kl_coef * mean_kl
+        kl_out = mean_kl.detach()
+    else:
+        kl_out = torch.tensor(0.0, device=device)
+    # Stochastic-gate contributions. Per-rollout averages then mean across
+    # rollouts — matches the per-rollout-mean convention used for emit-surr
+    # so a single gate decision in a short rollout doesn't dominate.
+    if all_gate_surrs:
+        gate_surr = torch.stack(all_gate_surrs).mean()
+        gate_ent = torch.stack(all_gate_entropies).mean()
+        total_loss = total_loss + gate_surr - gate_entropy_bonus * gate_ent
+        gate_stats = {
+            "gate_ratio": float(torch.stack(all_gate_ratios).mean().item()),
+            "gate_entropy": float(gate_ent.detach().item()),
+            "gate_fire_rate": float(
+                torch.stack(all_gate_emit_shares).mean().item()),
+        }
+    else:
+        gate_stats = empty_gate_stats
+    return total_loss, mean_ratio, kl_out, gate_stats
 
 
 def policy_loss_for_rollout(
@@ -788,6 +902,23 @@ def main():
                          "Trades ~30% extra compute for ~Nlayers× activation "
                          "memory reduction → enables higher --batch. Rollouts "
                          "use torch.no_grad so they're unaffected.")
+    p.add_argument("--stochastic_gate",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Treat the thinking gate as a Bernoulli policy "
+                        "variable during rollouts: sample emit/think from "
+                        "sigmoid(gate) instead of thresholding at "
+                        "emit_threshold. Same group-relative advantage that "
+                        "rewards emit-token PPO also rewards the gate's "
+                        "decisions, so the model can DISCOVER its own "
+                        "optimal thinking pattern instead of imitating "
+                        "Qwen's CoT. Default OFF — backwards-compat with "
+                        "existing launchers.")
+    p.add_argument("--gate_entropy_bonus", type=float, default=0.01,
+                   help="Bernoulli-entropy regularization on the gate's "
+                        "decisions (only used when --stochastic_gate). "
+                        "Prevents collapse to always-think / never-think. "
+                        "Subtracted from the loss → higher entropy lowers "
+                        "loss. 0 disables.")
     p.add_argument("--policy_film_bypass",
                     action=argparse.BooleanOptionalAction, default=False,
                     help="During the policy-update forward, skip FiLM K=3 "
@@ -957,6 +1088,7 @@ def main():
                 gate_floor=args.gate_floor,
                 temperature=args.temperature,
                 min_emit_before_eos=args.min_emit_before_eos,
+                stochastic_gate=args.stochastic_gate,
             )
             all_rollouts.append(group)
         tier_hist = {}
@@ -1041,6 +1173,7 @@ def main():
                         gate_floor=args.gate_floor,
                         temperature=rep_temp,
                         min_emit_before_eos=args.min_emit_before_eos,
+                        stochastic_gate=args.stochastic_gate,
                     )
                     rr = single[0]
                     if args.extract_code_block:
@@ -1148,7 +1281,7 @@ def main():
                 if ref_model is not None:
                     ref_model._film_bypass = True
             try:
-                loss, mean_ratio, mean_kl = policy_loss_for_rollouts_batched(
+                loss, mean_ratio, mean_kl, gate_stats = policy_loss_for_rollouts_batched(
                     flat_rollouts, flat_advantages, model,
                     clip_eps=args.clip_eps,
                     thinking_token_id=thinking_token_id,
@@ -1156,6 +1289,8 @@ def main():
                     pad_id=int(tok.eos_token_id) if tok.eos_token_id is not None else 0,
                     ref_model=ref_model,
                     kl_coef=args.kl_coef,
+                    stochastic_gate=args.stochastic_gate,
+                    gate_entropy_bonus=args.gate_entropy_bonus,
                 )
                 loss.backward()
             finally:
@@ -1180,8 +1315,14 @@ def main():
             dummy.backward()
             opt.zero_grad(set_to_none=True)
             loss_val, ratio_val, kl_val = float("nan"), float("nan"), float("nan")
+            gate_stats = {"gate_ratio": float("nan"),
+                          "gate_entropy": float("nan"),
+                          "gate_fire_rate": float("nan")}
         else:
             loss_val, ratio_val, kl_val = float("nan"), float("nan"), float("nan")
+            gate_stats = {"gate_ratio": float("nan"),
+                          "gate_entropy": float("nan"),
+                          "gate_fire_rate": float("nan")}
 
         # Logging.
         if step % args.log_every == 0:
@@ -1207,12 +1348,18 @@ def main():
                                 if repair_n_g > 0 else 0.0)
             repair_lift = (n_lift_to_var_g / n_zero_var_before_g
                            if n_zero_var_before_g > 0 else 0.0)
+            gate_str = ""
+            if args.stochastic_gate:
+                # Stash log-only floats; nan when no gate decisions this step.
+                gate_str = (f"  gate(fire={gate_stats['gate_fire_rate']:.2f}, "
+                            f"H={gate_stats['gate_entropy']:.3f}, "
+                            f"ratio={gate_stats['gate_ratio']:.3f})")
             if is_main(rank):
                 print(f"{step:>5}  {reward_mean_g:>10.4f}  "
                       f"{reward_max_g:>10.4f}  {depth_mean_g:>10.2f}  "
                       f"{think_rate_g:>10.3f}  {pass_n_g:>6d}  "
                       f"{ratio_val:>6.3f}  {loss_val:>8.4f}  "
-                      f"kl={kl_val:+.4f}  "
+                      f"kl={kl_val:+.4f}{gate_str}  "
                       f"cur(n={cur_stats['n_seen']}, "
                       f"p={cur_mean_p_g:.2f}, "
                       f"band={cur_pct_in_band_g:.2f}{cur_target_p_str})  "

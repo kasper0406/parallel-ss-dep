@@ -40,7 +40,11 @@ from experiments.train_lm import build_arch, parse_layers_arg
 def build_model_from_ckpt(ckpt_path: str,
                           *,
                           force_use_think_adapter: bool | None = None,
-                          force_think_adapter_hidden_mult: int | None = None):
+                          force_think_adapter_hidden_mult: int | None = None,
+                          force_use_refinement_head: bool | None = None,
+                          force_refinement_head_window: int | None = None,
+                          force_refinement_head_n_heads: int | None = None,
+                          force_refinement_head_mlp_mult: int | None = None):
     """Construct a TinyLM from a saved ckpt.
 
     `force_use_think_adapter` (optional) overrides the auto-detect:
@@ -48,6 +52,11 @@ def build_model_from_ckpt(ckpt_path: str,
     that didn't have one (e.g. adding the adapter during SFT from a
     pretrain ckpt). Set False to deliberately drop adapter weights
     that were saved. Default None = auto-detect.
+
+    `force_use_refinement_head` (optional, Phase D, 2026-05-27) mirrors
+    the Phase-B override semantics for the RefinementHead. Pass True
+    to attach a fresh refinement head to a ckpt that didn't have one;
+    the head's alpha=0 init means byte-identical decode until trained.
     """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
@@ -169,6 +178,31 @@ def build_model_from_ckpt(ckpt_path: str,
         use_think_adapter = bool(force_use_think_adapter)
     if force_think_adapter_hidden_mult is not None:
         think_adapter_hidden_mult = int(force_think_adapter_hidden_mult)
+    # Phase D (2026-05-27): same auto-detect pattern for RefinementHead.
+    # Keys live at `refinement_head.{W_q,W_k,...,alpha}`. Window can't
+    # be inferred from weight shapes (it's a mask-construction parameter)
+    # so we fall back to cfg / default.
+    use_refinement_head = bool(cfg.get("use_refinement_head", False))
+    refinement_head_window = int(cfg.get("refinement_head_window", 128))
+    refinement_head_n_heads = int(cfg.get("refinement_head_n_heads", 8))
+    refinement_head_mlp_mult = int(cfg.get("refinement_head_mlp_mult", 2))
+    if any(k.startswith("refinement_head.") for k in sd_keys):
+        use_refinement_head = True
+        # Infer n_heads can't be done reliably; if cfg knows, fine; else
+        # default 8. Same for window. mlp_mult inferable from W_up shape.
+        for k in sd_keys:
+            if k == "refinement_head.W_up.weight":
+                d_hidden = ckpt["state_dict"][k].shape[0]
+                refinement_head_mlp_mult = int(d_hidden // cfg["d_model"])
+                break
+    if force_use_refinement_head is not None:
+        use_refinement_head = bool(force_use_refinement_head)
+    if force_refinement_head_window is not None:
+        refinement_head_window = int(force_refinement_head_window)
+    if force_refinement_head_n_heads is not None:
+        refinement_head_n_heads = int(force_refinement_head_n_heads)
+    if force_refinement_head_mlp_mult is not None:
+        refinement_head_mlp_mult = int(force_refinement_head_mlp_mult)
     model = TinyLM(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"],
         n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
@@ -182,6 +216,10 @@ def build_model_from_ckpt(ckpt_path: str,
         think_index_emb_size=think_idx_emb,
         use_think_adapter=use_think_adapter,
         think_adapter_hidden_mult=think_adapter_hidden_mult,
+        use_refinement_head=use_refinement_head,
+        refinement_head_window=refinement_head_window,
+        refinement_head_n_heads=refinement_head_n_heads,
+        refinement_head_mlp_mult=refinement_head_mlp_mult,
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,

@@ -724,6 +724,17 @@ def main() -> int:
     p.add_argument("--think_adapter_hidden_mult", type=int, default=2,
                    help="Phase B: hidden width multiplier for the "
                         "ThinkAdapter MLP (default 2 → d_hidden=2*d_model).")
+    # --- Phase D: RefinementHead (THINKING_PLAN v5, 2026-05-27) -----------
+    p.add_argument("--use_refinement_head", action="store_true",
+                   help="Phase D: attach a RefinementHead (windowed local "
+                        "attention + MLP, soft-mixed with trunk via σ). "
+                        "Omit = inherit from ckpt; pass = force ON.")
+    p.add_argument("--refinement_head_window", type=int, default=128,
+                   help="Phase D: local-attention window (default 128).")
+    p.add_argument("--refinement_head_n_heads", type=int, default=8,
+                   help="Phase D: refinement-head attention heads (default 8).")
+    p.add_argument("--refinement_head_mlp_mult", type=int, default=2,
+                   help="Phase D: refinement-head MLP hidden mult (default 2).")
     # --- Phase A: process-reward auxiliary loss (THINKING_PLAN.md v5) -----
     # On a sampled subset of positions where the gate already wants to
     # think, do a SECOND forward over [prefix, K * THINK] and ask whether
@@ -779,12 +790,26 @@ def main() -> int:
             # (alpha init 0 → byte-identical at start). Auto-detect
             # path still wins if the flag isn't passed.
             force_adapter = True if args.use_think_adapter else None
+            # Phase D: same override pattern — attach a fresh refinement
+            # head when --use_refinement_head is passed on a ckpt that
+            # didn't have one (alpha init 0 → byte-identical at start).
+            force_refinement = True if args.use_refinement_head else None
             model, cfg = build_model_from_ckpt(
                 args.load_ckpt,
                 force_use_think_adapter=force_adapter,
                 force_think_adapter_hidden_mult=(
                     int(args.think_adapter_hidden_mult)
                     if args.use_think_adapter else None),
+                force_use_refinement_head=force_refinement,
+                force_refinement_head_window=(
+                    int(args.refinement_head_window)
+                    if args.use_refinement_head else None),
+                force_refinement_head_n_heads=(
+                    int(args.refinement_head_n_heads)
+                    if args.use_refinement_head else None),
+                force_refinement_head_mlp_mult=(
+                    int(args.refinement_head_mlp_mult)
+                    if args.use_refinement_head else None),
             )
             if args.use_think_adapter:
                 cfg["use_think_adapter"] = True
@@ -792,6 +817,19 @@ def main() -> int:
                     args.think_adapter_hidden_mult)
                 print(f"  Phase B: ThinkAdapter ON "
                       f"(hidden_mult={args.think_adapter_hidden_mult}, "
+                      "alpha init 0).")
+            if args.use_refinement_head:
+                cfg["use_refinement_head"] = True
+                cfg["refinement_head_window"] = int(
+                    args.refinement_head_window)
+                cfg["refinement_head_n_heads"] = int(
+                    args.refinement_head_n_heads)
+                cfg["refinement_head_mlp_mult"] = int(
+                    args.refinement_head_mlp_mult)
+                print(f"  Phase D: RefinementHead ON "
+                      f"(window={args.refinement_head_window}, "
+                      f"n_heads={args.refinement_head_n_heads}, "
+                      f"mlp_mult={args.refinement_head_mlp_mult}, "
                       "alpha init 0).")
             thinking_token_id = cfg.get("thinking_token_id")
             if thinking_token_id is None:

@@ -139,6 +139,14 @@ def build_model_from_args(args, *, vocab_size: int,
             getattr(args, "use_think_adapter", False)),
         think_adapter_hidden_mult=int(
             getattr(args, "think_adapter_hidden_mult", 2)),
+        use_refinement_head=bool(
+            getattr(args, "use_refinement_head", False)),
+        refinement_head_window=int(
+            getattr(args, "refinement_head_window", 128)),
+        refinement_head_n_heads=int(
+            getattr(args, "refinement_head_n_heads", 8)),
+        refinement_head_mlp_mult=int(
+            getattr(args, "refinement_head_mlp_mult", 2)),
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,

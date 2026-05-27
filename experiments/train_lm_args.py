@@ -464,6 +464,25 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Phase B think-adapter hidden width multiplier "
                         "(default 2 -> d_hidden = 2 * d_model). Only used "
                         "when --use_think_adapter is set.")
+    # ----- Phase D: RefinementHead (THINKING_PLAN v5, 2026-05-27) -----
+    p.add_argument("--use_refinement_head", action="store_true",
+                   help="Phase D — add a RefinementHead: 1 layer of "
+                        "causal local-window self-attention (n_heads, "
+                        "window=N) + 2-layer MLP, alpha-gated (init 0). "
+                        "Output is soft-mixed with the trunk hidden by "
+                        "sigma(gate): h_final = sigma*h + (1-sigma)*h_refined. "
+                        "Gives sigma a REAL job (weight two STRUCTURALLY "
+                        "DIFFERENT computations) instead of just deciding "
+                        "'append think token'. Default OFF; alpha init 0 "
+                        "means a fresh ckpt is byte-identical at decode.")
+    p.add_argument("--refinement_head_window", type=int, default=128,
+                   help="Phase D refinement-head local-attention window "
+                        "size (last N positions seen). Default 128.")
+    p.add_argument("--refinement_head_n_heads", type=int, default=8,
+                   help="Phase D refinement-head attention heads (default 8).")
+    p.add_argument("--refinement_head_mlp_mult", type=int, default=2,
+                   help="Phase D refinement-head MLP hidden multiplier "
+                        "(default 2 -> d_hidden = 2 * d_model).")
     p.add_argument("--mem_dim", type=int, default=0,
                    help="Memory projection dim. 0 = match d_model.")
     # ----- Persistent learned-RAG (Product-Key Memory) -----

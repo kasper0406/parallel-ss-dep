@@ -1095,6 +1095,98 @@ class WorkingMemory(nn.Module):
         return h + injection * inj
 
 
+class RefinementHead(nn.Module):
+    """Phase D — STRUCTURALLY DIFFERENT computation at think positions.
+
+    The diagnosis from v8/v9 (Phase A/B failures): every "think" in the
+    existing stack is just another forward pass through the SAME trunk
+    with a slightly different input embedding. Supervising it doesn't
+    help because there's no specialised computation to optimise.
+
+    This module IS that specialised computation:
+      - 1 layer of causal local-window self-attention (n_heads heads,
+        sliding window of last `window` positions). The attention can
+        see positions VERBATIM in the recent past — something the
+        DeltaNet trunk's bounded recurrent state structurally cannot.
+      - 2-layer GELU MLP for further mixing.
+      - LayerNorm + residual on each sub-block (Pre-LN).
+      - Scalar α (init 0) gating the entire contribution.
+
+        h_out = h + α · (attn_residual + mlp_residual)
+
+    With α=0 the output is bit-identical to the input — so a ckpt
+    loaded WITHOUT refinement-head training is byte-identical to its
+    pre-Phase-D self at decode. α moves first under loss gradient
+    (matches the FiLM-α / Phase-B pattern); fc1/fc2/attn weights
+    follow once α drifts off zero.
+
+    Caller (`TinyLM._apply_refinement_head`) handles the gate-mix:
+    `h_final = σ · h_trunk + (1-σ) · refinement_head(h_trunk)`.
+    σ = P(emit); σ high → keep trunk; σ low (uncertain / would have
+    wanted to think) → use refinement.
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 8, window: int = 128,
+                 mlp_mult: int = 2):
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(
+                f"d_model ({d_model}) must be divisible by n_heads "
+                f"({n_heads})")
+        self.d_model = int(d_model)
+        self.n_heads = int(n_heads)
+        self.d_head = int(d_model // n_heads)
+        self.window = int(window)
+        self.mlp_mult = int(mlp_mult)
+
+        self.attn_norm = nn.LayerNorm(d_model)
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, d_model, bias=False)
+        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        self.W_o = nn.Linear(d_model, d_model, bias=False)
+
+        self.mlp_norm = nn.LayerNorm(d_model)
+        d_ff = mlp_mult * d_model
+        self.W_up = nn.Linear(d_model, d_ff, bias=False)
+        self.W_down = nn.Linear(d_ff, d_model, bias=False)
+
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def _build_window_mask(self, T: int, device, dtype) -> torch.Tensor:
+        """Additive SDPA mask: 0 inside the causal sliding window, -inf
+        outside. (T, T)."""
+        i = torch.arange(T, device=device).unsqueeze(1)
+        j = torch.arange(T, device=device).unsqueeze(0)
+        allowed = (j <= i) & ((i - j) < self.window)
+        mask = torch.zeros((T, T), device=device, dtype=dtype)
+        mask.masked_fill_(~allowed, float("-inf"))
+        return mask
+
+    def _local_attn(self, h: torch.Tensor) -> torch.Tensor:
+        B, T, _ = h.shape
+        x = self.attn_norm(h)
+        q = self.W_q(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = self.W_k(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = self.W_v(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        mask = self._build_window_mask(T, device=h.device, dtype=q.dtype)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        o = o.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        return self.W_o(o)
+
+    def _mlp(self, h: torch.Tensor) -> torch.Tensor:
+        x = self.mlp_norm(h)
+        return self.W_down(F.gelu(self.W_up(x)))
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """h: (B, T, d). Returns h + α · refined_residual.
+
+        With α=0, returns h exactly (the load-bearing invariant).
+        """
+        refined = self._local_attn(h)
+        refined = refined + self._mlp(h + refined)
+        return h + self.alpha * refined
+
+
 class TinyLM(nn.Module):
     def __init__(
         self,
@@ -1247,6 +1339,17 @@ class TinyLM(nn.Module):
         # AdamW (not Muon — see optim_utils._is_think_adapter).
         use_think_adapter: bool = False,
         think_adapter_hidden_mult: int = 2,
+        # Phase D (THINKING_PLAN v5, 2026-05-27): RefinementHead — a
+        # dedicated module with windowed local attention + MLP whose
+        # output is soft-mixed with the trunk hidden by σ(gate). Gives
+        # the gate σ a REAL job: weight two STRUCTURALLY DIFFERENT
+        # predictions, not "compute / don't compute." Default OFF; with
+        # use_refinement_head=True the head's α starts at 0 so a fresh
+        # ckpt is byte-identical to the no-head trunk at decode.
+        use_refinement_head: bool = False,
+        refinement_head_window: int = 128,
+        refinement_head_n_heads: int = 8,
+        refinement_head_mlp_mult: int = 2,
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1301,6 +1404,20 @@ class TinyLM(nn.Module):
         if self.think_index_emb_size > 0:
             self.think_index_emb = nn.Embedding(self.think_index_emb_size, d_model)
             nn.init.zeros_(self.think_index_emb.weight)
+        # Phase D RefinementHead (2026-05-27) — built here so state-dict
+        # round-trip preserves weights. α init 0 (inside the module) → a
+        # freshly-attached head is byte-identical to no-head at decode.
+        self.use_refinement_head = bool(use_refinement_head)
+        self.refinement_head_window = int(refinement_head_window)
+        self.refinement_head_n_heads = int(refinement_head_n_heads)
+        self.refinement_head_mlp_mult = int(refinement_head_mlp_mult)
+        if self.use_refinement_head:
+            self.refinement_head = RefinementHead(
+                d_model=d_model,
+                n_heads=self.refinement_head_n_heads,
+                window=self.refinement_head_window,
+                mlp_mult=self.refinement_head_mlp_mult,
+            )
         self.out_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         if tie_embeddings:
@@ -1652,6 +1769,40 @@ class TinyLM(nn.Module):
         return self.memory(h_normed, input_ids, read_mask=read_mask,
                            doc_ids=doc_ids)
 
+    def _apply_refinement_head(self, h: torch.Tensor) -> torch.Tensor:
+        """Phase D soft-mixture: σ · h + (1-σ) · refinement_head(h).
+
+        σ = sigmoid(gate_head(out_norm(h))) — P(emit). σ high (confident
+        emit) keeps the trunk output; σ low (would have wanted to
+        think) routes to the refinement-head output. Refinement head
+        starts with α=0 so the mix is identity at cold start.
+
+        Tests can override σ via `model._force_gate_sigma = <float>`.
+
+        No-op when use_refinement_head is False (byte-identical).
+        """
+        if not getattr(self, "use_refinement_head", False):
+            return h
+        # Short-circuit when α is exactly 0 — preserves byte-identity
+        # against the no-head trunk for freshly-attached heads, since
+        # the soft-mix `σ·h + (1-σ)·h` accumulates fp32 rounding even
+        # when h_refined == h.
+        if self.refinement_head.alpha.item() == 0.0 and not self.training:
+            return h
+        if not getattr(self, "output_gate", False):
+            # Without a gate head we can't soft-mix; just apply the head
+            # additively (α=0 → identity). Useful for non-thinking ckpts
+            # that experiment with the head alone.
+            return self.refinement_head(h)
+        h_norm = self.out_norm(h)
+        gate_logit = self.gate_head(h_norm)
+        override = getattr(self, "_force_gate_sigma", None)
+        sigma = (torch.sigmoid(gate_logit) if override is None
+                 else torch.full_like(gate_logit, float(override)))
+        self._last_refinement_sigma = sigma.detach()
+        h_refined = self.refinement_head(h)
+        return sigma * h + (1.0 - sigma) * h_refined
+
     def _finalize(self, h_raw: torch.Tensor,
                   input_ids: torch.Tensor,
                   mem_read_mask: torch.Tensor | None,
@@ -1670,6 +1821,13 @@ class TinyLM(nn.Module):
         the dense-feedback path to thread `surprise_loss` through.
         `doc_ids` confines working-memory reads/writes to within a document.
         """
+        # Phase D: soft-mix refinement-head output with the trunk hidden
+        # BEFORE out_norm / memory / lm_head. The mix is
+        # `σ · h_raw + (1-σ) · refinement_head(h_raw)` where σ = P(emit)
+        # comes from the gate_head (computed on out_norm(h_raw)). At
+        # cold-start refinement_head's α=0 → output == h_raw → mix is
+        # identity for any σ → byte-identical to no-head training.
+        h_raw = self._apply_refinement_head(h_raw)
         h = self.out_norm(h_raw)
         h = self._apply_memory(h, input_ids, read_mask=mem_read_mask,
                                doc_ids=doc_ids)
@@ -2250,6 +2408,9 @@ class TinyLM(nn.Module):
                                     think_mask=prefill_think_mask)
                 h = self._maybe_pkm(h, L)
 
+        # Phase D — apply refinement head soft-mixture before out_norm
+        # (mirror _finalize). No-op when use_refinement_head is False.
+        h = self._apply_refinement_head(h)
         # Gate + memory + lm_head (mirror _finalize).
         h_normed = self.out_norm(h)
         # Build the WM buffer entries for the prompt BEFORE applying
@@ -2594,6 +2755,12 @@ class TinyLM(nn.Module):
                                     think_mask=step_think_mask)
                 h = self._maybe_pkm(h, L)
 
+        # Phase D — apply refinement head soft-mixture (mirror _finalize).
+        # No-op when use_refinement_head is False. NOTE: at T=1 the local
+        # attention only sees its own token; effectively becomes the MLP
+        # branch only. For real benefit during incremental decode the
+        # head would need a KV cache over recent positions — TODO.
+        h = self._apply_refinement_head(h)
         # Gate + memory + lm_head (mirror _finalize).
         h_normed = self.out_norm(h)
         if self.use_memory:

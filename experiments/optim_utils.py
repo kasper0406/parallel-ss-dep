@@ -53,6 +53,16 @@ def _is_think_adapter(name: str) -> bool:
     return ".think_adapter." in name or name.endswith(".think_adapter.alpha")
 
 
+def _is_refinement_head(name: str) -> bool:
+    """Phase D RefinementHead params (2026-05-27). Lives at
+    `refinement_head.{W_q,W_k,W_v,W_o,W_up,W_down,attn_norm,mlp_norm}.*`
+    plus the scalar `refinement_head.alpha`. ALL go to AdamW: attention
+    matrices need adaptive moments; Muon's Newton-Schulz orthogonalisation
+    is the wrong inductive bias for short local-window attention.
+    """
+    return name.startswith("refinement_head.") or name == "refinement_head.alpha"
+
+
 def _wsd_lambda(total_steps: int, warmup_steps: int, decay_frac: float):
     """Warmup-Stable-Decay LR multiplier in [0, 1].
 
@@ -172,6 +182,9 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
             continue
         seen.add(id(p))
         if _is_think_adapter(name):
+            adamw_regular.append(p)
+            continue
+        if _is_refinement_head(name):
             adamw_regular.append(p)
             continue
         if _is_embedding_like(name) or p.ndim != 2:

@@ -30,7 +30,8 @@ def _make_model(*, use_refinement_head: bool = False, seed: int = 0,
                 n_heads: int = 2, d_head: int = 8,
                 refinement_head_window: int = 8,
                 refinement_head_n_heads: int = 2,
-                refinement_head_mlp_mult: int = 2) -> TinyLM:
+                refinement_head_mlp_mult: int = 2,
+                refinement_head_alpha_init: float = 0.3) -> TinyLM:
     torch.manual_seed(seed)
     return TinyLM(
         vocab_size=vocab_size,
@@ -44,6 +45,7 @@ def _make_model(*, use_refinement_head: bool = False, seed: int = 0,
         refinement_head_window=refinement_head_window,
         refinement_head_n_heads=refinement_head_n_heads,
         refinement_head_mlp_mult=refinement_head_mlp_mult,
+        refinement_head_alpha_init=refinement_head_alpha_init,
     )
 
 
@@ -75,8 +77,27 @@ def test_on_creates_expected_params():
         "refinement_head.mlp_norm.bias",
     }
     assert names == expected_suffixes
-    # Alpha must init to exactly zero (load-bearing invariant).
-    assert m.refinement_head.alpha.item() == 0.0
+    # Default alpha init is 0.3 (v10 lesson — α=0 stays inert).
+    assert abs(m.refinement_head.alpha.item() - 0.3) < 1e-6
+
+
+def test_alpha_init_zero_supported():
+    """Explicit alpha_init=0 preserves the byte-identity invariant
+    for callers that want to recover the pre-v11 cold-start behaviour."""
+    m = _make_model(use_refinement_head=True,
+                    refinement_head_n_heads=2)
+    # Default is 0.3 — but the kwarg flows through TinyLM
+    m_zero = TinyLM(
+        vocab_size=64, d_model=16, n_layers=2, n_heads=2, d_head=8,
+        attention_cls=DeltaNetAttention,
+        output_gate=True,
+        use_refinement_head=True,
+        refinement_head_window=8,
+        refinement_head_n_heads=2,
+        refinement_head_mlp_mult=2,
+        refinement_head_alpha_init=0.0,
+    )
+    assert m_zero.refinement_head.alpha.item() == 0.0
 
 
 # --------------------------------------------------------------------------
@@ -102,10 +123,11 @@ def test_default_off_forward_byte_identical():
 @pytest.mark.skipif(not torch.cuda.is_available(),
                     reason="DeltaNet Triton kernels require CUDA")
 def test_alpha_zero_byte_identical_to_no_head():
-    """The load-bearing invariant: a freshly-attached RefinementHead
-    (α=0) contributes nothing to the forward output."""
+    """The load-bearing invariant: a RefinementHead with explicit
+    alpha_init=0 contributes nothing to the forward output."""
     m_off = _make_model(use_refinement_head=False, seed=0).cuda().eval()
-    m_on = _make_model(use_refinement_head=True, seed=0).cuda().eval()
+    m_on = _make_model(use_refinement_head=True, seed=0,
+                       refinement_head_alpha_init=0.0).cuda().eval()
     # Sync non-head weights so any difference is from the head.
     on_state = m_on.state_dict()
     off_state = m_off.state_dict()

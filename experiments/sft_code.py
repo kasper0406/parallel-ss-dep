@@ -735,6 +735,9 @@ def main() -> int:
                    help="Phase D: refinement-head attention heads (default 8).")
     p.add_argument("--refinement_head_mlp_mult", type=int, default=2,
                    help="Phase D: refinement-head MLP hidden mult (default 2).")
+    p.add_argument("--refinement_head_alpha_init", type=float, default=0.3,
+                   help="Phase D: refinement-head alpha init (default 0.3 "
+                        "based on v10 lesson — α=0 stays inert).")
     # --- Phase A: process-reward auxiliary loss (THINKING_PLAN.md v5) -----
     # On a sampled subset of positions where the gate already wants to
     # think, do a SECOND forward over [prefix, K * THINK] and ask whether
@@ -809,6 +812,9 @@ def main() -> int:
                     if args.use_refinement_head else None),
                 force_refinement_head_mlp_mult=(
                     int(args.refinement_head_mlp_mult)
+                    if args.use_refinement_head else None),
+                force_refinement_head_alpha_init=(
+                    float(args.refinement_head_alpha_init)
                     if args.use_refinement_head else None),
             )
             if args.use_think_adapter:

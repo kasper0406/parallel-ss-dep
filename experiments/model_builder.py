@@ -147,6 +147,8 @@ def build_model_from_args(args, *, vocab_size: int,
             getattr(args, "refinement_head_n_heads", 8)),
         refinement_head_mlp_mult=int(
             getattr(args, "refinement_head_mlp_mult", 2)),
+        refinement_head_alpha_init=float(
+            getattr(args, "refinement_head_alpha_init", 0.3)),
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,

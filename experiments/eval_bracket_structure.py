@@ -44,7 +44,8 @@ def build_model_from_ckpt(ckpt_path: str,
                           force_use_refinement_head: bool | None = None,
                           force_refinement_head_window: int | None = None,
                           force_refinement_head_n_heads: int | None = None,
-                          force_refinement_head_mlp_mult: int | None = None):
+                          force_refinement_head_mlp_mult: int | None = None,
+                          force_refinement_head_alpha_init: float | None = None):
     """Construct a TinyLM from a saved ckpt.
 
     `force_use_think_adapter` (optional) overrides the auto-detect:
@@ -195,6 +196,7 @@ def build_model_from_ckpt(ckpt_path: str,
                 d_hidden = ckpt["state_dict"][k].shape[0]
                 refinement_head_mlp_mult = int(d_hidden // cfg["d_model"])
                 break
+    refinement_head_alpha_init = float(cfg.get("refinement_head_alpha_init", 0.3))
     if force_use_refinement_head is not None:
         use_refinement_head = bool(force_use_refinement_head)
     if force_refinement_head_window is not None:
@@ -203,6 +205,8 @@ def build_model_from_ckpt(ckpt_path: str,
         refinement_head_n_heads = int(force_refinement_head_n_heads)
     if force_refinement_head_mlp_mult is not None:
         refinement_head_mlp_mult = int(force_refinement_head_mlp_mult)
+    if force_refinement_head_alpha_init is not None:
+        refinement_head_alpha_init = float(force_refinement_head_alpha_init)
     model = TinyLM(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"],
         n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
@@ -220,6 +224,7 @@ def build_model_from_ckpt(ckpt_path: str,
         refinement_head_window=refinement_head_window,
         refinement_head_n_heads=refinement_head_n_heads,
         refinement_head_mlp_mult=refinement_head_mlp_mult,
+        refinement_head_alpha_init=refinement_head_alpha_init,
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,

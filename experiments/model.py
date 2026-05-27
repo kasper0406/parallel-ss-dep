@@ -1127,7 +1127,7 @@ class RefinementHead(nn.Module):
     """
 
     def __init__(self, d_model: int, n_heads: int = 8, window: int = 128,
-                 mlp_mult: int = 2):
+                 mlp_mult: int = 2, alpha_init: float = 0.3):
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError(
@@ -1150,7 +1150,14 @@ class RefinementHead(nn.Module):
         self.W_up = nn.Linear(d_model, d_ff, bias=False)
         self.W_down = nn.Linear(d_ff, d_model, bias=False)
 
-        self.alpha = nn.Parameter(torch.zeros(1))
+        # Alpha init: 0.0 → byte-identical at cold start but the head
+        # stays inert (v10 lesson — α moved only 2.6e-4 over 960 steps,
+        # MLPs never trained). 0.3 → head contributes from step 1, MLP
+        # weights get real gradient, model learns whether to keep or
+        # suppress the contribution. The α=0 short-circuit in
+        # TinyLM._apply_refinement_head still preserves byte-identity
+        # for ckpts that explicitly want zero contribution.
+        self.alpha = nn.Parameter(torch.full((1,), float(alpha_init)))
 
     def _build_window_mask(self, T: int, device, dtype) -> torch.Tensor:
         """Additive SDPA mask: 0 inside the causal sliding window, -inf
@@ -1350,6 +1357,7 @@ class TinyLM(nn.Module):
         refinement_head_window: int = 128,
         refinement_head_n_heads: int = 8,
         refinement_head_mlp_mult: int = 2,
+        refinement_head_alpha_init: float = 0.3,
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1411,12 +1419,14 @@ class TinyLM(nn.Module):
         self.refinement_head_window = int(refinement_head_window)
         self.refinement_head_n_heads = int(refinement_head_n_heads)
         self.refinement_head_mlp_mult = int(refinement_head_mlp_mult)
+        self.refinement_head_alpha_init = float(refinement_head_alpha_init)
         if self.use_refinement_head:
             self.refinement_head = RefinementHead(
                 d_model=d_model,
                 n_heads=self.refinement_head_n_heads,
                 window=self.refinement_head_window,
                 mlp_mult=self.refinement_head_mlp_mult,
+                alpha_init=self.refinement_head_alpha_init,
             )
         self.out_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)

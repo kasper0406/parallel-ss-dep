@@ -483,6 +483,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--refinement_head_mlp_mult", type=int, default=2,
                    help="Phase D refinement-head MLP hidden multiplier "
                         "(default 2 -> d_hidden = 2 * d_model).")
+    p.add_argument("--refinement_head_alpha_init", type=float, default=0.3,
+                   help="Phase D refinement-head alpha init. 0.0 → "
+                        "byte-identical at cold start BUT v10 lesson: "
+                        "alpha stays stuck near 0 because the MLP gets "
+                        "no real gradient when its contribution is zero. "
+                        "Default 0.3 → head contributes from step 1, "
+                        "MLP weights learn whether to keep or suppress.")
     p.add_argument("--mem_dim", type=int, default=0,
                    help="Memory projection dim. 0 = match d_model.")
     # ----- Persistent learned-RAG (Product-Key Memory) -----

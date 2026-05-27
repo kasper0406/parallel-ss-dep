@@ -206,6 +206,55 @@ def test_gate_calibration_runs_extra_forward_when_on():
     assert torch.isfinite(loss)
 
 
+def test_process_reward_overwrites_last_gate_logits():
+    """Regression: an extra `compute_process_reward_loss` call MUTATES
+    `model._last_gate_logits` to the after-forward's (N, T_after)
+    shape. Any trainer code that needs the main-forward gate logits
+    AFTER calling process_reward must have snapshotted them first —
+    re-reading the attribute returns the smaller (and semantically
+    wrong) after-forward tensor.
+
+    This nails down the invariant the train_lm.py / sft_code.py
+    snapshot fix depends on. Without this guarantee, the snapshot
+    code in both trainers becomes "defensive" dead code; with it,
+    omitting the snapshot is a (CUDA-asserting / wrong-tensor-
+    trained) bug.
+    """
+    model = _MockLM(vocab=16, d=8)
+    x, y = _build_inputs()
+    with torch.no_grad():
+        model.gate_head.bias.fill_(5.0)
+    logits = model(x)
+    pre_snap = model._last_gate_logits           # the main-forward tensor
+    assert pre_snap is not None
+    pre_shape = tuple(pre_snap.shape)
+    rng = torch.Generator(device="cpu").manual_seed(0)
+    _, stats = compute_process_reward_loss(
+        model, x, y,
+        gate=model._last_gate, main_logits=logits,
+        thinking_token_id=THINK_ID, K=4,
+        apply_min_sigma=0.3, sample_frac=1.0,
+        rng=rng, pad_token_id=PAD_ID,
+        retrieval_as_input=False, base_vocab_for_loss=None,
+        max_positions=4,
+    )
+    assert stats.n_sampled > 0
+    post = model._last_gate_logits               # now the after-forward tensor
+    assert post is not None
+    # Identity test: the attribute now points to a DIFFERENT object.
+    assert post is not pre_snap, (
+        "process_reward did not overwrite _last_gate_logits — the "
+        "snapshot fix in train_lm.py / sft_code.py is no longer "
+        "load-bearing; either the snapshot can be dropped OR this "
+        "test needs updating to reflect a new invariant.")
+    # Shape test: typically smaller (n_sampled rows, ≤ T cols).
+    post_shape = tuple(post.shape)
+    assert post_shape != pre_shape, (
+        f"shapes match unexpectedly: pre={pre_shape}, post={post_shape}")
+    # The held snapshot is still valid (no in-place mutation).
+    assert tuple(pre_snap.shape) == pre_shape
+
+
 def test_pad_id_equals_think_id_raises():
     """Caller must use a pad_id distinct from thinking_token_id — the
     helper raises to surface this trap."""

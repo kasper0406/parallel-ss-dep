@@ -1332,6 +1332,17 @@ def main() -> int:
                     # --process_reward_sample_frac and
                     # --process_reward_max_positions.
                     main_gate = getattr(model, "_last_gate", None)
+                    # Snapshot the pre-sigmoid gate logits BEFORE any
+                    # extra forwards — process_reward's after-forward
+                    # overwrites `_last_gate_logits` to the wrong
+                    # shape (N_pr, T_pr), and gate_calibration would
+                    # then index it with the main-forward (B, T)
+                    # indices (CUDA assert / wrong tensor trained).
+                    # Same fix as train_lm.py:1407-1414 (commit 828940b
+                    # bug #5). Held in a local so the later
+                    # gate_calibration call doesn't re-read from model.
+                    main_gate_logits = getattr(
+                        model, "_last_gate_logits", None)
                     if use_process_reward and main_gate is not None:
                         # PAD must NOT equal thinking_token_id — when
                         # state_readonly_at_think / mem_write_only_at_think
@@ -1372,8 +1383,11 @@ def main() -> int:
                     # for the gate, not a gradient path).
                     if use_gate_calibration and main_gate is not None:
                         pad_id = 0
-                        gate_logit = getattr(
-                            model, "_last_gate_logits", None)
+                        # Use the pre-extra-forward snapshot taken
+                        # above; reading `model._last_gate_logits`
+                        # here returns the after-forward's overwritten
+                        # tensor with the wrong shape.
+                        gate_logit = main_gate_logits
                         gc_loss, gc_stats = compute_gate_calibration_loss(
                             model, x, y,
                             gate=main_gate,

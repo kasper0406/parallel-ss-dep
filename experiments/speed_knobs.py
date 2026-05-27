@@ -130,6 +130,15 @@ def apply_speed_knobs(model: nn.Module, bf16: bool = True, tf32: bool = True,
         # required (the graph breaks are expected, not errors).
         # Control-flow changes (e.g. the K-self-feed curriculum flipping
         # _film_bypass) trigger a one-time recompile — acceptable.
+        # Stash the bf16-wrapped (but NOT yet compiled) forward as
+        # `model._eager_forward` so callers that need an out-of-shape
+        # extra forward — e.g. `compute_process_reward_loss` /
+        # `compute_gate_calibration_loss` (their `after_ids` is
+        # `(N, L_after)` ≠ the main `(B, T)` shape) — can opt out of
+        # compile per call without triggering a recompile / Inductor
+        # symbolic-shape assertion. The main hot path still runs through
+        # the compiled forward installed below.
+        model._eager_forward = model.forward
         compiled_fwd = torch.compile(model.forward, fullgraph=False,
                                       mode=compile_mode)
         # Verify dynamo can install + run the wrapper at all. If the model

@@ -474,6 +474,86 @@ gate selectivity to survive RL rollouts** without explicit
 robustification (train under sampling, or replace the discrete gate
 with a continuous "soft think" attention-style head).
 
+### Gate-calibration auxiliary loss + pretrain wiring (2026-05-27)
+
+**Premise**: every post-pretrain attempt to make thinking productive
+regressed (SFT v8-v11: 1-5/164; DPO v1/v2: 9/164 and 12/164; discovery
+RL on v2_step300: regressed from 16 → 13). Common diagnosis: features
+added post-pretrain stay inert because the trunk has learned to fit
+data WITHOUT them, KL anchors prevent moving far enough, and short
+runs give insufficient gradient. The fix has to be in pretrain.
+
+**New aux loss — gate-calibration**
+(`experiments/process_reward.py::compute_gate_calibration_loss`). For
+each sampled position with σ ∈ [low, high], run an extra forward over
+`[prefix, K * THINK_ID]` under `no_grad`, compare
+`log p_with_think(true)` vs `log p_no_think(true)`, set
+`target = 1{Δlogp > 0}`, train gate via BCE-with-logits. **Symmetric**:
+penalises both "gate fires but thinking doesn't help" and "gate doesn't
+fire but thinking would help." Mirrors `compute_process_reward_loss`'s
+extra-forward mechanism but trains the GATE, not the trunk. Wired into
+both `experiments/sft_code.py` AND `experiments/train_lm.py` via
+`--gate_calibration_weight` (default 0.0 = off, backwards-compat).
+14 tests in `experiments/test_gate_calibration.py`.
+
+**Pretrain wiring of `process_reward` + `gate_calibration`**
+(`experiments/train_lm.py`, 2026-05-27). Both aux losses now fire in
+the non-thinking-queue pretrain step body. Same `pad_id=0` /
+`thinking_token_id != pad_token_id` guard as the SFT path. Logs:
+`pr(n=., Δlogp=., %pos=.)` and
+`gc(n=., tgt1=., σ=., Δlogp=.)` per step.
+
+**5 latent bugs hit + fixed during the smoke**:
+1. `torch.compile` + extra-forward shape mismatch → Inductor symbolic
+   shape assertion in `tiling_utils`. Workaround: `--no-compile`.
+2. b=14 OOMed at first extra forward → drop to `b=8 grad_accum=14`.
+3. `TinyLM.forward` returns `(logits, gist_loss)` tuple in training
+   mode; helpers expected a Tensor → unwrap if tuple.
+4. CUDA assert: pretrain `y` contains `thinking_token_id` (49152) at
+   think-burst positions; gather into base_vocab was OOB → mask
+   `target == thinking_token_id` to -100 inside helpers (this fix
+   has a test: `test_compute_respects_sample_frac` now uses
+   `y ∈ [0, THINK_ID)` to keep the count assertion stable).
+5. **Load-bearing one**: `model._last_gate_logits` is overwritten by
+   `process_reward`'s extra forward, so `gate_calibration` (running
+   after) used a wrong-shape (N_pr, T_pr) tensor → CUDA assert. Same
+   problem affected the per-step `emit_ce` diagnostic. Fix: snapshot
+   `_last_gate` AND `_last_gate_logits` BEFORE any extra forwards
+   and pass the snapshot to every consumer.
+
+**Smoke validation** (`launch_pretrain_smoke_thinking.sh`, +1000 steps
+on top of `pretrain_phase_c.pt`, ~3h on a 5090 with `--no-compile`):
+- **The gate IS miscalibrated**. At step 23005:
+  `gc(tgt1=0.88, σ=0.29, Δlogp=+2.9)` — at 88% of uncertain-gate
+  positions thinking would help, but the model's σ is only 0.29
+  (wants to emit). The loss has a real signal to fix.
+- **The gate is learning the right direction**. By step 23045 σ at
+  the same uncertain positions climbed 0.29 → 0.76. The
+  supervision is moving the gate where intended.
+- **Thinking IS productive at high-σ positions, just under-used**.
+  Process-reward `Δlogp` is consistently +3 to +8 across the run,
+  `%pos=88-100` — when the gate fires think at high-σ positions,
+  the post-think prediction beats the no-think one by a lot. The
+  trunk supports useful thinking already; the gate just didn't
+  know WHERE.
+- **Cost**: VAL ppl drifts up ~3-5% over 500 steps. The trunk is
+  being asked to be good at BOTH "predict directly" (VAL) AND
+  "predict after K thinks" (process_reward). At 287M they compete
+  for capacity. **The bet**: downstream evals that USE thinking
+  (HumanEval at high-σ positions) gain more than VAL loses. To be
+  verified on the smoke ckpt.
+
+**Open follow-ups**:
+- `torch.compile` + aux-extra-forwards (Inductor crash). Likely fixable
+  by `torch._dynamo.disable` around the extra forward.
+- Recipe knob `--process_reward_weight 0.05` may be too aggressive for
+  pretrain — VAL hit suggests a 0.025 sweep is worth running.
+- Per-position think-index embedding (`--think_index_emb_size`) +
+  `--use_think_adapter` + `--use_refinement_head` are queued for
+  a longer "v2" pretrain (`launch_pretrain_v2_thinking.sh`) — all
+  these modules were inert when attached post-pretrain. Co-training
+  from day 1 is the only way to make them load-bear.
+
 ## Lessons learnt (don't relive these)
 
 - **PKM α-decay is real and means the bootstrap is incomplete.** v7.0 (before the α-floor + value-LR-mult fixes) showed αL grow 0 → +0.085 by step 280, then steadily decay back to +0.04 by step 400 — the optimizer correctly sees random-init values as noise. The fix is to keep αL high enough long enough that value rows actually learn (α-floor curriculum), AND give values a separate higher LR (`--pkm_value_lr_mult 100`). Without both, PKM stays inert.

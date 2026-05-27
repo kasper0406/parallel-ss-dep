@@ -214,7 +214,11 @@ def test_compute_respects_sample_frac():
     model = _MockLM(vocab=16, d=8)
     B, T = 4, 16
     x = torch.randint(0, 16, (B, T))
-    y = torch.randint(0, 16, (B, T))
+    # Targets in [0, THINK_ID) so none equal THINK_ID — the loss now
+    # masks target==thinking_token_id positions (pretrain-safety fix,
+    # 2026-05-27) to avoid gather-out-of-bounds when logits are sliced
+    # to base_vocab_for_loss.
+    y = torch.randint(0, THINK_ID, (B, T))
     main_logits = model(x)
     gate = torch.full((B, T), 0.9)
     rng = torch.Generator().manual_seed(0)
@@ -309,6 +313,80 @@ def test_default_off_is_zero_loss():
     assert loss.item() == 0.0
     assert not loss.requires_grad
     assert stats.n_sampled == 0
+
+
+def test_eager_forward_used_when_present():
+    """When `model._eager_forward` is set (as `speed_knobs.apply_speed_knobs`
+    does under `compile_model=True`), the extra after-forward must go
+    through it instead of `model.__call__`. This dodges the Inductor
+    symbolic-shape assertion that fires when the aux's `(N, L_after)`
+    shape collides with the compiled main `(B, T)` graph.
+    """
+    torch.manual_seed(0)
+    model = _MockLM(vocab=16, d=8)
+    B, T = 2, 12
+    x = torch.randint(1, 16, (B, T))  # avoid pad id 0
+    y = x.clone()
+    main_logits = model(x)
+    gate = torch.full((B, T), 0.9)
+
+    # Install a sentinel "eager" forward that records its call and
+    # delegates to the real model. The compiled forward stays the
+    # original (and should NOT be invoked from compute_process_reward).
+    calls = {"eager": 0, "compiled": 0}
+    real_fwd = model.forward
+
+    def eager_fwd(*a, **kw):
+        calls["eager"] += 1
+        return real_fwd(*a, **kw)
+
+    def compiled_fwd(*a, **kw):
+        calls["compiled"] += 1
+        return real_fwd(*a, **kw)
+
+    model._eager_forward = eager_fwd
+    model.forward = compiled_fwd
+    try:
+        rng = torch.Generator().manual_seed(0)
+        loss, stats = compute_process_reward_loss(
+            model, x, y, gate=gate, main_logits=main_logits,
+            thinking_token_id=THINK_ID,
+            K=2, apply_min_sigma=0.5, sample_frac=1.0,
+            rng=rng, pad_token_id=PAD_ID,
+            retrieval_as_input=False, base_vocab_for_loss=None)
+    finally:
+        # Clean up the monkey-patch.
+        del model._eager_forward
+        model.forward = real_fwd
+
+    assert stats.n_sampled > 0
+    assert calls["eager"] >= 1, "after-forward must use _eager_forward"
+    assert calls["compiled"] == 0, "after-forward must NOT route through compile"
+
+
+def test_eager_forward_fallback_when_absent():
+    """When `model._eager_forward` is missing (no-compile mode), the
+    aux loss must still work by falling back to `model(...)`. Guarantees
+    the optimization is backwards-compatible.
+    """
+    torch.manual_seed(0)
+    model = _MockLM(vocab=16, d=8)
+    assert not hasattr(model, "_eager_forward")
+    B, T = 2, 8
+    x = torch.randint(1, 16, (B, T))
+    y = x.clone()
+    main_logits = model(x)
+    gate = torch.full((B, T), 0.9)
+    rng = torch.Generator().manual_seed(0)
+    loss, stats = compute_process_reward_loss(
+        model, x, y, gate=gate, main_logits=main_logits,
+        thinking_token_id=THINK_ID,
+        K=2, apply_min_sigma=0.5, sample_frac=1.0,
+        rng=rng, pad_token_id=PAD_ID,
+        retrieval_as_input=False, base_vocab_for_loss=None)
+    assert stats.n_sampled > 0
+    assert loss.requires_grad
+    loss.backward()  # gradient must flow
 
 
 def test_pad_eq_think_raises():

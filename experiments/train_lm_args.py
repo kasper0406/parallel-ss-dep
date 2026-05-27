@@ -147,6 +147,67 @@ def build_parser() -> argparse.ArgumentParser:
                         "(no clip). Use 0.01 to prevent BCE blow-up at target=0 "
                         "(rare in practice — exp(-H) > 0 always — but useful "
                         "if the model emits a very-low-entropy collapse).")
+    # --- Gate-calibration auxiliary loss (sibling of process_reward) -------
+    # At sampled positions where σ ∈ [min, max] (uncertain gate), run an
+    # extra forward over [prefix, K * THINK] and ask whether the K-think
+    # prediction is more accurate than the no-think prediction. Use that
+    # 0/1 label as a BCE target on σ. Trains the gate to PREDICT
+    # whether thinking will help — symmetric (penalises both "fire but
+    # didn't help" and "didn't fire but would have helped"). Default
+    # 0.0 = off → byte-identical training.
+    p.add_argument("--gate_calibration_weight", type=float, default=0.0,
+                   help="Weight on the gate-calibration aux loss. 0 "
+                        "disables (default). Try 0.1.")
+    p.add_argument("--gate_calibration_K", type=int, default=4,
+                   help="Number of think tokens to insert before the "
+                        "sampled position for the 'think' forward.")
+    p.add_argument("--gate_calibration_apply_min_sigma", type=float,
+                   default=0.1,
+                   help="Lower σ bound for candidate positions. Skips "
+                        "positions where the gate is already saturated "
+                        "low (σ ≈ 0) — calibrating those is wasted "
+                        "compute.")
+    p.add_argument("--gate_calibration_apply_max_sigma", type=float,
+                   default=0.9,
+                   help="Upper σ bound for candidate positions. Skips "
+                        "positions where the gate is already saturated "
+                        "high (σ ≈ 1).")
+    p.add_argument("--gate_calibration_sample_frac", type=float, default=0.05,
+                   help="Fraction of qualifying positions to evaluate "
+                        "per batch (bounds compute).")
+    p.add_argument("--gate_calibration_max_positions", type=int, default=32,
+                   help="Hard cap on sampled positions per batch — extra "
+                        "guard so the after-forward stays bounded even "
+                        "on a huge batch.")
+    p.add_argument("--gate_calibration_smooth_target_scale", type=float,
+                   default=0.0,
+                   help="If > 0, use a smooth target σ((logp_think - "
+                        "logp_no_think) * scale) instead of the hard "
+                        "{0, 1} indicator. 0 = hard target (default).")
+    # --- Process-reward auxiliary loss (Phase A of THINKING_PLAN v5) -------
+    # At sampled positions where σ > min_sigma (gate wants to think), run
+    # an extra forward over [prefix, K * THINK_ID] and minimise
+    # (log p_before - log p_after) on the true next token. Pushes thinks
+    # to be productive. Default 0.0 = off → byte-identical training.
+    p.add_argument("--process_reward_weight", type=float, default=0.0,
+                   help="Weight on the process-reward aux loss. 0 "
+                        "disables (default). Try 0.05.")
+    p.add_argument("--process_reward_K", type=int, default=4,
+                   help="Number of [THINKING] tokens to insert before the "
+                        "sampled position for the 'after' forward.")
+    p.add_argument("--process_reward_apply_min_sigma", type=float,
+                   default=0.3,
+                   help="Only consider positions whose post-sigmoid gate "
+                        "value σ exceeds this threshold. Restricts the "
+                        "aux loss to positions the gate already wants "
+                        "to think on.")
+    p.add_argument("--process_reward_sample_frac", type=float, default=0.05,
+                   help="Fraction of qualifying positions to evaluate "
+                        "per batch (bounds compute).")
+    p.add_argument("--process_reward_max_positions", type=int, default=32,
+                   help="Hard cap on sampled positions per batch — extra "
+                        "guard so the after-forward stays bounded even "
+                        "on a huge batch.")
     p.add_argument("--enable_thinking_token", action="store_true",
                    help="Enable discrete [THINKING] token training with an "
                         "on-policy continuation queue. A THINKING action pays "

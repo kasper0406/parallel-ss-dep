@@ -157,6 +157,12 @@ def main() -> int:
     p.add_argument("--max_len", type=int, default=1024)
     p.add_argument("--max_pairs_per_problem", type=int, default=4)
     p.add_argument("--log_every", type=int, default=20)
+    p.add_argument("--save_every", type=int, default=0,
+                   help="Snapshot ckpt every N steps. 0 = only save final. "
+                        "Used to capture the early-training sweet spot "
+                        "before DPO over-fits (the 2026-05-23 v1 over-train "
+                        "lesson: 3908 steps drove winrate to 0.97 / "
+                        "log_ratio +200 and regressed HumanEval to 9/164).")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -240,6 +246,15 @@ def main() -> int:
                       f"chosen_winrate={sum(accs[-wnd:])/wnd:.3f}  "
                       f"log_ratio={log_ratio.item():+.3f}  "
                       f"lr={lr:.2e}")
+            if args.save_every > 0 and step % args.save_every == 0:
+                snap_path = (args.save_ckpt
+                             .replace(".pt", f"_step{step}.pt"))
+                pathlib.Path(snap_path).parent.mkdir(
+                    parents=True, exist_ok=True)
+                torch.save({"state_dict": model.state_dict(),
+                            "config": dict(cfg),
+                            "step": step}, snap_path)
+                print(f"  [saved snapshot → {snap_path}]")
     print(f"\n[dpo] done in {(time.time()-t0)/60:.1f}m. "
           f"Final loss: {losses[-1]:.4f}, winrate: "
           f"{sum(accs[-200:])/min(200,len(accs)):.3f}")

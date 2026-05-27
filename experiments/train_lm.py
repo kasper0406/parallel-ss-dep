@@ -33,6 +33,10 @@ from experiments.layers import (
 from experiments.model import TinyLM
 from experiments.aux_brackets import compute_bracket_deltas, bracket_depth
 from experiments.gist_loss import build_gist_heads, parse_horizons
+from experiments.process_reward import (
+    compute_process_reward_loss,
+    compute_gate_calibration_loss,
+)
 from experiments.thinking import (
     ThinkContinuation,
     ThinkContinuationQueue,
@@ -557,6 +561,59 @@ def main():
               f"auto_stop={args.auto_stop} (Δ<{args.auto_stop_threshold:.3f} "
               f"for {args.auto_stop_k} consecutive intervals).")
     losses_gate_window: list[tuple] = []  # (mean_g, emit_frac, raw_ce) per step
+    # --- Process-reward / gate-calibration aux loss state -------------------
+    # `use_process_reward` / `use_gate_calibration` gate the extra-forward
+    # auxiliary losses. Both require the model to expose `_last_gate` (which
+    # happens whenever `--output_gate` is on OR a thinking gate head is
+    # wired). Pretrain runs with `--use_memory` + `--enable_thinking_token`
+    # have `_last_gate` populated; non-gate pretrain skips the aux losses
+    # silently (no gate signal to train).
+    use_process_reward = (
+        getattr(args, "process_reward_weight", 0.0) > 0.0
+        and thinking_token_id is not None
+        and (args.output_gate or args.enable_thinking_token)
+    )
+    if getattr(args, "process_reward_weight", 0.0) > 0.0 and not use_process_reward:
+        print("WARN  --process_reward_weight > 0 but disabled: needs a "
+              "thinking_token_id AND a gate head (--output_gate or "
+              "--enable_thinking_token).")
+    use_gate_calibration = (
+        getattr(args, "gate_calibration_weight", 0.0) > 0.0
+        and thinking_token_id is not None
+        and (args.output_gate or args.enable_thinking_token)
+    )
+    if getattr(args, "gate_calibration_weight", 0.0) > 0.0 and not use_gate_calibration:
+        print("WARN  --gate_calibration_weight > 0 but disabled: needs a "
+              "thinking_token_id AND a gate head.")
+    if use_process_reward:
+        print(f"  [process-reward] ON: weight={args.process_reward_weight}, "
+              f"K={args.process_reward_K}, "
+              f"min_sigma={args.process_reward_apply_min_sigma}, "
+              f"sample_frac={args.process_reward_sample_frac}, "
+              f"max_positions={args.process_reward_max_positions}")
+    if use_gate_calibration:
+        print(f"  [gate-calibration] ON: weight="
+              f"{args.gate_calibration_weight}, "
+              f"K={args.gate_calibration_K}, "
+              f"sigma=[{args.gate_calibration_apply_min_sigma}, "
+              f"{args.gate_calibration_apply_max_sigma}], "
+              f"sample_frac={args.gate_calibration_sample_frac}, "
+              f"max_positions={args.gate_calibration_max_positions}, "
+              f"smooth_target_scale="
+              f"{args.gate_calibration_smooth_target_scale}")
+    # CPU rng for position sampling (matches sft_code.py convention).
+    aux_rng = torch.Generator(device="cpu")
+    aux_rng.manual_seed(int(args.seed) + 17)
+    last_pr_stats = None
+    last_gc_stats = None
+    # `base_vocab_for_loss` truncates the after-forward's logits to the real
+    # token slots when computing the softmax denom for log p_after. In
+    # pretrain (with thinking enabled) the model_vocab_size is padded to
+    # multiple-of-64 with the THINK_ID token reserved; the proper denom
+    # excludes both the THINK_ID slot and any pad-up slots, matching the
+    # tokenizer's base vocab.
+    base_vocab_for_loss = (
+        int(tok.vocab_size) if thinking_token_id is not None else None)
     think_queue = (ThinkContinuationQueue(args.think_queue_max)
                    if args.enable_thinking_token else None)
     think_replay_queue = (ThinkReplayQueue(args.think_queue_max)
@@ -1338,6 +1395,84 @@ def main():
                         and getattr(args, "pkm_diversity_weight", 0.0) > 0.0):
                     div_loss = _pkm_diversity_loss(model.pkm_layer)
                     loss = loss + args.pkm_diversity_weight * div_loss
+                # --- Phase A: process-reward auxiliary loss ----------------
+                # Reads the main-forward gate via `model._last_gate` and
+                # reuses the just-computed `logits` for the "before"
+                # log-probabilities (no extra forward). The "after"
+                # forward runs over a small synthesised batch where K
+                # think tokens are inserted before each sampled
+                # position. Bounded by --process_reward_sample_frac and
+                # --process_reward_max_positions.
+                # PAD must NOT equal thinking_token_id; we use 0.
+                main_gate = getattr(model, "_last_gate", None)
+                # Snapshot the pre-sigmoid logits BEFORE any extra
+                # forwards — process_reward's extra forward overwrites
+                # `_last_gate_logits` to the wrong shape (N_pr, T_pr),
+                # and gate_calibration would then index it with the
+                # main-forward (B, T) indices, causing a CUDA assert.
+                main_gate_logits = getattr(
+                    model, "_last_gate_logits", None)
+                if use_process_reward and main_gate is not None:
+                    # Slice logits to base vocab for an apples-to-apples
+                    # softmax denom with the after-forward (which is also
+                    # sliced inside the helper).
+                    pr_main_logits = (
+                        logits[..., :base_vocab_for_loss]
+                        if base_vocab_for_loss is not None else logits)
+                    pr_loss, pr_stats = compute_process_reward_loss(
+                        model, x, y,
+                        gate=main_gate,
+                        main_logits=pr_main_logits,
+                        thinking_token_id=int(thinking_token_id),
+                        K=int(args.process_reward_K),
+                        apply_min_sigma=float(
+                            args.process_reward_apply_min_sigma),
+                        sample_frac=float(
+                            args.process_reward_sample_frac),
+                        rng=aux_rng,
+                        pad_token_id=0,
+                        retrieval_as_input=False,
+                        base_vocab_for_loss=base_vocab_for_loss,
+                        max_positions=int(
+                            args.process_reward_max_positions),
+                    )
+                    last_pr_stats = pr_stats
+                    if pr_stats.n_sampled > 0:
+                        loss = loss + (
+                            args.process_reward_weight * pr_loss)
+                # --- Gate-calibration aux loss (sibling of pr) -----------
+                if use_gate_calibration and main_gate is not None:
+                    # Use the pre-extra-forward snapshot (see above).
+                    gate_logit = main_gate_logits
+                    gc_main_logits = (
+                        logits[..., :base_vocab_for_loss]
+                        if base_vocab_for_loss is not None else logits)
+                    gc_loss, gc_stats = compute_gate_calibration_loss(
+                        model, x, y,
+                        gate=main_gate,
+                        main_logits=gc_main_logits,
+                        thinking_token_id=int(thinking_token_id),
+                        K=int(args.gate_calibration_K),
+                        apply_min_sigma=float(
+                            args.gate_calibration_apply_min_sigma),
+                        apply_max_sigma=float(
+                            args.gate_calibration_apply_max_sigma),
+                        sample_frac=float(
+                            args.gate_calibration_sample_frac),
+                        rng=aux_rng,
+                        pad_token_id=0,
+                        retrieval_as_input=False,
+                        base_vocab_for_loss=base_vocab_for_loss,
+                        max_positions=int(
+                            args.gate_calibration_max_positions),
+                        gate_logits=gate_logit,
+                        smooth_target_scale=float(
+                            args.gate_calibration_smooth_target_scale),
+                    )
+                    last_gc_stats = gc_stats
+                    if gc_stats.n_sampled > 0:
+                        loss = loss + (
+                            args.gate_calibration_weight * gc_loss)
                 (loss / n_micro).backward()
         _log_this_step = (step % args.log_every == 0 or step == args.steps)
         # Per-layer diagnostics: grad norms must be read before clip; the
@@ -1354,7 +1489,11 @@ def main():
                         if _log_this_step else None)
         losses.append(lm_loss.item())  # track LM loss alone for comparison
         if args.output_gate:
-            g_detached = model._last_gate.detach()
+            # Read the MAIN-forward snapshot — model._last_gate may have
+            # been overwritten by process_reward / gate_calibration
+            # extra forwards (which produce smaller (N, T') tensors).
+            g_detached = (main_gate.detach() if main_gate is not None
+                          else model._last_gate.detach())
             ce_detached = ce_per_token.detach()
             emit_mask = g_detached > 0.5
             # CE averaged only over emitted positions — the fair comparison metric.
@@ -1418,6 +1557,17 @@ def main():
                 ece_str = f"{emit_ce:.4f}" if emit_ce == emit_ce else "nan"
                 line += (f"  gate(g={mean_g:.3f},emit={emit_frac:.2f},"
                          f"emit_ce={ece_str},ce={raw_ce:.4f}{gf})")
+            if use_process_reward and last_pr_stats is not None:
+                line += (f"  pr(n={last_pr_stats.n_sampled}/"
+                         f"{last_pr_stats.n_candidates}, "
+                         f"Δlogp={last_pr_stats.mean_log_ratio:+.3f}, "
+                         f"%pos={100 * last_pr_stats.frac_positive:.0f})")
+            if use_gate_calibration and last_gc_stats is not None:
+                line += (f"  gc(n={last_gc_stats.n_sampled}/"
+                         f"{last_gc_stats.n_candidates}, "
+                         f"tgt1={last_gc_stats.target_frac_one:.2f}, "
+                         f"σ={last_gc_stats.mean_sigma:.2f}, "
+                         f"Δlogp={last_gc_stats.mean_log_ratio:+.3f})")
             if args.enable_thinking_token and think_stats_window:
                 recent = think_stats_window[-args.log_every:]
                 normal_items = sum(r.get("normal_items", 0.0) for r in recent)
@@ -1727,6 +1877,30 @@ def main():
                 output_gate=bool(args.output_gate
                                   or (args.enable_thinking_token
                                       and args.think_decision == "gate")),
+                # Thinking-loss recipe (so post-pretrain eval can detect).
+                process_reward_weight=float(
+                    getattr(args, "process_reward_weight", 0.0)),
+                gate_calibration_weight=float(
+                    getattr(args, "gate_calibration_weight", 0.0)),
+                state_readonly_at_think=bool(
+                    getattr(args, "state_readonly_at_think", False)),
+                use_think_adapter=bool(
+                    getattr(args, "use_think_adapter", False)),
+                think_adapter_hidden_mult=int(
+                    getattr(args, "think_adapter_hidden_mult", 2)),
+                use_refinement_head=bool(
+                    getattr(args, "use_refinement_head", False)),
+                refinement_head_window=int(
+                    getattr(args, "refinement_head_window", 128)),
+                refinement_head_n_heads=int(
+                    getattr(args, "refinement_head_n_heads", 8)),
+                refinement_head_mlp_mult=int(
+                    getattr(args, "refinement_head_mlp_mult", 2)),
+                refinement_head_alpha_init=float(
+                    getattr(args, "refinement_head_alpha_init", 0.3)),
+                think_index_emb_size=int(
+                    getattr(args, "think_index_emb_size", 0)),
+                retrieval_input_additive=False,
             )
             torch.save({"state_dict": model.state_dict(), "step": step,
                         "config": _save_cfg}, str(mid_path))
@@ -1868,6 +2042,50 @@ def main():
                 "think_backpressure_lambda": args.think_backpressure_lambda,
                 "think_backpressure_threshold": args.think_backpressure_threshold,
                 "think_backpressure_explore": args.think_backpressure_explore,
+                # Thinking-loss / thinking-arch recipe.
+                "process_reward_weight": float(
+                    getattr(args, "process_reward_weight", 0.0)),
+                "process_reward_K": int(
+                    getattr(args, "process_reward_K", 4)),
+                "process_reward_apply_min_sigma": float(
+                    getattr(args, "process_reward_apply_min_sigma", 0.3)),
+                "process_reward_sample_frac": float(
+                    getattr(args, "process_reward_sample_frac", 0.05)),
+                "process_reward_max_positions": int(
+                    getattr(args, "process_reward_max_positions", 32)),
+                "gate_calibration_weight": float(
+                    getattr(args, "gate_calibration_weight", 0.0)),
+                "gate_calibration_K": int(
+                    getattr(args, "gate_calibration_K", 4)),
+                "gate_calibration_apply_min_sigma": float(
+                    getattr(args, "gate_calibration_apply_min_sigma", 0.1)),
+                "gate_calibration_apply_max_sigma": float(
+                    getattr(args, "gate_calibration_apply_max_sigma", 0.9)),
+                "gate_calibration_sample_frac": float(
+                    getattr(args, "gate_calibration_sample_frac", 0.05)),
+                "gate_calibration_max_positions": int(
+                    getattr(args, "gate_calibration_max_positions", 32)),
+                "gate_calibration_smooth_target_scale": float(
+                    getattr(args, "gate_calibration_smooth_target_scale", 0.0)),
+                "state_readonly_at_think": bool(
+                    getattr(args, "state_readonly_at_think", False)),
+                "use_think_adapter": bool(
+                    getattr(args, "use_think_adapter", False)),
+                "think_adapter_hidden_mult": int(
+                    getattr(args, "think_adapter_hidden_mult", 2)),
+                "use_refinement_head": bool(
+                    getattr(args, "use_refinement_head", False)),
+                "refinement_head_window": int(
+                    getattr(args, "refinement_head_window", 128)),
+                "refinement_head_n_heads": int(
+                    getattr(args, "refinement_head_n_heads", 8)),
+                "refinement_head_mlp_mult": int(
+                    getattr(args, "refinement_head_mlp_mult", 2)),
+                "refinement_head_alpha_init": float(
+                    getattr(args, "refinement_head_alpha_init", 0.3)),
+                "think_index_emb_size": int(
+                    getattr(args, "think_index_emb_size", 0)),
+                "retrieval_input_additive": False,
             },
         }
         pathlib.Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)

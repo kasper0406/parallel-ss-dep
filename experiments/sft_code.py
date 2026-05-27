@@ -56,7 +56,10 @@ from experiments.gist_loss import (
     build_gist_heads, trunk_gist_loss, parse_horizons,
     build_think_gist_head, think_gist_loss,
 )
-from experiments.process_reward import compute_process_reward_loss
+from experiments.process_reward import (
+    compute_process_reward_loss,
+    compute_gate_calibration_loss,
+)
 
 
 def _flatten_to_oneline(s: str) -> str:
@@ -765,6 +768,36 @@ def main() -> int:
                    help="Hard cap on sampled positions per batch — extra "
                         "guard so the after-forward stays bounded even "
                         "on a huge batch.")
+    # --- Gate-calibration auxiliary loss (sibling of process_reward) ------
+    # At sampled uncertain-gate positions (σ ∈ [min, max]), run a
+    # SECOND forward over [prefix, K * THINK] and ask whether the
+    # K-think prediction puts more mass on the true next token than
+    # the no-think main forward did. Use that 0/1 label as a BCE
+    # target on σ. Trains the GATE to PREDICT whether thinking will
+    # help; symmetric across both error directions. Default off
+    # → byte-identical training.
+    p.add_argument("--gate_calibration_weight", type=float, default=0.0,
+                   help="Weight on the gate-calibration aux loss. "
+                        "0 disables (default). Try 0.1.")
+    p.add_argument("--gate_calibration_K", type=int, default=4,
+                   help="Number of think tokens inserted before the "
+                        "sampled position for the 'think' forward.")
+    p.add_argument("--gate_calibration_apply_min_sigma", type=float,
+                   default=0.1,
+                   help="Lower σ bound for candidate positions.")
+    p.add_argument("--gate_calibration_apply_max_sigma", type=float,
+                   default=0.9,
+                   help="Upper σ bound for candidate positions.")
+    p.add_argument("--gate_calibration_sample_frac", type=float, default=0.05,
+                   help="Fraction of qualifying positions to evaluate "
+                        "per batch (bounds compute).")
+    p.add_argument("--gate_calibration_max_positions", type=int, default=32,
+                   help="Hard cap on sampled positions per batch.")
+    p.add_argument("--gate_calibration_smooth_target_scale", type=float,
+                   default=0.0,
+                   help="If > 0, target = σ((logp_think - logp_no_think) "
+                        "* scale) instead of hard {0,1}. 0 = hard "
+                        "(default).")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1192,6 +1225,26 @@ def main() -> int:
               f"min_sigma={args.process_reward_apply_min_sigma}, "
               f"sample_frac={args.process_reward_sample_frac}, "
               f"max_positions={args.process_reward_max_positions}")
+    # Gate-calibration: similar gating, sibling loss.
+    last_gc_stats = None
+    use_gate_calibration = (
+        args.gate_calibration_weight > 0.0
+        and args.with_thinking
+        and thinking_token_id is not None
+    )
+    if args.gate_calibration_weight > 0.0 and not use_gate_calibration:
+        print("  [gate-calibration] requested but disabled: requires "
+              "--with_thinking AND a thinking_token_id in the loaded ckpt.")
+    if use_gate_calibration:
+        print(f"  [gate-calibration] ON: weight="
+              f"{args.gate_calibration_weight}, "
+              f"K={args.gate_calibration_K}, "
+              f"sigma=[{args.gate_calibration_apply_min_sigma}, "
+              f"{args.gate_calibration_apply_max_sigma}], "
+              f"sample_frac={args.gate_calibration_sample_frac}, "
+              f"max_positions={args.gate_calibration_max_positions}, "
+              f"smooth_target_scale="
+              f"{args.gate_calibration_smooth_target_scale}")
     for epoch in range(args.epochs):
         # Shuffle each epoch.
         idx = torch.randperm(len(encoded), generator=rng).tolist()
@@ -1310,6 +1363,46 @@ def main() -> int:
                         if pr_stats.n_sampled > 0:
                             loss = loss + (
                                 args.process_reward_weight * pr_loss)
+                    # --- Gate-calibration aux loss (sibling of pr) ------
+                    # Reads `model._last_gate_logits` (preferred for
+                    # numerical stability) — populated by the same
+                    # main forward as `_last_gate`. Runs its own extra
+                    # forward over [prefix, K * THINK] (under no_grad
+                    # inside the helper — the think output is a label
+                    # for the gate, not a gradient path).
+                    if use_gate_calibration and main_gate is not None:
+                        pad_id = 0
+                        gate_logit = getattr(
+                            model, "_last_gate_logits", None)
+                        gc_loss, gc_stats = compute_gate_calibration_loss(
+                            model, x, y,
+                            gate=main_gate,
+                            main_logits=logits,
+                            thinking_token_id=int(thinking_token_id),
+                            K=int(args.gate_calibration_K),
+                            apply_min_sigma=float(
+                                args.gate_calibration_apply_min_sigma),
+                            apply_max_sigma=float(
+                                args.gate_calibration_apply_max_sigma),
+                            sample_frac=float(
+                                args.gate_calibration_sample_frac),
+                            rng=rng,
+                            pad_token_id=pad_id,
+                            retrieval_as_input=bool(
+                                args.retrieval_as_input_thinking),
+                            base_vocab_for_loss=(
+                                int(base_vocab_for_loss)
+                                if args.with_thinking else None),
+                            max_positions=int(
+                                args.gate_calibration_max_positions),
+                            gate_logits=gate_logit,
+                            smooth_target_scale=float(
+                                args.gate_calibration_smooth_target_scale),
+                        )
+                        last_gc_stats = gc_stats
+                        if gc_stats.n_sampled > 0:
+                            loss = loss + (
+                                args.gate_calibration_weight * gc_loss)
                 # ====== Phase 1a path: gist-at-think supervision ============
                 # Run the student forward over the compressed sequence and
                 # the teacher forward (no_grad) over the full CoT sequence.
@@ -1389,6 +1482,13 @@ def main() -> int:
                               f"{last_pr_stats.n_candidates}, "
                               f"Δlogp={last_pr_stats.mean_log_ratio:+.3f}, "
                               f"%pos={100 * last_pr_stats.frac_positive:.0f})")
+                if use_gate_calibration and last_gc_stats is not None:
+                    extra += (f"  gc(n={last_gc_stats.n_sampled}/"
+                              f"{last_gc_stats.n_candidates}, "
+                              f"tgt1={last_gc_stats.target_frac_one:.2f}, "
+                              f"σ={last_gc_stats.mean_sigma:.2f}, "
+                              f"Δlogp="
+                              f"{last_gc_stats.mean_log_ratio:+.3f})")
                 print(f"  step {step:>5}/{n_steps}  loss={loss.item():.4f}  "
                       f"ppl={ppl:.2f}  lr={lr:.2e}  tok/s={tok_s:.0f}{extra}")
 
@@ -1418,6 +1518,18 @@ def main() -> int:
             args.process_reward_apply_min_sigma)
         new_cfg["process_reward_sample_frac"] = float(
             args.process_reward_sample_frac)
+    if use_gate_calibration:
+        new_cfg["gate_calibration_weight"] = float(
+            args.gate_calibration_weight)
+        new_cfg["gate_calibration_K"] = int(args.gate_calibration_K)
+        new_cfg["gate_calibration_apply_min_sigma"] = float(
+            args.gate_calibration_apply_min_sigma)
+        new_cfg["gate_calibration_apply_max_sigma"] = float(
+            args.gate_calibration_apply_max_sigma)
+        new_cfg["gate_calibration_sample_frac"] = float(
+            args.gate_calibration_sample_frac)
+        new_cfg["gate_calibration_smooth_target_scale"] = float(
+            args.gate_calibration_smooth_target_scale)
     ckpt_dict = {"state_dict": model.state_dict(), "config": new_cfg}
     if future_gist_heads is not None:
         ckpt_dict["future_gist_heads_state_dict"] = \

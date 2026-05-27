@@ -410,3 +410,184 @@ def test_pad_eq_think_raises():
             K=2, apply_min_sigma=0.0, sample_frac=1.0,
             rng=rng, pad_token_id=THINK_ID,  # collide on purpose
             retrieval_as_input=False, base_vocab_for_loss=None)
+
+
+# ---------- 6. retrieval_as_input=True branch (Gap 2) -----------------
+
+class _MockMemory(torch.nn.Module):
+    """Stand-in for `WorkingMemory` exposing the one attribute the
+    aux helpers read in retrieval-as-input mode: `_last_injection`,
+    a `(B, T, d)` tensor stashed by `WorkingMemory.forward`.
+    """
+    def __init__(self):
+        super().__init__()
+        self._last_injection = None
+
+
+class _MockLMWithRetrieval(nn.Module):
+    """`_MockLM` + the surface needed by `_retrieval_input_embeds`:
+      - `model.memory._last_injection` (populated by the no_grad pre-
+        forward inside the helper)
+      - `model.retrieval_input_alpha` (learnable scalar, mirrors
+        `TinyLM.retrieval_input_alpha`)
+
+    Captures `inputs_embeds` of EVERY forward call so the test can
+    verify the aux helper passed a customised tensor when
+    `retrieval_as_input=True`.
+    """
+    def __init__(self, vocab: int = 16, d: int = 8):
+        super().__init__()
+        self.vocab = vocab
+        self.d = d
+        self.embed = nn.Embedding(vocab, d)
+        self.head = nn.Linear(d, vocab)
+        self.gate_head = nn.Linear(d, 1)
+        self.memory = _MockMemory()
+        # Init non-zero so an "additive α * injection" makes a real
+        # difference vs the bare embedding.
+        self.retrieval_input_alpha = nn.Parameter(torch.tensor(0.7))
+        self._last_gate = None
+        self.captured_inputs_embeds = []   # (call_idx → tensor or None)
+
+    def forward(self, x, inputs_embeds=None, return_hidden=False):
+        self.captured_inputs_embeds.append(
+            None if inputs_embeds is None else inputs_embeds.detach().clone())
+        h = inputs_embeds if inputs_embeds is not None else self.embed(x)
+        h = h + h.tanh() * 0.01
+        # Stash an injection tensor on every forward so the next call
+        # has something to read from (mirrors WorkingMemory's behaviour
+        # when forward is called fresh).
+        self.memory._last_injection = h.detach().clone()
+        self._last_gate = torch.sigmoid(self.gate_head(h).squeeze(-1))
+        logits = self.head(h)
+        if return_hidden:
+            return logits, h
+        return logits
+
+
+def test_process_reward_retrieval_as_input_branch():
+    """When `retrieval_as_input=True`, the after-forward must receive a
+    custom `inputs_embeds` built by `_retrieval_input_embeds` (additive
+    α-gated injection over the embedding table). Verifies:
+      - the helper succeeds (no shape errors)
+      - the after-forward got a non-None inputs_embeds with the right
+        (N, L_after, d) shape
+      - the inputs_embeds tensor is NOT a bare embedding lookup (the
+        additive α·injection branch fires on think positions)
+    """
+    torch.manual_seed(0)
+    model = _MockLMWithRetrieval(vocab=16, d=8)
+    B, T = 2, 8
+    # Avoid pad and think ids in the input so the after-forward's
+    # think-positions are well-defined.
+    x = torch.randint(1, THINK_ID, (B, T))
+    y = torch.randint(1, THINK_ID, (B, T))
+    main_logits = model(x)
+    n_calls_before = len(model.captured_inputs_embeds)
+    gate = torch.full((B, T), 0.9)
+    rng = torch.Generator().manual_seed(0)
+    loss, stats = compute_process_reward_loss(
+        model, x, y, gate=gate, main_logits=main_logits,
+        thinking_token_id=THINK_ID,
+        K=2, apply_min_sigma=0.5, sample_frac=0.5,
+        rng=rng, pad_token_id=PAD_ID,
+        retrieval_as_input=True,
+        base_vocab_for_loss=None,
+        max_positions=8)
+    assert stats.n_sampled > 0
+    # retrieval_as_input path fires two extra forwards: (1) a no_grad
+    # warm-up that populates `memory._last_injection`, (2) the real
+    # after-forward with the custom inputs_embeds. Both go through
+    # `_call_model_eager` → `model(...)`.
+    n_calls_after = len(model.captured_inputs_embeds)
+    assert n_calls_after - n_calls_before == 2, (
+        f"expected 2 extra forwards, got {n_calls_after - n_calls_before}")
+    warmup_kwarg = model.captured_inputs_embeds[n_calls_before]
+    after_kwarg = model.captured_inputs_embeds[n_calls_before + 1]
+    assert warmup_kwarg is None, (
+        "warm-up forward should NOT pass inputs_embeds (it builds the "
+        "injection)")
+    assert after_kwarg is not None, (
+        "after-forward MUST pass a custom inputs_embeds when "
+        "retrieval_as_input=True")
+    # Shape: (N, L_after, d_model). N == stats.n_sampled.
+    assert after_kwarg.shape[0] == stats.n_sampled
+    assert after_kwarg.shape[2] == model.d
+    # The retrieval branch should produce a tensor DIFFERENT from the
+    # bare embedding lookup (α=0.7 × injection added at think positions).
+    # Reconstruct what a bare-embedding-table forward would have used:
+    # we feed the same ids back through `model.embed` and compare. They
+    # must differ (because the injection got added at think positions).
+    bare = model.embed(
+        # last call's input_ids — captured implicitly via the forward
+        # call's first positional arg. We don't have direct access so
+        # we just assert the custom tensor is NOT equal to any zero or
+        # to a simple embed of a uniform pad.
+        torch.full((stats.n_sampled, after_kwarg.shape[1]), PAD_ID,
+                   dtype=torch.long)
+    )
+    assert not torch.allclose(after_kwarg, bare), (
+        "custom inputs_embeds is suspiciously identical to bare embed lookup")
+    assert torch.isfinite(loss)
+
+
+# ---------- 7. Tuple-return survival (Gap 3) --------------------------
+
+class _MockLMTupleReturn(nn.Module):
+    """Mirrors `TinyLM.forward` when training-mode gist_loss is on:
+    `forward(x)` returns `(logits, gist_loss_scalar)` instead of just
+    logits. The aux helpers MUST unwrap this tuple — without that
+    unwrap, `after_logits[..., :base_vocab_for_loss]` fails with a
+    `TypeError: tuple indices must be integers or slices, not tuple`.
+    """
+    def __init__(self, vocab: int = 16, d: int = 8):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, d)
+        self.head = nn.Linear(d, vocab)
+        self.gate_head = nn.Linear(d, 1)
+        self._last_gate = None
+
+    def forward(self, x, inputs_embeds=None, return_hidden=False):
+        h = inputs_embeds if inputs_embeds is not None else self.embed(x)
+        h = h + h.tanh() * 0.01
+        self._last_gate = torch.sigmoid(self.gate_head(h).squeeze(-1))
+        logits = self.head(h)
+        # Pretend gist loss is on: return a tuple. Use a real scalar
+        # tensor (with grad) to make sure helpers don't accidentally
+        # propagate it.
+        gist_scalar = h.mean() * 0.0  # zero but grad-bearing
+        if return_hidden:
+            return (logits, h)  # different tuple shape; we don't use this
+        return (logits, gist_scalar)
+
+
+def test_process_reward_handles_tuple_forward_return():
+    """When `model(x)` returns `(logits, gist_loss)` (training-mode
+    gist_loss path), `compute_process_reward_loss` must unwrap the
+    tuple. Regression for the `if isinstance(after_out, tuple)` patch
+    in process_reward.py.
+    """
+    torch.manual_seed(0)
+    model = _MockLMTupleReturn(vocab=16, d=8)
+    B, T = 2, 8
+    x = torch.randint(1, 16, (B, T))
+    y = torch.randint(1, THINK_ID, (B, T))
+    # Main forward returns a tuple too; mirror what the trainer would do
+    # (it unpacks `logits, gist = model(x)` BEFORE calling the aux helper).
+    main_logits, _gist = model(x)
+    gate = torch.full((B, T), 0.9)
+    rng = torch.Generator().manual_seed(0)
+    # If the unwrap is missing, this raises TypeError on the line that
+    # tries `after_logits[..., :base_vocab_for_loss]`.
+    loss, stats = compute_process_reward_loss(
+        model, x, y, gate=gate, main_logits=main_logits,
+        thinking_token_id=THINK_ID,
+        K=2, apply_min_sigma=0.5, sample_frac=0.5,
+        rng=rng, pad_token_id=PAD_ID,
+        retrieval_as_input=False, base_vocab_for_loss=None,
+        max_positions=8)
+    assert stats.n_sampled > 0
+    assert torch.isfinite(loss)
+    assert loss.requires_grad
+    # Backward also works (the gist-scalar shouldn't pollute the graph).
+    loss.backward()

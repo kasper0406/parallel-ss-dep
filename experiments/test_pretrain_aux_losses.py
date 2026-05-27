@@ -318,3 +318,171 @@ def test_cfg_dict_carries_new_fields():
     assert cfg["refinement_head_window"] == 64
     assert cfg["refinement_head_alpha_init"] == 0.25
     assert cfg["think_index_emb_size"] == 8
+
+
+# ---------------------------------------------------------------------------
+# 5. End-to-end smoke tests — the wired trainer paths (Gap 1)
+#
+# We don't construct a real TinyLM (FLA Triton kernels need CUDA + we want
+# <5s CPU-only tests). Instead we faithfully emulate the *step body* of
+# both train_lm.py and sft_code.py inline against the same _MockLM the
+# other tests use. The structural pieces being exercised:
+#   - main forward + per-token CE
+#   - snapshot of `main_gate` / `main_gate_logits` BEFORE any aux forward
+#   - if use_process_reward: pr_loss is added (with weight=0.1)
+#   - if use_gate_calibration: gc_loss is added (with weight=0.1, snapshot
+#     gate_logits passed in to avoid the overwrite-bug fixed by the
+#     snapshot)
+#   - total.backward() + opt.step()
+#
+# Assertions: no exception, total is finite, gate_head's gradient is
+# non-zero (proves BCE backprop reached), trunk (head/embed) parameters
+# changed after the step.
+# ---------------------------------------------------------------------------
+
+def _emulate_step_body(model, x, y, *, args_proc_w, args_gc_w,
+                       proc_K=2, gc_K=2,
+                       proc_sample_frac=0.5, gc_sample_frac=0.5,
+                       proc_max_positions=8, gc_max_positions=8,
+                       retrieval_as_input=False,
+                       base_vocab_for_loss=None,
+                       smooth_target_scale=0.0):
+    """Re-implements the relevant slice of train_lm.py / sft_code.py
+    step body. Returns (total_loss, pr_stats, gc_stats)."""
+    import torch.nn.functional as F
+    # --- Main forward, LM loss --------------------------------------------
+    logits = model(x)
+    # The trainers slice logits to base_vocab_for_loss when thinking is on;
+    # here base_vocab_for_loss=None mirrors the pretrain default.
+    main_logits = (
+        logits[..., :base_vocab_for_loss]
+        if base_vocab_for_loss is not None else logits)
+    shift_logits = main_logits[:, :-1].contiguous()
+    shift_labels = y[:, 1:].contiguous()
+    lm_loss = F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1), ignore_index=-100)
+    total = lm_loss
+
+    # --- Snapshot BEFORE any aux forward (the train_lm.py:1407 / sft_code.py
+    # :1334 fix) -------------------------------------------------------
+    main_gate = model._last_gate
+    main_gate_logits = model._last_gate_logits
+
+    use_proc = args_proc_w > 0.0
+    use_gc = args_gc_w > 0.0
+    pr_stats = None
+    gc_stats = None
+
+    if use_proc and main_gate is not None:
+        rng = torch.Generator(device="cpu").manual_seed(0)
+        pr_loss, pr_stats = compute_process_reward_loss(
+            model, x, y,
+            gate=main_gate, main_logits=main_logits,
+            thinking_token_id=THINK_ID, K=proc_K,
+            apply_min_sigma=0.3, sample_frac=proc_sample_frac,
+            rng=rng, pad_token_id=PAD_ID,
+            retrieval_as_input=retrieval_as_input,
+            base_vocab_for_loss=base_vocab_for_loss,
+            max_positions=proc_max_positions,
+        )
+        if pr_stats.n_sampled > 0:
+            total = total + args_proc_w * pr_loss
+
+    if use_gc and main_gate is not None:
+        rng = torch.Generator(device="cpu").manual_seed(1)
+        gc_loss, gc_stats = compute_gate_calibration_loss(
+            model, x, y,
+            gate=main_gate, main_logits=main_logits,
+            thinking_token_id=THINK_ID, K=gc_K,
+            apply_min_sigma=0.1, apply_max_sigma=0.9,
+            sample_frac=gc_sample_frac,
+            rng=rng, pad_token_id=PAD_ID,
+            retrieval_as_input=retrieval_as_input,
+            base_vocab_for_loss=base_vocab_for_loss,
+            max_positions=gc_max_positions,
+            gate_logits=main_gate_logits,       # <-- snapshot, not re-read
+            smooth_target_scale=smooth_target_scale,
+        )
+        if gc_stats.n_sampled > 0:
+            total = total + args_gc_w * gc_loss
+
+    return total, pr_stats, gc_stats
+
+
+def test_train_lm_step_body_end_to_end():
+    """Emulates one optimizer step of train_lm.py with BOTH aux losses
+    enabled. Verifies: no exception, total loss finite, gate_head sees
+    a non-zero gradient (BCE backprop reached), trunk params change.
+    """
+    torch.manual_seed(0)
+    model = _MockLM(vocab=16, d=8)
+    # Drive the gate high enough to give both selectors candidates in
+    # their respective windows ([0.3,1] for process_reward, [0.1,0.9]
+    # for gate_calibration).
+    with torch.no_grad():
+        model.gate_head.bias.fill_(0.5)  # σ(0.5) ≈ 0.62 → both windows hit
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    # Snapshot trunk weights pre-step.
+    head_before = model.head.weight.detach().clone()
+    embed_before = model.embed.weight.detach().clone()
+    x, y = _build_inputs(B=2, T=12, vocab=16)
+
+    total, pr_stats, gc_stats = _emulate_step_body(
+        model, x, y,
+        args_proc_w=0.1, args_gc_w=0.1)
+    assert pr_stats is not None and pr_stats.n_sampled > 0
+    assert gc_stats is not None and gc_stats.n_sampled > 0
+    assert torch.isfinite(total)
+    opt.zero_grad(set_to_none=True)
+    total.backward()
+    # Gate-head MUST have received gradient through the BCE term.
+    g = model.gate_head.weight.grad
+    assert g is not None, "gate_head.weight has no grad after backward"
+    assert g.abs().sum() > 0, "gate_head got zero gradient"
+    opt.step()
+    # All params finite.
+    for p in model.parameters():
+        assert torch.isfinite(p).all()
+    # Trunk params actually moved.
+    assert not torch.allclose(model.head.weight, head_before), (
+        "head.weight did not change after one optimizer step")
+    assert not torch.allclose(model.embed.weight, embed_before), (
+        "embed.weight did not change after one optimizer step")
+
+
+def test_sft_code_step_body_end_to_end():
+    """Emulates one optimizer step of sft_code.py's legacy forward path
+    with BOTH aux losses enabled. Distinct from the train_lm test by
+    enabling `smooth_target_scale=1.0` (a flag sft_code.py exposes and
+    that we want covered) and using a slightly different seed/batch
+    shape. Asserts the same invariants: no exception, finite loss,
+    non-zero gate-head gradient, trunk params change.
+    """
+    torch.manual_seed(1)
+    model = _MockLM(vocab=16, d=8)
+    with torch.no_grad():
+        model.gate_head.bias.fill_(0.5)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    head_before = model.head.weight.detach().clone()
+    gate_head_before = model.gate_head.weight.detach().clone()
+    x, y = _build_inputs(B=2, T=14, vocab=16)
+
+    total, pr_stats, gc_stats = _emulate_step_body(
+        model, x, y,
+        args_proc_w=0.1, args_gc_w=0.1,
+        proc_K=2, gc_K=2,
+        smooth_target_scale=1.0)
+    assert pr_stats is not None and pr_stats.n_sampled > 0
+    assert gc_stats is not None and gc_stats.n_sampled > 0
+    assert torch.isfinite(total)
+    opt.zero_grad(set_to_none=True)
+    total.backward()
+    g = model.gate_head.weight.grad
+    assert g is not None and g.abs().sum() > 0, (
+        "gate_head did not receive BCE gradient")
+    opt.step()
+    for p in model.parameters():
+        assert torch.isfinite(p).all()
+    assert not torch.allclose(model.head.weight, head_before)
+    assert not torch.allclose(model.gate_head.weight, gate_head_before)

@@ -411,3 +411,150 @@ def test_end_to_end_one_step_finite():
     opt.step()
     for p in model.parameters():
         assert torch.isfinite(p).all()
+
+
+# ---------- 11. retrieval_as_input=True branch (Gap 2) -----------------
+
+class _MockMemory(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._last_injection = None
+
+
+class _MockLMWithRetrieval(nn.Module):
+    """Same surface as `_MockLM` plus `memory._last_injection` +
+    `retrieval_input_alpha` so `_retrieval_input_embeds` can run.
+    Captures every forward call's `inputs_embeds` kwarg.
+    """
+    def __init__(self, vocab: int = 16, d: int = 8):
+        super().__init__()
+        self.vocab = vocab
+        self.d = d
+        self.embed = nn.Embedding(vocab, d)
+        self.head = nn.Linear(d, vocab)
+        self.gate_head = nn.Linear(d, 1)
+        self.memory = _MockMemory()
+        self.retrieval_input_alpha = nn.Parameter(torch.tensor(0.7))
+        self._last_gate = None
+        self._last_gate_logits = None
+        self.captured_inputs_embeds = []
+
+    def forward(self, x, inputs_embeds=None, return_hidden=False):
+        self.captured_inputs_embeds.append(
+            None if inputs_embeds is None else inputs_embeds.detach().clone())
+        h = inputs_embeds if inputs_embeds is not None else self.embed(x)
+        h = h + h.tanh() * 0.01
+        self.memory._last_injection = h.detach().clone()
+        gl = self.gate_head(h).squeeze(-1)
+        self._last_gate_logits = gl
+        self._last_gate = torch.sigmoid(gl)
+        logits = self.head(h)
+        if return_hidden:
+            return logits, h
+        return logits
+
+
+def test_gate_calibration_retrieval_as_input_branch():
+    """`compute_gate_calibration_loss(retrieval_as_input=True)` must
+    route the after-forward through `_retrieval_input_embeds` (1
+    no_grad warm-up forward to populate `memory._last_injection`, then
+    the real after-forward with a custom `inputs_embeds`). All under
+    `torch.no_grad()` since the gate-calibration after-forward only
+    produces labels for BCE.
+    """
+    torch.manual_seed(0)
+    model = _MockLMWithRetrieval()
+    B, T = 2, 8
+    x = torch.randint(1, THINK_ID, (B, T))
+    y = torch.randint(1, THINK_ID, (B, T))
+    main_logits = model(x)
+    n_before = len(model.captured_inputs_embeds)
+    gate = model._last_gate
+    gate_logits = model._last_gate_logits
+    rng = torch.Generator().manual_seed(0)
+    loss, stats = compute_gate_calibration_loss(
+        model, x, y, gate=gate, main_logits=main_logits,
+        thinking_token_id=THINK_ID,
+        K=2, apply_min_sigma=0.1, apply_max_sigma=0.9,
+        sample_frac=0.5, rng=rng, pad_token_id=PAD_ID,
+        retrieval_as_input=True,
+        base_vocab_for_loss=None,
+        gate_logits=gate_logits, max_positions=8)
+    assert stats.n_sampled > 0
+    n_after = len(model.captured_inputs_embeds)
+    # Exactly two extra forwards: the no_grad warm-up (no inputs_embeds)
+    # and the after-forward (with custom inputs_embeds).
+    assert n_after - n_before == 2, (
+        f"expected 2 extra forwards, got {n_after - n_before}")
+    warmup_kwarg = model.captured_inputs_embeds[n_before]
+    after_kwarg = model.captured_inputs_embeds[n_before + 1]
+    assert warmup_kwarg is None, (
+        "warm-up forward should NOT pass inputs_embeds (it builds the "
+        "injection)")
+    assert after_kwarg is not None, (
+        "after-forward MUST pass a custom inputs_embeds when "
+        "retrieval_as_input=True")
+    assert after_kwarg.shape[0] == stats.n_sampled
+    assert after_kwarg.shape[2] == model.d
+    # Loss is finite, computed via BCE on the gate.
+    assert torch.isfinite(loss)
+    assert loss.requires_grad         # gradient flows via gate_logits
+    loss.backward()
+    assert model.gate_head.weight.grad is not None
+
+
+# ---------- 12. Tuple-return survival (Gap 3) --------------------------
+
+class _MockLMTupleReturn(nn.Module):
+    """`forward(x)` returns `(logits, gist_scalar)` mimicking
+    `TinyLM.forward` in training-mode with gist_loss enabled.
+    """
+    def __init__(self, vocab: int = 16, d: int = 8):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, d)
+        self.head = nn.Linear(d, vocab)
+        self.gate_head = nn.Linear(d, 1)
+        self._last_gate = None
+        self._last_gate_logits = None
+
+    def forward(self, x, inputs_embeds=None, return_hidden=False):
+        h = inputs_embeds if inputs_embeds is not None else self.embed(x)
+        h = h + h.tanh() * 0.01
+        gl = self.gate_head(h).squeeze(-1)
+        self._last_gate_logits = gl
+        self._last_gate = torch.sigmoid(gl)
+        logits = self.head(h)
+        gist_scalar = h.mean() * 0.0
+        if return_hidden:
+            return (logits, h)
+        return (logits, gist_scalar)
+
+
+def test_gate_calibration_handles_tuple_forward_return():
+    """When `model(x)` returns `(logits, gist_scalar)` (training-mode
+    gist-loss path), `compute_gate_calibration_loss` must unwrap the
+    tuple before reading `after_logits[..., :base_vocab_for_loss]`.
+    Without the patch this raises TypeError.
+    """
+    torch.manual_seed(0)
+    model = _MockLMTupleReturn()
+    B, T = 2, 8
+    x = torch.randint(1, 16, (B, T))
+    y = torch.randint(1, THINK_ID, (B, T))
+    main_logits, _gist = model(x)        # caller unwraps tuple itself
+    gate = model._last_gate
+    gate_logits = model._last_gate_logits
+    rng = torch.Generator().manual_seed(0)
+    loss, stats = compute_gate_calibration_loss(
+        model, x, y, gate=gate, main_logits=main_logits,
+        thinking_token_id=THINK_ID,
+        K=2, apply_min_sigma=0.1, apply_max_sigma=0.9,
+        sample_frac=0.5, rng=rng, pad_token_id=PAD_ID,
+        retrieval_as_input=False,
+        base_vocab_for_loss=None,
+        gate_logits=gate_logits, max_positions=8)
+    assert stats.n_sampled > 0
+    assert torch.isfinite(loss)
+    assert loss.requires_grad
+    loss.backward()
+    assert model.gate_head.weight.grad is not None

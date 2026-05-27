@@ -57,6 +57,7 @@ from experiments.model import (
     TinyLM, _shift_right_by_k, _shift_right_by_1,
 )
 from experiments.decode_bench import _block_with_cache
+from experiments.thinking import cross_entropy_masking_token
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +84,15 @@ def load_film_ckpt(path: str, device: str = "cuda",
         feedback_mode=cfg.get("feedback_mode", "film"),
         feedback_pairs=cfg.get("feedback_pairs", ()),
         feedback_self_k=self_k,
+        # If the ckpt was trained with L_sem (Phase 22), it carries a
+        # W_semantic projection in the state_dict. Re-instantiate the
+        # layer here so the weights load cleanly. The W is not needed at
+        # inference; it sits unused.
+        semantic_loss_dim=cfg.get("semantic_loss_dim", 0)
+            or (cfg["d_model"] if cfg.get("semantic_loss_beta", 0.0) > 0.0 else 0),
     ).to(device)
     model.load_state_dict(ckpt["state_dict"])
+    model.thinking_token_id = cfg.get("thinking_token_id")
     model.eval()
     # Set layer_idx on every fla DeltaNet layer for cache plumbing.
     for L, blk in enumerate(model.blocks):
@@ -146,10 +154,15 @@ def eval_model_forward_ppl(model, chunks: torch.Tensor, batch: int = 2) -> tuple
         x = batch_chunks[:, :-1]
         y = batch_chunks[:, 1:]
         logits = model(x)
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]).float(), y.reshape(-1),
-            reduction="sum",
-        )
+        flat_logits = logits.reshape(-1, logits.shape[-1]).float()
+        flat_y = y.reshape(-1)
+        thinking_token_id = getattr(model, "thinking_token_id", None)
+        if thinking_token_id is None:
+            loss = F.cross_entropy(flat_logits, flat_y, reduction="sum")
+        else:
+            loss = cross_entropy_masking_token(
+                flat_logits, flat_y, int(thinking_token_id), reduction="sum"
+            )
         losses_sum += float(loss.item())
         n_tokens += y.numel()
     mean_ce = losses_sum / n_tokens
@@ -207,11 +220,15 @@ def eval_lagged_cached_ppl(model, chunks: torch.Tensor) -> tuple:
         y = chunk[:, 1:]
         logits = lagged_cached_logits_one_seq(model, x,
                                                 target=target, source=source)
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]).float(),
-            y.reshape(-1),
-            reduction="sum",
-        )
+        flat_logits = logits.reshape(-1, logits.shape[-1]).float()
+        flat_y = y.reshape(-1)
+        thinking_token_id = getattr(model, "thinking_token_id", None)
+        if thinking_token_id is None:
+            loss = F.cross_entropy(flat_logits, flat_y, reduction="sum")
+        else:
+            loss = cross_entropy_masking_token(
+                flat_logits, flat_y, int(thinking_token_id), reduction="sum"
+            )
         losses_sum += float(loss.item())
         n_tokens += y.numel()
         now = time.perf_counter()

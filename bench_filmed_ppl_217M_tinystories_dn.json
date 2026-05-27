@@ -1,0 +1,24 @@
+{
+  "ckpt": "checkpoints/dn_baseline_30L_217M_tinystories_seed0.pt",
+  "T": 512,
+  "n_chunks": 64,
+  "n_eval_tokens": 32768,
+  "config": {
+    "d_model": 576,
+    "n_layers": 30,
+    "feedback_pairs": [],
+    "feedback_mode": "none",
+    "feedback_self_k": 0,
+    "feedback_alpha_mode": "scalar"
+  },
+  "training_protocol": {
+    "ce": 1.9037372320890427,
+    "ppl": 6.710927930373725,
+    "n_tokens": 32768,
+    "elapsed_s": 0.7069468840491027
+  },
+  "self_consistency": {
+    "feedback_self_k": 0,
+    "note": "no self-feeding; skipped"
+  }
+}

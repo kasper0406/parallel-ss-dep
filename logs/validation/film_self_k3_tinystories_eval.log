@@ -1,0 +1,18 @@
+GPU: NVIDIA GeForce RTX 5090
+Loading checkpoint: checkpoints/film_self_k3_30L_217M_tinystories_seed0.pt
+  config: {'d_model': 576, 'n_layers': 30, 'feedback_pairs': [(2, 28)], 'feedback_mode': 'film', 'feedback_self_k': 3, 'feedback_alpha_mode': 'scalar'}
+Loading roneneldan/TinyStories val tail (skip=10_000) at T=512 ...
+  64 chunks × T=512 = 32768 eval tokens
+
+--- Training-protocol PPL (model's K-iter self-feeding forward) ---
+  CE  = 1.8939
+  PPL = 6.6454
+  (32768 tokens, 1.3s)
+
+--- Self-consistency norms (prev_iter vs final_iter source state) ---
+  {'feedback_self_k': 3, 'n_batches': 16, 'abs_norm_mean': 931.2846946716309, 'final_norm_mean': 8757.458068847656, 'rel_norm_mean': 0.10635201028257489}
+  (1.0s)
+
+--- (Skipping 2-pass and lagged-cached — no FiLM pair) ---
+
+Results written to bench_filmed_ppl_217M_tinystories_k3.json

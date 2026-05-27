@@ -931,3 +931,90 @@ Recommended next steps for proper-LLM integration:
 3. Test on TinyStories to see if win is code-specific or general
 4. If all positive: distillation experiment from Qwen2.5-Coder using sparse-feedback backbone
 5. Or scale up directly: 350-500M / 10-20B tokens / 1-2 weeks on 2× 5090
+
+---
+
+# Session 2026-05-12 — Bounded Working Memory for DeltaNet
+
+**Full write-up:** [`WORKING_MEMORY_FINDINGS.md`](WORKING_MEMORY_FINDINGS.md).
+
+**Headline:** added `WorkingMemory` to TinyLM — bounded write-gated buffer
+of past hidden states with soft-attention reads at chosen positions, cost
+O(T·K·d). On MQAR at the saturation regime, +10–11 pp recall over DN
+baseline; at T=1024/K=128 the baseline never escapes uniform prior in
+16,000 steps while DN+memory reaches 0.310. At T=2048 the envelope closes
+again — memory extends working-T ~2× at fixed model size.
+
+**Cross-task ablation** establishes a **read-event-density threshold**:
+many reads/seq → memory helps (MQAR, dyck); one read/seq → memory hurts
+(induction, −28 pp gradient starvation).
+
+**Killed predecessor:** the old "Continuous RAG" path had `rag_projection.weight`
+zero-initialised AND was never passed into the loss-bearing forward, so its
+gradient was structurally zero. Two RL runs with vs without `--enable_rag`
+produced bit-identical TB scalars — diagnostic preserved in `CLAUDE.md`.
+
+**Distillation + SFT pipeline:** wired end-to-end (Qwen3.6-35B-A3B-AWQ
+teacher → student via KL on top-20 logprobs → SFT on MBPP+CodeAlpaca).
+Val PPL 81 → 41 → SFT loss ~2 but HumanEval pass@1 stays at 0/50 at
+this data scale. Bottleneck is data, not architecture.
+
+**Files added this session:**
+- `experiments/model.py::WorkingMemory` + `mem_read_mask` threading.
+- `experiments/code_grader.py` (HumanEval + MBPP unit-test grader).
+- `experiments/probe_thinking.py` (gate/memory ckpt diagnostics).
+- `experiments/sft_code.py` (supervised instruction-tune from a distilled ckpt).
+- `scripts/aggregate_mqar_sweep.py`, `scripts/aggregate_longctx_recall.py`.
+- `launch_mqar_boundary.sh`, `launch_longctx_recall.sh`, `launch_longctx_d256.sh`.
+
+**Memory notes** (in `/home/knielsen/.claude/projects/.../memory/`):
+- `project_super_coder_vision.md`
+- `project_working_memory_win.md`
+- `project_memory_read_density.md`
+- `project_base_ckpt_undertrained.md`
+- `project_distillation_run_2026_05_12.md`
+- `project_sft_run_2026_05_12.md`
+- `project_longctx_recall_2026_05_12.md`
+
+---
+
+# Session findings — Residual-stream collapse, the WD fix, and the v3 family
+
+**Date:** 2026-05-14
+**Question:** Why is the 217 M pretrain undertraining so badly (0/50 HumanEval, modest loss gains), and is it fixable?
+
+## What was built
+- `experiments/diag_ckpt.py` — per-layer logit-lens CE, hidden effective rank, ||h|| + Δh/||h_prev||, per-source held-out CE. Importable `run_diag(...)`.
+- `experiments/diag_reference_lm.py` — same metrics for a HuggingFace causal LM; SmolLM2-135M (30L×576d, matched shape) is the reference.
+- `experiments/profile_train.py` — torch.profiler harness on the real train config; A/B `--compile` / `--film_bypass`.
+- `experiments/build_arch.py` — extracted `build_arch`/`parse_layers_arg` (latent refactor bug: `model_builder.py` imported a module that never existed).
+- Per-layer grad-norm + update-to-weight-ratio logging in `train_lm.py` (default-on).
+- `--wd`, `--lr_schedule {cosine,wsd}` (+`--warmup_steps`,`--lr_decay_frac`), `--compile`, `--feedback_self_k_warmup_steps`, `--layer_drop_max` CLI flags.
+- Dense `code_grader.py` (tier ladder + fractional `score` + `error_text`); `experiments/test_code_grader.py` (15 tests).
+
+## Key findings
+
+### 1. Residual-stream collapse — the root cause
+`diag_ckpt` on v2's 500 M / 1 B mid-eval ckpts: ||h||@L0 *shrank* 8.1 → 3.5; the whole residual stream was thin (||h||@L29 ≈ 5) and diffuse (effrank ~340–395). SmolLM2-135M on the same data: ||h||@L0 ≈ 44, growing **20× over depth** to ~827. The "dead logit-lens until L27" we'd worried about turned out to be **normal** — SmolLM2 has the identical lens shape. The real pathology was the residual magnitude, and the cause was **weight decay 0.1 holding weights too small** → block contributions vanish.
+
+### 2. The WD fix (v3a)
+`--wd 0.01` (vs the legacy hard-coded 0.1). v3a: ||h||@L0 23.5 growing 7×, and **beat v2 on every per-source CE** — overall 1.98 vs 2.20, bigvul 2.43 vs 3.25. v2 had been *regressing* on the hard CVE streams (bigvul 2.96→3.25 over 500 M→1 B); v3a fixed that. WD=0.1 is a Moonlight-scale (5.7 T-token) setting; at ~5–10 tok/param it's pure brake.
+
+### 3. LayerDrop — clean negative result (v3b)
+`--layer_drop_max 0.2` (linear 0→0.2 Stochastic Depth). It *did* what the technique promises — logit-lens saturates ~5 layers earlier, depth utilisation redistributed — but made L25–L29 vestigial (Δh/||h_prev|| ≈ 0.2, flat lensCE) and cost ~0.02–0.10 CE on **every** source vs v3a. It fixes depth-concentration, but depth-concentration was never the bottleneck. **Don't use it.**
+
+### 4. The schedule artifact → WSD
+v3a's "modest 500 M→1 B gain" was a cosine-schedule artifact: `T_max=70k` floored the LR exactly when token counts got interesting. v3-long (`--wd 0.01`, 149 k steps, only the schedule changed) keeps descending — overall CE 2.11 @1 B → **1.92 @1.5 B, already past v3a/v3b's finals** with the decay tail still ahead. Added WSD (warmup-stable-decay) as the new default schedule: constant peak LR for the bulk, no wasted low-LR tail, stoppable anywhere.
+
+### 5. Persistent unsolved problem — hard-stream drift
+`bigvul`/`cybernative` CE drifts *upward* across 500 M→1 B→1.5 B in **every** run (v2, v3a, v3-long). WD fixed the residual collapse but not this — it's mix imbalance / easy-data gradient dominance. v4 mix re-weighting is the lever.
+
+## Decisions locked in
+- `--wd 0.01` mandate (residual-collapse fix).
+- `--lr_schedule wsd` is the default for new runs.
+- LayerDrop stays in the code but off — negative result.
+- Dense execution-grounded grading for GRPO; **not** embedding-similarity-to-reference (hackable, no single target).
+- v4 = re-weighted mix + the staged knobs.
+
+## Runs
+- v2: killed at ~1 B (residual collapse). v3a: 70 k/1 B, done. v3b: 70 k/1 B + LayerDrop, done. v3-long: 149 k/2.13 B, active.

@@ -1,0 +1,25 @@
+GPU: NVIDIA GeForce RTX 5090  arch=deltanet
+Loading tokeniser HuggingFaceTB/SmolLM2-135M ...
+  vocab size: 49152
+Loading dataset roneneldan/TinyStories (streaming) ...
+  params: 217.3M  aux_dim=0  feedback=film@d=1
+Loading frozen encoder: checkpoints/dn_baseline_30L_217M_tinystories_seed0.pt
+  encoder: 216.3M params (no oracle: uniform/per-token/KL mode)
+  semantic_loss_beta = 1.0 (token-granularity per-position cosine alignment)
+
+  step     tok/s     tloss        ce      lsem    ntok         lr
+   500     16080    3.7585    3.7585    0.3801  4096.0   2.93e-04  α=[2<-28:-0.049]
+  1000     16208    2.7030    2.7030    0.1974  4096.0   2.74e-04  α=[2<-28:-0.051]
+  1500     16178    2.3179    2.3179    0.1330  4096.0   2.44e-04  α=[2<-28:-0.049]
+  2000     16208    2.3107    2.3107    0.1014  4096.0   2.07e-04  α=[2<-28:-0.049]
+  2500     16215    2.1527    2.1527    0.0867  4096.0   1.65e-04  α=[2<-28:-0.049]
+        VAL  loss=1.8438  ppl=6.32
+  3000     15981    2.0618    2.0618    0.0780  4096.0   1.23e-04  α=[2<-28:-0.049]
+  3500     16194    2.0072    2.0072    0.0712  4096.0   8.56e-05  α=[2<-28:-0.048]
+  4000     16180    1.9464    1.9464    0.0671  4096.0   5.58e-05  α=[2<-28:-0.047]
+  4500     16203    1.8855    1.8855    0.0646  4096.0   3.66e-05  α=[2<-28:-0.047]
+  5000     16191    1.9659    1.9659    0.0616  4096.0   3.00e-05  α=[2<-28:-0.047]
+        VAL  loss=1.6383  ppl=5.15
+
+Done in 1269s (254 ms/step avg).
+Checkpoint saved to checkpoints/film_self_k3_lsem_pertoken_b10_30L_217M_tinystories_seed0.pt

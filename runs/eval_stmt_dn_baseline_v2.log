@@ -1,0 +1,49 @@
+GPU: NVIDIA GeForce RTX 5090
+Loading checkpoint: /home/knielsen/ml/parallel-ss-dep/checkpoints/dn_baseline_30L_217M_for_oracle.pt
+  config: {'d_model': 576, 'n_layers': 30, 'feedback_pairs': [], 'feedback_self_k': 0, 'feedback_alpha_mode': 'scalar'}
+
+Building val-tail file chunks at T=512, n_eval_tokens=32768 ...
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (15558 > 8192). Running this sequence through the model will result in indexing errors
+<unknown>:37: SyntaxWarning: invalid escape sequence '\s'
+<unknown>:80: SyntaxWarning: invalid escape sequence '\>'
+<unknown>:87: SyntaxWarning: invalid escape sequence '\!'
+<unknown>:60: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:64: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:65: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:701: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:889: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:1244: SyntaxWarning: invalid escape sequence '\d'
+<unknown>:1337: SyntaxWarning: invalid escape sequence '\('
+<unknown>:2392: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:2443: SyntaxWarning: invalid escape sequence '\_'
+<unknown>:2587: SyntaxWarning: invalid escape sequence '\_'
+  67 files, 33013 real tokens, 1604 statements
+
+--- Per-statement metrics (overall PPL) ---
+  overall CE  = 3.8529
+  overall PPL = 47.1277
+  (22047 stmt-internal tokens, 0.8s)
+
+Loading frozen encoder from /home/knielsen/ml/parallel-ss-dep/checkpoints/dn_baseline_30L_217M_for_oracle.pt ...
+Loading oracle head from /home/knielsen/ml/parallel-ss-dep/checkpoints/oracle_predictive_head_217M.pt ...
+
+--- Computing oracle surprise per statement ---
+  (0.6s)
+
+--- Decile-binned metrics ---
+  Overall:        n_stmts=1604, n_tokens=22047, PPL=47.1277
+  Top decile:     n_stmts=153, n_tokens=2054, PPL=53.3953, surprise_range=[0.5489,0.9441]
+  Bottom decile:  n_stmts=153, n_tokens=2104, PPL=47.7049, surprise_range=[0.0361,0.1144]
+  Per-decile PPL (low to high surprise):
+    D0: n_stmts=153, n_toks=2104, PPL=47.7049, surp=[0.0361,0.1144]
+    D1: n_stmts=154, n_toks=1770, PPL=33.1217, surp=[0.1144,0.1581]
+    D2: n_stmts=154, n_toks=1693, PPL=30.0025, surp=[0.1583,0.1902]
+    D3: n_stmts=153, n_toks=1768, PPL=47.2237, surp=[0.1906,0.2237]
+    D4: n_stmts=154, n_toks=2068, PPL=33.0246, surp=[0.2240,0.2619]
+    D5: n_stmts=154, n_toks=1918, PPL=48.7506, surp=[0.2625,0.3039]
+    D6: n_stmts=153, n_toks=2391, PPL=53.0569, surp=[0.3040,0.3594]
+    D7: n_stmts=154, n_toks=2132, PPL=48.9021, surp=[0.3598,0.4306]
+    D8: n_stmts=154, n_toks=2477, PPL=51.3117, surp=[0.4327,0.5478]
+    D9: n_stmts=154, n_toks=2063, PPL=52.8749, surp=[0.5488,0.9441]
+
+Results written to bench_stmt_ppl_dn_baseline_v2.json

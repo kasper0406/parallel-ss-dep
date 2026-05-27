@@ -27,110 +27,214 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset
 
 from experiments.layers import (
-    DeltaNetAttention, DeltaNetNegEigAttention, GatedDeltaNetAttention,
-    DeltaNetForgetGateAttention,
-    GatedDeltaProductAttention,
-    OrthogonalScanAttention, SymbolGroundedAttention,
-    HeisenbergAttention, MultiPassAttention,
+    DeltaNetAttention,
     SoftmaxAttention, Mamba2Attention,
 )
 from experiments.model import TinyLM
 from experiments.aux_brackets import compute_bracket_deltas, bracket_depth
+from experiments.gist_loss import build_gist_heads, parse_horizons
+from experiments.process_reward import (
+    compute_process_reward_loss,
+    compute_gate_calibration_loss,
+)
+from experiments.thinking import (
+    ThinkContinuation,
+    ThinkContinuationQueue,
+    ThinkReplay,
+    ThinkReplayQueue,
+    build_continuation_batch,
+    build_replay_batch,
+    choose_explore_actions,
+    choose_think_actions,
+    cross_entropy_masking_token,
+    mask_token_logit,
+)
 
 
-_NAME_TO_CLS = {
-    "deltanet":   DeltaNetAttention,
-    "deltanet_negeig": DeltaNetNegEigAttention,
-    "deltanet_forgetgate": DeltaNetForgetGateAttention,
-    "gated_deltanet": GatedDeltaNetAttention,
-    "gated_deltaproduct": GatedDeltaProductAttention,
-    "ortho":      OrthogonalScanAttention,
-    "transformer": SoftmaxAttention,
-    "mamba2":     Mamba2Attention,
-}
+from experiments.build_arch import build_arch, parse_layers_arg, _NAME_TO_CLS  # noqa: F401
 
 
-def _make_sg_factory(vocab_size: int, n_symbols: int):
-    """Factory closure for SymbolGroundedAttention with vocab params bound."""
-    def _f(**kw):
-        return SymbolGroundedAttention(vocab_size=vocab_size, n_symbols=n_symbols, **kw)
-    return _f
+# ---------------------------------------------------------------------------
+# Per-layer learning diagnostics. Logged every --log_every steps to answer a
+# specific question: are early layers gradient-starved (the vanishing-gradient
+# signature) or is the gradient healthy and "slow early layers" just a misread
+# of the logit-lens? Cheap — grad norms are free post-backward; the
+# update-ratio clones one matrix per block on log steps only.
+
+def _block_repr_weight(blk):
+    """First 2D weight in a block — the representative matrix tracked for the
+    update-to-weight ratio."""
+    return next((p for p in blk.parameters() if p.ndim == 2), None)
 
 
-def build_arch(name: str, n_layers: int, vocab_size: int = 0, n_symbols: int = 512):
-    """Map an arch name to either a single attention class or a per-layer list.
+def _block_grad_norms(model) -> list[float]:
+    """Per-block total gradient L2 norm. Call after backward(), before clip."""
+    out = []
+    for blk in model.blocks:
+        sq = 0.0
+        for p in blk.parameters():
+            if p.grad is not None:
+                sq += float(p.grad.detach().float().pow(2).sum())
+        out.append(sq ** 0.5)
+    return out
 
-    For shorthand patterns:
-      hybrid        — alternating ortho/deltanet (50/50, ortho first).
-      hybrid_25_75  — 1 ortho + 3 deltanet, repeating.
-      hybrid_75_25  — 3 ortho + 1 deltanet, repeating.
-    Or use --layers for an explicit comma-separated list.
+
+def _block_weight_snapshot(model) -> list:
+    """Clone each block's representative weight (call pre-step)."""
+    snap = []
+    for blk in model.blocks:
+        w = _block_repr_weight(blk)
+        snap.append(None if w is None else w.detach().clone())
+    return snap
+
+
+def _block_update_ratios(model, snapshot) -> list[float]:
+    """‖ΔW‖/‖W‖ for each block's representative weight (call post-step)."""
+    out = []
+    for blk, w_before in zip(model.blocks, snapshot):
+        w_after = _block_repr_weight(blk)
+        if w_before is None or w_after is None:
+            out.append(float("nan"))
+            continue
+        delta = float((w_after.detach() - w_before).float().norm())
+        denom = max(float(w_before.float().norm()), 1e-9)
+        out.append(delta / denom)
+    return out
+
+
+def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
+                           doc_ids=None, gist_horizons=None):
+    """Forward + LM loss for the non-thinking-token (pretrain) path.
+
+    Returns (logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss,
+    gist_loss). Factored out of the step loop so gradient accumulation
+    can run it once per microbatch. Mirrors the inline forward +
+    gate/plain-loss branches exactly.
+
+    When `gist_horizons` is set and --gist_loss_weight > 0, the model
+    computes the multi-horizon trunk gist loss INSIDE its forward and
+    returns it as a scalar (model._gist_loss_enabled gates it). Not
+    supported together with --aux_brackets.
+
+    When --gate_entropy_aux_weight > 0, the gate logit gets an auxiliary
+    BCE target derived from the SAME forward's per-position next-token
+    entropy (detached): target_t = exp(-H_t/T). High entropy ⇒ low target
+    ⇒ gate trained to close (think). Costs nothing extra — no second
+    forward, just turns the gate into a free predictive-uncertainty head.
     """
-    if name in _NAME_TO_CLS:
-        return dict(attention_cls=_NAME_TO_CLS[name])
-    if name == "hybrid":
-        cls = [OrthogonalScanAttention if i % 2 == 0 else DeltaNetAttention
-               for i in range(n_layers)]
-        return dict(attention_cls_per_layer=cls)
-    if name == "hybrid_25_75":
-        # 1 ortho + 3 deltanet pattern, ortho at every 4th position.
-        cls = [OrthogonalScanAttention if i % 4 == 0 else DeltaNetAttention
-               for i in range(n_layers)]
-        return dict(attention_cls_per_layer=cls)
-    if name == "hybrid_75_25":
-        # 3 ortho + 1 deltanet pattern.
-        cls = [DeltaNetAttention if i % 4 == 0 else OrthogonalScanAttention
-               for i in range(n_layers)]
-        return dict(attention_cls_per_layer=cls)
-    if name == "hybrid_negeig":
-        cls = [OrthogonalScanAttention if i % 2 == 0 else DeltaNetNegEigAttention
-               for i in range(n_layers)]
-        return dict(attention_cls_per_layer=cls)
-    # SymbolGrounded variants: need vocab_size + n_symbols bound at build time.
-    if name == "symgrounded":
-        sg = _make_sg_factory(vocab_size, n_symbols)
-        return dict(attention_cls=sg)
-    if name == "hybrid_sg":
-        # 50/50 alternating SymGrounded + DeltaNet (sg first).
-        sg = _make_sg_factory(vocab_size, n_symbols)
-        cls = [sg if i % 2 == 0 else DeltaNetAttention for i in range(n_layers)]
-        return dict(attention_cls_per_layer=cls)
-    if name == "hybrid_sg_25_75":
-        # 1 sg + 3 delta pattern (sparse symbolic).
-        sg = _make_sg_factory(vocab_size, n_symbols)
-        cls = [sg if i % 4 == 0 else DeltaNetAttention for i in range(n_layers)]
-        return dict(attention_cls_per_layer=cls)
-    # Multi-pass — direction B. K cells in parallel within each layer.
-    if name == "multipass_dh":
-        # DeltaNet + Heisenberg in parallel at every layer.
-        def _mp(**kw):
-            return MultiPassAttention(
-                cells=[DeltaNetAttention, HeisenbergAttention], **kw
-            )
-        return dict(attention_cls=_mp)
-    if name == "multipass_dho":
-        # DeltaNet + Heisenberg + Ortho in parallel.
-        def _mp(**kw):
-            return MultiPassAttention(
-                cells=[DeltaNetAttention, HeisenbergAttention,
-                       OrthogonalScanAttention], **kw
-            )
-        return dict(attention_cls=_mp)
-    if name == "multipass_dd":
-        # Two strong LM cells: DeltaNet + DeltaNet_negeig (allow_neg_eigval).
-        # Tests whether multi-pass helps when both cells are competent LMs.
-        def _mp(**kw):
-            return MultiPassAttention(
-                cells=[DeltaNetAttention, DeltaNetNegEigAttention], **kw
-            )
-        return dict(attention_cls=_mp)
-    raise ValueError(f"unknown arch: {name}")
+    want_gist = (gist_horizons is not None
+                 and getattr(args, "gist_loss_weight", 0.0) > 0.0)
+    if args.aux_brackets:
+        if want_gist:
+            raise SystemExit("--gist_loss_weight is not supported "
+                             "together with --aux_brackets.")
+        logits, aux_logits = model(x, return_aux=True, doc_ids=doc_ids)
+        depth = bracket_depth(x, bracket_deltas).clamp(0, args.aux_max_depth)
+        aux_loss = F.cross_entropy(
+            aux_logits.reshape(-1, args.aux_max_depth + 1),
+            depth.reshape(-1),
+        )
+        gist_loss = logits.new_zeros(())
+    elif want_gist:
+        # The model computes the gist loss inside the (compiled) forward
+        # and returns it as a scalar — see TinyLM._finalize. This keeps
+        # the hidden state from ever crossing the compile boundary.
+        logits, gist_loss = model(x, doc_ids=doc_ids)
+        aux_loss = logits.new_zeros(())
+    else:
+        logits = model(x, doc_ids=doc_ids)
+        aux_loss = logits.new_zeros(())
+        gist_loss = logits.new_zeros(())
+    V = logits.shape[-1]
+    ce_per_token = F.cross_entropy(
+        logits.reshape(-1, V), y.reshape(-1), reduction="none",
+    ).reshape(y.shape)                                                   # (B, T)
+    if args.output_gate:
+        g = model._last_gate                                             # (B, T)
+        if args.gate_warmup_steps > 0:
+            progress = min(1.0, step / args.gate_warmup_steps)
+            gate_floor = (1.0 - progress) * 1.0 + progress * args.gate_floor_min
+        else:
+            gate_floor = args.gate_floor_min
+        g_eff = g.clamp(min=gate_floor) if gate_floor > 0.0 else g
+        gate_terms = g_eff * ce_per_token + (1.0 - g_eff) * args.gate_lambda
+        valid = (y != -100).float()
+        denom = valid.sum().clamp(min=1.0)
+        lm_loss = (gate_terms * valid).sum() / denom
+    else:
+        valid = (y != -100).float()
+        denom = valid.sum().clamp(min=1.0)
+        lm_loss = (ce_per_token * valid).sum() / denom
+    # Entropy-grounded gate target (CE-reduction self-reward, cheap form).
+    gate_aux_loss = torch.zeros((), device=logits.device)
+    if args.output_gate and args.gate_entropy_aux_weight > 0.0:
+        gate_logits = model._last_gate_logits                            # (B, T)
+        # logsumexp + p·logp = stable entropy. We detach the source logits
+        # because the target is a SELF-supervised signal — gradient must
+        # flow into the gate head, not into the LM head.
+        lse = torch.logsumexp(logits.detach(), dim=-1)                   # (B, T)
+        # H_t = lse - sum(p * raw_logit) = lse - mean over support
+        # using p = softmax(logits): H = lse - sum(p*logits)
+        p = (logits.detach() - lse.unsqueeze(-1)).exp()                  # (B, T, V)
+        H = lse - (p * logits.detach()).sum(dim=-1)                      # (B, T) ≥ 0
+        T = max(args.gate_entropy_aux_temperature, 1e-6)
+        target = torch.exp(-H / T).clamp(0.0, 1.0)                       # (B, T)
+        c = args.gate_entropy_aux_target_clamp
+        if c > 0.0:
+            target = target.clamp(c, 1.0 - c)
+        # BCE-with-logits over valid (non-ignored) positions only.
+        valid = (y != -100).float()
+        bce = F.binary_cross_entropy_with_logits(
+            gate_logits, target, reduction="none",
+        )
+        denom = valid.sum().clamp(min=1.0)
+        gate_aux_loss = (bce * valid).sum() / denom
+    return logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss, gist_loss
 
 
-def parse_layers_arg(spec: str) -> list:
-    """Parse comma-separated --layers spec into a class list."""
-    parts = [p.strip() for p in spec.split(",") if p.strip()]
-    return [_NAME_TO_CLS[p] for p in parts]
+def _z_loss_term(logits, weight):
+    """z-loss regulariser: weight * mean(logsumexp(logits)^2)."""
+    if weight <= 0.0:
+        return logits.new_zeros(())
+    return weight * (torch.logsumexp(logits, dim=-1) ** 2).mean()
+
+
+def _pkm_diversity_loss(pkm) -> torch.Tensor:
+    """Negative entropy of the per-head slot-selection distribution.
+
+    Aggregates the per-head top-k retrievals into a (n_heads, n_slots)
+    histogram and returns the mean of (-H_per_head). Minimising this loss
+    increases entropy — encouraging the model to spread retrievals across
+    the full table rather than concentrate on a handful of hot slots.
+
+    Operates on the STASHED detached indices/weights from the last forward,
+    so this aux loss does NOT backprop through the router. It only affects
+    the value-table grads (which see a slightly more diverse retrieval
+    pattern across a training run).
+    """
+    if pkm._last_slot_idx is None:
+        # Forward hasn't been called yet (curriculum order during start);
+        # return a no-op zero.
+        device = next(pkm.parameters()).device
+        return torch.zeros((), device=device)
+    slot_idx = pkm._last_slot_idx       # (B, T, H, top_k), int64
+    weights = pkm._last_weights         # (B, T, H, top_k), float
+    H = pkm.n_heads
+    n_slots = pkm.n_keys * pkm.n_keys
+    B, T, _, tk = slot_idx.shape
+    # Build a per-head slot mass: (H, n_slots).
+    # Flatten (B,T,top_k) → mass scatter-adds into slot bins.
+    device = slot_idx.device
+    mass = torch.zeros(H, n_slots, device=device, dtype=torch.float32)
+    for h in range(H):
+        idx_h = slot_idx[:, :, h, :].reshape(-1)
+        w_h = weights[:, :, h, :].reshape(-1).float()
+        mass[h].scatter_add_(0, idx_h, w_h)
+    # Normalise per head so each row sums to 1.
+    mass = mass / mass.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+    # H(p) = -sum p log p ; we MAXIMISE entropy → minimise neg_entropy.
+    neg_entropy = (mass * (mass.clamp_min(1e-12).log())).sum(dim=-1)  # (H,)
+    return neg_entropy.mean()
 
 
 class TokenisedStream(IterableDataset):
@@ -165,159 +269,82 @@ class TokenisedStream(IterableDataset):
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--arch", type=str, default=None,
-                   choices=["deltanet", "deltanet_negeig", "deltanet_forgetgate",
-                            "gated_deltanet",
-                            "gated_deltaproduct",
-                            "ortho", "transformer", "mamba2",
-                            "hybrid", "hybrid_25_75", "hybrid_75_25",
-                            "hybrid_negeig",
-                            "symgrounded", "hybrid_sg", "hybrid_sg_25_75",
-                            "multipass_dh", "multipass_dho", "multipass_dd"])
-    p.add_argument("--n_symbols", type=int, default=512,
-                   help="Hash bucket size for SymbolGrounded layer.")
-    p.add_argument("--aux_brackets", action="store_true",
-                   help="Add bracket-depth auxiliary loss (direction E).")
-    p.add_argument("--aux_weight", type=float, default=0.1,
-                   help="Weight on the aux loss term.")
-    p.add_argument("--aux_max_depth", type=int, default=24,
-                   help="Cap bracket depth at this value for the aux head.")
-    p.add_argument("--feedback", type=str, default="none",
-                   choices=["none", "additive", "film", "predictive"],
-                   help="Cross-layer top-down feedback mode (Day 1).")
-    p.add_argument("--surprise_weight", type=float, default=0.0,
-                   help="Weight on the surprise (prediction-error) aux "
-                        "loss for predictive feedback mode.")
-    p.add_argument("--freeze_alpha", action="store_true",
-                   help="Diagnostic: build film/additive arch with all α=0 "
-                        "frozen. Tests dead-weight effect of feedback "
-                        "machinery without active feedback.")
-    p.add_argument("--save_ckpt", type=str, default=None,
-                   help="Path to save final model checkpoint (for downstream "
-                        "evals like HumanEval, bracket-structure, long-T PPL).")
-    p.add_argument("--feedback_distances", type=str, default="1",
-                   help="Comma-separated distances for multi-scale top-down "
-                        "feedback. '1' = single-step (default), "
-                        "'1,2,4,8,16' = exponential reach.")
-    p.add_argument("--feedback_pairs", type=str, default="",
-                   help="Sparse (target,source) feedback connections; "
-                        "semicolon-separated. E.g. '2,28;3,27' means "
-                        "layer 2's input gets feedback from layer 28, "
-                        "and layer 3's input gets feedback from layer 27. "
-                        "If non-empty, overrides --feedback_distances.")
-    p.add_argument("--feedback_xattn", type=str, default="",
-                   help="Cross-layer attention feedback. Each target attends "
-                        "over multiple source layers' lagged hidden states. "
-                        "Syntax 'target:src1,src2,...; target2:src3,src4,...'. "
-                        "Example '2:14,21,28' = layer 2's input attends over "
-                        "layers 14, 21, 28. 'all' = every layer attends over "
-                        "every later layer (Idea 2). If non-empty, overrides "
-                        "BOTH --feedback_distances and --feedback_pairs and "
-                        "ignores --feedback (attention is its own form).")
-    p.add_argument("--feedback_xattn_heads", type=int, default=4,
-                   help="Number of heads inside the cross-layer attention.")
-    p.add_argument("--feedback_lag", type=int, default=1,
-                   help="Lag in tokens for the source state before feeding "
-                        "to target (default 1 = t-1, parallel-scan friendly).")
-    p.add_argument("--feedback_position", type=str, default="pre",
-                   choices=["pre", "post"],
-                   help="'pre' (default) modulates target's input; "
-                        "'post' modulates target's output.")
-    p.add_argument("--feedback_per_channel_alpha", action="store_true",
-                   help="Use per-channel α (d_model floats) instead of scalar α "
-                        "for sparse FiLM. Tests whether channel-dependent gating "
-                        "can mix the negative- and positive-α basins per channel.")
-    p.add_argument("--feedback_self_k", type=int, default=0,
-                   choices=[0, 2, 3],
-                   help="K-iteration self-feeding training for sparse FiLM. "
-                        "0 (default) = standard 2-pass training. "
-                        "2 = cold start + one self-feed; loss on iter 2 "
-                        "(same compute as default 2-pass). "
-                        "3 = cold start + two self-feeds; loss on iter 3 "
-                        "(~50%% more compute). Trains the model to be "
-                        "self-consistent under lagged-cached deployment, "
-                        "closing the train/inference gap. Requires "
-                        "--feedback_pairs to be set.")
-    p.add_argument("--feedback_scratchpad", type=str, default="",
-                   help="Surprise-gated scratchpad pairs, semicolon-separated. "
-                        "Each is 'target,source' where target attends causally "
-                        "over source-layer pass-1 outputs with attention scores "
-                        "biased by per-position surprise. E.g. '2,28' applies "
-                        "the scratchpad at layer 2 reading from layer 28.")
-    p.add_argument("--feedback_scratchpad_heads", type=int, default=9,
-                   help="Number of heads inside the scratchpad attention.")
-    p.add_argument("--feedback_scratchpad_routing", type=str, default="softmax",
-                   choices=["softmax", "sigmoid", "sigmoid_uniform",
-                            "uniform_surprise"],
-                   help="Routing for the scratchpad attention. Disentangling: "
-                        "'softmax' = content (Q·K) softmax + surprise log-bias; "
-                        "'sigmoid' = content sigmoid × surprise (multiplicative); "
-                        "'sigmoid_uniform' = content only, surprise IGNORED "
-                        "(tests pure content retrieval); "
-                        "'uniform_surprise' = surprise only, content IGNORED "
-                        "(tests pure saliency-based retrieval).")
-    p.add_argument("--feedback_xattn_form", type=str, default="attn",
-                   choices=["attn", "film_sum", "film_sum_mlp", "film_sum_glu",
-                            "film_target_gated",
-                            "film_attn", "film_sigmoid", "all_sigmoid"],
-                   help="Form of the cross-layer feedback module: "
-                        "'attn' = additive Q-K-V softmax residual (default); "
-                        "'film_sum' = multi-source FiLM, sum (no softmax); "
-                        "'film_sum_mlp' = film_sum but each W is an MLP "
-                        "(Linear-GELU-Linear) — tests nonlinear expressivity; "
-                        "'film_attn' = softmax routing + multiplicative FiLM "
-                        "output (lets attention learn negative-α basin); "
-                        "'film_sigmoid' = sigmoid (not softmax) per-source "
-                        "gates + FiLM output (no 1/K dilution, per-token "
-                        "routing preserved); "
-                        "'all_sigmoid' = all-to-all sigmoid-gated FiLM with "
-                        "shared K/W projections per source (Idea 2); pair "
-                        "with --feedback_xattn 'all_above' or 'all'.")
-    p.add_argument("--layers", type=str, default=None,
-                   help="explicit comma-separated layer arch list, "
-                        "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
-                        "Overrides --arch.")
-    p.add_argument("--T", type=int, default=512)
-    p.add_argument("--max_T", type=int, default=0,
-                   help="Max sequence length for the (optional) absolute "
-                        "positional embedding. Set to >= --T (e.g. equal) "
-                        "for the Transformer baseline (softmax attention "
-                        "is permutation-invariant without position info). "
-                        "Linear-RNN architectures (DeltaNet, Mamba2, etc.) "
-                        "have implicit position via state and do not need "
-                        "this. Default 0 = no positional embedding.")
-    p.add_argument("--batch", type=int, default=8)
-    p.add_argument("--steps", type=int, default=5000)
-    p.add_argument("--d_model", type=int, default=576)
-    p.add_argument("--n_heads", type=int, default=9)
-    p.add_argument("--d_head", type=int, default=64)
-    p.add_argument("--n_layers", type=int, default=30)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--optimizer", type=str, default="adamw",
-                   choices=["adamw", "muon"],
-                   help="'adamw' (default) — single AdamW for all params. "
-                        "'muon' — Muon for ≥2D hidden-layer matrices, AdamW "
-                        "for embeddings, lm_head, and 1D params. Typically "
-                        "30-50% faster convergence per Keller Jordan / NanoGPT "
-                        "speedrunning. Pair with --lr_muon ~1e-3.")
-    p.add_argument("--lr_muon", type=float, default=1e-3,
-                   help="Muon learning rate (used only when --optimizer muon). "
-                        "AdamW LR for the remaining params is taken from --lr.")
-    p.add_argument("--log_every", type=int, default=100)
-    p.add_argument("--val_every", type=int, default=500)
-    p.add_argument("--tokenizer", type=str,
-                   default="HuggingFaceTB/SmolLM2-135M")
-    p.add_argument("--dataset", type=str, default="roneneldan/TinyStories",
-                   help="HF dataset id; supports also 'codeparrot/codeparrot-clean' "
-                        "and bigcode/the-stack-smol/data/python")
-    p.add_argument("--dataset_config", type=str, default=None,
-                   help="Optional config name (e.g. 'python' for the-stack-smol)")
-    p.add_argument("--text_field", type=str, default="text",
-                   help="Field in the dataset that contains the text "
-                        "('text' for TinyStories, 'content' for codeparrot/the-stack)")
-    p.add_argument("--seed", type=int, default=0)
+    from experiments.train_lm_args import build_parser
+    p = build_parser()
     args = p.parse_args()
+    if args.enable_thinking_token and args.output_gate:
+        raise SystemExit(
+            "--enable_thinking_token and --output_gate are mutually exclusive. "
+            "Use --think_decision gate to train the discrete THINKING path "
+            "with a binary gate head."
+        )
+    if args.enable_thinking_token and args.think_lambda < 0:
+        raise SystemExit("--think_lambda must be non-negative.")
+    if (args.enable_thinking_token and args.think_lambda_start is not None
+            and args.think_lambda_start < 0):
+        raise SystemExit("--think_lambda_start must be non-negative.")
+    if args.enable_thinking_token and args.think_curriculum_steps < 0:
+        raise SystemExit("--think_curriculum_steps must be non-negative.")
+    if args.enable_thinking_token and args.think_queue_max <= 0:
+        raise SystemExit("--think_queue_max must be positive.")
+    if args.enable_thinking_token and not (0.0 <= args.think_explore_prob <= 1.0):
+        raise SystemExit("--think_explore_prob must be in [0, 1].")
+    if args.enable_thinking_token and not (0.0 <= args.think_explore_start_prob <= 1.0):
+        raise SystemExit("--think_explore_start_prob must be in [0, 1].")
+    if args.enable_thinking_token and args.think_min_fresh_rows < 0:
+        raise SystemExit("--think_min_fresh_rows must be non-negative.")
+    if args.enable_thinking_token and not (0.0 < args.think_gate_threshold < 1.0):
+        raise SystemExit("--think_gate_threshold must be in (0, 1).")
+    if (args.enable_thinking_token and args.think_gate_threshold_start is not None
+            and not (0.0 < args.think_gate_threshold_start < 1.0)):
+        raise SystemExit("--think_gate_threshold_start must be in (0, 1).")
+    if args.enable_thinking_token and args.think_max_new_per_step < 0:
+        raise SystemExit("--think_max_new_per_step must be non-negative.")
+    if args.enable_thinking_token and args.think_safety_max_depth < 0:
+        raise SystemExit("--think_safety_max_depth must be non-negative.")
+    if (args.enable_thinking_token and args.think_safety_max_depth_start is not None
+            and args.think_safety_max_depth_start < 0):
+        raise SystemExit("--think_safety_max_depth_start must be non-negative.")
+    if args.enable_thinking_token and args.think_replay_weight < 0:
+        raise SystemExit("--think_replay_weight must be non-negative.")
+    if args.enable_thinking_token and args.think_aux_loss_scale < 0:
+        raise SystemExit("--think_aux_loss_scale must be non-negative.")
+    if args.grad_accum < 1:
+        raise SystemExit("--grad_accum must be >= 1.")
+    if args.grad_accum > 1 and args.enable_thinking_token:
+        raise SystemExit(
+            "--grad_accum > 1 is only supported on the non-thinking-token "
+            "(pretrain) path; the thinking-token path has its own "
+            "--think_queue_accum_steps."
+        )
+    if args.enable_thinking_token and args.think_queue_accum_steps < 0:
+        raise SystemExit("--think_queue_accum_steps must be non-negative.")
+    if args.enable_thinking_token and args.think_queue_accum_max_steps < 0:
+        raise SystemExit("--think_queue_accum_max_steps must be non-negative.")
+    if (args.enable_thinking_token and args.think_queue_accum_max_steps > 0
+            and args.think_queue_accum_max_steps < args.think_queue_accum_steps):
+        raise SystemExit(
+            "--think_queue_accum_max_steps must be >= --think_queue_accum_steps."
+        )
+    if args.enable_thinking_token and args.think_queue_drain_target < -1:
+        raise SystemExit("--think_queue_drain_target must be >= -1.")
+    if args.enable_thinking_token and args.think_backpressure_target < -1:
+        raise SystemExit("--think_backpressure_target must be >= -1.")
+    if args.enable_thinking_token and args.think_backpressure_max < 0:
+        raise SystemExit("--think_backpressure_max must be non-negative.")
+    if args.enable_thinking_token and args.think_backpressure_lambda < 0:
+        raise SystemExit("--think_backpressure_lambda must be non-negative.")
+    if args.enable_thinking_token and args.think_backpressure_threshold < 0:
+        raise SystemExit("--think_backpressure_threshold must be non-negative.")
+    if args.enable_thinking_token and args.think_backpressure_explore < 0:
+        raise SystemExit("--think_backpressure_explore must be non-negative.")
+    if args.enable_thinking_token and args.think_gate_emit_weight < 0:
+        raise SystemExit("--think_gate_emit_weight must be non-negative.")
+    if args.enable_thinking_token and args.aux_brackets:
+        raise SystemExit(
+            "--enable_thinking_token currently supports the standard LM loss "
+            "path only; disable aux losses for thinking experiments."
+        )
 
     torch.manual_seed(args.seed)
     arch_label = args.arch if args.arch else f"layers={args.layers}"
@@ -328,109 +355,105 @@ def main():
     from datasets import load_dataset
     print(f"Loading tokeniser {args.tokenizer} ...")
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
-    print(f"  vocab size: {tok.vocab_size}")
-
-    print(f"Loading dataset {args.dataset} (streaming) ...")
-    ds_kwargs = dict(streaming=True)
-    if args.dataset_config:
-        ds_kwargs["name"] = args.dataset_config
-    try:
-        train_stream = load_dataset(args.dataset, split="train", **ds_kwargs)
-    except ValueError:
-        # Some datasets only have "train".
-        train_stream = load_dataset(args.dataset, **ds_kwargs)["train"]
-    try:
-        val_stream = load_dataset(args.dataset, split="validation", **ds_kwargs)
-    except (ValueError, KeyError):
-        # No validation split — split off a slice of train as held-out.
-        # We just take a separate streaming pass with a different seed-shuffle.
-        try:
-            val_stream = load_dataset(args.dataset, split="test", **ds_kwargs)
-        except (ValueError, KeyError):
-            print("  no val/test split — using shuffled train tail as validation")
-            val_stream = load_dataset(args.dataset, split="train",
-                                      **ds_kwargs).shuffle(seed=42).skip(10_000)
-
-    train_ds = TokenisedStream(train_stream, tok, args.T,
-                               text_field=args.text_field)
-    val_ds = TokenisedStream(val_stream, tok, args.T,
-                             text_field=args.text_field)
-    train_loader = DataLoader(train_ds, batch_size=args.batch, num_workers=2)
-    val_loader = DataLoader(val_ds, batch_size=args.batch, num_workers=1)
-
-    # 2. Model.
-    if args.layers:
-        cls_list = parse_layers_arg(args.layers)
-        n_layers_actual = len(cls_list)
-        attn_kw = dict(attention_cls_per_layer=cls_list)
+    thinking_token_id = None
+    added_thinking_tokens = 0
+    if args.enable_thinking_token:
+        added_thinking_tokens = tok.add_special_tokens(
+            {"additional_special_tokens": [args.thinking_token]}
+        )
+        thinking_token_id = tok.convert_tokens_to_ids(args.thinking_token)
+        if thinking_token_id is None or thinking_token_id < 0:
+            raise SystemExit(
+                f"failed to add/resolve thinking token {args.thinking_token!r}"
+            )
+    if args.data_mix:
+        # Mixed-corpus pretrain. Reserve one slot above the base tokenizer
+        # vocab for the think token; round model vocab up to multiple-of-64
+        # so embedding / lm_head dims are GPU-friendly.
+        thinking_token_id = int(tok.vocab_size)
+        model_vocab_size = ((int(tok.vocab_size) + 1 + 63) // 64) * 64
     else:
-        if args.arch is None:
-            raise SystemExit("specify --arch or --layers")
-        attn_kw = build_arch(args.arch, args.n_layers,
-                             vocab_size=tok.vocab_size, n_symbols=args.n_symbols)
-        n_layers_actual = args.n_layers
-    aux_dim = (args.aux_max_depth + 1) if args.aux_brackets else 0
-    fb_distances = tuple(int(d) for d in args.feedback_distances.split(",") if d)
-    fb_pairs = ()
-    if args.feedback_pairs:
-        fb_pairs = tuple(
-            tuple(int(x) for x in pair.split(","))
-            for pair in args.feedback_pairs.split(";") if pair
+        model_vocab_size = len(tok)
+    print(f"  vocab size: base={tok.vocab_size}, model={model_vocab_size}"
+          f"{f', thinking_id={thinking_token_id}' if thinking_token_id is not None else ''}")
+
+    if args.data_mix:
+        print(f"Loading data mix from {args.data_mix} (streaming) ...")
+        from experiments.data_mix import (
+            MixedSourceStream, load_sources_from_yaml,
         )
-    # Cross-layer attention pairs.
-    # 'all'  -> every layer attends over every layer above it.
-    # else   -> 'tgt:src1,src2; tgt2:src3,...' explicit form.
-    fb_scratchpad_pairs = ()
-    if args.feedback_scratchpad:
-        fb_scratchpad_pairs = tuple(
-            tuple(int(x) for x in pair.split(","))
-            for pair in args.feedback_scratchpad.split(";") if pair
+        sources = load_sources_from_yaml(args.data_mix)
+        print(f"  {len(sources)} sources:")
+        for s in sources:
+            print(f"    - {s.name:30s} weight={s.weight:.3f}  id={s.dataset_id}")
+        train_ds = MixedSourceStream(
+            sources=sources, tokenizer=tok, block_size=args.T,
+            thinking_token_id=thinking_token_id,
+            think_burst_prob=args.think_burst_prob,
+            think_max_bursts=args.think_max_bursts,
+            think_max_burst_depth=args.think_max_burst_depth,
+            base_seed=args.seed,
+            mask_eos_in_targets=bool(args.mask_eos_in_targets),
+            emit_doc_ids=True,
         )
-    fb_xattn_pairs = ()
-    if args.feedback_xattn:
-        if args.feedback_xattn.strip() == "all":
-            fb_xattn_pairs = tuple(
-                (tgt, tuple(s for s in range(n_layers_actual) if s != tgt))
-                for tgt in range(n_layers_actual)
-            )
-        elif args.feedback_xattn.strip() == "all_above":
-            # Every layer attends only over LATER layers (higher indices).
-            # Last layer has no sources and is skipped.
-            fb_xattn_pairs = tuple(
-                (tgt, tuple(range(tgt + 1, n_layers_actual)))
-                for tgt in range(n_layers_actual - 1)
-            )
-        else:
-            tmp = []
-            for group in args.feedback_xattn.split(";"):
-                group = group.strip()
-                if not group:
-                    continue
-                target_str, src_str = group.split(":")
-                tgt = int(target_str.strip())
-                srcs = tuple(int(s) for s in src_str.split(",") if s.strip())
-                tmp.append((tgt, srcs))
-            fb_xattn_pairs = tuple(tmp)
-    model = TinyLM(
-        vocab_size=tok.vocab_size, d_model=args.d_model, n_layers=n_layers_actual,
-        n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim,
-        max_T=args.max_T,
-        feedback_mode=args.feedback, feedback_distances=fb_distances,
-        feedback_pairs=fb_pairs,
-        feedback_xattn_pairs=fb_xattn_pairs,
-        feedback_xattn_heads=args.feedback_xattn_heads,
-        feedback_xattn_form=args.feedback_xattn_form,
-        feedback_lag=args.feedback_lag,
-        feedback_position=args.feedback_position,
-        feedback_per_channel_alpha=args.feedback_per_channel_alpha,
-        feedback_scratchpad_pairs=fb_scratchpad_pairs,
-        feedback_scratchpad_heads=args.feedback_scratchpad_heads,
-        feedback_scratchpad_routing=args.feedback_scratchpad_routing,
-        feedback_self_k=args.feedback_self_k,
-        **attn_kw,
-    ).to("cuda")
-    if args.freeze_alpha and (args.feedback != "none" or fb_xattn_pairs):
-        model.freeze_alpha()
+        # Val: same sources, different seed, burst injection off so val PPL
+        # reflects the clean data distribution.
+        val_ds = MixedSourceStream(
+            sources=sources, tokenizer=tok, block_size=args.T,
+            thinking_token_id=thinking_token_id,
+            think_burst_prob=0.0,
+            base_seed=args.seed + 999_983,
+            mask_eos_in_targets=bool(args.mask_eos_in_targets),
+            emit_doc_ids=True,
+        )
+        train_loader = DataLoader(train_ds, batch_size=args.batch, num_workers=2)
+        val_loader = DataLoader(val_ds, batch_size=args.batch, num_workers=1)
+    else:
+        print(f"Loading dataset {args.dataset} (streaming) ...")
+        ds_kwargs = dict(streaming=True)
+        if args.dataset_config:
+            ds_kwargs["name"] = args.dataset_config
+        try:
+            train_stream = load_dataset(args.dataset, split="train", **ds_kwargs)
+        except ValueError:
+            # Some datasets only have "train".
+            train_stream = load_dataset(args.dataset, **ds_kwargs)["train"]
+        try:
+            val_stream = load_dataset(args.dataset, split="validation",
+                                       **ds_kwargs)
+        except (ValueError, KeyError):
+            # No validation split — split off a slice of train as held-out.
+            try:
+                val_stream = load_dataset(args.dataset, split="test", **ds_kwargs)
+            except (ValueError, KeyError):
+                print("  no val/test split — using shuffled train tail as validation")
+                val_stream = load_dataset(args.dataset, split="train",
+                                          **ds_kwargs).shuffle(seed=42).skip(10_000)
+
+        train_ds = TokenisedStream(train_stream, tok, args.T,
+                                   text_field=args.text_field)
+        val_ds = TokenisedStream(val_stream, tok, args.T,
+                                 text_field=args.text_field)
+        train_loader = DataLoader(train_ds, batch_size=args.batch,
+                                   num_workers=2)
+        val_loader = DataLoader(val_ds, batch_size=args.batch, num_workers=1)
+
+    # 2. Model — see experiments/model_builder.py.
+    from experiments.model_builder import build_model_from_args
+    model, _build_info = build_model_from_args(
+        args, vocab_size=model_vocab_size,
+        thinking_token_id=thinking_token_id,
+    )
+    fb_pairs = _build_info.fb_pairs
+    fb_xattn_pairs = _build_info.fb_xattn_pairs
+    n_layers_actual = _build_info.n_layers
+    aux_dim = _build_info.aux_dim
+    # ---- Speed knobs (must run AFTER model is built but BEFORE the train
+    # loop touches it). See experiments/speed_knobs.py.
+    from experiments.speed_knobs import apply_speed_knobs
+    apply_speed_knobs(model, bf16=bool(args.bf16), tf32=bool(args.tf32),
+                      compile_model=bool(args.compile),
+                      compile_mode=args.compile_mode)
     if fb_xattn_pairs:
         n_total_pairs = sum(len(srcs) for _, srcs in fb_xattn_pairs)
         feedback_desc = (f"xattn[{args.feedback_xattn_form}]"
@@ -438,10 +461,9 @@ def main():
                          f"src-edges={n_total_pairs},"
                          f"heads={args.feedback_xattn_heads})")
     else:
-        feedback_desc = f"{args.feedback}@d={args.feedback_distances}"
+        feedback_desc = f"{args.feedback}"
     print(f"  params: {model.num_params() / 1e6:.1f}M  aux_dim={aux_dim}  "
-          f"feedback={feedback_desc}"
-          f"{' (α frozen=0)' if args.freeze_alpha else ''}")
+          f"feedback={feedback_desc}")
 
     if args.aux_brackets:
         print("Computing bracket-deltas table for tokenizer ...")
@@ -451,47 +473,62 @@ def main():
     else:
         bracket_deltas = None
 
-    # Optimizer construction — single AdamW (default) or Muon + AdamW split.
-    if args.optimizer == "adamw":
-        opts = [torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                   betas=(0.9, 0.95), weight_decay=0.1)]
-        scheds = [torch.optim.lr_scheduler.CosineAnnealingLR(
-            opts[0], T_max=args.steps, eta_min=args.lr * 0.1)]
-    else:  # muon
-        # Split params: ≥2D hidden-layer matrices → Muon; embeddings, lm_head,
-        # and 1D params (alphas, RMSNorm scales) → AdamW.
-        embed_or_head_names = {"embed.weight", "pos_embed.weight", "lm_head.weight"}
-        muon_params, adamw_params = [], []
-        seen = set()
-        for name, p in model.named_parameters():
-            if not p.requires_grad or id(p) in seen:
-                continue
-            seen.add(id(p))
-            # Muon supports strictly 2D matrices. Embeddings/lm_head + 1D
-            # params + 3D+ tensors (short_conv kernels, etc.) go to AdamW.
-            if name in embed_or_head_names or p.ndim != 2:
-                adamw_params.append(p)
+    # Trunk multi-horizon gist heads (v7, see experiments/gist_loss.py).
+    # Attached as a model submodule so they ride the existing optimizer,
+    # state_dict and resume paths with no special handling. Must be
+    # attached BEFORE build_optimizer so the optimizer picks them up.
+    gist_horizons = None
+    if args.gist_loss_weight > 0.0:
+        gist_horizons = parse_horizons(args.gist_horizons)
+        model.gist_heads = build_gist_heads(args.d_model,
+                                            gist_horizons).cuda()
+        # The model computes the gist loss inside its own forward (see
+        # TinyLM._finalize) — it reads these two attributes.
+        model._gist_horizons = gist_horizons
+        model._gist_loss_enabled = True
+        # build_model_from_args loaded --load_ckpt BEFORE gist_heads
+        # existed, so its gist_heads.* keys (if any) were dropped as
+        # "unexpected". Re-load just those now. The v7.1 pretrain ckpt
+        # has none → fresh heads, which is correct for Phase C.
+        if args.load_ckpt is not None:
+            _ck = torch.load(args.load_ckpt, map_location="cuda",
+                             weights_only=False)
+            _sd = (_ck["state_dict"] if isinstance(_ck, dict)
+                   and "state_dict" in _ck else _ck)
+            _gh = {k[len("gist_heads."):]: v for k, v in _sd.items()
+                   if k.startswith("gist_heads.")}
+            if _gh:
+                model.gist_heads.load_state_dict(_gh)
+                print(f"  gist_heads: restored from {args.load_ckpt!r}")
             else:
-                muon_params.append(p)
-        print(f"  optimizer split: {len(muon_params)} Muon params "
-              f"({sum(p.numel() for p in muon_params)/1e6:.1f}M), "
-              f"{len(adamw_params)} AdamW params "
-              f"({sum(p.numel() for p in adamw_params)/1e6:.1f}M)")
-        opts = [
-            torch.optim.Muon(muon_params, lr=args.lr_muon,
-                             momentum=0.95, weight_decay=0.1),
-            torch.optim.AdamW(adamw_params, lr=args.lr,
-                              betas=(0.9, 0.95), weight_decay=0.1),
-        ]
-        scheds = [
-            torch.optim.lr_scheduler.CosineAnnealingLR(
-                opts[0], T_max=args.steps, eta_min=args.lr_muon * 0.1),
-            torch.optim.lr_scheduler.CosineAnnealingLR(
-                opts[1], T_max=args.steps, eta_min=args.lr * 0.1),
-        ]
+                print("  gist_heads: fresh (absent from loaded ckpt)")
+        print(f"  trunk gist loss ON: horizons={gist_horizons} "
+              f"weight={args.gist_loss_weight}")
+
+    # Optimizer construction — see experiments/optim_utils.py.
+    from experiments.optim_utils import build_optimizer
+    opts, scheds = build_optimizer(
+        model, optimizer=args.optimizer, lr=args.lr, lr_muon=args.lr_muon,
+        alpha_wd=args.alpha_wd, steps=args.steps, wd=args.wd,
+        lr_schedule=args.lr_schedule, warmup_steps=args.warmup_steps,
+        decay_frac=args.lr_decay_frac,
+        bf16_optim_state=args.bf16_optim_state,
+        pkm_value_lr_mult=float(getattr(args, "pkm_value_lr_mult", 1.0)),
+    )
     # Backwards-compat aliases used elsewhere in the loop.
     opt = opts[0]
     scheduler = scheds[0]
+
+    # Resume support: fast-forward LR scheduler to match --start_step so the
+    # cosine schedule continues from where the ckpt left off. Optimizer
+    # momenta are still fresh (we don't save them in mid-eval ckpts) — a
+    # brief loss-spike transient is expected on resume.
+    if args.start_step > 0:
+        for _ in range(args.start_step):
+            for s in scheds:
+                s.step()
+        print(f"Fast-forwarded LR scheduler by {args.start_step} steps; "
+              f"resumed lr={scheduler.get_last_lr()[0]:.2e}")
 
     # 3. Train loop.
     print(f"\n{'step':>6}  {'tok/s':>8}  {'tloss':>8}  {'lr':>9}")
@@ -500,54 +537,985 @@ def main():
     last_log = t0
     last_log_step = 0
     losses = []
-    for step in range(1, args.steps + 1):
-        try:
-            x, y = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            x, y = next(train_iter)
-        x, y = x.to("cuda"), y.to("cuda")
-        want_surprise = (args.feedback == "predictive" and args.surprise_weight > 0)
-        if args.aux_brackets and want_surprise:
-            logits, aux_logits, surprise = model(x, return_aux=True, return_surprise=True)
-        elif args.aux_brackets:
-            logits, aux_logits = model(x, return_aux=True)
-            surprise = torch.zeros((), device="cuda")
-        elif want_surprise:
-            logits, surprise = model(x, return_surprise=True)
-            aux_logits = None
-        else:
-            logits = model(x)
-            aux_logits = None
-            surprise = torch.zeros((), device="cuda")
-        if args.aux_brackets:
-            depth = bracket_depth(x, bracket_deltas).clamp(0, args.aux_max_depth)
-            aux_loss = F.cross_entropy(
-                aux_logits.reshape(-1, args.aux_max_depth + 1),
-                depth.reshape(-1),
+    # Mid-training eval state.
+    mid_eval_controller = None
+    tokens_seen = 0
+    next_eval_at = 0
+    tokens_at_last_probe = 0
+    if args.probe_humaneval_every_tokens > 0:
+        if not pathlib.Path(args.probe_humaneval_path).exists():
+            print(f"  [probe] {args.probe_humaneval_path} not found; "
+                  f"run experiments/build_probe_dataset.py first. "
+                  f"Disabling probe.")
+            args.probe_humaneval_every_tokens = 0
+    if args.mid_eval_every_tokens > 0:
+        from experiments.eval_callback import EvalStopController, run_eval
+        mid_eval_controller = EvalStopController(
+            stop_threshold=args.auto_stop_threshold,
+            k_consecutive_flat=args.auto_stop_k,
+        )
+        next_eval_at = int(args.mid_eval_every_tokens)
+        print(f"\nMid-training eval enabled: HumanEval @ "
+              f"{args.mid_eval_n_problems} problems every "
+              f"{args.mid_eval_every_tokens:,} tokens. "
+              f"auto_stop={args.auto_stop} (Δ<{args.auto_stop_threshold:.3f} "
+              f"for {args.auto_stop_k} consecutive intervals).")
+    losses_gate_window: list[tuple] = []  # (mean_g, emit_frac, raw_ce) per step
+    # --- Process-reward / gate-calibration aux loss state -------------------
+    # `use_process_reward` / `use_gate_calibration` gate the extra-forward
+    # auxiliary losses. Both require the model to expose `_last_gate` (which
+    # happens whenever `--output_gate` is on OR a thinking gate head is
+    # wired). Pretrain runs with `--use_memory` + `--enable_thinking_token`
+    # have `_last_gate` populated; non-gate pretrain skips the aux losses
+    # silently (no gate signal to train).
+    use_process_reward = (
+        getattr(args, "process_reward_weight", 0.0) > 0.0
+        and thinking_token_id is not None
+        and (args.output_gate or args.enable_thinking_token)
+    )
+    if getattr(args, "process_reward_weight", 0.0) > 0.0 and not use_process_reward:
+        print("WARN  --process_reward_weight > 0 but disabled: needs a "
+              "thinking_token_id AND a gate head (--output_gate or "
+              "--enable_thinking_token).")
+    use_gate_calibration = (
+        getattr(args, "gate_calibration_weight", 0.0) > 0.0
+        and thinking_token_id is not None
+        and (args.output_gate or args.enable_thinking_token)
+    )
+    if getattr(args, "gate_calibration_weight", 0.0) > 0.0 and not use_gate_calibration:
+        print("WARN  --gate_calibration_weight > 0 but disabled: needs a "
+              "thinking_token_id AND a gate head.")
+    if use_process_reward:
+        print(f"  [process-reward] ON: weight={args.process_reward_weight}, "
+              f"K={args.process_reward_K}, "
+              f"min_sigma={args.process_reward_apply_min_sigma}, "
+              f"sample_frac={args.process_reward_sample_frac}, "
+              f"max_positions={args.process_reward_max_positions}")
+    if use_gate_calibration:
+        print(f"  [gate-calibration] ON: weight="
+              f"{args.gate_calibration_weight}, "
+              f"K={args.gate_calibration_K}, "
+              f"sigma=[{args.gate_calibration_apply_min_sigma}, "
+              f"{args.gate_calibration_apply_max_sigma}], "
+              f"sample_frac={args.gate_calibration_sample_frac}, "
+              f"max_positions={args.gate_calibration_max_positions}, "
+              f"smooth_target_scale="
+              f"{args.gate_calibration_smooth_target_scale}")
+    # CPU rng for position sampling (matches sft_code.py convention).
+    aux_rng = torch.Generator(device="cpu")
+    aux_rng.manual_seed(int(args.seed) + 17)
+    last_pr_stats = None
+    last_gc_stats = None
+    # `base_vocab_for_loss` truncates the after-forward's logits to the real
+    # token slots when computing the softmax denom for log p_after. In
+    # pretrain (with thinking enabled) the model_vocab_size is padded to
+    # multiple-of-64 with the THINK_ID token reserved; the proper denom
+    # excludes both the THINK_ID slot and any pad-up slots, matching the
+    # tokenizer's base vocab.
+    base_vocab_for_loss = (
+        int(tok.vocab_size) if thinking_token_id is not None else None)
+    think_queue = (ThinkContinuationQueue(args.think_queue_max)
+                   if args.enable_thinking_token else None)
+    think_replay_queue = (ThinkReplayQueue(args.think_queue_max)
+                          if args.enable_thinking_token else None)
+    think_stats_window: list[dict[str, float]] = []
+    think_closed_traj_window: list[float] = []
+    think_queue_batch = args.think_queue_batch or 1
+    think_replay_batch = args.think_replay_batch or think_queue_batch
+    if args.enable_thinking_token:
+        print(f"  THINKING queue: max={args.think_queue_max:,} CPU records, "
+              f"packed_cont={think_queue_batch}, packed_replay={think_replay_batch}, "
+              f"accum_steps={args.think_queue_accum_steps}, "
+              f"accum_max={args.think_queue_accum_max_steps or args.think_queue_accum_steps}, "
+              f"drain_target={args.think_queue_drain_target}, "
+              f"decision={args.think_decision}, "
+              f"priority={'on' if args.think_prioritize_queue else 'off'}")
+    pad_token_id = tok.eos_token_id
+    if pad_token_id is None:
+        pad_token_id = tok.bos_token_id if tok.bos_token_id is not None else 0
+
+    # TensorBoard writer — no-op context when --tb_dir is not set.
+    if args.tb_dir:
+        from torch.utils.tensorboard import SummaryWriter
+        tb = SummaryWriter(log_dir=args.tb_dir)
+        print(f"TensorBoard logging → {args.tb_dir}")
+    else:
+        tb = None
+
+    def thinking_schedule(step: int) -> dict[str, float]:
+        if step <= args.think_warmup_steps:
+            curriculum = 0.0
+        elif args.think_curriculum_steps > 0:
+            curriculum = min(
+                1.0,
+                (step - args.think_warmup_steps)
+                / float(args.think_curriculum_steps),
             )
         else:
-            aux_loss = torch.zeros((), device="cuda")
-        lm_loss = F.cross_entropy(
-            logits.reshape(-1, tok.vocab_size), y.reshape(-1),
+            curriculum = 1.0
+        explore_prob = (
+            args.think_explore_start_prob
+            + curriculum
+            * (args.think_explore_prob - args.think_explore_start_prob)
         )
-        loss = lm_loss + args.aux_weight * aux_loss + args.surprise_weight * surprise
+        lambda_start = (
+            args.think_lambda if args.think_lambda_start is None
+            else args.think_lambda_start
+        )
+        lambda_eff = lambda_start + curriculum * (args.think_lambda - lambda_start)
+        gate_threshold_start = (
+            args.think_gate_threshold
+            if args.think_gate_threshold_start is None
+            else args.think_gate_threshold_start
+        )
+        gate_threshold = (
+            gate_threshold_start
+            + curriculum * (args.think_gate_threshold - gate_threshold_start)
+        )
+        depth_start = (
+            args.think_safety_max_depth
+            if args.think_safety_max_depth_start is None
+            else args.think_safety_max_depth_start
+        )
+        if args.think_safety_max_depth <= 0 and depth_start <= 0:
+            safety_max_depth = 0
+        else:
+            depth_eff_float = (
+                depth_start
+                + curriculum * (args.think_safety_max_depth - depth_start)
+            )
+            safety_max_depth = max(1, int(round(depth_eff_float)))
+        return {
+            "curriculum": float(curriculum),
+            "explore_prob": float(explore_prob),
+            "lambda": float(lambda_eff),
+            "gate_threshold": float(gate_threshold),
+            "safety_max_depth": float(safety_max_depth),
+            "queue_pressure": 0.0,
+            "backpressure_target": 0.0,
+        }
+
+    def apply_queue_backpressure(schedule: dict[str, float]) -> dict[str, float]:
+        if think_queue is None or think_replay_queue is None:
+            return schedule
+        target = args.think_backpressure_target
+        if target < 0:
+            target = args.think_queue_drain_target
+        uses_backpressure = (
+            target >= 0
+            and (
+                args.think_backpressure_lambda > 0.0
+                or args.think_backpressure_threshold > 0.0
+                or args.think_backpressure_explore > 0.0
+            )
+        )
+        if not uses_backpressure:
+            schedule["backpressure_target"] = float(max(0, target))
+            return schedule
+        target = max(1, target)
+        backlog = max(len(think_queue), len(think_replay_queue))
+        pressure = max(0.0, (backlog - target) / float(target))
+        if args.think_backpressure_max > 0.0:
+            pressure = min(pressure, args.think_backpressure_max)
+        schedule = dict(schedule)
+        schedule["queue_pressure"] = float(pressure)
+        schedule["backpressure_target"] = float(target)
+        if pressure <= 0.0:
+            return schedule
+        schedule["lambda"] = float(
+            schedule["lambda"] + args.think_backpressure_lambda * pressure
+        )
+        if args.think_backpressure_threshold > 0.0:
+            divisor = 1.0 + args.think_backpressure_threshold * pressure
+            schedule["gate_threshold"] = float(
+                max(1e-4, min(0.9999, schedule["gate_threshold"] / divisor))
+            )
+        if args.think_backpressure_explore > 0.0:
+            divisor = 1.0 + args.think_backpressure_explore * pressure
+            schedule["explore_prob"] = float(schedule["explore_prob"] / divisor)
+        return schedule
+
+    def new_thinking_stats(schedule: dict[str, float]) -> dict[str, float]:
+        return {
+            "cont_items": 0.0,
+            "cont_think": 0.0,
+            "cont_explore": 0.0,
+            "forced_emit": 0.0,
+            "closed": 0.0,
+            "replay_items": 0.0,
+            "replay_think": 0.0,
+            **schedule,
+        }
+
+    def merge_thinking_stats(dst: dict[str, float], src: dict[str, float]) -> None:
+        summed = {
+            "cont_items", "cont_think", "cont_explore", "forced_emit",
+            "closed", "replay_items", "replay_think",
+        }
+        for key, value in src.items():
+            if key in summed:
+                dst[key] = dst.get(key, 0.0) + float(value)
+            else:
+                dst[key] = float(value)
+
+    def process_thinking_aux_batch(
+        step: int,
+        cont_items: list[ThinkContinuation],
+        replay_items: list[ThinkReplay],
+        schedule: dict[str, float],
+    ) -> tuple[torch.Tensor, float, dict[str, float]]:
+        if not cont_items and not replay_items:
+            return torch.zeros((), device="cuda"), 0.0, new_thinking_stats(schedule)
+        assert think_queue is not None and think_replay_queue is not None
+        rows = []
+        cont_targets = cont_last = None
+        replay_targets = replay_last = replay_is_think = None
+        if cont_items:
+            cont_x, cont_targets, cont_last = build_continuation_batch(
+                cont_items, block_size=args.T, pad_token_id=pad_token_id,
+                device="cuda",
+            )
+            rows.append(cont_x)
+        if replay_items:
+            replay_x, replay_targets, replay_last, replay_is_think = build_replay_batch(
+                replay_items, block_size=args.T, pad_token_id=pad_token_id,
+                thinking_token_id=int(thinking_token_id), device="cuda",
+            )
+            rows.append(replay_x)
+        aux_x = torch.cat(rows, dim=0)
+        if args.think_checkpointing:
+            from torch.utils.checkpoint import checkpoint
+            # model is a nn.Module, which checkpoint can wrap.
+            # We use use_reentrant=False for modern compatibility.
+            aux_logits = checkpoint(model, aux_x, use_reentrant=False)
+        else:
+            aux_logits = model(aux_x)
+        loss_terms: list[torch.Tensor] = []
+        stats = new_thinking_stats(schedule)
+        lambda_eff = float(schedule["lambda"])
+        gate_threshold = float(schedule["gate_threshold"])
+        safety_max_depth = int(schedule["safety_max_depth"])
+        explore_prob = float(schedule["explore_prob"])
+
+        if cont_items:
+            assert cont_targets is not None and cont_last is not None
+            row = torch.arange(len(cont_items), device=aux_logits.device)
+            cont_logits = aux_logits[row, cont_last]
+            forced = torch.zeros(len(cont_items), dtype=torch.bool,
+                                 device=aux_logits.device)
+            if safety_max_depth > 0:
+                forced |= torch.tensor(
+                    [item.depth >= safety_max_depth for item in cont_items],
+                    dtype=torch.bool, device=aux_logits.device,
+                )
+            if args.think_queue_ttl > 0:
+                forced |= torch.tensor(
+                    [step - item.origin_step >= args.think_queue_ttl
+                     for item in cont_items],
+                    dtype=torch.bool, device=aux_logits.device,
+                )
+            if args.think_decision == "gate":
+                cont_gate = model._last_gate[row, cont_last].detach()
+                cont_think = (cont_gate < gate_threshold) & ~forced
+                cont_gate_logits = model._last_gate_logits[row, cont_last]
+                cont_think_nll = F.binary_cross_entropy_with_logits(
+                    cont_gate_logits,
+                    torch.zeros_like(cont_gate_logits),
+                    reduction="none",
+                )
+            else:
+                cont_think = choose_think_actions(
+                    cont_logits.detach(), int(thinking_token_id),
+                    args.think_policy, args.think_threshold,
+                    args.think_temperature, allow_think=~forced,
+                )
+                think_targets = torch.full_like(cont_targets, int(thinking_token_id))
+                cont_think_nll = F.cross_entropy(
+                    cont_logits, think_targets, reduction="none",
+                )
+            cont_explore = torch.zeros_like(cont_think)
+            if explore_prob > 0.0:
+                cont_explore = (
+                    torch.rand_like(cont_think.float()) < explore_prob
+                ) & ~forced
+                cont_think = cont_think | cont_explore
+            cont_answer_nll = cross_entropy_masking_token(
+                cont_logits, cont_targets, int(thinking_token_id),
+                reduction="none",
+            )
+            closed_traj: list[float] = []
+            for i, item in enumerate(cont_items):
+                if bool(cont_think[i].item()):
+                    next_ctx = (item.context_ids + [int(thinking_token_id)])[-args.T:]
+                    think_queue.enqueue(ThinkContinuation(
+                        context_ids=next_ctx,
+                        target_id=item.target_id,
+                        depth=item.depth + 1,
+                        accum_nll=(
+                            item.accum_nll
+                            + float(cont_think_nll[i].detach().item())
+                        ),
+                        accum_cost=item.accum_cost + lambda_eff,
+                        origin_step=item.origin_step,
+                        decision_context_ids=(
+                            item.decision_context_ids or item.context_ids
+                        ),
+                        immediate_nll=item.immediate_nll,
+                    ))
+                else:
+                    answer_after_think = float(cont_answer_nll[i].detach().item())
+                    traj = item.accum_nll + item.accum_cost + answer_after_think
+                    closed_traj.append(traj)
+                    comparable_traj = item.accum_cost + answer_after_think
+                    beneficial = (
+                        comparable_traj + args.think_advantage_margin
+                        < float(item.immediate_nll)
+                    )
+                    think_replay_queue.enqueue(ThinkReplay(
+                        context_ids=item.decision_context_ids or item.context_ids,
+                        target_id=item.target_id,
+                        target_is_thinking=beneficial,
+                    ))
+                    loss_terms.append(cont_answer_nll[i])
+            if closed_traj:
+                think_closed_traj_window.extend(closed_traj)
+            stats.update({
+                "cont_items": float(len(cont_items)),
+                "cont_think": float(cont_think.float().sum().item()),
+                "cont_explore": float(cont_explore.float().sum().item()),
+                "forced_emit": float(forced.float().sum().item()),
+                "closed": float(len(closed_traj)),
+            })
+
+        if replay_items:
+            assert replay_targets is not None
+            assert replay_last is not None and replay_is_think is not None
+            start = len(cont_items)
+            row = torch.arange(start, start + len(replay_items),
+                               device=aux_logits.device)
+            replay_logits = aux_logits[row, replay_last]
+            if args.think_decision == "gate":
+                replay_gate_logits = model._last_gate_logits[row, replay_last]
+                emit_targets = (~replay_is_think).float()
+                gate_ce = F.binary_cross_entropy_with_logits(
+                    replay_gate_logits, emit_targets, reduction="none",
+                )
+                replay_answer_ce = cross_entropy_masking_token(
+                    replay_logits, replay_targets, int(thinking_token_id),
+                    reduction="none",
+                )
+                replay_ce = torch.where(
+                    replay_is_think,
+                    gate_ce + lambda_eff,
+                    gate_ce + replay_answer_ce,
+                )
+            else:
+                replay_ce = F.cross_entropy(
+                    replay_logits, replay_targets, reduction="none",
+                )
+                replay_ce = replay_ce + lambda_eff * replay_is_think.float()
+            loss_terms.append(args.think_replay_weight * replay_ce)
+            stats["replay_items"] = float(len(replay_items))
+            stats["replay_think"] = float(replay_is_think.float().sum().item())
+
+        if not loss_terms:
+            return torch.zeros((), device=aux_logits.device), 0.0, stats
+        loss_sum = torch.stack([term.sum() for term in loss_terms]).sum()
+        count = float(sum(term.numel() for term in loss_terms))
+        return loss_sum, count, stats
+
+    for step in range(args.start_step + 1, args.steps + 1):
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+        # Streams may yield (x, y) or (x, y, doc_ids); doc_ids drives
+        # cross-document state isolation in the model (None = one document
+        # per row, the leak-free default for the non-data_mix path).
+        x, y, *_rest = batch
+        x, y = x.to("cuda"), y.to("cuda")
+        doc_ids = _rest[0].to("cuda") if _rest else None
+        # K-self-feed curriculum: bypass FiLM (1-pass forward) until the
+        # warmup boundary, then run the configured --feedback_self_k.
+        if args.feedback_self_k_warmup_steps > 0:
+            bypass = step <= args.feedback_self_k_warmup_steps
+            if bypass != model._film_bypass:
+                model._film_bypass = bypass
+                if not bypass:
+                    print(f"[step {step}] FiLM K-self-feed curriculum: "
+                          f"warmup over, enabling feedback_self_k="
+                          f"{args.feedback_self_k}")
+        # PKM ε-greedy curriculum: linear anneal from --pkm_epsilon_start
+        # to 0 over --pkm_epsilon_warmup_steps. Forces every slot to get
+        # gradient early; the learned router takes over after warmup.
+        if (getattr(args, "use_pkm", False)
+                and getattr(args, "pkm_epsilon_start", 0.0) > 0.0):
+            warm = max(1, int(getattr(args, "pkm_epsilon_warmup_steps", 0)))
+            progress = min(1.0, step / warm) if warm > 0 else 1.0
+            eps = float(args.pkm_epsilon_start) * (1.0 - progress)
+            model.pkm_layer.random_slot_epsilon = eps
+        # PKM α-floor curriculum: linear anneal of the additive
+        # sign-preserving floor on the output gate. Forces a minimum PKM
+        # contribution during the value-table-bootstrap window so values
+        # get meaningful gradient before α can shrink. Synced with ε.
+        if (getattr(args, "use_pkm", False)
+                and getattr(args, "pkm_alpha_floor_start", 0.0) > 0.0):
+            warm = max(1, int(getattr(args, "pkm_alpha_floor_warmup_steps", 0)))
+            progress = min(1.0, step / warm) if warm > 0 else 1.0
+            floor = float(args.pkm_alpha_floor_start) * (1.0 - progress)
+            model.pkm_layer.alpha_floor = floor
         for o in opts:
             o.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        pre_think_stats: dict[str, float] | None = None
+        if args.enable_thinking_token:
+            base_schedule = thinking_schedule(step)
+            schedule = apply_queue_backpressure(base_schedule)
+            pre_think_stats = new_thinking_stats(schedule)
+            if args.think_queue_accum_steps > 0:
+                assert think_queue is not None and think_replay_queue is not None
+                fresh_token_budget = max(1, x.numel())
+                accum_max_steps = (
+                    args.think_queue_accum_max_steps
+                    or args.think_queue_accum_steps
+                )
+                accum_step = 0
+                while accum_step < accum_max_steps:
+                    must_do_minimum = accum_step < args.think_queue_accum_steps
+                    should_drain = (
+                        args.think_queue_drain_target >= 0
+                        and (
+                            len(think_queue) > args.think_queue_drain_target
+                            or len(think_replay_queue) > args.think_queue_drain_target
+                        )
+                    )
+                    if not must_do_minimum and not should_drain:
+                        break
+                    cont_n = min(think_queue_batch, len(think_queue))
+                    replay_n = min(think_replay_batch, len(think_replay_queue))
+                    if cont_n == 0 and replay_n == 0:
+                        break
+                    cont_items = think_queue.pop_batch(cont_n)
+                    replay_items = think_replay_queue.pop_batch(replay_n)
+                    aux_schedule = apply_queue_backpressure(base_schedule)
+                    aux_loss_sum, aux_count, aux_stats = process_thinking_aux_batch(
+                        step, cont_items, replay_items, aux_schedule,
+                    )
+                    merge_thinking_stats(pre_think_stats, aux_stats)
+                    if aux_count > 0:
+                        aux_denom = (
+                            aux_count
+                            if args.think_aux_normalize == "aux_items"
+                            else fresh_token_budget
+                        )
+                        (args.think_aux_loss_scale
+                         * aux_loss_sum / max(1.0, aux_denom)).backward()
+                    accum_step += 1
+        packed_cont_items: list[ThinkContinuation] = []
+        packed_replay_items: list[ThinkReplay] = []
+        packed_cont_last = packed_cont_targets = None
+        packed_replay_last = packed_replay_targets = packed_replay_is_think = None
+        fresh_offset = 0
+        fresh_n = x.shape[0]
+        if args.enable_thinking_token:
+            assert think_queue is not None and think_replay_queue is not None
+            if args.think_queue_accum_steps > 0:
+                n_cont = 0
+                n_replay = 0
+            elif args.think_prioritize_queue:
+                queue_capacity = max(0, x.shape[0] - args.think_min_fresh_rows)
+                n_cont = min(len(think_queue), queue_capacity)
+                n_replay = min(len(think_replay_queue), queue_capacity - n_cont)
+            else:
+                max_aux_rows = max(0, x.shape[0] - args.think_min_fresh_rows)
+                n_cont = min(think_queue_batch, len(think_queue), max_aux_rows)
+                n_replay = min(think_replay_batch, len(think_replay_queue),
+                               max_aux_rows - n_cont)
+            packed_cont_items = think_queue.pop_batch(n_cont)
+            packed_replay_items = think_replay_queue.pop_batch(n_replay)
+            fresh_n = x.shape[0] - n_cont - n_replay
+            packed_rows = []
+            packed_targets = []
+            if packed_cont_items:
+                cont_x, packed_cont_targets, packed_cont_last = build_continuation_batch(
+                    packed_cont_items, block_size=args.T,
+                    pad_token_id=pad_token_id, device=x.device,
+                )
+                packed_rows.append(cont_x)
+                packed_targets.append(torch.zeros_like(cont_x))
+            if packed_replay_items:
+                replay_x, packed_replay_targets, packed_replay_last, packed_replay_is_think = build_replay_batch(
+                    packed_replay_items, block_size=args.T,
+                    pad_token_id=pad_token_id,
+                    thinking_token_id=int(thinking_token_id),
+                    device=x.device,
+                )
+                packed_rows.append(replay_x)
+                packed_targets.append(torch.zeros_like(replay_x))
+            if fresh_n > 0:
+                packed_rows.append(x[:fresh_n])
+                packed_targets.append(y[:fresh_n])
+            if packed_rows:
+                x = torch.cat(packed_rows, dim=0)
+                y = torch.cat(packed_targets, dim=0)
+            fresh_offset = n_cont + n_replay
+        # Gated loss (Phase 23): L = mean(g_t * CE_t + (1-g_t) * λ).
+        # g_t is stored in model._last_gate by the forward pass (side effect).
+        # When output_gate is off, fall back to standard mean CE.
+        if args.enable_thinking_token:
+            if args.aux_brackets:
+                logits, aux_logits = model(x, return_aux=True)
+            else:
+                logits = model(x)
+                aux_logits = None
+            if args.aux_brackets:
+                depth = bracket_depth(x, bracket_deltas).clamp(0, args.aux_max_depth)
+                aux_loss = F.cross_entropy(
+                    aux_logits.reshape(-1, args.aux_max_depth + 1),
+                    depth.reshape(-1),
+                )
+            else:
+                aux_loss = torch.zeros((), device="cuda")
+            V = logits.shape[-1]
+            ce_per_token = F.cross_entropy(
+                logits.reshape(-1, V), y.reshape(-1),
+                reduction="none",
+            ).reshape(y.shape)                                               # (B, T)
+            schedule = apply_queue_backpressure(thinking_schedule(step))
+            think_curriculum = schedule["curriculum"]
+            think_explore_prob_eff = schedule["explore_prob"]
+            think_lambda_eff = schedule["lambda"]
+            think_gate_threshold_eff = schedule["gate_threshold"]
+            think_safety_max_depth_eff = int(schedule["safety_max_depth"])
+            cont_loss_terms: list[torch.Tensor] = []
+            replay_loss_terms: list[torch.Tensor] = []
+            cont_stats = new_thinking_stats(schedule)
+            cont_stats["cont_items"] = float(len(packed_cont_items))
+            cont_stats["replay_items"] = float(len(packed_replay_items))
+            if packed_cont_items:
+                row = torch.arange(len(packed_cont_items), device=logits.device)
+                cont_logits = logits[row, packed_cont_last]
+                forced = torch.zeros(len(packed_cont_items), dtype=torch.bool,
+                                     device=logits.device)
+                if think_safety_max_depth_eff > 0:
+                    forced |= torch.tensor(
+                        [item.depth >= think_safety_max_depth_eff
+                         for item in packed_cont_items],
+                        dtype=torch.bool, device=logits.device,
+                    )
+                if args.think_queue_ttl > 0:
+                    forced |= torch.tensor(
+                        [step - item.origin_step >= args.think_queue_ttl
+                         for item in packed_cont_items],
+                        dtype=torch.bool, device=logits.device,
+                )
+                if args.think_decision == "gate":
+                    cont_gate = model._last_gate[row, packed_cont_last].detach()
+                    cont_think = (cont_gate < think_gate_threshold_eff) & ~forced
+                else:
+                    cont_think = choose_think_actions(
+                        cont_logits.detach(), int(thinking_token_id),
+                        args.think_policy, args.think_threshold,
+                        args.think_temperature, allow_think=~forced,
+                    )
+                cont_explore = torch.zeros_like(cont_think)
+                if think_explore_prob_eff > 0.0:
+                    cont_explore = (
+                        torch.rand_like(cont_think.float()) < think_explore_prob_eff
+                    ) & ~forced
+                    cont_think = cont_think | cont_explore
+                think_targets = torch.full_like(packed_cont_targets,
+                                                int(thinking_token_id))
+                if args.think_decision == "gate":
+                    cont_gate_logits = model._last_gate_logits[row, packed_cont_last]
+                    cont_think_nll = F.binary_cross_entropy_with_logits(
+                        cont_gate_logits,
+                        torch.zeros_like(cont_gate_logits),
+                        reduction="none",
+                    )
+                else:
+                    cont_think_nll = F.cross_entropy(
+                        cont_logits, think_targets, reduction="none"
+                    )
+                cont_answer_nll = cross_entropy_masking_token(
+                    cont_logits, packed_cont_targets, int(thinking_token_id),
+                    reduction="none",
+                )
+                closed_traj: list[float] = []
+                for i, item in enumerate(packed_cont_items):
+                    if bool(cont_think[i].item()):
+                        next_ctx = (item.context_ids + [int(thinking_token_id)])[-args.T:]
+                        think_queue.enqueue(ThinkContinuation(
+                            context_ids=next_ctx,
+                            target_id=item.target_id,
+                            depth=item.depth + 1,
+                            accum_nll=(item.accum_nll
+                                       + float(cont_think_nll[i].detach().item())),
+                            accum_cost=item.accum_cost + float(think_lambda_eff),
+                            origin_step=item.origin_step,
+                            decision_context_ids=(item.decision_context_ids
+                                                  or item.context_ids),
+                            immediate_nll=item.immediate_nll,
+                        ))
+                    else:
+                        answer_after_think = float(cont_answer_nll[i].detach().item())
+                        traj = item.accum_nll + item.accum_cost + answer_after_think
+                        closed_traj.append(traj)
+                        comparable_traj = item.accum_cost + answer_after_think
+                        beneficial = (
+                            comparable_traj + args.think_advantage_margin
+                            < float(item.immediate_nll)
+                        )
+                        think_replay_queue.enqueue(ThinkReplay(
+                            context_ids=(item.decision_context_ids
+                                         or item.context_ids),
+                            target_id=item.target_id,
+                            target_is_thinking=beneficial,
+                        ))
+                        cont_loss_terms.append(cont_answer_nll[i])
+                if closed_traj:
+                    think_closed_traj_window.extend(closed_traj)
+                cont_stats.update({
+                    "cont_think": float(cont_think.float().sum().item()),
+                    "cont_explore": float(cont_explore.float().sum().item()),
+                    "forced_emit": float(forced.float().sum().item()),
+                    "closed": float(len(closed_traj)),
+                })
+            if packed_replay_items:
+                start = len(packed_cont_items)
+                row = torch.arange(start, start + len(packed_replay_items),
+                                   device=logits.device)
+                replay_logits = logits[row, packed_replay_last]
+                if args.think_decision == "gate":
+                    replay_gate_logits = model._last_gate_logits[row, packed_replay_last]
+                    emit_targets = (~packed_replay_is_think).float()
+                    gate_ce = F.binary_cross_entropy_with_logits(
+                        replay_gate_logits, emit_targets, reduction="none"
+                    )
+                    replay_answer_ce = cross_entropy_masking_token(
+                        replay_logits, packed_replay_targets,
+                        int(thinking_token_id), reduction="none",
+                    )
+                    replay_ce = torch.where(
+                        packed_replay_is_think,
+                        gate_ce + think_lambda_eff,
+                        gate_ce + replay_answer_ce,
+                    )
+                else:
+                    replay_ce = F.cross_entropy(
+                        replay_logits, packed_replay_targets, reduction="none"
+                    )
+                    replay_ce = (
+                        replay_ce
+                        + think_lambda_eff * packed_replay_is_think.float()
+                    )
+                replay_loss_terms.append(args.think_replay_weight * replay_ce)
+                cont_stats["replay_think"] = float(
+                    packed_replay_is_think.float().sum().item()
+                )
+            allow_think = step > args.think_warmup_steps
+            fresh_logits = logits[fresh_offset:]
+            fresh_y = y[fresh_offset:]
+            if fresh_n > 0:
+                if args.think_decision == "gate":
+                    fresh_gate = model._last_gate[fresh_offset:].detach()
+                    think_mask = fresh_gate < think_gate_threshold_eff
+                    if not allow_think:
+                        think_mask = torch.zeros_like(think_mask)
+                else:
+                    think_mask = choose_think_actions(
+                        fresh_logits.detach(), int(thinking_token_id),
+                        args.think_policy, args.think_threshold,
+                        args.think_temperature, allow_think=allow_think,
+                    )
+            else:
+                think_mask = torch.zeros((0, args.T), dtype=torch.bool,
+                                         device=logits.device)
+            explore_mask = torch.zeros_like(think_mask)
+            free_slots = think_queue.max_len - len(think_queue)
+            if fresh_n > 0:
+                answer_ce_all = cross_entropy_masking_token(
+                    fresh_logits.reshape(-1, V), fresh_y.reshape(-1),
+                    int(thinking_token_id), reduction="none",
+                ).reshape(fresh_y.shape)
+                if allow_think and think_explore_prob_eff > 0.0:
+                    explore_mask = choose_explore_actions(
+                        answer_ce_all.detach(),
+                        probability=think_explore_prob_eff,
+                        mode=args.think_explore_mode,
+                        top_frac=args.think_explore_top_frac,
+                        min_score=args.think_explore_min_ce,
+                    )
+                    think_mask = think_mask | explore_mask
+                fresh_loss_sum = answer_ce_all.sum()
+            else:
+                answer_ce_all = torch.zeros((0, args.T), device=logits.device)
+                fresh_loss_sum = torch.zeros((), device=logits.device)
+            if free_slots <= 0:
+                think_mask = torch.zeros_like(think_mask)
+                explore_mask = torch.zeros_like(explore_mask)
+            else:
+                think_flat = think_mask.reshape(-1)
+                max_new = free_slots
+                if args.think_max_new_per_step > 0:
+                    max_new = min(max_new, int(args.think_max_new_per_step))
+                n_think = int(think_flat.sum().item())
+                if n_think > max_new:
+                    idx = think_flat.nonzero(as_tuple=False).flatten()
+                    if answer_ce_all.numel():
+                        scores = answer_ce_all.detach().reshape(-1)[idx]
+                        keep_idx = idx[torch.topk(scores, k=max_new).indices]
+                    else:
+                        keep_idx = idx[:max_new]
+                    limited = torch.zeros_like(think_flat)
+                    limited[keep_idx] = True
+                    think_mask = limited.reshape_as(think_mask)
+                    explore_mask = explore_mask & think_mask
+            extra_loss_sum = torch.zeros((), device=logits.device)
+            extra_count = 0
+            if cont_loss_terms:
+                extra_loss_sum = extra_loss_sum + torch.stack(cont_loss_terms).sum()
+                extra_count += len(cont_loss_terms)
+            if replay_loss_terms:
+                extra_loss_sum = extra_loss_sum + torch.cat(replay_loss_terms).sum()
+                extra_count += int(sum(t.numel() for t in replay_loss_terms))
+            gate_emit_items = 0.0
+            if (args.think_decision == "gate" and args.think_gate_emit_weight > 0
+                    and fresh_n > 0 and think_mask.numel() > 0):
+                emit_mask = ~think_mask.detach()
+                gate_logits_fresh = model._last_gate_logits[fresh_offset:]
+                if emit_mask.any():
+                    emit_ce = F.binary_cross_entropy_with_logits(
+                        gate_logits_fresh[emit_mask],
+                        torch.ones_like(gate_logits_fresh[emit_mask]),
+                        reduction="sum",
+                    )
+                    extra_loss_sum = (
+                        extra_loss_sum
+                        + args.think_gate_emit_weight * emit_ce
+                    )
+                    weighted_emit_count = (
+                        args.think_gate_emit_weight
+                        * float(emit_mask.float().sum().item())
+                    )
+                    extra_count += weighted_emit_count
+                    gate_emit_items = float(emit_mask.float().sum().item())
+            denom = fresh_y.numel() + extra_count
+            lm_loss = (fresh_loss_sum + extra_loss_sum) / max(1, denom)
+            think_coords = think_mask.detach().nonzero(as_tuple=False).cpu().tolist()
+            x_cpu = x[fresh_offset:].detach().cpu()
+            y_cpu = fresh_y.detach().cpu()
+            answer_ce_cpu = answer_ce_all.detach().cpu()
+            fresh_logits_cpu = fresh_logits.detach().cpu()
+            fresh_gate_logits_cpu = (
+                model._last_gate_logits[fresh_offset:].detach().cpu()
+                if args.think_decision == "gate" else None
+            )
+            for b, t_idx in think_coords:
+                ctx_ids = x_cpu[b, :t_idx + 1].tolist() + [int(thinking_token_id)]
+                decision_ctx = x_cpu[b, :t_idx + 1].tolist()
+                if args.think_decision == "gate":
+                    assert fresh_gate_logits_cpu is not None
+                    think_nll = F.binary_cross_entropy_with_logits(
+                        fresh_gate_logits_cpu[b, t_idx].unsqueeze(0),
+                        torch.zeros(1),
+                        reduction="none",
+                    )[0].item()
+                else:
+                    think_nll = F.cross_entropy(
+                        fresh_logits_cpu[b, t_idx].unsqueeze(0),
+                        torch.tensor([int(thinking_token_id)]),
+                        reduction="none",
+                    )[0].item()
+                think_queue.enqueue(ThinkContinuation(
+                    context_ids=ctx_ids[-args.T:],
+                    target_id=int(y_cpu[b, t_idx].item()),
+                    depth=1,
+                    accum_nll=float(think_nll),
+                    accum_cost=float(think_lambda_eff),
+                    origin_step=step,
+                    decision_context_ids=decision_ctx[-args.T:],
+                    immediate_nll=float(answer_ce_cpu[b, t_idx].item()),
+                ))
+            think_stats = {
+                "normal_items": float(fresh_y.numel()),
+                "normal_think": float(think_mask.float().sum().item()),
+                "normal_explore": float(explore_mask.float().sum().item()),
+                "answer_ce": (float(answer_ce_all.mean().detach().item())
+                              if answer_ce_all.numel() else 0.0),
+                "queue_len": float(len(think_queue)),
+                "queue_mean_depth": float(think_queue.mean_depth()),
+                "queue_max_depth": float(think_queue.max_depth()),
+                "queue_dropped": float(think_queue.dropped),
+                "replay_queue_len": float(len(think_replay_queue)),
+                "gate_emit_items": gate_emit_items,
+                **cont_stats,
+            }
+            if pre_think_stats is not None:
+                merge_thinking_stats(pre_think_stats, think_stats)
+                think_stats = pre_think_stats
+            think_stats_window.append(think_stats)
+            loss = lm_loss + args.aux_weight * aux_loss
+            loss = loss + _z_loss_term(logits, args.z_loss)
+            loss.backward()
+        else:
+            # Non-thinking (pretrain) path: gradient accumulation over
+            # --grad_accum microbatches, one optimizer step per `step`.
+            # The gate/plain-loss branches live in _nonthink_forward_loss.
+            n_micro = max(1, args.grad_accum)
+            for micro in range(n_micro):
+                if micro > 0:
+                    try:
+                        batch = next(train_iter)
+                    except StopIteration:
+                        train_iter = iter(train_loader)
+                        batch = next(train_iter)
+                    x, y, *_rest = batch
+                    x, y = x.to("cuda"), y.to("cuda")
+                    doc_ids = _rest[0].to("cuda") if _rest else None
+                logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss, \
+                    gist_loss = _nonthink_forward_loss(
+                        model, x, y, args, step, bracket_deltas,
+                        doc_ids=doc_ids, gist_horizons=gist_horizons)
+                loss = lm_loss + args.aux_weight * aux_loss
+                loss = loss + _z_loss_term(logits, args.z_loss)
+                if args.output_gate and args.gate_entropy_aux_weight > 0.0:
+                    loss = loss + args.gate_entropy_aux_weight * gate_aux_loss
+                if args.gist_loss_weight > 0.0:
+                    loss = loss + args.gist_loss_weight * gist_loss
+                # PKM diversity-bonus: -H(slot-selection distribution) per
+                # head, averaged across batch and heads. We MAXIMISE entropy
+                # so the auxiliary loss is NEGATIVE entropy. This is the
+                # direct fix for v5-pkm's "4 % of slots cover 95 % of mass"
+                # failure mode. The slot indices are detached upstream so the
+                # router itself isn't trained to produce high entropy — we
+                # only nudge the *distribution* (via the value-table grad
+                # this implies for diverse retrievals).
+                if (getattr(args, "use_pkm", False)
+                        and getattr(args, "pkm_diversity_weight", 0.0) > 0.0):
+                    div_loss = _pkm_diversity_loss(model.pkm_layer)
+                    loss = loss + args.pkm_diversity_weight * div_loss
+                # --- Phase A: process-reward auxiliary loss ----------------
+                # Reads the main-forward gate via `model._last_gate` and
+                # reuses the just-computed `logits` for the "before"
+                # log-probabilities (no extra forward). The "after"
+                # forward runs over a small synthesised batch where K
+                # think tokens are inserted before each sampled
+                # position. Bounded by --process_reward_sample_frac and
+                # --process_reward_max_positions.
+                # PAD must NOT equal thinking_token_id; we use 0.
+                main_gate = getattr(model, "_last_gate", None)
+                # Snapshot the pre-sigmoid logits BEFORE any extra
+                # forwards — process_reward's extra forward overwrites
+                # `_last_gate_logits` to the wrong shape (N_pr, T_pr),
+                # and gate_calibration would then index it with the
+                # main-forward (B, T) indices, causing a CUDA assert.
+                main_gate_logits = getattr(
+                    model, "_last_gate_logits", None)
+                if use_process_reward and main_gate is not None:
+                    # Slice logits to base vocab for an apples-to-apples
+                    # softmax denom with the after-forward (which is also
+                    # sliced inside the helper).
+                    pr_main_logits = (
+                        logits[..., :base_vocab_for_loss]
+                        if base_vocab_for_loss is not None else logits)
+                    pr_loss, pr_stats = compute_process_reward_loss(
+                        model, x, y,
+                        gate=main_gate,
+                        main_logits=pr_main_logits,
+                        thinking_token_id=int(thinking_token_id),
+                        K=int(args.process_reward_K),
+                        apply_min_sigma=float(
+                            args.process_reward_apply_min_sigma),
+                        sample_frac=float(
+                            args.process_reward_sample_frac),
+                        rng=aux_rng,
+                        pad_token_id=0,
+                        retrieval_as_input=False,
+                        base_vocab_for_loss=base_vocab_for_loss,
+                        max_positions=int(
+                            args.process_reward_max_positions),
+                    )
+                    last_pr_stats = pr_stats
+                    if pr_stats.n_sampled > 0:
+                        loss = loss + (
+                            args.process_reward_weight * pr_loss)
+                # --- Gate-calibration aux loss (sibling of pr) -----------
+                if use_gate_calibration and main_gate is not None:
+                    # Use the pre-extra-forward snapshot (see above).
+                    gate_logit = main_gate_logits
+                    gc_main_logits = (
+                        logits[..., :base_vocab_for_loss]
+                        if base_vocab_for_loss is not None else logits)
+                    gc_loss, gc_stats = compute_gate_calibration_loss(
+                        model, x, y,
+                        gate=main_gate,
+                        main_logits=gc_main_logits,
+                        thinking_token_id=int(thinking_token_id),
+                        K=int(args.gate_calibration_K),
+                        apply_min_sigma=float(
+                            args.gate_calibration_apply_min_sigma),
+                        apply_max_sigma=float(
+                            args.gate_calibration_apply_max_sigma),
+                        sample_frac=float(
+                            args.gate_calibration_sample_frac),
+                        rng=aux_rng,
+                        pad_token_id=0,
+                        retrieval_as_input=False,
+                        base_vocab_for_loss=base_vocab_for_loss,
+                        max_positions=int(
+                            args.gate_calibration_max_positions),
+                        gate_logits=gate_logit,
+                        smooth_target_scale=float(
+                            args.gate_calibration_smooth_target_scale),
+                    )
+                    last_gc_stats = gc_stats
+                    if gc_stats.n_sampled > 0:
+                        loss = loss + (
+                            args.gate_calibration_weight * gc_loss)
+                (loss / n_micro).backward()
+        _log_this_step = (step % args.log_every == 0 or step == args.steps)
+        # Per-layer diagnostics: grad norms must be read before clip; the
+        # weight snapshot must be taken before opt.step().
+        _blk_gnorms = _block_grad_norms(model) if _log_this_step else None
+        _blk_wsnap = _block_weight_snapshot(model) if _log_this_step else None
+        if args.grad_clip > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         for o in opts:
             o.step()
         for s in scheds:
             s.step()
+        _blk_uratios = (_block_update_ratios(model, _blk_wsnap)
+                        if _log_this_step else None)
         losses.append(lm_loss.item())  # track LM loss alone for comparison
+        if args.output_gate:
+            # Read the MAIN-forward snapshot — model._last_gate may have
+            # been overwritten by process_reward / gate_calibration
+            # extra forwards (which produce smaller (N, T') tensors).
+            g_detached = (main_gate.detach() if main_gate is not None
+                          else model._last_gate.detach())
+            ce_detached = ce_per_token.detach()
+            emit_mask = g_detached > 0.5
+            # CE averaged only over emitted positions — the fair comparison metric.
+            emit_ce = (ce_detached[emit_mask].mean().item()
+                       if emit_mask.any() else float("nan"))
+            losses_gate_window.append((
+                float(g_detached.mean().item()),
+                float(emit_mask.float().mean().item()),
+                float(ce_detached.mean().item()),
+                emit_ce,
+            ))
 
         if step % args.log_every == 0 or step == args.steps:
             now = time.perf_counter()
-            tok_per_sec = (step - last_log_step) * args.batch * args.T / (now - last_log)
+            tok_per_sec = ((step - last_log_step) * args.batch * args.T
+                           * args.grad_accum / (now - last_log))
+            tloss_avg = sum(losses[-args.log_every:]) / max(1, len(losses[-args.log_every:]))
             line = (f"{step:>6d}  {tok_per_sec:>8.0f}  "
-                    f"{sum(losses[-args.log_every:]) / max(1, len(losses[-args.log_every:])):>8.4f}  "
+                    f"{tloss_avg:>8.4f}  "
                     f"{scheduler.get_last_lr()[0]:>9.2e}")
+            if args.gist_loss_weight > 0.0:
+                line += f"  gist={gist_loss.item():.4f}"
             if args.feedback != "none" or fb_xattn_pairs:
                 alphas = model.feedback_alphas()
                 if not alphas:
@@ -572,7 +1540,233 @@ def main():
                     line += f"  max|α|=[{','.join(f'{a:.3f}' for a in summary)}]"
                 else:
                     line += f"  α=[{','.join(f'{a:+.3f}' for a in alphas)}]"
+            if args.output_gate and losses_gate_window:
+                recent = losses_gate_window[-args.log_every:]
+                mean_g = sum(r[0] for r in recent) / len(recent)
+                emit_frac = sum(r[1] for r in recent) / len(recent)
+                raw_ce = sum(r[2] for r in recent) / len(recent)
+                valid_emit = [r[3] for r in recent if r[3] == r[3]]  # drop NaN
+                emit_ce = sum(valid_emit) / len(valid_emit) if valid_emit else float("nan")
+                if args.gate_warmup_steps > 0:
+                    progress = min(1.0, step / args.gate_warmup_steps)
+                    floor_now = (1.0 - progress) * 1.0 + progress * args.gate_floor_min
+                    gf = f",floor={floor_now:.2f}"
+                else:
+                    gf = (f",floor={args.gate_floor_min:.2f}"
+                          if args.gate_floor_min > 0 else "")
+                ece_str = f"{emit_ce:.4f}" if emit_ce == emit_ce else "nan"
+                line += (f"  gate(g={mean_g:.3f},emit={emit_frac:.2f},"
+                         f"emit_ce={ece_str},ce={raw_ce:.4f}{gf})")
+            if use_process_reward and last_pr_stats is not None:
+                line += (f"  pr(n={last_pr_stats.n_sampled}/"
+                         f"{last_pr_stats.n_candidates}, "
+                         f"Δlogp={last_pr_stats.mean_log_ratio:+.3f}, "
+                         f"%pos={100 * last_pr_stats.frac_positive:.0f})")
+            if use_gate_calibration and last_gc_stats is not None:
+                line += (f"  gc(n={last_gc_stats.n_sampled}/"
+                         f"{last_gc_stats.n_candidates}, "
+                         f"tgt1={last_gc_stats.target_frac_one:.2f}, "
+                         f"σ={last_gc_stats.mean_sigma:.2f}, "
+                         f"Δlogp={last_gc_stats.mean_log_ratio:+.3f})")
+            if args.enable_thinking_token and think_stats_window:
+                recent = think_stats_window[-args.log_every:]
+                normal_items = sum(r.get("normal_items", 0.0) for r in recent)
+                normal_think = sum(r.get("normal_think", 0.0) for r in recent)
+                normal_explore = sum(r.get("normal_explore", 0.0) for r in recent)
+                cont_items = sum(r.get("cont_items", 0.0) for r in recent)
+                cont_think = sum(r.get("cont_think", 0.0) for r in recent)
+                cont_explore = sum(r.get("cont_explore", 0.0) for r in recent)
+                replay_items = sum(r.get("replay_items", 0.0) for r in recent)
+                replay_think = sum(r.get("replay_think", 0.0) for r in recent)
+                gate_emit_items = sum(r.get("gate_emit_items", 0.0) for r in recent)
+                forced_emit = sum(r.get("forced_emit", 0.0) for r in recent)
+                answer_ce = sum(r.get("answer_ce", 0.0) for r in recent) / len(recent)
+                think_rate = ((normal_think + cont_think)
+                              / max(1.0, normal_items + cont_items))
+                explore_rate = ((normal_explore + cont_explore)
+                                / max(1.0, normal_items + cont_items))
+                forced_rate = forced_emit / max(1.0, cont_items)
+                queue_len = recent[-1].get("queue_len", 0.0)
+                q_mean_depth = recent[-1].get("queue_mean_depth", 0.0)
+                q_max_depth = recent[-1].get("queue_max_depth", 0.0)
+                q_dropped = recent[-1].get("queue_dropped", 0.0)
+                replay_rate = replay_think / max(1.0, replay_items)
+                curr = recent[-1].get("curriculum", 1.0)
+                explore_prob = recent[-1].get("explore_prob", args.think_explore_prob)
+                lambda_eff = recent[-1].get("lambda", args.think_lambda)
+                gate_thr = recent[-1].get("gate_threshold", args.think_gate_threshold)
+                q_pressure = recent[-1].get("queue_pressure", 0.0)
+                depth_cap = recent[-1].get("safety_max_depth", args.think_safety_max_depth)
+                traj_recent = think_closed_traj_window[-args.log_every:]
+                traj_nll = (sum(traj_recent) / len(traj_recent)
+                            if traj_recent else float("nan"))
+                traj_str = f"{traj_nll:.4f}" if traj_nll == traj_nll else "nan"
+                line += (f"  think(rate={think_rate:.3f},ans_ce={answer_ce:.4f},"
+                          f"traj={traj_str},q={queue_len:.0f},"
+                          f"depth={q_mean_depth:.2f}/{q_max_depth:.0f},"
+                          f"work={cont_items:.0f}/{replay_items:.0f},"
+                          f"forced={forced_rate:.3f},explore={explore_rate:.3f},"
+                          f"replay_think={replay_rate:.3f},"
+                          f"gate_emit={gate_emit_items:.0f},"
+                          f"curr={curr:.2f},eps={explore_prob:.3f},"
+                          f"lam={lambda_eff:.3f},thr={gate_thr:.3f},"
+                          f"bp={q_pressure:.2f},"
+                          f"cap={depth_cap:.0f},"
+                          f"drop={q_dropped:.0f})")
+            if _blk_gnorms is not None:
+                gn, ur = _blk_gnorms, _blk_uratios
+                n = len(gn)
+                mid = n // 2
+                line += (f"  gnorm(L0={gn[0]:.2e},L{mid}={gn[mid]:.2e},"
+                         f"L{n-1}={gn[n-1]:.2e},last/first="
+                         f"{gn[-1] / max(gn[0], 1e-12):.1f})")
+                line += (f"  uratio(L0={ur[0]:.1e},L{mid}={ur[mid]:.1e},"
+                         f"L{n-1}={ur[n-1]:.1e})")
+            # PKM live diagnostics (v7.1): is the table actually waking up?
+            #   αL      = learned scalar gate (init 0)
+            #   αeff    = α + sign(α)·alpha_floor (the magnitude that
+            #             actually scales PKM output in the forward)
+            #   row     = mean row-norm of value table / expected init norm.
+            #             >1 means rows have GROWN from init; <1 means they
+            #             shrunk. =1 exactly means the table is frozen.
+            #             (Replaces the misleading `v_std` diagnostic which
+            #             is invariant under updates that preserve overall
+            #             Gaussian distribution — frozen and learning-but-
+            #             centred values both gave std≈1.)
+            #   slots/H = unique slots hit this microbatch (out of n_keys²)
+            #   top     = mass on the single hottest slot (lower=more diverse)
+            #   ε       = current ε-greedy exploration rate
+            #   φ       = current α-floor (decaying from start to 0)
+            if (getattr(args, "use_pkm", False)
+                    and hasattr(model, "pkm_layer")):
+                pkm = model.pkm_layer
+                with torch.no_grad():
+                    aL = float(pkm.out_alpha.detach()) if pkm.use_output_gate else float("nan")
+                    floor = float(getattr(pkm, "alpha_floor", 0.0))
+                    sign = 1.0 if aL >= 0.0 or abs(aL) < 1e-3 else -1.0
+                    aEff = aL + sign * floor if pkm.use_output_gate else float("nan")
+                    # Row-norm drift: mean over rows of ||v_row|| / expected_init.
+                    rn_mean = float(torch.stack([
+                        emb.weight.float().norm(dim=-1).mean()
+                        for emb in pkm.values
+                    ]).mean())
+                    init_norm = float(pkm._expected_init_row_norm)
+                    rn_ratio = rn_mean / max(init_norm, 1e-9)
+                    eps = float(getattr(pkm, "random_slot_epsilon", 0.0))
+                    n_slots = pkm.n_keys * pkm.n_keys
+                    if pkm._last_slot_idx is not None:
+                        idx = pkm._last_slot_idx       # (B, T, H, top_k)
+                        w = pkm._last_weights          # (B, T, H, top_k)
+                        H_ = pkm.n_heads
+                        slot_mass = torch.zeros(H_, n_slots,
+                                                 device=idx.device, dtype=torch.float32)
+                        for h_ in range(H_):
+                            slot_mass[h_].scatter_add_(
+                                0, idx[:, :, h_, :].reshape(-1),
+                                w[:, :, h_, :].reshape(-1).float())
+                        slot_mass = slot_mass / slot_mass.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                        unique_hit = int((slot_mass > 0).sum(dim=-1).float().mean())
+                        top_share = float(slot_mass.max(dim=-1).values.mean())
+                    else:
+                        unique_hit, top_share = 0, float("nan")
+                line += (f"  pkm(αL={aL:+.3f},αeff={aEff:+.3f},"
+                         f"row={rn_ratio:.3f},"
+                         f"slots/H={unique_hit}/{n_slots},top={top_share:.3f},"
+                         f"ε={eps:.2f},φ={floor:.2f})")
             print(line)
+            if tb is not None:
+                tb.add_scalar("train/loss", tloss_avg, step)
+                tb.add_scalar("train/ppl", float(torch.tensor(tloss_avg).exp()), step)
+                tb.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
+                tb.add_scalar("train/tok_per_sec", tok_per_sec, step)
+                if _blk_gnorms is not None:
+                    for L, (g, u) in enumerate(zip(_blk_gnorms, _blk_uratios)):
+                        tb.add_scalar(f"layer_grad_norm/L{L:02d}", g, step)
+                        tb.add_scalar(f"layer_update_ratio/L{L:02d}", u, step)
+                    tb.add_scalar("layer_grad_norm/last_over_first",
+                                  _blk_gnorms[-1] / max(_blk_gnorms[0], 1e-12),
+                                  step)
+                if (getattr(args, "use_pkm", False)
+                        and hasattr(model, "pkm_layer")):
+                    pkm = model.pkm_layer
+                    with torch.no_grad():
+                        if pkm.use_output_gate:
+                            tb.add_scalar("pkm/alpha_learned",
+                                          float(pkm.out_alpha.detach()), step)
+                        floor = float(getattr(pkm, "alpha_floor", 0.0))
+                        tb.add_scalar("pkm/alpha_floor", floor, step)
+                        rn_mean = float(torch.stack([
+                            emb.weight.float().norm(dim=-1).mean()
+                            for emb in pkm.values
+                        ]).mean())
+                        init_norm = float(pkm._expected_init_row_norm)
+                        tb.add_scalar("pkm/row_norm_mean", rn_mean, step)
+                        tb.add_scalar("pkm/row_norm_ratio_vs_init",
+                                      rn_mean / max(init_norm, 1e-9), step)
+                        tb.add_scalar("pkm/epsilon",
+                                      float(getattr(pkm, "random_slot_epsilon", 0.0)),
+                                      step)
+                        if pkm._last_slot_idx is not None:
+                            n_slots = pkm.n_keys * pkm.n_keys
+                            idx = pkm._last_slot_idx
+                            w_ = pkm._last_weights
+                            H_ = pkm.n_heads
+                            slot_mass = torch.zeros(H_, n_slots,
+                                                     device=idx.device,
+                                                     dtype=torch.float32)
+                            for h_ in range(H_):
+                                slot_mass[h_].scatter_add_(
+                                    0, idx[:, :, h_, :].reshape(-1),
+                                    w_[:, :, h_, :].reshape(-1).float())
+                            slot_mass = slot_mass / slot_mass.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                            uniq = (slot_mass > 0).sum(dim=-1).float().mean()
+                            top = slot_mass.max(dim=-1).values.mean()
+                            ent = -(slot_mass * slot_mass.clamp_min(1e-12).log()).sum(dim=-1).mean()
+                            tb.add_scalar("pkm/unique_slots_per_head", float(uniq), step)
+                            tb.add_scalar("pkm/top_slot_share", float(top), step)
+                            tb.add_scalar("pkm/slot_entropy", float(ent), step)
+                if args.output_gate and losses_gate_window:
+                    tb.add_scalar("gate/think_frac", 1.0 - emit_frac, step)
+                    tb.add_scalar("gate/mean_gate", mean_g, step)
+                    tb.add_scalar("gate/raw_ce", raw_ce, step)
+                    if emit_ce == emit_ce:  # not NaN
+                        tb.add_scalar("gate/emit_ce", emit_ce, step)
+                    if args.gate_warmup_steps > 0 or args.gate_floor_min > 0:
+                        if args.gate_warmup_steps > 0:
+                            progress = min(1.0, step / args.gate_warmup_steps)
+                            gate_floor = (1.0 - progress) + progress * args.gate_floor_min
+                        else:
+                            gate_floor = args.gate_floor_min
+                        tb.add_scalar("gate/floor", gate_floor, step)
+                if args.enable_thinking_token and think_stats_window:
+                    tb.add_scalar("think/rate", think_rate, step)
+                    tb.add_scalar("think/explore_rate", explore_rate, step)
+                    tb.add_scalar("think/explore_prob", explore_prob, step)
+                    tb.add_scalar("think/curriculum", curr, step)
+                    tb.add_scalar("think/lambda", lambda_eff, step)
+                    tb.add_scalar("think/gate_threshold", gate_thr, step)
+                    tb.add_scalar("think/queue_pressure", q_pressure, step)
+                    tb.add_scalar("think/safety_max_depth", depth_cap, step)
+                    tb.add_scalar("think/replay_think_rate", replay_rate, step)
+                    tb.add_scalar("think/answer_ce", answer_ce, step)
+                    if traj_nll == traj_nll:
+                        tb.add_scalar("think/trajectory_nll", traj_nll, step)
+                    tb.add_scalar("think/queue_len", queue_len, step)
+                    tb.add_scalar("think/queue_mean_depth", q_mean_depth, step)
+                    tb.add_scalar("think/queue_max_depth", q_max_depth, step)
+                    tb.add_scalar("think/forced_emit_rate", forced_rate, step)
+                    tb.add_scalar("think/queue_dropped", q_dropped, step)
+                    tb.add_scalar("think/cont_items", cont_items, step)
+                    tb.add_scalar("think/replay_items", replay_items, step)
+                # FiLM α values.
+                if args.feedback != "none" or fb_xattn_pairs:
+                    for entry in model.feedback_alphas():
+                        if isinstance(entry, tuple) and len(entry) == 3:
+                            t_idx, s_idx, alpha = entry
+                            label = (f"alpha/t{t_idx}"
+                                     if isinstance(s_idx, tuple)
+                                     else f"alpha/t{t_idx}_s{s_idx}")
+                            tb.add_scalar(label, alpha, step)
             last_log = now
             last_log_step = step
 
@@ -581,12 +1775,21 @@ def main():
             val_loss = 0.0
             n_val = 0
             with torch.no_grad():
-                for vx, vy in val_loader:
+                for vbatch in val_loader:
+                    vx, vy, *_vrest = vbatch
                     vx, vy = vx.to("cuda"), vy.to("cuda")
-                    vlogits = model(vx)
-                    vloss = F.cross_entropy(
-                        vlogits.reshape(-1, tok.vocab_size), vy.reshape(-1),
-                    )
+                    vdoc_ids = _vrest[0].to("cuda") if _vrest else None
+                    vlogits = model(vx, doc_ids=vdoc_ids)
+                    if args.enable_thinking_token:
+                        vloss = cross_entropy_masking_token(
+                            vlogits.reshape(-1, vlogits.shape[-1]), vy.reshape(-1),
+                            int(thinking_token_id),
+                            reduction="mean",
+                        )
+                    else:
+                        vloss = F.cross_entropy(
+                            vlogits.reshape(-1, vlogits.shape[-1]), vy.reshape(-1),
+                        )
                     val_loss += vloss.item() * vx.numel()
                     n_val += vx.numel()
                     if n_val >= 64 * args.T:                # cap val
@@ -594,28 +1797,295 @@ def main():
             val_loss /= n_val
             ppl = float(torch.tensor(val_loss).exp())
             print(f"        VAL  loss={val_loss:.4f}  ppl={ppl:.2f}")
+            if tb is not None:
+                tb.add_scalar("val/loss", val_loss, step)
+                tb.add_scalar("val/ppl", ppl, step)
             model.train()
+            torch.cuda.empty_cache()
+
+        if (args.probe_humaneval_every_tokens > 0
+                and tokens_seen - tokens_at_last_probe
+                    >= args.probe_humaneval_every_tokens):
+            from experiments.probe_humaneval import run_humaneval_probe
+            n_probe = (args.probe_humaneval_n_problems
+                       if args.probe_humaneval_n_problems > 0 else None)
+            try:
+                res = run_humaneval_probe(
+                    model, tok,
+                    probe_path=args.probe_humaneval_path,
+                    max_gen=args.probe_humaneval_max_gen,
+                    n_problems=n_probe,
+                    use_thinking=bool(args.output_gate
+                                       and thinking_token_id is not None),
+                    thinking_token_id=thinking_token_id,
+                    gate_floor=float(args.gate_floor_min),
+                    min_emit_before_eos=30,
+                )
+                print(f"        PROBE  pass@1={res['pass_rate']*100:.1f}% "
+                      f"({res['n_passed']}/{res['n_total']})  "
+                      f"emit={res['mean_emit_tokens']:.0f}tok  "
+                      f"t={res['elapsed_s']:.1f}s  "
+                      f"@tok={tokens_seen/1e6:.1f}M")
+                if tb is not None:
+                    tb.add_scalar("probe/pass_rate", res["pass_rate"], step)
+                    tb.add_scalar("probe/n_passed", res["n_passed"], step)
+            except Exception as e:
+                print(f"        PROBE  ERROR: {e}")
+            tokens_at_last_probe = tokens_seen
+            torch.cuda.empty_cache()
+
+        # ---- Mid-training HumanEval hook (auto_stop). ----
+        # tokens_seen is the rough count of tokens consumed by the train
+        # loop so far. At every `mid_eval_every_tokens` boundary, save a
+        # ckpt, shell out to eval_humaneval.py, log pass-rate to TB,
+        # append to controller, optionally stop.
+        tokens_seen = step * args.batch * args.T * args.grad_accum
+        if (mid_eval_controller is not None
+                and tokens_seen >= next_eval_at):
+            # Snapshot to a numbered ckpt — kept for the curve plot.
+            stem = pathlib.Path(args.save_ckpt or "checkpoints/pretrain.pt").stem
+            mid_path = pathlib.Path("checkpoints") / (
+                f"{stem}_step{step}_tok{tokens_seen}.pt")
+            mid_path.parent.mkdir(parents=True, exist_ok=True)
+            _save_cfg = dict(
+                vocab_size=model_vocab_size,
+                tokenizer_base_vocab_size=tok.vocab_size,
+                d_model=args.d_model, n_heads=args.n_heads,
+                d_head=args.d_head, n_layers=n_layers_actual,
+                max_T=args.max_T, feedback_mode=args.feedback,
+                feedback_pairs=fb_pairs,
+                feedback_self_k=args.feedback_self_k,
+                feedback_alpha_mode=args.feedback_alpha_mode,
+                arch=args.arch, layers_spec=args.layers,
+                tokenizer=args.tokenizer,
+                thinking_token_id=thinking_token_id,
+                use_memory=bool(args.use_memory),
+                mem_size=int(args.mem_size) if args.use_memory else 0,
+                mem_dim=(int(args.mem_dim) if args.mem_dim > 0
+                          else int(args.d_model)) if args.use_memory else 0,
+                use_pkm=bool(getattr(args, "use_pkm", False)),
+                pkm_after_layer=int(getattr(args, "pkm_after_layer", 14)),
+                pkm_n_keys=int(getattr(args, "pkm_n_keys", 256)),
+                pkm_n_heads=int(getattr(args, "pkm_n_heads", 4)),
+                pkm_k_dim=int(getattr(args, "pkm_k_dim", 128)),
+                pkm_top_k=int(getattr(args, "pkm_top_k", 32)),
+                pkm_value_bf16=bool(getattr(args, "pkm_value_bf16", True)),
+                # v7 PKM-bootstrap-fix package.
+                pkm_score_norm=str(getattr(args, "pkm_score_norm", "layer")),
+                pkm_value_init_std=float(getattr(args, "pkm_value_init_std", 1.0)),
+                pkm_use_output_gate=bool(getattr(args, "pkm_use_output_gate", True)),
+                output_gate=bool(args.output_gate
+                                  or (args.enable_thinking_token
+                                      and args.think_decision == "gate")),
+                # Thinking-loss recipe (so post-pretrain eval can detect).
+                process_reward_weight=float(
+                    getattr(args, "process_reward_weight", 0.0)),
+                gate_calibration_weight=float(
+                    getattr(args, "gate_calibration_weight", 0.0)),
+                state_readonly_at_think=bool(
+                    getattr(args, "state_readonly_at_think", False)),
+                use_think_adapter=bool(
+                    getattr(args, "use_think_adapter", False)),
+                think_adapter_hidden_mult=int(
+                    getattr(args, "think_adapter_hidden_mult", 2)),
+                use_refinement_head=bool(
+                    getattr(args, "use_refinement_head", False)),
+                refinement_head_window=int(
+                    getattr(args, "refinement_head_window", 128)),
+                refinement_head_n_heads=int(
+                    getattr(args, "refinement_head_n_heads", 8)),
+                refinement_head_mlp_mult=int(
+                    getattr(args, "refinement_head_mlp_mult", 2)),
+                refinement_head_alpha_init=float(
+                    getattr(args, "refinement_head_alpha_init", 0.3)),
+                think_index_emb_size=int(
+                    getattr(args, "think_index_emb_size", 0)),
+                retrieval_input_additive=False,
+            )
+            torch.save({"state_dict": model.state_dict(), "step": step,
+                        "config": _save_cfg}, str(mid_path))
+            print(f"\n[mid-eval] saved ckpt at step={step} tokens={tokens_seen:,}"
+                  f" → {mid_path}")
+
+            # Decide whether to run the HumanEval subprocess. Two skip paths,
+            # both leave the ckpt on disk and advance the counter (resume
+            # artifact > HumanEval signal during pretrain):
+            #   1. --mid_eval_save_only: explicit user opt-out.
+            #   2. Auto-skip: trainer is using nearly all of GPU memory; the
+            #      eval subprocess would OOM trying to load its own model copy
+            #      on the same device (observed in v4 at step 1526).
+            skip_eval = False
+            skip_reason = ""
+            if args.mid_eval_save_only:
+                skip_eval = True
+                skip_reason = "--mid_eval_save_only"
+            elif args.mid_eval_min_free_gib > 0:
+                free_b, _ = torch.cuda.mem_get_info()
+                free_gib = free_b / (1024 ** 3)
+                if free_gib < args.mid_eval_min_free_gib:
+                    skip_eval = True
+                    skip_reason = (
+                        f"free GPU memory {free_gib:.2f} GiB < "
+                        f"{args.mid_eval_min_free_gib:.2f} GiB — eval "
+                        f"subprocess would OOM")
+
+            if skip_eval:
+                print(f"[mid-eval] SKIPPED HumanEval ({skip_reason}). "
+                      f"Ckpt is on disk; advancing counter.")
+                from experiments.eval_callback import EvalResult
+                res = EvalResult(
+                    humaneval_pass_rate=float("nan"),
+                    mbpp_pass_rate=None,
+                    tokens_seen=tokens_seen, step=step,
+                    ckpt_path=str(mid_path),
+                    raw_log_tail=f"<skipped: {skip_reason}>",
+                )
+            else:
+                print(f"[mid-eval] running HumanEval (max_problems="
+                      f"{args.mid_eval_n_problems}) ...")
+                model.eval()
+                res = run_eval(
+                    str(mid_path), tokens_seen=tokens_seen, step=step,
+                    n_problems=args.mid_eval_n_problems,
+                    max_gen=args.mid_eval_max_gen,
+                    use_thinking=bool(args.use_memory),
+                    emit_threshold=0.5,
+                    min_emit_before_eos=int(args.mid_eval_min_emit_before_eos),
+                    gate_floor=float(args.gate_floor_min),
+                )
+                model.train()
+            mid_eval_controller.append(res)
+            print(f"[mid-eval] {mid_eval_controller.summary_line()}")
+            if not skip_eval and res.humaneval_pass_rate != res.humaneval_pass_rate:  # NaN
+                print("[mid-eval] WARNING: humaneval=NaN — eval subprocess "
+                      "did not emit a parseable `pass@k =` line. Last 2 kB "
+                      "of its stdout/stderr:")
+                print(res.raw_log_tail)
+            if tb is not None:
+                tb.add_scalar("eval/humaneval", res.humaneval_pass_rate, step)
+                tb.add_scalar("eval/humaneval_vs_tokens",
+                              res.humaneval_pass_rate, tokens_seen // 1_000_000)
+            # Advance the next-eval threshold to the next interval; if we
+            # blew past several intervals (e.g. small batch * long step),
+            # snap forward by multiples.
+            while next_eval_at <= tokens_seen:
+                next_eval_at += int(args.mid_eval_every_tokens)
+            if args.auto_stop and mid_eval_controller.should_stop():
+                print(f"[mid-eval] AUTO STOP — pass-rate plateaued. "
+                      f"Last {args.auto_stop_k} intervals each gained "
+                      f"<{args.auto_stop_threshold:.3f}. Stopping at "
+                      f"step={step} tokens={tokens_seen:,}.")
+                break
 
     secs = time.perf_counter() - t0
     print(f"\nDone in {secs:.0f}s ({secs/args.steps*1000:.0f} ms/step avg).")
+    if tb is not None:
+        tb.close()
 
     if args.save_ckpt:
         ckpt = {
             "state_dict": model.state_dict(),
+            "step": locals().get("step", 0),
             "config": {
-                "vocab_size": tok.vocab_size,
+                "vocab_size": model_vocab_size,
+                "tokenizer_base_vocab_size": tok.vocab_size,
+                "use_memory": bool(args.use_memory),
+                "mem_size": (int(args.mem_size) if args.use_memory else 0),
+                "mem_dim": ((int(args.mem_dim) if args.mem_dim > 0
+                             else int(args.d_model)) if args.use_memory else 0),
+                "use_pkm": bool(getattr(args, "use_pkm", False)),
+                "pkm_after_layer": int(getattr(args, "pkm_after_layer", 14)),
+                "pkm_n_keys": int(getattr(args, "pkm_n_keys", 256)),
+                "pkm_n_heads": int(getattr(args, "pkm_n_heads", 4)),
+                "pkm_k_dim": int(getattr(args, "pkm_k_dim", 128)),
+                "pkm_top_k": int(getattr(args, "pkm_top_k", 32)),
+                "pkm_value_bf16": bool(getattr(args, "pkm_value_bf16", True)),
+                "pkm_score_norm": str(getattr(args, "pkm_score_norm", "layer")),
+                "pkm_value_init_std": float(getattr(args, "pkm_value_init_std", 1.0)),
+                "pkm_use_output_gate": bool(getattr(args, "pkm_use_output_gate", True)),
+                "data_mix": args.data_mix,
+                "think_burst_prob": args.think_burst_prob,
+                "think_max_bursts": args.think_max_bursts,
+                "think_max_burst_depth": args.think_max_burst_depth,
                 "d_model": args.d_model, "n_heads": args.n_heads,
                 "d_head": args.d_head, "n_layers": n_layers_actual,
                 "max_T": args.T, "feedback_mode": args.feedback,
-                "feedback_distances": fb_distances,
                 "feedback_pairs": fb_pairs,
                 "feedback_xattn_pairs": fb_xattn_pairs,
                 "feedback_xattn_heads": args.feedback_xattn_heads,
                 "feedback_xattn_form": args.feedback_xattn_form,
                 "feedback_self_k": args.feedback_self_k,
+                "feedback_alpha_mode": args.feedback_alpha_mode,
                 "arch": args.arch, "layers_spec": args.layers,
-                "n_symbols": args.n_symbols,
                 "tokenizer": args.tokenizer,
+                "enable_thinking_token": bool(args.enable_thinking_token),
+                "thinking_token": args.thinking_token,
+                "thinking_token_id": thinking_token_id,
+                "think_lambda": args.think_lambda,
+                "think_lambda_start": args.think_lambda_start,
+                "think_curriculum_steps": args.think_curriculum_steps,
+                "think_policy": args.think_policy,
+                "think_decision": args.think_decision,
+                "think_gate_threshold": args.think_gate_threshold,
+                "think_gate_threshold_start": args.think_gate_threshold_start,
+                "think_explore_prob": args.think_explore_prob,
+                "think_explore_start_prob": args.think_explore_start_prob,
+                "think_safety_max_depth": args.think_safety_max_depth,
+                "think_safety_max_depth_start": args.think_safety_max_depth_start,
+                "think_aux_normalize": args.think_aux_normalize,
+                "think_aux_loss_scale": args.think_aux_loss_scale,
+                "think_queue_accum_steps": args.think_queue_accum_steps,
+                "think_queue_accum_max_steps": args.think_queue_accum_max_steps,
+                "think_queue_drain_target": args.think_queue_drain_target,
+                "think_backpressure_target": args.think_backpressure_target,
+                "think_backpressure_max": args.think_backpressure_max,
+                "think_backpressure_lambda": args.think_backpressure_lambda,
+                "think_backpressure_threshold": args.think_backpressure_threshold,
+                "think_backpressure_explore": args.think_backpressure_explore,
+                # Thinking-loss / thinking-arch recipe.
+                "process_reward_weight": float(
+                    getattr(args, "process_reward_weight", 0.0)),
+                "process_reward_K": int(
+                    getattr(args, "process_reward_K", 4)),
+                "process_reward_apply_min_sigma": float(
+                    getattr(args, "process_reward_apply_min_sigma", 0.3)),
+                "process_reward_sample_frac": float(
+                    getattr(args, "process_reward_sample_frac", 0.05)),
+                "process_reward_max_positions": int(
+                    getattr(args, "process_reward_max_positions", 32)),
+                "gate_calibration_weight": float(
+                    getattr(args, "gate_calibration_weight", 0.0)),
+                "gate_calibration_K": int(
+                    getattr(args, "gate_calibration_K", 4)),
+                "gate_calibration_apply_min_sigma": float(
+                    getattr(args, "gate_calibration_apply_min_sigma", 0.1)),
+                "gate_calibration_apply_max_sigma": float(
+                    getattr(args, "gate_calibration_apply_max_sigma", 0.9)),
+                "gate_calibration_sample_frac": float(
+                    getattr(args, "gate_calibration_sample_frac", 0.05)),
+                "gate_calibration_max_positions": int(
+                    getattr(args, "gate_calibration_max_positions", 32)),
+                "gate_calibration_smooth_target_scale": float(
+                    getattr(args, "gate_calibration_smooth_target_scale", 0.0)),
+                "state_readonly_at_think": bool(
+                    getattr(args, "state_readonly_at_think", False)),
+                "use_think_adapter": bool(
+                    getattr(args, "use_think_adapter", False)),
+                "think_adapter_hidden_mult": int(
+                    getattr(args, "think_adapter_hidden_mult", 2)),
+                "use_refinement_head": bool(
+                    getattr(args, "use_refinement_head", False)),
+                "refinement_head_window": int(
+                    getattr(args, "refinement_head_window", 128)),
+                "refinement_head_n_heads": int(
+                    getattr(args, "refinement_head_n_heads", 8)),
+                "refinement_head_mlp_mult": int(
+                    getattr(args, "refinement_head_mlp_mult", 2)),
+                "refinement_head_alpha_init": float(
+                    getattr(args, "refinement_head_alpha_init", 0.3)),
+                "think_index_emb_size": int(
+                    getattr(args, "think_index_emb_size", 0)),
+                "retrieval_input_additive": False,
             },
         }
         pathlib.Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)

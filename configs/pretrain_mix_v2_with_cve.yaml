@@ -1,0 +1,120 @@
+# Mixed-corpus pretrain v2 — adds CVE-fix sources to the v1 mix.
+#
+# Two new sources (combined weight ~7%) teach the model real-world
+# vulnerability patterns and their patches:
+#   - bigvul: 188k vulnerable→fixed C/C++ function pairs from CVE
+#     commits. Each rendered as: CVE/CWE preamble + commit message +
+#     vulnerable code block + patched code block. Bug patterns
+#     (UAF, buffer overflow, integer overflow, race conditions)
+#     generalise beyond C/C++ syntax.
+#   - cybernative_dpo: multi-language preference pairs (Python, JS,
+#     C++ ...) with one-line vulnerability descriptions. Pretrain
+#     uses only the *chosen* (safe) side; the rejected side is for
+#     DPO fine-tuning later.
+#
+# Weights of v1 sources scaled down proportionally to make room.
+
+sources:
+
+  # ---- Raw code (48 % vs 52 % in v1) ----
+
+  - name: codeparrot
+    dataset_id: codeparrot/codeparrot-clean
+    text_field: content
+    split: train
+    weight: 0.37
+    filter:
+      name: min_content_len
+      args: { min_chars: 200 }
+
+  - name: python_codes_25k
+    dataset_id: flytech/python-codes-25k
+    text_field: text
+    split: train
+    weight: 0.11
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  # ---- Problem-solving instruction code (26 % vs 28 %) ----
+
+  - name: magicoder_oss
+    dataset_id: ise-uiuc/Magicoder-OSS-Instruct-75K
+    text_field: [problem, solution]
+    split: train
+    weight: 0.09
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  - name: code_exercises_jinaai
+    dataset_id: jinaai/code_exercises
+    text_field: [problem, solution]
+    split: train
+    weight: 0.06
+    filter: always
+
+  - name: python_instr_18k_alpaca
+    dataset_id: iamtarun/python_code_instructions_18k_alpaca
+    text_field: [prompt, output]
+    split: train
+    weight: 0.06
+    filter: always
+
+  - name: codealpaca_20k
+    dataset_id: HuggingFaceH4/CodeAlpaca_20K
+    text_field: [prompt, completion]
+    split: train
+    weight: 0.05
+    filter: always
+
+  # ---- CVE / vulnerability + fix (NEW in v2, ~7 %) ----
+
+  - name: bigvul
+    dataset_id: bstee615/bigvul
+    text_builder: bigvul   # see TEXT_BUILDER_REGISTRY in data_mix.py
+    split: train
+    weight: 0.05
+    filter: bigvul_vulnerable   # keep only the vul=1 records (~7% of stream)
+                                 # where func_before != func_after; the
+                                 # vul=0 sibling rows are safe-state
+                                 # classifier examples we don't want.
+
+  - name: cybernative_vuln_dpo
+    dataset_id: CyberNative/Code_Vulnerability_Security_DPO
+    text_builder: cybernative_dpo
+    split: train
+    weight: 0.02
+    filter: always
+
+  # ---- Synthetic CS textbooks (11 % vs 12 %) ----
+
+  - name: textbooks_lite_sciphi
+    dataset_id: SciPhi/textbooks-are-all-you-need-lite
+    text_field: completion
+    split: train
+    weight: 0.06
+    filter:
+      name: min_content_len
+      args: { min_chars: 400 }
+
+  - name: textbook_quality_programming
+    dataset_id: vikp/textbook_quality_programming
+    text_field: markdown
+    split: train
+    weight: 0.05
+    filter:
+      name: min_content_len
+      args: { min_chars: 400 }
+
+  # ---- Wikipedia (8 %, unchanged) ----
+
+  - name: wikipedia_en
+    dataset_id: wikimedia/wikipedia
+    hf_extra: { name: "20231101.en" }
+    text_field: text
+    split: train
+    weight: 0.08
+    filter:
+      name: min_content_len
+      args: { min_chars: 500 }

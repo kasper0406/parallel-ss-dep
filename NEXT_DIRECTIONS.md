@@ -1,6 +1,461 @@
 # NEXT_DIRECTIONS.md
 
-## Current focus (2026-04-27): scaling sparse far-distance feedback
+## Update (2026-05-14): residual-collapse fix, v3 family, v4 plan
+
+The v2 pretrain's bad undertraining was diagnosed to a **root cause**: weight
+decay 0.1 was collapsing the residual stream (||h|| shrinking, not growing,
+over training). Fixes landed and validated — see `SESSION_FINDINGS.md`
+(2026-05-14 entry) and the `GEMINI.md` mandates. Headline decisions:
+
+- **`--wd 0.01`** (not the legacy 0.1) — un-collapses the residual stream;
+  v3a beat v2 on every per-source CE.
+- **`--lr_schedule wsd`** is the new default — cosine's commit-`T_max`-upfront
+  was flooring the LR exactly when token counts got interesting.
+- **LayerDrop is a dead end** — v3b clean negative result; flag stays, off.
+- **Dense execution-grounded GRPO reward** + the **iterative self-repair loop**
+  designed and the grader built — see `PHASE_C_RL.md`.
+
+**v4 plan**: re-weighted mix (the one thing still unfixed — `bigvul`/
+`cybernative` drift *up* in CE in every run; down-weight jinaai/codeparrot,
+up-weight bigvul/wiki) + the staged knobs (`--wd 0.01 --lr_schedule wsd
+--compile --feedback_self_k_warmup_steps`). Gate `--compile` + the K-curriculum
+on the `profile_train.py` validation run first.
+
+---
+
+## Phase-D candidate (2026-05-15): persistent learned-RAG / memory layer
+
+**Idea.** Add a *second* memory tier alongside `WorkingMemory`:
+
+- `WorkingMemory` (existing): per-sequence, ephemeral, written/read inside one
+  forward pass. Holds context the model just saw.
+- **New: persistent learned key-value memory** trained jointly with the
+  backbone. Entries persist across sequences and across training. Frozen at
+  inference. Idea: offload long-tail factual content (Wikipedia entities, API
+  signatures, CVE numbers, library quirks, algorithm complexities) to this
+  table so the residual stream's parameter budget can concentrate on
+  program-synthesis *skill*.
+
+This is the **product-key memory (PKM)** family — Lample 2019, scaled in
+Meta's "Memory Layers at Scale" (2024). A single PKM layer matched the lift of
+12 extra dense transformer blocks on language modeling. Drop-in inside an
+existing block, end-to-end differentiable, top-k product-key lookup is
+sub-linear so cost ≈ one MLP per token.
+
+**Why this is well-targeted to *our* mix specifically:**
+
+- Our v3/v4 pretrain mix is unusually fact-loaded for a code model: Wikipedia
+  + the CVE streams (bigvul, cybernative) are pure encyclopedic content —
+  named entities, version strings, function signatures. A 218 M dense model
+  has nowhere near capacity to memorize all that, and the **persistent
+  upward CE drift on bigvul/cybernative across every run** is the literal
+  symptom of "trying to memorize facts in too few weights." A memory layer
+  is a structurally appropriate fix, not just a re-weighting band-aid.
+- Algorithm/DS knowledge is the cleanest possible fact/skill decoupling:
+  `Floyd-Warshall is O(V³)` is a fact, *applying* it is a skill. Forcing
+  both into one residual wastes parameters.
+- Library-specific knowledge (`numpy.random.choice` signature,
+  `torch.nn.functional.cross_entropy` expects logits) is the canonical PKM
+  use case — long-tail, low-frequency, mostly self-contained.
+
+**Sizing for our hardware (32 GB consumer cards):**
+
+- 1 PKM layer mid-depth (between blocks 14/15 of the 30-block model).
+- Product keys: 2 sets × 256 keys → 65 536 slots (or 2 × 1024 → 1 M slots).
+- Top-k = 32, value dim = 576 (matches residual).
+- 65 k slots: ~75 MB params (bf16). 1 M slots: ~1.15 GB — still fits.
+
+**Honest reservations:**
+
+- **Sparse-gradient cold start.** Only top-k slots get gradient per query, so
+  most slots stay at init for a long time. PKM papers solve this with
+  key BatchNorm + small noise injection on the lookup; that has to be wired
+  right or the table never warms up. This is the biggest implementation risk.
+- **Risk of crutching.** At small scale the model might lean on retrieval for
+  things it should generalize. Need an ablation that toggles the layer at
+  eval to measure how much the rest of the network actually depends on it.
+- **Inference-time memory cost.** A 1 M-slot table is 1.15 GB always
+  resident. Fine for our hardware; bad for users on smaller GPUs. Probably
+  fine to defer that worry — fix the training-quality gap first.
+
+**Ablation plan that would settle whether it's worth full investment:**
+
+1. Train a v5 variant with one 65k-slot PKM layer mid-depth, same mix +
+   schedule as v4. Compare per-source CE on the eval streams.
+2. **Primary success metric: bigvul + cybernative CE stops drifting up.**
+   This is the existing pathology a memory layer ought to fix, and the
+   per-source CE plumbing is already in `diag_ckpt.py`.
+3. Secondary: HumanEval pass@1 (downstream code skill should be stable or
+   better — if it regresses, the memory layer is crutching).
+4. If 65k wins, scale to 1 M-slot and re-measure.
+
+**Sequencing:** orthogonal to v4 pretrain and the Phase-C RL plan; could go in
+parallel with either. Largest infra cost is the PKM layer itself + the
+key-BN warmup-stability bits; both are well-documented in prior work.
+
+---
+
+## Phase-D candidate (2026-05-15): MCTS-guided rollouts for code RL
+
+**Idea.** Replace (or supplement) plain temperature sampling in GRPO with a
+PUCT-style tree search over partial trajectories, using the dense
+`code_grader.score ∈ [0,1]` as the value signal. Train on the search-improved
+trajectories — either as expert iteration (ReST^EM / STaR-style SFT on
+MCTS-best) or as an off-policy correction layer over GRPO.
+
+**Why it fits this stack specifically:**
+
+- **DeltaNet state is cheap to fork.** Branching a transformer's KV cache costs
+  O(prefix·d) per node; forking DeltaNet's bounded recurrent state is O(d²)
+  flat. `WorkingMemory` adds O(K·d), still bounded. Tree search is
+  asymptotically *cheaper* on our backbone than on a transformer of equivalent
+  quality — most LM-MCTS papers (CodeRL, PG-TD, MCTS-DPO, RAP) are bottlenecked
+  by KV-cache fork cost. This is a real differentiator, not a wash.
+- **Dense grader = smooth value landscape.** The tier ladder
+  (`syntax_error 0.0 < exec_error 0.05 < runtime_error 0.2 < partial 0.2 +
+  0.7·passed/total < pass 1.0`) is exactly what UCT needs; pass/fail rewards
+  make tree search thrash. Already shipped — see `code_grader.py`.
+- **Thinking-gate gives a natural action factoring.** Branch at gate decisions
+  and at high-entropy emit positions, not at every token. The gate already
+  exists, costs nothing extra, and "think harder here" is a meaningful action.
+
+**Honest cons:**
+
+- **GRPO + biased samples don't compose naively.** The group baseline goes
+  optimistic when rollouts come from search. Cleanest split is two streams:
+  - GRPO continues on uniformly-sampled rollouts (unbiased baseline).
+  - Search-best trajectories feed an SFT / expert-iteration head.
+- **No value head.** AlphaZero needs one. The cheap substitute is grader
+  rollouts at every leaf (expensive). Could bootstrap one over time from
+  collected (prefix, score) pairs.
+- **Compute.** Real MCTS over codegen is a budget item.
+
+**Cheap precursor — do this first:** *best-of-N filtered by grader*. Literally
+MCTS with branching factor B, depth 1. Gives the variance-reduction win of
+search without any tree-search infrastructure. If best-of-N pays off in GRPO
+group quality, *then* invest in proper tree search. If it doesn't, MCTS won't
+either.
+
+**Sequencing:** runs after Phase-C plain GRPO and the iterative-self-repair
+loop are working (the self-repair loop is itself a degenerate form of search —
+iterative refinement along a single trajectory). Don't start MCTS until those
+have produced a baseline.
+
+---
+
+## Current Focus (2026-05-12): Small Super-Coder
+
+The top-level goal is now a small DeltaNet-backbone code model that competes
+with larger Transformer code models on HumanEval/MBPP under tight compute.
+The thinking head + memory architecture below is in service of that target.
+
+### What changed since 2026-05-10
+
+- **Bounded working memory** (`experiments/model.py::WorkingMemory`) supersedes
+  the old "Continuous RAG" (`rag_projection`) idea — the latter was structurally
+  dead (gradient = 0 throughout RL training; runs were bit-identical with vs
+  without). The new module is in-sequence, bounded at `mem_size` (default 1024)
+  with write-gated soft-attention reads at think / query positions. Cost
+  O(T·K·d), no quadratic attention. Validated on MQAR: **+10–11 pp recall** at
+  the saturation regime.
+- **Cross-task validation** shows the architecture has a *read-event-density*
+  threshold: helps on tasks with many reads per sequence (MQAR, dyck) and hurts
+  on sparse-decision tasks (induction, single read site).
+- **Distillation pipeline** from Qwen3.6-35B-A3B-AWQ is wired and runs end-to-end:
+  PPL 81 → 41 on 10 M tokens. Subsequent SFT on MBPP+CodeAlpaca drops loss further
+  but HumanEval pass@1 remains 0/50 — bottleneck is data scale (we're at ~10 M
+  distill + 10 k SFT tokens vs typical small-coder budgets of 100 M-1 B+).
+- **Code grader** (`experiments/code_grader.py`) wired against HumanEval and
+  MBPP, gold-check verified. Drop-in reward function for the eventual RL push.
+
+### Active next steps
+1. Scale the distillation extract (more Qwen3.6 tokens, broader prompt mix).
+2. Generate or curate ≥100 k HumanEval-format (signature + docstring → body)
+   SFT pairs — the current SFT format mismatch is a known issue.
+3. Once HumanEval pass@1 is nonzero, the existing GRPO infra +
+   `code_grader.grade` is the natural follow-up.
+
+### Queued: make pretrain teach *useful* thinking, not just *benign* thinking (2026-05-13)
+
+**Motivation.** v2 pretrain trains the thinking *substrate* (gate head learns
+positional difficulty, think-token embedding stays sane, memory writes + reads
+get gradient at burst positions) but **not** the value of thinking. Bursts are
+inserted at random chunk boundaries, uncorrelated with token difficulty, so the
+model has no incentive to put *useful* content into the hidden state during a
+think step — its next emit's CE is the same whether the think token did work
+or just passed through. This shifts the entire "thinking helps" learning to
+RL, which is a heavy lift if pretrain leaves the memory module functionally
+dormant (writes happen but contents are noise).
+
+**Proposed pretrain-v3 augmentation: supervised memory-utility task.**
+
+1. With probability ~0.2, *occlude* a contiguous span of K∈{4, 8, 16} tokens
+   in the input by replacing them with a `[MASKED]` token.
+2. At the next chunk boundary insert a think-burst of depth 1-3.
+3. Targets at occluded positions remain non-masked in the loss — so the model
+   must recover the occluded content via the working memory read at the think
+   burst.
+
+This gives a direct gradient signal: "if you wrote the occluded tokens into
+memory before they were masked, the think-burst read can recover them and
+your CE on those positions drops." Both `WorkingMemory.W_write` and
+`WorkingMemory.W_read` get loss-shaped gradient. Closes the gap between
+"memory has weights that move" (today) and "memory is doing useful work"
+(target).
+
+Implementation surface: `data_mix.py` chunk emitter + a new `--mem_occlude_prob`
+flag in `train_lm.py`. ~80 lines new code + a unit test that verifies the
+masked positions appear, the corresponding `mem_read_mask` aligns to the
+think burst, and the loss is non-zero at masked positions.
+
+**Risk to flag**: if occlusion is too aggressive, the standard LM signal
+degrades. Start with a small occlude probability (≤ 0.2) and a small span
+(K=4) and ramp up if memory utility is low.
+
+### Queued: Fill-in-the-Middle (FIM) augmentation for v4+ pretrain (2026-05-13)
+
+**Motivation.** Even with EOS-mask-in-targets (Task #63) and inference-time
+EOS suppression (already shipped in `eval_humaneval.py`), the model has no
+positive incentive to produce useful intermediate content given a
+prompt-suffix pair. FIM (Bavarian et al., 2022; the standard recipe in
+StarCoder / CodeLlama / DeepSeek-Coder / Qwen-Coder) reformulates a
+fraction of training samples as:
+
+    <FIM_PREFIX> prefix <FIM_SUFFIX> suffix <FIM_MIDDLE> middle
+
+The model is trained to predict `middle` from the surrounding context.
+This:
+- Eliminates the halt-at-docstring trap structurally — when the
+  training set contains `prefix=docstring + suffix=def next_func()`,
+  the model must produce a non-empty middle (the function body).
+- Doubles as an "infill" capability — the model learns to complete code
+  given context on both sides, useful for IDE-style completion later.
+- Empirically lifts HumanEval pass@1 by ~5-15 pp on small code models;
+  see StarCoder Figure 3.
+
+**Implementation surface**: ~120 lines in `experiments/data_mix.py`:
+- 3 new sentinel tokens at vocab tail (after `[THINKING]`): `<FIM_PREFIX>`,
+  `<FIM_SUFFIX>`, `<FIM_MIDDLE>`. Snap vocab_size up to next multiple of 64.
+- Per-chunk: with probability `fim_prob` (~0.5 per StarCoder), pick a
+  random span [a, b] uniform in `[1, len-1]`, reformat as
+  `[FIM_PREFIX] chunk[:a] [FIM_SUFFIX] chunk[b:] [FIM_MIDDLE] chunk[a:b]`.
+- Labels at sentinel positions: -100 (no loss contribution).
+- Two FIM modes: "PSM" (Prefix-Suffix-Middle, format above) and "SPM"
+  (Suffix-Prefix-Middle, used by CodeLlama for left-to-right consistency).
+  Default 0.5/0.5 mix per Bavarian.
+
+**Inference**: existing `eval_humaneval.py` works unchanged — FIM is a
+training-time augmentation; the model still does left-to-right generation
+for HumanEval. The benefit shows up as higher pass@1 from better
+representations.
+
+**Risk to flag**: FIM with `fim_prob` too high (>0.7) measurably hurts
+left-to-right perplexity. Start at 0.5 and ablate down if perplexity
+suffers.
+
+**When to enable**: only after the cheaper fixes (Task #63 EOS-mask,
+Task #64 EOS-suppression inference) are validated. If suppressed EOS at
+inference doesn't lift v2's HumanEval pass-rate at the 1B-token mid-eval,
+prioritise EOS-mask training first; FIM is the next escalation.
+
+### Queued: verify the model uses memory efficiently — read vs write probes (2026-05-13)
+
+**Motivation.** Even after the memory-utility task above, "reads happen" and
+"reads are useful" are not the same thing — and they can fail independently.
+The model could write noise but read it sharply, or write meaningful content
+but read it diffusely. We need a way to separate the two failure modes
+post-training.
+
+**Probe 1: separability lesion test (post-pretrain, cheap).** Take a trained
+ckpt, run on a synthetic recall task (a small MQAR variant: 8 random (key,
+value) pairs in a 256-token context, query the value for a key at position
+T-1). Run three conditions:
+
+- **Both**: model's own writes + model's own reads — baseline accuracy.
+- **Oracle write**: replace `WorkingMemory._write` so every token gets stored
+  verbatim (no gate). If accuracy jumps → *write* was the bottleneck.
+- **Oracle read**: keep model's writes, replace read with mean-pool of the
+  memory. If accuracy *doesn't* drop much → *read* was the bottleneck (sharp
+  reads weren't adding much beyond the average).
+
+Cost: ~10 min on a single GPU. Implement as `experiments/probe_memory.py`,
+wired to load `build_model_from_ckpt`.
+
+**Probe 2: write quality via linear decoder (orthogonal sanity check).** Take
+the final memory contents after a forward pass, train a small linear probe
+to recover the original input tokens from the memory slots. High top-1
+recovery rate → writes preserve information; chance-level recovery → writes
+are noise. Doesn't tell you *which* information is preserved, but it tells
+you whether the write gate is doing more than gating uniformly.
+
+**Probe 3: read attention diagnostics during training.** Cheap, runnable as
+part of the existing TB logging in `train_lm.py`. At each VAL pass, sample
+~16 think-burst positions and log:
+- Mean read-attention entropy (high entropy = uniform / uninformative reads)
+- Mean read-attention max weight (high max = sharp / committed reads)
+- Read-position distribution (close to current token? distant?)
+
+A model that uses memory effectively should show entropy *decreasing* and
+max-weight *increasing* through training; a dormant memory plateaus.
+
+**What "memory is working" should look like in the metrics:**
+
+| metric | dormant | working |
+|---|---|---|
+| write-gate mean (TB scalar) | 0.5 (uniform init unchanged) | varies by token type |
+| read-attention entropy | ~log(K) | < log(K)/2 |
+| Probe 1 baseline-vs-oracle-write gap | large (write is broken) | small |
+| Probe 1 baseline-vs-oracle-read gap | small (read does nothing) | large |
+
+**Tie-in to v2 outcome.** Once v2 hits its first mid-eval, run Probe 3 against
+the saved ckpt — that tells us, before we kick off SFT or RL, whether the
+working memory is doing visible work in pretrain. If entropy is at uniform
+and max-weight is at 1/K, the memory is dormant and the memory-utility task
+above moves up the priority list.
+
+### Ablations to revisit at training scale (post-pretrain-v1)
+
+Observed in `pretrain_mix_v1` (217 M / mixed-corpus / Muon / 60 k+ steps):
+the FiLM (2, 28) scalar α grew **monotonically** from 0 → +0.75 over 60 k
+steps and appears to be saturating in the last 5 k (range 0.743-0.756).
+
+Trajectory:
+
+| step | α |
+|---:|---:|
+| 100 | +0.003 |
+| 1 k | +0.026 |
+| 5 k | +0.127 |
+| 10 k | +0.271 |
+| 20 k | +0.478 |
+| 40 k | +0.677 |
+| 60 k | +0.748 |
+
+Compared to the original FiLM validation runs (α ≈ +0.16 to ±0.20 at
+5-15 k steps), this run pushes the scalar 3-5× higher. **Saturation
+suggests the *scalar-α* form is hitting its capacity ceiling** — the
+model is asking for more cross-layer signal than a single learnable
+scalar can deliver.
+
+Things worth retrying at full-pretrain scale, motivated by this
+observation:
+
+- **Cross-attention feedback** (`--feedback_xattn_pairs`) — tested at
+  short scale (5 k steps, codeparrot only) and didn't beat scalar-α
+  FiLM there. With scalar-α now visibly saturated, the higher-capacity
+  cross-attention form has a real shot at paying back. Try a 1-2 B
+  token rerun with e.g. `--feedback_xattn "2:14,21,28"` (layer 2's
+  input attends over layers 14, 21, 28).
+- **Per-channel α** (`--feedback_per_channel_alpha`) — scalar α
+  forces every channel to share one feedback strength. If different
+  channels have different needs, per-channel α should unlock more
+  capacity at much lower compute cost than full cross-attention.
+  Cheap experiment.
+- **Multi-scale feedback distances** (`--feedback_distances 1,2,4`) —
+  the current run uses single-step lag. Multi-scale was validated
+  at short scale; revisit whether it compounds at long training.
+- **K=4 or K=5 self-feed** (currently K=3) — if the self-feed
+  amplifies the FiLM effect and K=3 is on a plateau, more iterations
+  might extend it. Cheap diagnostic.
+
+Decision: queue these for after pretrain-v1 finishes. Run the
+`--freeze_alpha` control first to attribute how much of the actual
+val-PPL drop is FiLM-driven; then run the highest-capacity variant
+(cross-attention) at matched compute to see if the headline metric
+moves.
+
+#### Pre-ablation step: distinguish real saturation from WD equilibrium
+
+Before scaling to cross-attention, do a **30-second one-shot probe**
+against the final pretrain ckpt to determine whether α=+0.75 is
+real saturation (loss flat in the α direction) or just where
+weight-decay-pull-down equals gradient-pull-up:
+
+1. Load the final pretrain ckpt with `weights_only=False`.
+2. Set Muon WD=0 for the α parameter only; do one forward+backward
+   on a 4-sample mini-batch from the same data mix.
+3. Inspect `model.sparse_feedback['2'].alpha.grad.item()`.
+
+Interpretation:
+- `|grad| ≪ 0.075` (≈ WD·α): **true saturation** — loss is genuinely
+  flat in the α direction. Cross-attention is the right next step.
+- `|grad| ≈ 0.075`: **WD equilibrium** — the loss wants higher α but
+  WD is the brake. Cheapest first follow-up: remove WD from α (or
+  re-parameterise α = scale × tanh(raw_α) to remove the shrink-to-0
+  pressure). Cross-attention is still worth trying but the result
+  will be interpretable.
+- `|grad| ≫ 0.075`: WD is meaningfully *under-weighting* — α would
+  climb much further if untethered. Strong signal that the
+  feedback-from-deep-layers prior is load-bearing.
+
+#### Result of the probe (run 2026-05-13 on v1 mid-eval ckpt @500M tokens)
+
+`experiments/probe_alpha_wd.py` on `pretrain_mix_v1_step61036_tok500006912.pt`
+with 6 batches of (B=4, T=2048) from the v1 mix:
+
+| | value |
+|---|---:|
+| α | +0.7471 |
+| WD · \|α\| | 0.0747 |
+| mean(grad on α) over 6 batches | **+0.137** |
+| per-batch grads | all positive: +0.04, +0.06, +0.09, +0.26, +0.21, +0.16 |
+| \|mean grad\| / (WD·α) | **1.83** |
+
+**Interpretation: borderline WD-equilibrium / WD under-weighting.**
+The gradient consistently wants α higher (every batch positive), and
+its magnitude is ~1.8× the WD pull-down. The "saturation" appearance
+in the training-log trajectory (α range 0.743–0.756 over last 5k
+steps) was an artifact of a slow-creep regime where gradient barely
+beat WD; the actual movement was ~+0.002 per 5k steps, below per-step
+noise.
+
+**Action implied:** before doing the cross-attention ablation, do the
+cheap experiment first — remove WD on α (or reparametrise as
+`α_eff = scale * tanh(raw)` with WD only on `raw`) and see whether α
+climbs to 1.5–2.0 and val PPL drops further. If yes, the
+single-scalar-FiLM form is still load-bearing and we haven't actually
+needed more capacity. If α climbs and val PPL stays flat, *then*
+scalar-α is at its true ceiling and cross-attention is justified.
+
+### Historical context (original 2026-05-10 framing below)
+
+While the sparse far-distance feedback (Finding 9) remains a core architectural
+win, the project has pivoted to the **Thinking Head** as the primary path to
+frontier scaling and **Continuous RAG**.
+
+### 1. The Thinking Head (Active)
+We have implemented a discrete gated path that enables Linear RNNs (DeltaNet) to
+perform **Adaptive Computation Time (ACT)** without increasing context length or
+KV-cache size.
+
+- **Current Status:** Sweep on auxiliary loss normalization/scaling is active.
+- **Key Insight:** Moving from `fresh_tokens` to `aux_items` normalization
+  stabilizes the curriculum by decoupling the learning signal from the frequency
+  of thinking steps.
+- **Verification:** Monitor `runs/think_sweep_*.log`.
+- **Scaling Path:** Transition to Reinforcement Learning (**GRPO**) to support
+  deep thinking chains (depth 50+) and Continuous RAG. See
+  [`RL_RAG_ROADMAP.md`](RL_RAG_ROADMAP.md).
+
+### 2. The Roadmap to Continuous RAG
+The thinking mechanism provides the necessary temporal hooks for **External Retrieval**.
+
+- **Mechanism:** Thinking steps will be extended to trigger vector-database
+  lookups. The retrieved facts will be projected directly into the DeltaNet
+  recurrent state matrix.
+- **Impact:** Eliminates the need for massive prompt prefixing in RAG; the model
+  loads facts into memory dynamically.
+
+### 3. Scaling & Distillation (Next)
+Once the thinking curriculum is stabilized at the 217M scale, we will return to
+the distillation track:
+- Distill from **Qwen2.5-Coder** (or Qwen3.6) using the Thinking-DeltaNet backbone.
+- Evaluate on **HumanEval** and **MBPP** to measure the reasoning lift from the
+  extra "thought" passes.
+
+---
+
+## Previous focus (2026-04-27): scaling sparse far-distance feedback
 
 After the architectural exploration logged in
 [`SESSION_FINDINGS.md`](SESSION_FINDINGS.md) and

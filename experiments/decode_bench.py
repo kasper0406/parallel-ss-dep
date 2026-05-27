@@ -87,6 +87,7 @@ def load_dn_or_film(path: str, device: str = "cuda") -> TinyLM:
         feedback_pairs=cfg["feedback_pairs"],
     ).to(device)
     model.load_state_dict(ckpt["state_dict"])
+    model.thinking_token_id = cfg.get("thinking_token_id")
     model.eval()
     # Set layer_idx on every fla DeltaNet layer for cache plumbing.
     for L, blk in enumerate(model.blocks):

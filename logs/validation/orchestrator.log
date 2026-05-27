@@ -1,0 +1,83 @@
+=== Phase 22 validation launcher ===
+Date: Thu May  7 04:41:17 PM UTC 2026
+
+--- 1. Multi-seed: K=3 + L_sem on codeparrot, seed=1 ---
+[seed1] training -> checkpoints/film_self_k3_lsem_uniform_b10_30L_217M_seed1.pt
+[wait_for_gpu] GPU 1 busy: mem=17680 MiB (waited 120s)
+[wait_for_gpu] GPU 1 busy: mem=17680 MiB (waited 240s)
+[wait_for_gpu] GPU 1 busy: mem=17680 MiB (waited 360s)
+[wait_for_gpu] GPU 1 busy: mem=17680 MiB (waited 480s)
+[wait_for_gpu] GPU 1 free (mem 2 MiB)
+[seed1] training done. Tail:
+<unknown>:56: SyntaxWarning: invalid escape sequence '\P'
+        VAL  loss=3.8888  ppl=48.85
+
+Done in 1332s (266 ms/step avg).
+Checkpoint saved to checkpoints/film_self_k3_lsem_uniform_b10_30L_217M_seed1.pt
+[seed1] eval -> bench_stmt_ppl_lsem_uniform_seed1.json
+[wait_for_gpu] GPU 1 free (mem 2 MiB)
+[seed1] eval done. Tail:
+--- Per-statement metrics (overall PPL) ---
+  overall PPL = 43.6943
+  Overall:        n_stmts=1604, n_tokens=22047, PPL=43.6943
+  Top decile:     n_stmts=153, n_tokens=2054, PPL=49.6587, surprise_range=[0.5489,0.9441]
+  Bottom decile:  n_stmts=153, n_tokens=2104, PPL=43.5971, surprise_range=[0.0361,0.1144]
+
+--- 2. Multi-seed: K=3 + L_sem on codeparrot, seed=2 ---
+[seed2] training -> checkpoints/film_self_k3_lsem_uniform_b10_30L_217M_seed2.pt
+[wait_for_gpu] GPU 1 free (mem 2 MiB)
+[seed2] training done. Tail:
+<unknown>:56: SyntaxWarning: invalid escape sequence '\P'
+        VAL  loss=3.8767  ppl=48.27
+
+Done in 1331s (266 ms/step avg).
+Checkpoint saved to checkpoints/film_self_k3_lsem_uniform_b10_30L_217M_seed2.pt
+[seed2] eval -> bench_stmt_ppl_lsem_uniform_seed2.json
+[wait_for_gpu] GPU 1 free (mem 2 MiB)
+[seed2] eval done. Tail:
+--- Per-statement metrics (overall PPL) ---
+  overall PPL = 43.1522
+  Overall:        n_stmts=1604, n_tokens=22047, PPL=43.1522
+  Top decile:     n_stmts=153, n_tokens=2054, PPL=48.8636, surprise_range=[0.5489,0.9441]
+  Bottom decile:  n_stmts=153, n_tokens=2104, PPL=43.0068, surprise_range=[0.0361,0.1144]
+
+--- 3. TinyStories: plain DN baseline ---
+[ts-dn] training plain DN on TinyStories -> checkpoints/dn_baseline_30L_217M_tinystories_seed0.pt
+[wait_for_gpu] GPU 1 free (mem 2 MiB)
+[ts-dn] training done. Tail:
+  5000     28840    2.0707   3.00e-05
+        VAL  loss=1.7311  ppl=5.65
+
+Done in 748s (150 ms/step avg).
+Checkpoint saved to checkpoints/dn_baseline_30L_217M_tinystories_seed0.pt
+[ts-dn] eval
+[wait_for_gpu] GPU 1 free (mem 2 MiB)
+  PPL = 6.7109
+
+--- 4. TinyStories: K=3 self-feeding only ---
+[ts-k3] training K=3 self-feeding on TinyStories -> checkpoints/film_self_k3_30L_217M_tinystories_seed0.pt
+[wait_for_gpu] GPU 1 free (mem 2 MiB)
+[ts-k3] training done. Tail:
+  5000     19305    2.0577   3.00e-05  α=[2<-28:-0.063]
+        VAL  loss=1.7160  ppl=5.56
+
+Done in 1065s (213 ms/step avg).
+Checkpoint saved to checkpoints/film_self_k3_30L_217M_tinystories_seed0.pt
+[ts-k3] eval
+[wait_for_gpu] GPU 1 free (mem 2 MiB)
+  PPL = 6.6454
+
+--- 5. TinyStories: K=3 + per-token L_sem ---
+[ts-k3-lsem] training K=3 + per-token L_sem β=1 on TinyStories -> checkpoints/film_self_k3_lsem_pertoken_b10_30L_217M_tinystories_seed0.pt
+[wait_for_gpu] GPU 1 free (mem 2 MiB)
+[ts-k3-lsem] training done. Tail:
+  5000     16191    1.9659    1.9659    0.0616  4096.0   3.00e-05  α=[2<-28:-0.047]
+        VAL  loss=1.6383  ppl=5.15
+
+Done in 1269s (254 ms/step avg).
+Checkpoint saved to checkpoints/film_self_k3_lsem_pertoken_b10_30L_217M_tinystories_seed0.pt
+[ts-k3-lsem] eval
+[wait_for_gpu] GPU 1 free (mem 2 MiB)
+  PPL = 6.1356
+
+=== All done Thu May  7 06:28:25 PM UTC 2026 ===

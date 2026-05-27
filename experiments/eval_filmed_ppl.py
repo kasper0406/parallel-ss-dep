@@ -43,6 +43,7 @@ from fla.models.utils import Cache as FLACache
 from experiments.decode_bench import (
     _block_with_cache, load_dn_or_film,
 )
+from experiments.thinking import cross_entropy_masking_token
 
 
 CKPT_FILM = "checkpoints/sparse_2_34_708M_muon.pt"
@@ -112,10 +113,15 @@ def eval_2pass_ppl(model, chunks: torch.Tensor, batch: int = 4) -> tuple:
         y = batch_chunks[:, 1:]
         logits = model(x)
         # Per-token CE summed (so we can weight properly across batches).
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]), y.reshape(-1),
-            reduction="sum",
-        )
+        flat_logits = logits.reshape(-1, logits.shape[-1])
+        flat_y = y.reshape(-1)
+        thinking_token_id = getattr(model, "thinking_token_id", None)
+        if thinking_token_id is None:
+            loss = F.cross_entropy(flat_logits, flat_y, reduction="sum")
+        else:
+            loss = cross_entropy_masking_token(
+                flat_logits, flat_y, int(thinking_token_id), reduction="sum"
+            )
         losses_sum += float(loss.item())
         n_tokens += y.numel()
     mean_ce = losses_sum / n_tokens
@@ -182,11 +188,15 @@ def eval_lagged_cached_ppl(model, chunks: torch.Tensor) -> tuple:
         logits = lagged_cached_logits_one_seq(model, x,
                                                 target=target, source=source)
         # CE per chunk.
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]).float(),
-            y.reshape(-1),
-            reduction="sum",
-        )
+        flat_logits = logits.reshape(-1, logits.shape[-1]).float()
+        flat_y = y.reshape(-1)
+        thinking_token_id = getattr(model, "thinking_token_id", None)
+        if thinking_token_id is None:
+            loss = F.cross_entropy(flat_logits, flat_y, reduction="sum")
+        else:
+            loss = cross_entropy_masking_token(
+                flat_logits, flat_y, int(thinking_token_id), reduction="sum"
+            )
         losses_sum += float(loss.item())
         n_tokens += y.numel()
         now = time.perf_counter()

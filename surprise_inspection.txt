@@ -1,0 +1,50 @@
+Oracle inspection — encoder=/home/knielsen/ml/parallel-ss-dep/checkpoints/dn_baseline_30L_217M_for_oracle.pt
+oracle config: d=576, h=8, layers=2
+validation file count: 50
+total statements scored: 1217
+
+surprise distribution (n=1217, min=0.0360, max=0.9105, mean=0.3037, std=0.1681):
+    0.0360 –   0.0797 |     37 █████████
+    0.0797 –   0.1234 |    101 ████████████████████████
+    0.1234 –   0.1671 |    127 ███████████████████████████████
+    0.1671 –   0.2109 |    143 ███████████████████████████████████
+    0.2109 –   0.2546 |    163 ████████████████████████████████████████
+    0.2546 –   0.2983 |    129 ███████████████████████████████
+    0.2983 –   0.3420 |    108 ██████████████████████████
+    0.3420 –   0.3858 |     86 █████████████████████
+    0.3858 –   0.4295 |     70 █████████████████
+    0.4295 –   0.4732 |     56 █████████████
+    0.4732 –   0.5169 |     48 ███████████
+    0.5169 –   0.5607 |     37 █████████
+    0.5607 –   0.6044 |     28 ██████
+    0.6044 –   0.6481 |     21 █████
+    0.6481 –   0.6918 |     23 █████
+    0.6918 –   0.7356 |     14 ███
+    0.7356 –   0.7793 |     12 ██
+    0.7793 –   0.8230 |     10 ██
+    0.8230 –   0.8667 |      0 
+    0.8667 –   0.9105 |      4 
+
+Top-10 most-surprising statements:
+  surp=0.9105  kind=Assign          file= 36  'self.turned_off_filtering = True'
+  surp=0.9030  kind=Expr            file= 45  "'''\\n        To be implemented by subclcass\\n        :return:\\n        '''"
+  surp=0.8699  kind=Try             file= 30  'try:'
+  surp=0.8673  kind=If              file=  2  "if __name__ == '__main__':"
+  surp=0.8147  kind=Assign          file= 10  'expected = [\\n        "ProgramContext \'<EOF>\'",\\n        "+-SourceElementsContext",\\n        "+-+-SourceElementContext",\\n        "+-+-+-Sta'
+  surp=0.8071  kind=Try             file= 32  'try:'
+  surp=0.8015  kind=ClassDef        file= 40  'class Config:'
+  surp=0.7952  kind=Expr            file=  7  '"""Convert the quota object to a result dict"""'
+  surp=0.7947  kind=Return          file= 45  'return []'
+  surp=0.7944  kind=Assign          file= 13  'BLUE = "\\033[34m"'
+
+Bottom-10 least-surprising statements:
+  surp=0.0360  kind=ImportFrom      file= 28  'from tensorflow.python.framework import tensor_shape'
+  surp=0.0369  kind=ImportFrom      file= 28  'from tensorflow.python.keras._impl.keras.utils import generic_utils'
+  surp=0.0388  kind=ImportFrom      file=  7  'from nova.api.openstack import extensions'
+  surp=0.0421  kind=ImportFrom      file= 28  'from tensorflow.python.keras._impl.keras.utils.layer_utils import print_summary as print_layer_summary'
+  surp=0.0435  kind=ImportFrom      file= 28  'from tensorflow.python.keras._impl.keras.engine import saving'
+  surp=0.0446  kind=Assign          file=  0  'self.lineWidth = self.width - 30'
+  surp=0.0453  kind=ImportFrom      file= 28  'from tensorflow.python.util import tf_inspect'
+  surp=0.0484  kind=ImportFrom      file= 42  'from apps.landmatrix.tests.mixins import ElasticSearchFixtureMixin'
+  surp=0.0492  kind=ImportFrom      file= 42  'from apps.grid.forms.deal_spatial_form import DealSpatialForm'
+  surp=0.0493  kind=ImportFrom      file= 41  'from grr_response_core.lib.rdfvalues import paths as rdf_paths'

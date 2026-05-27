@@ -1,0 +1,32 @@
+{
+  "ckpt": "checkpoints/film_self_k3_lsem_pertoken_b10_30L_217M_tinystories_seed0.pt",
+  "T": 512,
+  "n_chunks": 64,
+  "n_eval_tokens": 32768,
+  "config": {
+    "d_model": 576,
+    "n_layers": 30,
+    "feedback_pairs": [
+      [
+        2,
+        28
+      ]
+    ],
+    "feedback_mode": "film",
+    "feedback_self_k": 3,
+    "feedback_alpha_mode": "scalar"
+  },
+  "training_protocol": {
+    "ce": 1.8141095265746117,
+    "ppl": 6.135610146344545,
+    "n_tokens": 32768,
+    "elapsed_s": 1.317214858951047
+  },
+  "self_consistency": {
+    "feedback_self_k": 3,
+    "n_batches": 16,
+    "abs_norm_mean": 553.711254119873,
+    "final_norm_mean": 9764.704711914062,
+    "rel_norm_mean": 0.05670560998641705
+  }
+}

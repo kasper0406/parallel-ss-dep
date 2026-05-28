@@ -56,10 +56,6 @@ from experiments.gist_loss import (
     build_gist_heads, trunk_gist_loss, parse_horizons,
     build_think_gist_head, think_gist_loss,
 )
-from experiments.process_reward import (
-    compute_process_reward_loss,
-    compute_gate_calibration_loss,
-)
 
 
 def _flatten_to_oneline(s: str) -> str:
@@ -741,63 +737,6 @@ def main() -> int:
     p.add_argument("--refinement_head_alpha_init", type=float, default=0.3,
                    help="Phase D: refinement-head alpha init (default 0.3 "
                         "based on v10 lesson — α=0 stays inert).")
-    # --- Phase A: process-reward auxiliary loss (THINKING_PLAN.md v5) -----
-    # On a sampled subset of positions where the gate already wants to
-    # think, do a SECOND forward over [prefix, K * THINK] and ask whether
-    # the K-think prediction puts more probability mass on the true
-    # next token than the original (no-think) main-forward prediction.
-    # Loss = mean(log p_before - log p_after); the optimiser is pushed
-    # to make thinks actually reduce next-token error. Default off
-    # → byte-identical training.
-    p.add_argument("--process_reward_weight", type=float, default=0.0,
-                   help="Phase A: weight on the process-reward aux loss. "
-                        "0 disables (default). Try 0.1.")
-    p.add_argument("--process_reward_K", type=int, default=4,
-                   help="Number of think tokens to insert before the "
-                        "sampled position for the 'after' forward.")
-    p.add_argument("--process_reward_apply_min_sigma", type=float,
-                   default=0.3,
-                   help="Only apply the loss at positions where σ(gate) "
-                        "exceeds this threshold (avoids wasting compute "
-                        "on positions the gate clearly didn't want to "
-                        "think at).")
-    p.add_argument("--process_reward_sample_frac", type=float, default=0.1,
-                   help="Fraction of qualifying positions to evaluate "
-                        "per batch (bounds compute).")
-    p.add_argument("--process_reward_max_positions", type=int, default=128,
-                   help="Hard cap on sampled positions per batch — extra "
-                        "guard so the after-forward stays bounded even "
-                        "on a huge batch.")
-    # --- Gate-calibration auxiliary loss (sibling of process_reward) ------
-    # At sampled uncertain-gate positions (σ ∈ [min, max]), run a
-    # SECOND forward over [prefix, K * THINK] and ask whether the
-    # K-think prediction puts more mass on the true next token than
-    # the no-think main forward did. Use that 0/1 label as a BCE
-    # target on σ. Trains the GATE to PREDICT whether thinking will
-    # help; symmetric across both error directions. Default off
-    # → byte-identical training.
-    p.add_argument("--gate_calibration_weight", type=float, default=0.0,
-                   help="Weight on the gate-calibration aux loss. "
-                        "0 disables (default). Try 0.1.")
-    p.add_argument("--gate_calibration_K", type=int, default=4,
-                   help="Number of think tokens inserted before the "
-                        "sampled position for the 'think' forward.")
-    p.add_argument("--gate_calibration_apply_min_sigma", type=float,
-                   default=0.1,
-                   help="Lower σ bound for candidate positions.")
-    p.add_argument("--gate_calibration_apply_max_sigma", type=float,
-                   default=0.9,
-                   help="Upper σ bound for candidate positions.")
-    p.add_argument("--gate_calibration_sample_frac", type=float, default=0.05,
-                   help="Fraction of qualifying positions to evaluate "
-                        "per batch (bounds compute).")
-    p.add_argument("--gate_calibration_max_positions", type=int, default=32,
-                   help="Hard cap on sampled positions per batch.")
-    p.add_argument("--gate_calibration_smooth_target_scale", type=float,
-                   default=0.0,
-                   help="If > 0, target = σ((logp_think - logp_no_think) "
-                        "* scale) instead of hard {0,1}. 0 = hard "
-                        "(default).")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1209,46 +1148,6 @@ def main() -> int:
     # ~hundred steps; a frozen/dead signal stays flat. Printed every
     # log_every steps when use_phase_1a is on.
     last_gist_loss = None
-    # Honest-diagnostic (THINKING_AUDIT_2026_05_28.md flaw D): whole-batch
-    # gate fire-rate, paired with the biased candidate-set pr/gc metrics so
-    # they are never read in isolation as "thinking works".
-    last_gate_fire_wb = float("nan")
-    # Phase A: most-recent process-reward stats for logging.
-    last_pr_stats = None
-    use_process_reward = (
-        args.process_reward_weight > 0.0
-        and args.with_thinking
-        and thinking_token_id is not None
-    )
-    if args.process_reward_weight > 0.0 and not use_process_reward:
-        print("  [process-reward] requested but disabled: requires "
-              "--with_thinking AND a thinking_token_id in the loaded ckpt.")
-    if use_process_reward:
-        print(f"  [process-reward] ON: weight={args.process_reward_weight}, "
-              f"K={args.process_reward_K}, "
-              f"min_sigma={args.process_reward_apply_min_sigma}, "
-              f"sample_frac={args.process_reward_sample_frac}, "
-              f"max_positions={args.process_reward_max_positions}")
-    # Gate-calibration: similar gating, sibling loss.
-    last_gc_stats = None
-    use_gate_calibration = (
-        args.gate_calibration_weight > 0.0
-        and args.with_thinking
-        and thinking_token_id is not None
-    )
-    if args.gate_calibration_weight > 0.0 and not use_gate_calibration:
-        print("  [gate-calibration] requested but disabled: requires "
-              "--with_thinking AND a thinking_token_id in the loaded ckpt.")
-    if use_gate_calibration:
-        print(f"  [gate-calibration] ON: weight="
-              f"{args.gate_calibration_weight}, "
-              f"K={args.gate_calibration_K}, "
-              f"sigma=[{args.gate_calibration_apply_min_sigma}, "
-              f"{args.gate_calibration_apply_max_sigma}], "
-              f"sample_frac={args.gate_calibration_sample_frac}, "
-              f"max_positions={args.gate_calibration_max_positions}, "
-              f"smooth_target_scale="
-              f"{args.gate_calibration_smooth_target_scale}")
     for epoch in range(args.epochs):
         # Shuffle each epoch.
         idx = torch.randperm(len(encoded), generator=rng).tolist()
@@ -1325,108 +1224,6 @@ def main() -> int:
                     if future_gist_heads is not None:
                         loss = loss + args.future_emb_loss_weight * (
                             trunk_gist_loss(h, future_gist_heads, gist_horizons))
-                    # --- Phase A: process-reward auxiliary loss ----------
-                    # Reads the main-forward gate via `model._last_gate`
-                    # (side-effect populated by TinyLM.forward when
-                    # output_gate=True); reuses the just-computed `logits`
-                    # for the "before" log-probabilities (no extra
-                    # forward). The "after" forward runs over a small
-                    # synthesised batch where K think tokens are inserted
-                    # before each sampled position. Bounded by
-                    # --process_reward_sample_frac and
-                    # --process_reward_max_positions.
-                    main_gate = getattr(model, "_last_gate", None)
-                    if main_gate is not None:
-                        # Whole-batch (population) gate fire-rate — the
-                        # honest counterpart to the biased candidate-set
-                        # pr/gc metrics (flaw D).
-                        last_gate_fire_wb = float(
-                            (main_gate.detach() > 0.5).float().mean().item())
-                    # Snapshot the pre-sigmoid gate logits BEFORE any
-                    # extra forwards — process_reward's after-forward
-                    # overwrites `_last_gate_logits` to the wrong
-                    # shape (N_pr, T_pr), and gate_calibration would
-                    # then index it with the main-forward (B, T)
-                    # indices (CUDA assert / wrong tensor trained).
-                    # Same fix as train_lm.py:1407-1414 (commit 828940b
-                    # bug #5). Held in a local so the later
-                    # gate_calibration call doesn't re-read from model.
-                    main_gate_logits = getattr(
-                        model, "_last_gate_logits", None)
-                    if use_process_reward and main_gate is not None:
-                        # PAD must NOT equal thinking_token_id — when
-                        # state_readonly_at_think / mem_write_only_at_think
-                        # are on, pad-as-think silently corrupts the
-                        # after-forward's recurrent state. Use 0 (a
-                        # bytefallback / safe non-think id).
-                        pad_id = 0
-                        pr_loss, pr_stats = compute_process_reward_loss(
-                            model, x, y,
-                            gate=main_gate,
-                            main_logits=logits,
-                            thinking_token_id=int(thinking_token_id),
-                            K=int(args.process_reward_K),
-                            apply_min_sigma=float(
-                                args.process_reward_apply_min_sigma),
-                            sample_frac=float(
-                                args.process_reward_sample_frac),
-                            rng=rng,
-                            pad_token_id=pad_id,
-                            retrieval_as_input=bool(
-                                args.retrieval_as_input_thinking),
-                            base_vocab_for_loss=(
-                                int(base_vocab_for_loss)
-                                if args.with_thinking else None),
-                            max_positions=int(
-                                args.process_reward_max_positions),
-                        )
-                        last_pr_stats = pr_stats
-                        if pr_stats.n_sampled > 0:
-                            loss = loss + (
-                                args.process_reward_weight * pr_loss)
-                    # --- Gate-calibration aux loss (sibling of pr) ------
-                    # Reads `model._last_gate_logits` (preferred for
-                    # numerical stability) — populated by the same
-                    # main forward as `_last_gate`. Runs its own extra
-                    # forward over [prefix, K * THINK] (under no_grad
-                    # inside the helper — the think output is a label
-                    # for the gate, not a gradient path).
-                    if use_gate_calibration and main_gate is not None:
-                        pad_id = 0
-                        # Use the pre-extra-forward snapshot taken
-                        # above; reading `model._last_gate_logits`
-                        # here returns the after-forward's overwritten
-                        # tensor with the wrong shape.
-                        gate_logit = main_gate_logits
-                        gc_loss, gc_stats = compute_gate_calibration_loss(
-                            model, x, y,
-                            gate=main_gate,
-                            main_logits=logits,
-                            thinking_token_id=int(thinking_token_id),
-                            K=int(args.gate_calibration_K),
-                            apply_min_sigma=float(
-                                args.gate_calibration_apply_min_sigma),
-                            apply_max_sigma=float(
-                                args.gate_calibration_apply_max_sigma),
-                            sample_frac=float(
-                                args.gate_calibration_sample_frac),
-                            rng=rng,
-                            pad_token_id=pad_id,
-                            retrieval_as_input=bool(
-                                args.retrieval_as_input_thinking),
-                            base_vocab_for_loss=(
-                                int(base_vocab_for_loss)
-                                if args.with_thinking else None),
-                            max_positions=int(
-                                args.gate_calibration_max_positions),
-                            gate_logits=gate_logit,
-                            smooth_target_scale=float(
-                                args.gate_calibration_smooth_target_scale),
-                        )
-                        last_gc_stats = gc_stats
-                        if gc_stats.n_sampled > 0:
-                            loss = loss + (
-                                args.gate_calibration_weight * gc_loss)
                 # ====== Phase 1a path: gist-at-think supervision ============
                 # Run the student forward over the compressed sequence and
                 # the teacher forward (no_grad) over the full CoT sequence.
@@ -1501,35 +1298,6 @@ def main() -> int:
                 extra = ""
                 if use_phase_1a and last_gist_loss is not None:
                     extra = f"  gist={last_gist_loss:.4f}"
-                # HONEST DIAGNOSTICS (THINKING_AUDIT_2026_05_28.md flaw C/D,
-                # PLAN_FLAW_D §2-3). pr/gc Δlogp / tgt1 / %pos are measured on
-                # the loss's OWN candidate set (σ>min or σ∈[lo,hi]) — a
-                # self-fulfilling subsample (the repo's uniform-sample probe
-                # found Δlogp = -0.165). They are NEXT-TOKEN-LOGP proxies,
-                # blind to terminal task success. Labelled [BIASED-cand],
-                # paired with the whole-batch gate fire-rate, and tripwired so
-                # a positive candidate Δlogp is never misread as task help.
-                # The honest metric is probe_think_grader_reward.py.
-                if use_process_reward and last_pr_stats is not None:
-                    extra += (f"  pr[BIASED-cand](n={last_pr_stats.n_sampled}/"
-                              f"{last_pr_stats.n_candidates}, "
-                              f"Δlogp={last_pr_stats.mean_log_ratio:+.3f}, "
-                              f"%pos={100 * last_pr_stats.frac_positive:.0f}; "
-                              f"gate_fire_wb={last_gate_fire_wb:.2f})")
-                    if last_pr_stats.mean_log_ratio > 0.0:
-                        extra += (" [THINK-TRIPWIRE: candidate Δlogp>0 is "
-                                  "selection bias, not task help]")
-                if use_gate_calibration and last_gc_stats is not None:
-                    extra += (f"  gc[BIASED-cand](n={last_gc_stats.n_sampled}/"
-                              f"{last_gc_stats.n_candidates}, "
-                              f"cand_tgt1={last_gc_stats.target_frac_one:.2f}, "
-                              f"σ={last_gc_stats.mean_sigma:.2f}, "
-                              f"Δlogp="
-                              f"{last_gc_stats.mean_log_ratio:+.3f}; "
-                              f"gate_fire_wb={last_gate_fire_wb:.2f})")
-                    if last_gc_stats.mean_log_ratio > 0.0:
-                        extra += (" [THINK-TRIPWIRE: cand_tgt1/Δlogp>0 is "
-                                  "selection bias, not task help]")
                 print(f"  step {step:>5}/{n_steps}  loss={loss.item():.4f}  "
                       f"ppl={ppl:.2f}  lr={lr:.2e}  tok/s={tok_s:.0f}{extra}")
 
@@ -1552,25 +1320,6 @@ def main() -> int:
         new_cfg["cot_min_thinks"] = int(args.cot_min_thinks)
         new_cfg["think_gist_weight"] = float(args.think_gist_weight)
         new_cfg["think_gist_loss_type"] = str(args.think_gist_loss_type)
-    if use_process_reward:
-        new_cfg["process_reward_weight"] = float(args.process_reward_weight)
-        new_cfg["process_reward_K"] = int(args.process_reward_K)
-        new_cfg["process_reward_apply_min_sigma"] = float(
-            args.process_reward_apply_min_sigma)
-        new_cfg["process_reward_sample_frac"] = float(
-            args.process_reward_sample_frac)
-    if use_gate_calibration:
-        new_cfg["gate_calibration_weight"] = float(
-            args.gate_calibration_weight)
-        new_cfg["gate_calibration_K"] = int(args.gate_calibration_K)
-        new_cfg["gate_calibration_apply_min_sigma"] = float(
-            args.gate_calibration_apply_min_sigma)
-        new_cfg["gate_calibration_apply_max_sigma"] = float(
-            args.gate_calibration_apply_max_sigma)
-        new_cfg["gate_calibration_sample_frac"] = float(
-            args.gate_calibration_sample_frac)
-        new_cfg["gate_calibration_smooth_target_scale"] = float(
-            args.gate_calibration_smooth_target_scale)
     ckpt_dict = {"state_dict": model.state_dict(), "config": new_cfg}
     if future_gist_heads is not None:
         ckpt_dict["future_gist_heads_state_dict"] = \

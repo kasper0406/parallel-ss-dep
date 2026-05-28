@@ -149,6 +149,41 @@ regressed to 0.01); the consolidation phase fixes it.
 - Checkpoints: `latent_think_curriculum_k4.pt`, `latent_think_halt_k6.pt`,
   `latent_arith_n6_mixed.pt`.
 
+## Real 287M code model — port results (2026-05-28)
+
+`generate_latent_think` (eval_humaneval.py) + `latent_sft.py` port the
+mechanism to the production 287M ckpt. First latent-SFT (forced R≥1 every
+example, `latent_sft_v1.pt`) on HumanEval:
+
+| config | pass@1 |
+|---|---|
+| baseline `sft_phase_c_combined`, no-think | 9/164 |
+| latent_sft_v1, **no-think** | **0/164** (collapsed) |
+| latent_sft_v1, **latent-think (R=4)** | 7/164 |
+
+**v1 finding (forced R≥1 every example):** no-think collapsed to 0/164,
+latent-think recovered to 7/164 — i.e. thinking became *mandatory*, not
+*helpful*.
+
+**v3 finding (mixed think/no-think training, format-matched CoT+fence):** the
+clean, honest result. no-think recovers to **7/164** (full set) / 7/60
+(subset); latent-think (forced R=2 burst) **3/60 — WORSE than no-think 7/60**;
+baseline 8/60. So on HumanEval, latent think-before-solution does **not help
+and tends to hurt**.
+
+**Verdict: HumanEval is the WRONG probe for a depth mechanism.** HumanEval at
+287M is capacity-bound (documented ~16/164 ceiling), and its problems are short
+enough to fit DeltaNet's state — there is no sequential-depth bottleneck for
+latent thinking to relieve. The v1 "0→7" was forced-dependence, not benefit.
+The mechanism's value is proven where depth *is* the bottleneck: pointer-chase
+(floor→1.00, bandwidth-essential) and real arithmetic chains (0.15–0.52→~1.00
+across all rungs, the exact task discrete thinking scored 0/80). A small
+think-before-solution SFT cost ~2 HumanEval points (SFT drift), unrelated to the
+mechanism. **Recommendation: evaluate/deploy latent thinking on depth-bound
+reasoning tasks, not on HumanEval.** Ports: `experiments/latent_sft.py`,
+`eval_humaneval.generate_latent_think` (`--generator latent_think
+--force_prefix_think N`).
+
 ## Next phase (port to the 287M code model)
 1. Wire `generate_latent_think` into `eval_humaneval.py` (think burst =
    state-readonly latent ponder, gate halts) — replaces the discrete

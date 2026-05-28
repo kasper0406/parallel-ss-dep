@@ -85,21 +85,28 @@ def train(args):
           f"film={cfg.get('feedback_mode')} max_R={args.max_R} "
           f"params={model.num_params():,}")
 
-    pairs = load_distilled_jsonl(args.data, prefer_full_completion=False,
+    # prefer_full_completion=True keeps the CoT-prose + ```python``` fence
+    # format the baseline ckpt emits, so HumanEval grading (--extract_code_block)
+    # is matched and the comparison isn't confounded by an output-format shift.
+    pairs = load_distilled_jsonl(args.data,
+                                 prefer_full_completion=not args.code_only,
                                  require_extracted_code=True,
                                  keep_only_passing=args.keep_only_passing)
     if args.max_pairs:
         pairs = pairs[:args.max_pairs]
     comment_line = "# Complete the following Python function.\n"
     # Pre-tokenize (truncate long ones to keep the latent loop cheap).
+    print(f"  tokenizing {len(pairs)} pairs...", flush=True)
     data = []
-    for prob, sol in pairs:
+    for k, (prob, sol) in enumerate(pairs):
         c = tok.encode(comment_line + prob, add_special_tokens=False)
         s = tok.encode(sol, add_special_tokens=False)
-        if len(c) + len(s) + args.max_R + 2 > args.max_len:
-            continue
-        data.append((c, s))
-    print(f"  usable examples: {len(data)}")
+        if len(c) + len(s) + args.max_R + 2 <= args.max_len:
+            data.append((c, s))
+        if (k + 1) % 5000 == 0:
+            print(f"    tokenized {k+1}/{len(pairs)}  (kept {len(data)})",
+                  flush=True)
+    print(f"  usable examples: {len(data)}", flush=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                             weight_decay=0.0)
@@ -110,7 +117,12 @@ def train(args):
     opt.zero_grad(set_to_none=True)
     running = 0.0
     for step in range(1, args.steps + 1):
-        if step < 0.6 * args.steps:
+        # A fraction of steps train with NO think burst (R=0) so the model
+        # retains direct-solving competence; the rest use the latent burst so
+        # thinking adds on top (fixes the "no-think collapse to 0/164").
+        if torch.rand(1, generator=g).item() < args.no_think_frac:
+            R = 0
+        elif step < 0.6 * args.steps:
             frac = step / (0.6 * args.steps)
             R = max(1, min(args.max_R, int(round(1 + frac * (args.max_R - 1)))))
         else:
@@ -147,8 +159,14 @@ def main():
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--accum", type=int, default=8)
     ap.add_argument("--max_R", type=int, default=4)
+    ap.add_argument("--no_think_frac", type=float, default=0.5,
+                    help="fraction of steps trained with R=0 (no think burst) "
+                         "so direct-solving competence is retained")
     ap.add_argument("--lr", type=float, default=1e-5)
-    ap.add_argument("--max_len", type=int, default=512)
+    ap.add_argument("--max_len", type=int, default=768)
+    ap.add_argument("--code_only", action="store_true",
+                    help="train on extracted_code (no CoT/fence) instead of "
+                         "the full completion; changes output format")
     ap.add_argument("--max_pairs", type=int, default=20000)
     ap.add_argument("--keep_only_passing", action="store_true")
     ap.add_argument("--log_every", type=int, default=50)

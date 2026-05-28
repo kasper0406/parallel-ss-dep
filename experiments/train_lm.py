@@ -1557,17 +1557,44 @@ def main():
                 ece_str = f"{emit_ce:.4f}" if emit_ce == emit_ce else "nan"
                 line += (f"  gate(g={mean_g:.3f},emit={emit_frac:.2f},"
                          f"emit_ce={ece_str},ce={raw_ce:.4f}{gf})")
+            # HONEST DIAGNOSTICS (THINKING_AUDIT_2026_05_28.md flaw C/D,
+            # PLAN_FLAW_D §2-3). The pr/gc Δlogp / tgt1 / %pos numbers are
+            # measured on the loss's OWN candidate set (σ>min or σ∈[lo,hi]) —
+            # a self-fulfilling subsample, NOT a population estimate (the
+            # repo's uniform-sample probe found Δlogp = -0.165). They are
+            # NEXT-TOKEN-LOGP proxies, blind to whether the function passes
+            # tests. They are explicitly labelled [BIASED-cand] and paired
+            # with the whole-batch gate fire-rate so the candidate metric can
+            # never again be read in isolation as "thinking works". The
+            # honest signal is `gate_fire` rising while task metric is flat,
+            # and the Δ(grader) probe (probe_think_grader_reward.py).
+            if args.output_gate and losses_gate_window:
+                _gate_fire_wb = sum(
+                    r[1] for r in losses_gate_window[-args.log_every:]
+                ) / len(losses_gate_window[-args.log_every:])
+            else:
+                _gate_fire_wb = float("nan")
             if use_process_reward and last_pr_stats is not None:
-                line += (f"  pr(n={last_pr_stats.n_sampled}/"
+                line += (f"  pr[BIASED-cand](n={last_pr_stats.n_sampled}/"
                          f"{last_pr_stats.n_candidates}, "
                          f"Δlogp={last_pr_stats.mean_log_ratio:+.3f}, "
-                         f"%pos={100 * last_pr_stats.frac_positive:.0f})")
+                         f"%pos={100 * last_pr_stats.frac_positive:.0f}; "
+                         f"gate_fire_wb={_gate_fire_wb:.2f})")
+                # Sign-divergence tripwire: the candidate-set Δlogp is
+                # positive almost by construction (extra compute sharpens
+                # uncertain positions). A positive candidate Δlogp is NOT
+                # evidence of task help — flag it so it is not misread.
+                if last_pr_stats.mean_log_ratio > 0.0:
+                    line += " [THINK-TRIPWIRE: candidate Δlogp>0 is selection bias, not task help]"
             if use_gate_calibration and last_gc_stats is not None:
-                line += (f"  gc(n={last_gc_stats.n_sampled}/"
+                line += (f"  gc[BIASED-cand](n={last_gc_stats.n_sampled}/"
                          f"{last_gc_stats.n_candidates}, "
-                         f"tgt1={last_gc_stats.target_frac_one:.2f}, "
+                         f"cand_tgt1={last_gc_stats.target_frac_one:.2f}, "
                          f"σ={last_gc_stats.mean_sigma:.2f}, "
-                         f"Δlogp={last_gc_stats.mean_log_ratio:+.3f})")
+                         f"Δlogp={last_gc_stats.mean_log_ratio:+.3f}; "
+                         f"gate_fire_wb={_gate_fire_wb:.2f})")
+                if last_gc_stats.mean_log_ratio > 0.0:
+                    line += " [THINK-TRIPWIRE: cand_tgt1/Δlogp>0 is selection bias, not task help]"
             if args.enable_thinking_token and think_stats_window:
                 recent = think_stats_window[-args.log_every:]
                 normal_items = sum(r.get("normal_items", 0.0) for r in recent)

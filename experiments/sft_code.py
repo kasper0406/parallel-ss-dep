@@ -1209,6 +1209,10 @@ def main() -> int:
     # ~hundred steps; a frozen/dead signal stays flat. Printed every
     # log_every steps when use_phase_1a is on.
     last_gist_loss = None
+    # Honest-diagnostic (THINKING_AUDIT_2026_05_28.md flaw D): whole-batch
+    # gate fire-rate, paired with the biased candidate-set pr/gc metrics so
+    # they are never read in isolation as "thinking works".
+    last_gate_fire_wb = float("nan")
     # Phase A: most-recent process-reward stats for logging.
     last_pr_stats = None
     use_process_reward = (
@@ -1332,6 +1336,12 @@ def main() -> int:
                     # --process_reward_sample_frac and
                     # --process_reward_max_positions.
                     main_gate = getattr(model, "_last_gate", None)
+                    if main_gate is not None:
+                        # Whole-batch (population) gate fire-rate — the
+                        # honest counterpart to the biased candidate-set
+                        # pr/gc metrics (flaw D).
+                        last_gate_fire_wb = float(
+                            (main_gate.detach() > 0.5).float().mean().item())
                     # Snapshot the pre-sigmoid gate logits BEFORE any
                     # extra forwards — process_reward's after-forward
                     # overwrites `_last_gate_logits` to the wrong
@@ -1491,18 +1501,35 @@ def main() -> int:
                 extra = ""
                 if use_phase_1a and last_gist_loss is not None:
                     extra = f"  gist={last_gist_loss:.4f}"
+                # HONEST DIAGNOSTICS (THINKING_AUDIT_2026_05_28.md flaw C/D,
+                # PLAN_FLAW_D §2-3). pr/gc Δlogp / tgt1 / %pos are measured on
+                # the loss's OWN candidate set (σ>min or σ∈[lo,hi]) — a
+                # self-fulfilling subsample (the repo's uniform-sample probe
+                # found Δlogp = -0.165). They are NEXT-TOKEN-LOGP proxies,
+                # blind to terminal task success. Labelled [BIASED-cand],
+                # paired with the whole-batch gate fire-rate, and tripwired so
+                # a positive candidate Δlogp is never misread as task help.
+                # The honest metric is probe_think_grader_reward.py.
                 if use_process_reward and last_pr_stats is not None:
-                    extra += (f"  pr(n={last_pr_stats.n_sampled}/"
+                    extra += (f"  pr[BIASED-cand](n={last_pr_stats.n_sampled}/"
                               f"{last_pr_stats.n_candidates}, "
                               f"Δlogp={last_pr_stats.mean_log_ratio:+.3f}, "
-                              f"%pos={100 * last_pr_stats.frac_positive:.0f})")
+                              f"%pos={100 * last_pr_stats.frac_positive:.0f}; "
+                              f"gate_fire_wb={last_gate_fire_wb:.2f})")
+                    if last_pr_stats.mean_log_ratio > 0.0:
+                        extra += (" [THINK-TRIPWIRE: candidate Δlogp>0 is "
+                                  "selection bias, not task help]")
                 if use_gate_calibration and last_gc_stats is not None:
-                    extra += (f"  gc(n={last_gc_stats.n_sampled}/"
+                    extra += (f"  gc[BIASED-cand](n={last_gc_stats.n_sampled}/"
                               f"{last_gc_stats.n_candidates}, "
-                              f"tgt1={last_gc_stats.target_frac_one:.2f}, "
+                              f"cand_tgt1={last_gc_stats.target_frac_one:.2f}, "
                               f"σ={last_gc_stats.mean_sigma:.2f}, "
                               f"Δlogp="
-                              f"{last_gc_stats.mean_log_ratio:+.3f})")
+                              f"{last_gc_stats.mean_log_ratio:+.3f}; "
+                              f"gate_fire_wb={last_gate_fire_wb:.2f})")
+                    if last_gc_stats.mean_log_ratio > 0.0:
+                        extra += (" [THINK-TRIPWIRE: cand_tgt1/Δlogp>0 is "
+                                  "selection bias, not task help]")
                 print(f"  step {step:>5}/{n_steps}  loss={loss.item():.4f}  "
                       f"ppl={ppl:.2f}  lr={lr:.2e}  tok/s={tok_s:.0f}{extra}")
 

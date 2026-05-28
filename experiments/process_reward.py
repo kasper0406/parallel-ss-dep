@@ -1,5 +1,23 @@
 """Phase A — process-reward auxiliary loss.
 
+DEPRECATED AS A GATE OBJECTIVE (2026-05-28). Per THINKING_AUDIT_2026_05_28.md
+flaw C (FATAL), the target below — "a think is good iff it raises
+logp(y[t+1])" — is a NEXT-TOKEN-LOGP PROXY, NOT a task-helpfulness signal:
+  * It rewards sharpening locally-uncertain SURFACE tokens (string literals,
+    variable names, whitespace) that are uncorrelated with whether the
+    emitted FUNCTION PASSES TESTS.
+  * Extra think positions = extra sequential compute, which nudges the true
+    token's logp up for almost any uncertain position — so the target is
+    nearly equivalent to the (free) entropy-grounded gate prior
+    (`--gate_entropy_aux_weight`), launders an uncertainty signal through an
+    expensive double forward, and calls it "helpfulness".
+  * It has NO terminal credit assignment (HumanEval/MBPP reward is terminal).
+The honest, execution-grounded replacement is `train_rl_grader.py
+--stochastic_gate` (terminal grader reward as the policy signal); the honest
+diagnostic is `probe_think_grader_reward.py` (Δ grader score on the real
+deploy generator), NOT Δlogp. DO NOT use this loss as the primary gate
+objective. It is kept (with tests) only as a documented logp proxy.
+
 Trains the trunk + WM to make thinks *productive*: at sampled positions
 where the gate already wants to fire, run a second forward with K think
 tokens inserted before position t and check whether the resulting
@@ -202,6 +220,12 @@ def compute_process_reward_loss(
 ) -> tuple[torch.Tensor, ProcessRewardStats]:
     """Compute the process-reward auxiliary loss.
 
+    DEPRECATED AS A GATE OBJECTIVE — this optimizes Δ next-token-logp, a
+    proxy that is structurally blind to terminal task success (see the
+    module docstring and THINKING_AUDIT_2026_05_28.md flaw C). Use
+    `train_rl_grader.py --stochastic_gate` for the task signal; use
+    `probe_think_grader_reward.py` to measure "does thinking help".
+
     Returns `(loss, stats)`. When there are no candidate positions the
     loss is a zero scalar with `requires_grad=False`; callers should
     multiply by the configured weight and add to the total loss.
@@ -378,6 +402,16 @@ def compute_gate_calibration_loss(
                                        # of hard {0,1} target.
 ) -> tuple[torch.Tensor, GateCalibrationStats]:
     """Compute the gate-calibration auxiliary loss.
+
+    DEPRECATED AS A GATE OBJECTIVE — the target (`logp_think > logp_no_think`)
+    is the same next-token-logp proxy as compute_process_reward_loss and is
+    blind to terminal task success (THINKING_AUDIT_2026_05_28.md flaw C). Its
+    in-distribution success metric (`target_frac_one`) is additionally
+    self-fulfilling: it is measured on the σ∈[min,max] candidate window the
+    loss itself empties as it drives σ→1 (flaw D). Use
+    `train_rl_grader.py --stochastic_gate` for the task signal and
+    `probe_think_grader_reward.py` for the honest diagnostic. Kept (with
+    tests) only as a documented proxy.
 
     For each sampled position t:
       - "no-think" log-prob from `main_logits[b, t, y[b, t+1]]`

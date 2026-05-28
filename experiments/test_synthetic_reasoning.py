@@ -27,7 +27,8 @@ from experiments.code_grader import (
     load_synth_reasoning_train,
 )
 from experiments.gen_synthetic_reasoning_tasks import (
-    _FAMILIES, generate, problem_to_record, record_to_problem,
+    _FAMILIES, _gen_multi_step_arith, generate, problem_to_record,
+    record_to_problem,
 )
 
 
@@ -235,3 +236,75 @@ def test_tasks_are_multi_step(family):
             f"gold body has {body_n} stmts, prompt didn't hit any "
             f"multi-step marker.\nPROMPT:\n{p.prompt}\nGOLD:\n{p.gold_solution}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 5) Difficulty ladder: parametrized n_steps for multi_step_arith
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("n_steps", [1, 2, 3, 4, 5, 6])
+def test_arith_n_steps_controls_chain_length(n_steps):
+    """`_gen_multi_step_arith(..., n_steps_min=n, n_steps_max=n)` produces
+    exactly n chain steps: n+1 'Let' lines in the prompt (one seed value
+    plus n derived values)."""
+    rng = __import__("random").Random(n_steps)
+    for i in range(20):
+        p = _gen_multi_step_arith(
+            rng, i, n_steps_min=n_steps, n_steps_max=n_steps)
+        lets = p.prompt.count("Let ")
+        assert lets == n_steps + 1, (
+            f"n_steps={n_steps}: expected {n_steps + 1} 'Let' lines, "
+            f"got {lets}\n{p.prompt}"
+        )
+
+
+@pytest.mark.parametrize("n_steps", [1, 2, 3, 4, 5, 6])
+def test_arith_ladder_gold_passes(n_steps):
+    """Every ladder-rung task's gold solution passes its own check()."""
+    problems = generate(
+        families=["multi_step_arith"],
+        n_per_family=12,
+        seed=500 + n_steps,
+        validate=False,
+        arith_n_steps=n_steps,
+    )
+    assert len(problems) == 12
+    for p in problems:
+        # Confirm the chain length is the requested rung.
+        assert p.prompt.count("Let ") == n_steps + 1
+        res = grade(p, p.gold_solution)
+        assert res.passed, (
+            f"n_steps={n_steps} task {p.task_id} gold failed: "
+            f"tier={res.tier} err={res.error}"
+        )
+
+
+def test_arith_n_steps_default_matches_legacy_range():
+    """Default generate() (no arith_n_steps) keeps the historical 5-8
+    range, so existing train/heldout reproduction is unaffected."""
+    problems = generate(
+        families=["multi_step_arith"], n_per_family=40, seed=0,
+        validate=False,
+    )
+    lengths = {p.prompt.count("Let ") - 1 for p in problems}
+    assert lengths.issubset({5, 6, 7, 8}), lengths
+    # With 40 samples we should see more than one distinct length.
+    assert len(lengths) >= 2, lengths
+
+
+@pytest.mark.parametrize("n_steps", [1, 2, 3, 4, 5, 6])
+def test_ladder_data_files_well_formed(n_steps):
+    """The committed ladder JSONL for each rung exists, has 80 tasks, the
+    right chain length, and every gold passes. Guards the artifact the
+    thinking-demonstration eval consumed."""
+    path = (pathlib.Path(__file__).resolve().parents[1]
+            / "data" / f"synth_arith_ladder_n{n_steps}.jsonl")
+    if not path.exists():
+        pytest.skip(f"ladder file {path.name} not generated")
+    loaded = load_synth_reasoning(str(path))
+    assert len(loaded) == 80, f"{path.name}: {len(loaded)} tasks"
+    for p in loaded:
+        assert p.prompt.count("Let ") == n_steps + 1
+        assert p.task_id.startswith("synth_reason/multi_step_arith/")
+        res = grade(p, p.gold_solution)
+        assert res.passed, f"{path.name} {p.task_id} gold failed"

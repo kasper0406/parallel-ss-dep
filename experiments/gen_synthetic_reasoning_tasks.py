@@ -60,14 +60,24 @@ from experiments.code_grader import Problem, grade
 # Family generators. Each returns a Problem with gold_solution set.
 # ---------------------------------------------------------------------------
 
-def _gen_multi_step_arith(rng: random.Random, idx: int) -> Problem:
-    """5-8 sequential assignments composing intermediate values.
+def _gen_multi_step_arith(
+    rng: random.Random,
+    idx: int,
+    n_steps_min: int = 5,
+    n_steps_max: int = 8,
+) -> Problem:
+    """`n_steps_min`-`n_steps_max` sequential assignments composing
+    intermediate values.
 
     Task: define solve() returning the final value of a chain like
         x = a + b; y = x * c; z = y - d; w = z + e; return w
     The model must propagate intermediate values through each step.
+
+    The default 5-8 range matches the historical generator. The
+    difficulty-ladder uses fixed single-value ranges (e.g. n_steps_min ==
+    n_steps_max == 3) to isolate a single rung.
     """
-    n_steps = rng.randint(5, 8)
+    n_steps = rng.randint(n_steps_min, n_steps_max)
     vals = [rng.randint(2, 9) for _ in range(n_steps + 1)]
     ops = [rng.choice(["+", "-", "*"]) for _ in range(n_steps)]
 
@@ -544,17 +554,26 @@ def generate(
     n_per_family: int,
     seed: int,
     validate: bool = True,
+    arith_n_steps: int | None = None,
 ) -> list[Problem]:
     """Generate `n_per_family` tasks for each family in `families`.
 
     If `validate` is True (default), each generated task's gold solution
     is graded; tasks whose gold doesn't pass are dropped silently (the
     caller can inspect the returned list length to detect attrition).
+
+    `arith_n_steps`, when set, fixes the chain length of the
+    `multi_step_arith` family to exactly that value (both min and max),
+    used to build a single difficulty rung of the ladder. It has no
+    effect on the other families.
     """
     rng = random.Random(seed)
     out: list[Problem] = []
     for fam in families:
         gen = _FAMILIES[fam]
+        if fam == "multi_step_arith" and arith_n_steps is not None:
+            gen = lambda r, i, _n=arith_n_steps: _gen_multi_step_arith(
+                r, i, n_steps_min=_n, n_steps_max=_n)
         n_emitted = 0
         idx = 0
         # Up to 3x sampling budget per family — generators are tight, the
@@ -583,6 +602,9 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no_validate", action="store_true",
                     help="Skip the gold-solution grading pass (faster).")
+    ap.add_argument("--arith_n_steps", type=int, default=None,
+                    help="If set, fix the multi_step_arith chain length to "
+                         "exactly this many steps (single difficulty rung).")
     args = ap.parse_args()
 
     if args.families:
@@ -600,6 +622,7 @@ def main() -> int:
         n_per_family=args.n_per_family,
         seed=args.seed,
         validate=not args.no_validate,
+        arith_n_steps=args.arith_n_steps,
     )
 
     out_path = pathlib.Path(args.out)

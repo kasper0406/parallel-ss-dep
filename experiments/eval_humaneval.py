@@ -429,6 +429,118 @@ def generate_with_retrieval_as_input(
     return out, diag
 
 
+@torch.no_grad()
+def generate_latent_think(
+    model, prompt_ids: torch.Tensor, max_gen: int = 256,
+    temperature: float = 0.0, eos_token_id: int | None = None,
+    thinking_token_id: int | None = None,
+    max_think_per_step: int = 8,
+    total_think_budget: int | None = None,
+    emit_threshold: float = 0.5,
+    min_emit_before_eos: int = 0,
+    gate_floor: float = 0.0,
+    force_prefix_think: int = 0,
+) -> tuple[torch.Tensor, dict]:
+    """Latent-ponder generation (2026-05-28, `THINKING_LATENT_2026_05_28.md`).
+
+    `force_prefix_think` (>0): run exactly that many latent steps BEFORE the
+    first emit, then emit the rest with no further thinking. This matches the
+    `latent_sft.py` "think-before-solution" training layout; with it set the
+    per-step gate is ignored.
+
+    At a think step the next input embedding is the model's OWN hidden state
+    at the last position (Coconut-style continuous feedback), and think
+    positions run STATE-READONLY (DeltaNet β=0) so the recurrent state — the
+    long-range bindings — is never corrupted. The emit after a think burst is
+    conditioned on the final refined latent (we emit from the last think
+    slot's logits, exactly as the validated synthetic/arith decode).
+
+    Unlike the discrete-[THINKING] `generate` (one homogeneous embedding) or
+    `generate_with_retrieval_as_input` (a WM lookup), this feeds back a full
+    d_model continuous vector — maximum thinking bandwidth.
+
+    Requires the model loaded with `state_readonly_at_think=True`
+    (build_model_from_ckpt(force_state_readonly=True)). Full-forward path only
+    (correctness-first; the prefix is re-read each step).
+    """
+    if total_think_budget is None:
+        total_think_budget = 2 * max_gen
+    if thinking_token_id is None:
+        raise ValueError("generate_latent_think requires thinking_token_id")
+    if not getattr(model, "state_readonly_at_think", False):
+        raise ValueError("generate_latent_think requires a model with "
+                         "state_readonly_at_think=True (load with "
+                         "force_state_readonly=True).")
+    device = prompt_ids.device
+    out = prompt_ids.clone()
+    inputs_embeds = model.embed(out).clone()      # (B, prompt_len, d)
+    emit_count = 0
+    think_total = 0
+    think_steps_used: list[int] = []
+    gate_emit_values: list[float] = []
+    while emit_count < max_gen:
+        thinks_this_step = 0
+        while True:
+            logits, h = model(out, inputs_embeds=inputs_embeds,
+                              return_hidden=True)
+            next_logits = logits[:, -1, :]
+            gate_t = getattr(model, "_last_gate", None)
+            gate_val = (1.0 if gate_t is None
+                        else float(gate_t[0, -1].item()))
+            if gate_floor > 0.0:
+                gate_val = max(gate_val, gate_floor)
+            if force_prefix_think > 0:
+                # Forced burst before the first emit only; then no thinking.
+                want_think = (emit_count == 0
+                              and thinks_this_step < force_prefix_think)
+                if not want_think:
+                    break
+            else:
+                force_emit = (thinks_this_step >= max_think_per_step
+                              or think_total >= total_think_budget)
+                if gate_val >= emit_threshold or force_emit:
+                    break
+            # THINK STEP: feed the model's own hidden back as the next input
+            # embedding. The appended think token makes β=0 fire at this
+            # position (state-readonly), so the recurrence is not written.
+            latent = h[:, -1:, :].to(inputs_embeds.dtype)     # (B, 1, d)
+            think_tok = torch.full((out.shape[0], 1), int(thinking_token_id),
+                                   dtype=out.dtype, device=device)
+            out = torch.cat([out, think_tok], dim=1)
+            inputs_embeds = torch.cat([inputs_embeds, latent], dim=1)
+            thinks_this_step += 1
+            think_total += 1
+        # EMIT STEP — conditioned on the final refined latent.
+        next_logits = next_logits.clone()
+        next_logits[..., int(thinking_token_id)] = -float("inf")
+        if (eos_token_id is not None and min_emit_before_eos > 0
+                and emit_count < min_emit_before_eos):
+            next_logits[..., int(eos_token_id)] = -float("inf")
+        if temperature == 0.0:
+            next_tok = next_logits.argmax(dim=-1, keepdim=True)
+        else:
+            probs = torch.softmax(next_logits / temperature, dim=-1)
+            next_tok = torch.multinomial(probs, num_samples=1)
+        out = torch.cat([out, next_tok], dim=1)
+        inputs_embeds = torch.cat(
+            [inputs_embeds, model.embed(next_tok).to(inputs_embeds.dtype)], dim=1)
+        emit_count += 1
+        think_steps_used.append(thinks_this_step)
+        gate_emit_values.append(gate_val)
+        if eos_token_id is not None and (next_tok == eos_token_id).all():
+            break
+    diag = {
+        "emit_count": emit_count,
+        "think_total": think_total,
+        "think_steps_used": think_steps_used,
+        "gate_emit_values": gate_emit_values,
+        "think_rate": (think_total / max(1, think_total + emit_count)),
+        "mode": "latent_think",
+        "decode_path": "full_forward",
+    }
+    return out, diag
+
+
 def _clone_fla_cache(fla_cache):
     """Deep-clone an FLA Cache so a what-if forward_step on the clone does
     not mutate the original. Each per-layer state slot holds a
@@ -719,7 +831,8 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
              prompt_style: str = "humaneval",
              extract_code_block: bool = False,
              generator: str = "standard",
-             gate_mode: str = "hard"):
+             gate_mode: str = "hard",
+             force_prefix_think: int = 0):
     """
     prompt_style:
       "humaneval"   — use the original HumanEval prompt verbatim (default).
@@ -736,7 +849,10 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
       that emit CoT prose around their code block.
     """
     print(f"Loading checkpoint: {ckpt_path}")
-    model, cfg = build_model_from_ckpt(ckpt_path)
+    # The latent-think generator needs DeltaNet β=0 at think positions.
+    model, cfg = build_model_from_ckpt(
+        ckpt_path,
+        force_state_readonly=True if generator == "latent_think" else None)
     print(f"  feedback={cfg.get('feedback_mode')}  n_layers={cfg['n_layers']}")
 
     # Resolve thinking_token_id. We need it whenever use_thinking=True OR the
@@ -815,6 +931,20 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
                     min_emit_before_eos=min_emit_before_eos,
                     gate_floor=gate_floor,
                     additive=cfg.get("retrieval_input_additive", True),
+                )
+            elif generator == "latent_think":
+                # Latent-ponder thinking: state-readonly, hidden fed back as
+                # the think-slot input embedding (THINKING_LATENT_2026_05_28).
+                gen, diag = generate_latent_think(
+                    model, prompt_t, max_gen=max_gen,
+                    temperature=temperature, eos_token_id=tok.eos_token_id,
+                    thinking_token_id=thinking_token_id,
+                    max_think_per_step=max_think_per_step,
+                    total_think_budget=total_think_budget,
+                    emit_threshold=emit_threshold,
+                    min_emit_before_eos=min_emit_before_eos,
+                    gate_floor=gate_floor,
+                    force_prefix_think=force_prefix_think,
                 )
             elif generator == "retrieval_as_input":
                 # v5+ models trained with --retrieval_as_input_thinking
@@ -970,8 +1100,12 @@ def main():
                         "compute, but the threshold can never make a wrong "
                         "decision. Requires a model with WorkingMemory "
                         "and incremental decode.")
+    p.add_argument("--force_prefix_think", type=int, default=0,
+                   help="latent_think generator: force this many latent steps "
+                        "before the first emit, then no more thinking (matches "
+                        "latent_sft think-before-solution training).")
     p.add_argument("--generator", type=str, default="standard",
-                   choices=["standard", "retrieval_as_input"],
+                   choices=["standard", "retrieval_as_input", "latent_think"],
                    help="'standard' (default): append [THINKING] tokens. "
                         "'retrieval_as_input': at think positions inject "
                         "the WM retrieval as the next input embedding. "
@@ -997,6 +1131,7 @@ def main():
             extract_code_block=args.extract_code_block,
             generator=args.generator,
             gate_mode=args.gate_mode,
+            force_prefix_think=args.force_prefix_think,
         )
 
     print("\n" + "=" * 70)

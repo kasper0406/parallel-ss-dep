@@ -62,8 +62,32 @@ Dead direction (do **not** revive without explicit justification):
 - **Pretrain knobs (`--grad_accum`, `--grad_clip`, `--z_loss`), added 2026-05-14** from the "techniques we should be using" review. (1) `--grad_accum N` accumulates N microbatches per optimizer step on the **non-thinking (pretrain) path only** — the thinking-token queue path has its own `--think_queue_accum_steps`, and `--grad_accum > 1` errors if combined with `--enable_thinking_token`. The v3-and-earlier effective batch was 7×2048 = 14 k tok/step, far below the 0.5–4 M typical for pretraining; the tiny-batch gradient noise was a real convergence-efficiency drag. Use `--activation_checkpointing --batch 14 --grad_accum 8` for ~229 k tok/step. The non-thinking forward+loss is factored into `train_lm.py::_nonthink_forward_loss`; `tokens_seen` and `tok/s` both multiply by `grad_accum`. (2) `--grad_clip` (default 1.0) exposes the previously-hardcoded global grad-norm clip; 0 disables. (3) `--z_loss` (**defaults to 1e-4**; 0 disables) adds `weight·mean(logsumexp(logits)²)` — the PaLM/Chinchilla logit-drift regulariser, cheap bf16-stability insurance. Tests in `experiments/test_pretrain_knobs.py`.
 - **Cross-document state isolation — implemented 2026-05-14.** `data_mix.py` packs multiple documents into each T=2048 sequence separated only by an EOS *token*; DeltaNet is a linear RNN so its recurrent state (and `WorkingMemory` reads) would otherwise flow straight across those boundaries. Fix: `MixedSourceStream(emit_doc_ids=True)` emits a per-position `doc_id` array (kept aligned through `insert_think_bursts` via its new optional `aligned=` arg); `train_lm.py` threads `doc_ids` into `TinyLM.forward`; `model._build_cu_seqlens` turns it into a ragged `cu_seqlens` (int32) that `_FlaWrapper` feeds to FLA's `chunk_delta_rule` after flattening `(B,T,d)→(1,B*T,d)` — verified in the local fork, fwd+bwd. `WorkingMemory.forward` gained a same-document read mask. `doc_ids=None` (any non-`data_mix` stream, eval, MQAR) is byte-identical to the old path — only `DeltaNetAttention` opts in (`accepts_cu_seqlens=True`). Tests: `experiments/test_cu_seqlens.py` (8, incl. the packed==unpacked CUDA equality test). The `doc_id` representation is also what FIM (#65) reuses. Full design: `CROSS_DOC_ISOLATION_PLAN.md`. **Open follow-up**: the RL replay-packing path still passes `doc_ids=None`; the FiLM `_shift_right` lag is not doc-aware (second-order, documented non-fix).
 
+## LATENT-SPACE THINKING WORKS (2026-05-28) — the breakthrough
+
+After discrete-token thinking never helped on any task (0/80 on every
+arithmetic rung), the user redirected to **latent-space thinking, max
+bandwidth, not CoT**. This is the first thinking mechanism that performs useful
+sequential computation. Mechanism (`experiments/latent_think.py`): at an
+appended "think" slot, feed the trunk's OWN continuous hidden state back as the
+next input embedding (Coconut-style) for R iterations, **state-readonly**
+(DeltaNet β=0 via `state_readonly_at_think`) so the recurrent state is never
+corrupted. Each step feeds a full `d_model` vector — no discrete token emitted.
+Validated on pointer-chase `f^K(s)` (needs depth + recall): floor → 1.00; needs
+*exactly* R=K steps (per-hop thread 100%); discrete-token feedback FAILS (0.09)
+→ bandwidth is essential; learns from **final-answer-only + a depth curriculum**
+(per-hop reasoning emerges unsupervised); length-generalizes (K=4→10 hops,
+K=8→12); the gate learns **adaptive halting** (halt_exact 1.00). **Transfer**
+(`experiments/latent_arith.py`): real DeltaNet on real arithmetic-chain text,
+latent thinking solves all rungs n=1–6 (~1.00) vs no-think 0.15–0.52 — the exact
+task discrete thinking scored 0/80. Recipe needs a **consolidation phase**
+(uniform-depth sampling after the ramp) to avoid forgetting shallow rungs. Full
+writeup + next-phase plan (port to the 287M code model): `THINKING_LATENT_2026_05_28.md`.
+Tests: `experiments/test_latent_think.py` (5 pass). Ckpts:
+`checkpoints/latent_think_{curriculum_k4,halt_k6}.pt`, `latent_arith_n6_mixed.pt`.
+
 ## Documentation index
 
+- `THINKING_LATENT_2026_05_28.md` — **latent-space thinking works** (the result above): mechanism, ablations, real-arithmetic transfer, port plan.
 - `MILESTONE_ARCH.md` — north-star milestone: PKM, WM, thinking gate (+ long chains), and selective memory writes must each be measurably load-bearing. Current status, ablation table, and workstreams (A–D) to get there.
 - `README.md` — headline results (FiLM lift, MQAR recall, deployment-fair scoring) and the small-super-coder framing.
 - `THESIS.md` — project framing: small-model performance is under-served by training-methodology research; what we claim and what we explicitly don't.

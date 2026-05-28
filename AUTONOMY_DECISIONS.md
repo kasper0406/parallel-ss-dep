@@ -253,3 +253,69 @@ synthetic_pyfunc → sft_code-compatible format
 - ~16 ± 1: SFT can't move it; 16/164 is genuine size-class ceiling.
 - <14/164: SFT itself regresses regardless of data shape. Contradicts
   agent diagnosis; would need re-investigation.
+
+
+## D19 RESULT (2026-05-28) — TRAINED state-readonly thinking gives ZERO lift on arithmetic. Verdict: NEGATIVE.
+
+**Rework shipped** (`train_rl_grader.py`): `--state_readonly_at_think` (passes
+`force_state_readonly=True` to `build_model_from_ckpt` for BOTH the policy and the
+frozen KL ref; tags `cfg["state_readonly_at_think"]=True` so reloads auto-enable
+the hook) and `--dataset_jsonl PATH` (loads a synth_reasoning-schema JSONL via
+`code_grader.load_synth_reasoning`). Both backwards-compatible. 8 tests in
+`experiments/test_rl_grader_state_readonly.py` (14 with the gate_floor suite).
+Training set `data/synth_arith_train_n234.jsonl` (gitignored under data/) =
+n2+n3+n4 (240 tasks). Launcher `launch_rl_arith_stateread.sh`.
+
+**Training** (250 steps GRPO from `rl_grader_phase_c_v2_step300`, state-readonly
+ON, deterministic gate, ponder 0, kl 0.05, lr 2e-6, GPU 0; completed). VERIFIED
+trend: s1 rmean 0.016 passn 0; s50 rmean 0.072 passn 0; s100 rmean 0.056 passn 0; s150 rmean 0.084 passn 0; s200 rmean 0.109 passn 0; s250 rmean 0.059 passn 0. **pass_n=0 at all but 3 of 250 steps (max_passn=1)**
+— the grader essentially NEVER saw a fully-correct chain, so GRPO had almost no
+task-correctness signal. KL range 0.000..1.196.
+
+**Ladder verdict** (final step-250 ckpt, 3-way, 80/rung, greedy, max_gen 96 —
+VERIFIED, `results/ladder_arith_stateread_final.json`, prompt_style=code_fence,
+generator=retrieval_as_input):
+
+| n | no-think | with-think (state-WRITE) | think + state-READONLY |
+|--:|:--|:--|:--|
+| 1 | 0/80 | 0/80 | 0/80 |
+| 2 | 0/80 | 0/80 | 0/80 |
+| 3 | 3/80 | 0/80 | 0/80 |
+| 4 | 0/80 | 0/80 | 0/80 |
+| 5 | 0/80 | 0/80 | 0/80 |
+| 6 | 0/80 | 0/80 | 0/80 |
+
+**Within-model comparison (the load-bearing question): with-think == 0/80 at
+EVERY rung, while no-think reaches 3/80 (n=3).** state-readonly == state-write ==
+0/80. Thinking provides ZERO lift; with-think <= no-think everywhere. beta=0 is
+verifiably active (the 3-way harness toggles the b_proj hook between the write and
+readonly conditions on the same model; their generations differ) and it makes no
+difference.
+
+**HARNESS CAVEAT.** The no-think column maxes at 3/80, NOT the 17/80 the D16
+demonstration doc reported for the SAME band. The current `eval_thinking_ladder`
+(gained prompt_style/generator args + data AFTER commit 7f1a49f) no longer
+reproduces D16's numbers on the original `rl_grader_phase_c_v2_step300.pt` either.
+A direct `generate()` probe shows the model emits CORRECT arithmetic as PROSE
+("Let me trace... v0 = 7, v1 = v0 - 4...") but rarely as an extractable
+`def solve(): return -1`, so the grader returns exec_error/0. The absolute 0/80
+floor is partly a measurement artifact of harness drift; the WITHIN-MODEL
+with-vs-without comparison is unaffected and decisive.
+
+**Verdict (decisive)**: TRAINED state-readonly thinking does NOT beat no-think on
+the arithmetic ladder — tied or worse at every rung. The success criterion
+(with-think > no-think at any rung) FAILS. Two causes: (1) during RL the grader
+almost never saw a correct gradeable chain (pass_n~=0) so there was no
+thinking-productivity gradient to climb; (2) the harness can't detect the model's
+prose-form correct answers. At 287M, latent state-readonly thinking did not become
+useful computation on arithmetic. GEMINI's 1-layer probe (0.88 vs 0.41) does NOT
+transfer to the trunk.
+
+**Next steps the evidence demands**: (a) FIX THE HARNESS before any future
+thinking-on-reasoning claim — `eval_thinking_ladder` must grade prose-wrapped
+answers (extract `return <int>` from CoT, or force code output). (b) The honest
+path to the coding headline remains post-training scale + model size, not the
+thinking primitive.
+
+Artifacts: `checkpoints/rl_arith_stateread{,_step50,_step100,_step150,_step200}.pt`,
+`results/ladder_arith_stateread_final.json` (full 6-rung 3-way, verified).

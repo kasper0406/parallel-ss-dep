@@ -1,0 +1,123 @@
+{
+  "ckpt": "checkpoints/rl_arith_stateread.pt",
+  "config": {
+    "ckpt": "checkpoints/rl_arith_stateread.pt",
+    "rungs": "1,2,3,4,5,6",
+    "max_gen": 96,
+    "temperature": 0.0,
+    "prompt_style": "code_fence",
+    "generator": "retrieval_as_input",
+    "state_readonly_3way": true,
+    "note": "reconstructed from run log /tmp/EFINAL.log; the eval completed all 6 rungs but its final json.dump did not land because results/ was transiently removed mid-run. Per-rung numbers are the exact stdout the eval printed."
+  },
+  "results": [
+    {
+      "n_steps": 1,
+      "n": 80,
+      "no_think": {
+        "n_passed": 0,
+        "n_total": 80
+      },
+      "with_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "mean_think_tokens": 286.8
+      },
+      "with_think_sr": {
+        "n_passed": 0,
+        "n_total": 80
+      },
+      "delta": 0
+    },
+    {
+      "n_steps": 2,
+      "n": 80,
+      "no_think": {
+        "n_passed": 0,
+        "n_total": 80
+      },
+      "with_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "mean_think_tokens": 165.8
+      },
+      "with_think_sr": {
+        "n_passed": 0,
+        "n_total": 80
+      },
+      "delta": 0
+    },
+    {
+      "n_steps": 3,
+      "n": 80,
+      "no_think": {
+        "n_passed": 3,
+        "n_total": 80
+      },
+      "with_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "mean_think_tokens": 134.0
+      },
+      "with_think_sr": {
+        "n_passed": 0,
+        "n_total": 80
+      },
+      "delta": -3
+    },
+    {
+      "n_steps": 4,
+      "n": 80,
+      "no_think": {
+        "n_passed": 0,
+        "n_total": 80
+      },
+      "with_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "mean_think_tokens": 103.8
+      },
+      "with_think_sr": {
+        "n_passed": 0,
+        "n_total": 80
+      },
+      "delta": 0
+    },
+    {
+      "n_steps": 5,
+      "n": 80,
+      "no_think": {
+        "n_passed": 0,
+        "n_total": 80
+      },
+      "with_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "mean_think_tokens": 78.7
+      },
+      "with_think_sr": {
+        "n_passed": 0,
+        "n_total": 80
+      },
+      "delta": 0
+    },
+    {
+      "n_steps": 6,
+      "n": 80,
+      "no_think": {
+        "n_passed": 0,
+        "n_total": 80
+      },
+      "with_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "mean_think_tokens": 227.5
+      },
+      "with_think_sr": {
+        "n_passed": 0,
+        "n_total": 80
+      },
+      "delta": 0
+    }
+  ]
+}

@@ -78,7 +78,8 @@ def all_reduce_sum_int(x: int, world_size: int) -> int:
     return int(t.item())
 
 from experiments.code_grader import (
-    Problem, grade, load_mbpp, truncate_at_stop, _STOP_SEQUENCES, LOADERS,
+    Problem, grade, load_mbpp, load_synth_reasoning,
+    truncate_at_stop, _STOP_SEQUENCES, LOADERS,
 )
 from experiments.curriculum import ProblemDifficultyEMA, merge_rank_updates
 from experiments.distill_solutions import extract_code_block
@@ -902,6 +903,23 @@ def main():
                          "without it HumanEval is structurally 0/164.")
     p.add_argument("--smoke", action="store_true",
                     help="Run a tiny end-to-end smoke (2 steps, B=N=2, max_gen=32).")
+    p.add_argument("--state_readonly_at_think", action="store_true",
+                    default=False,
+                    help="Force the DeltaNet per-token write-gate beta to 0 at "
+                         "think positions (think tokens READ the recurrent state "
+                         "but never WRITE to it). Installs the state-readonly hook "
+                         "on BOTH the policy and the frozen KL reference via "
+                         "build_model_from_ckpt(force_state_readonly=True). "
+                         "Default OFF (backwards-compat). The decisive lever for "
+                         "training read-only thinking so thinks don't corrupt the "
+                         "carried bindings the chain reasoning needs (D18).")
+    p.add_argument("--dataset_jsonl", type=str, default=None,
+                    help="Path to a synth_reasoning-schema JSONL (task_id, "
+                         "prompt, tests, entry_point, prompt_is_code, "
+                         "gold_solution). When set, problems are loaded from this "
+                         "file via code_grader.load_synth_reasoning instead of "
+                         "the --dataset LOADERS registry. Default None = use "
+                         "--dataset (backwards-compat).")
     p.add_argument("--curriculum_filter", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="Weight problem sampling by a per-problem pass-rate EMA "
@@ -1045,7 +1063,13 @@ def main():
     # ---- Load model + tokenizer
     if is_main(rank):
         print(f"[rl-grader] loading {args.load_ckpt}")
-    model, cfg = build_model_from_ckpt(args.load_ckpt)
+    _force_sr = True if args.state_readonly_at_think else None
+    model, cfg = build_model_from_ckpt(args.load_ckpt,
+                                       force_state_readonly=_force_sr)
+    if args.state_readonly_at_think:
+        # Make the saved ckpt self-describing so build_model_from_ckpt
+        # auto-enables the state-readonly hook on reload (eval / continue).
+        cfg["state_readonly_at_think"] = True
     model = model.to(device)
     model.train()
     if args.activation_checkpointing and hasattr(model, "activation_checkpointing"):
@@ -1060,7 +1084,8 @@ def main():
         if is_main(rank):
             print(f"[rl-grader] loading reference policy from {args.load_ckpt}"
                   f" (frozen, kl_coef={args.kl_coef})")
-        ref_model, _ = build_model_from_ckpt(args.load_ckpt)
+        ref_model, _ = build_model_from_ckpt(args.load_ckpt,
+                                             force_state_readonly=_force_sr)
         ref_model = ref_model.to(device).eval()
         for _p in ref_model.parameters():
             _p.requires_grad = False
@@ -1090,12 +1115,17 @@ def main():
               f"params={sum(p.numel() for p in model_module.parameters())/1e6:.1f}M")
 
     # ---- Load problems
-    if is_main(rank):
-        print(f"[rl-grader] loading dataset: {args.dataset}")
-    if args.dataset not in LOADERS:
-        raise SystemExit(
-            f"unknown --dataset {args.dataset!r}; choose from {list(LOADERS)}")
-    problems = LOADERS[args.dataset]()
+    if args.dataset_jsonl is not None:
+        if is_main(rank):
+            print(f"[rl-grader] loading dataset from JSONL: {args.dataset_jsonl}")
+        problems = load_synth_reasoning(path=args.dataset_jsonl)
+    else:
+        if is_main(rank):
+            print(f"[rl-grader] loading dataset: {args.dataset}")
+        if args.dataset not in LOADERS:
+            raise SystemExit(
+                f"unknown --dataset {args.dataset!r}; choose from {list(LOADERS)}")
+        problems = LOADERS[args.dataset]()
     if is_main(rank):
         print(f"  loaded {len(problems)} problems; will sample "
               f"{args.batch} per step per rank "

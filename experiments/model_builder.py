@@ -92,8 +92,6 @@ def build_model_from_args(args, *, vocab_size: int,
             mem_size=int(args.mem_size),
             mem_dim=int(args.mem_dim) if args.mem_dim > 0 else int(args.d_model),
             thinking_token_id=int(thinking_token_id),
-            mem_write_only_at_think=bool(
-                getattr(args, "mem_write_only_at_think", False)),
         )
 
     pkm_kwargs: dict = {}
@@ -123,7 +121,6 @@ def build_model_from_args(args, *, vocab_size: int,
         feedback_xattn_form=args.feedback_xattn_form,
         feedback_lag=args.feedback_lag,
         feedback_position=args.feedback_position,
-        feedback_per_channel_alpha=args.feedback_per_channel_alpha,
         feedback_self_k=args.feedback_self_k,
         feedback_alpha_mode=args.feedback_alpha_mode,
         output_gate=(args.output_gate

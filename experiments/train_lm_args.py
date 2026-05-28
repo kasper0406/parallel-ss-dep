@@ -61,10 +61,6 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["pre", "post"],
                    help="'pre' (default) modulates target's input; "
                         "'post' modulates target's output.")
-    p.add_argument("--feedback_per_channel_alpha", action="store_true",
-                   help="Use per-channel α (d_model floats) instead of scalar α "
-                        "for sparse FiLM. Tests whether channel-dependent gating "
-                        "can mix the negative- and positive-α basins per channel.")
     p.add_argument("--feedback_self_k", type=int, default=0,
                    choices=[0, 2, 3],
                    help="K-iteration self-feeding training for sparse FiLM. "
@@ -418,13 +414,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Enable WorkingMemory module. Requires a thinking-token "
                         "id; auto-set when --data_mix is used.")
     p.add_argument("--mem_size", type=int, default=1024)
-    p.add_argument("--mem_write_only_at_think", action="store_true",
-                   help="FIX A (2026-05-18): force the WorkingMemory buffer "
-                        "to be filled ONLY from think-position writes. "
-                        "Diagnostic showed the write gate fires uniformly "
-                        "across think/emit, so reads (which ARE sharp at "
-                        "think positions) hit a buffer of noise. This "
-                        "mechanically forces think-content into the buffer.")
     p.add_argument("--state_readonly_at_think", action="store_true",
                    help="Phase 2 thinking fix (2026-05-26): force the "
                         "DeltaNet per-token write gate β to 0 at think "
@@ -435,61 +424,6 @@ def build_parser() -> argparse.ArgumentParser:
                         "plain DeltaNet attention blocks; other variants "
                         "silently skip. Default OFF (every existing ckpt "
                         "behaves byte-identically without the flag).")
-    p.add_argument("--think_index_emb_size", type=int, default=0,
-                   help="Phase 3 thinking fix (2026-05-26): per-position "
-                        "think-index embedding table size. >0 enables a "
-                        "small nn.Embedding(N, d_model), zero-init, added "
-                        "to each think token according to its index within "
-                        "its consecutive-think burst (0, 1, ..., N-1; "
-                        "bursts longer than N share the last embedding). "
-                        "Breaks the homogenization (8 consecutive thinks -> "
-                        "8 identical inputs -> low-rank hidden states; "
-                        "median pairwise cosine +0.146 vs +0.060 at emit). "
-                        "0 = disabled (default, byte-identical).")
-    p.add_argument("--use_think_adapter", action="store_true",
-                   help="Phase B thinking-specialized adapter (2026-05-26): "
-                        "every Block grows a small 2-layer MLP "
-                        "(d_model -> hidden_mult*d_model -> d_model, GELU) "
-                        "plus a learnable scalar alpha (init 0). At think "
-                        "positions, the adapter contribution is added to "
-                        "the residual stream after the standard attn + MLP: "
-                        "h += alpha * think_mask * ThinkAdapter(h). With "
-                        "alpha=0 a cold start is byte-identical to no "
-                        "adapter; existing ckpts load with strict=False. "
-                        "Gives the trunk dedicated capacity for "
-                        "think-time-specialized computation (today the "
-                        "trunk runs IDENTICAL ops at think vs emit; only "
-                        "the input embedding differs).")
-    p.add_argument("--think_adapter_hidden_mult", type=int, default=2,
-                   help="Phase B think-adapter hidden width multiplier "
-                        "(default 2 -> d_hidden = 2 * d_model). Only used "
-                        "when --use_think_adapter is set.")
-    # ----- Phase D: RefinementHead (THINKING_PLAN v5, 2026-05-27) -----
-    p.add_argument("--use_refinement_head", action="store_true",
-                   help="Phase D — add a RefinementHead: 1 layer of "
-                        "causal local-window self-attention (n_heads, "
-                        "window=N) + 2-layer MLP, alpha-gated (init 0). "
-                        "Output is soft-mixed with the trunk hidden by "
-                        "sigma(gate): h_final = sigma*h + (1-sigma)*h_refined. "
-                        "Gives sigma a REAL job (weight two STRUCTURALLY "
-                        "DIFFERENT computations) instead of just deciding "
-                        "'append think token'. Default OFF; alpha init 0 "
-                        "means a fresh ckpt is byte-identical at decode.")
-    p.add_argument("--refinement_head_window", type=int, default=128,
-                   help="Phase D refinement-head local-attention window "
-                        "size (last N positions seen). Default 128.")
-    p.add_argument("--refinement_head_n_heads", type=int, default=8,
-                   help="Phase D refinement-head attention heads (default 8).")
-    p.add_argument("--refinement_head_mlp_mult", type=int, default=2,
-                   help="Phase D refinement-head MLP hidden multiplier "
-                        "(default 2 -> d_hidden = 2 * d_model).")
-    p.add_argument("--refinement_head_alpha_init", type=float, default=0.3,
-                   help="Phase D refinement-head alpha init. 0.0 → "
-                        "byte-identical at cold start BUT v10 lesson: "
-                        "alpha stays stuck near 0 because the MLP gets "
-                        "no real gradient when its contribution is zero. "
-                        "Default 0.3 → head contributes from step 1, "
-                        "MLP weights learn whether to keep or suppress.")
     p.add_argument("--mem_dim", type=int, default=0,
                    help="Memory projection dim. 0 = match d_model.")
     # ----- Persistent learned-RAG (Product-Key Memory) -----
@@ -657,10 +591,6 @@ def build_parser() -> argparse.ArgumentParser:
                         "0.1 is the Moonlight-scale setting and over-brakes "
                         "at our token budget — see the residual-collapse "
                         "diagnosis).")
-    p.add_argument("--layer_drop_max", type=float, default=0.0,
-                   help="Stochastic Depth: per-block drop probability "
-                        "ramps linearly 0 → this value across depth. "
-                        "Default 0.0 (off).")
     p.add_argument("--grad_accum", type=int, default=1,
                    help="Gradient-accumulation microbatches per optimizer "
                         "step. Effective batch = batch * grad_accum. Only "

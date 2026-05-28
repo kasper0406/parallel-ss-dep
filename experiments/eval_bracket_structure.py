@@ -45,7 +45,8 @@ def build_model_from_ckpt(ckpt_path: str,
                           force_refinement_head_window: int | None = None,
                           force_refinement_head_n_heads: int | None = None,
                           force_refinement_head_mlp_mult: int | None = None,
-                          force_refinement_head_alpha_init: float | None = None):
+                          force_refinement_head_alpha_init: float | None = None,
+                          force_state_readonly: bool | None = None):
     """Construct a TinyLM from a saved ckpt.
 
     `force_use_think_adapter` (optional) overrides the auto-detect:
@@ -152,6 +153,13 @@ def build_model_from_ckpt(ckpt_path: str,
     # zero. Read from cfg so a ckpt trained with them stays consistent
     # when reloaded for eval/SFT/RL; default off for back-compat.
     sr_at_think = bool(cfg.get("state_readonly_at_think", False))
+    # Explicit caller override (2026-05-28): force state-readonly ON (or
+    # OFF) at inference regardless of how the ckpt was trained. Has no
+    # state-dict footprint — the flag just installs the b_proj β-masking
+    # hook — so a ckpt trained WITHOUT it can be evaluated WITH it (the
+    # off-distribution rescue probe) and vice versa.
+    if force_state_readonly is not None:
+        sr_at_think = bool(force_state_readonly)
     think_idx_emb = int(cfg.get("think_index_emb_size", 0))
     # Auto-detect think_index_emb from state dict when not in cfg (older
     # ckpts that predate the cfg key but were trained with it on).

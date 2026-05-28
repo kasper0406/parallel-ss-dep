@@ -48,6 +48,22 @@ from experiments.code_grader import grade, load_synth_reasoning
 from experiments.distill_solutions import extract_code_block as _extract_code
 from experiments.eval_bracket_structure import build_model_from_ckpt
 from experiments.eval_humaneval import generate, generate_with_retrieval_as_input
+from experiments.layers import _FlaWrapper
+
+
+def _set_state_readonly(model, enabled: bool) -> None:
+    """Toggle the Phase-2 state-readonly β-masking on every DeltaNet block
+    at inference. The model must have been built with the b_proj hook
+    installed (force_state_readonly=True); this flips the per-wrapper
+    `state_readonly_at_think` bool the hook reads. When False the hook is a
+    no-op (byte-identical to a model that never had it), so the same model
+    instance serves both the with-think (state-write) and
+    with-think+state-readonly conditions."""
+    model.state_readonly_at_think = bool(enabled)
+    for blk in model.blocks:
+        attn = blk.attn
+        if isinstance(attn, _FlaWrapper) and hasattr(attn, "_b_proj_hook_handle"):
+            attn.state_readonly_at_think = bool(enabled)
 
 
 def _run_condition(
@@ -156,6 +172,12 @@ def main():
                    choices=["standard", "retrieval_as_input"])
     p.add_argument("--grader_timeout_s", type=int, default=5)
     p.add_argument("--out", type=str, default="THINKING_LADDER_RESULTS.json")
+    p.add_argument("--state_readonly_3way", action="store_true",
+                   help="Add a THIRD condition: with-think + state-readonly "
+                        "(β=0 at think positions). Forces state-readonly ON "
+                        "at inference regardless of how the ckpt was trained "
+                        "— the off-distribution rescue probe for the "
+                        "'thinking corrupts recall' failure mode.")
     args = p.parse_args()
 
     rungs = [int(x) for x in args.rungs.split(",") if x.strip()]
@@ -163,8 +185,17 @@ def main():
     print(f"[ladder] generator(with-think)={args.generator}  "
           f"max_gen={args.max_gen}  temp={args.temperature}")
 
-    model, cfg = build_model_from_ckpt(args.ckpt)
+    # When running the 3-way comparison, build with the b_proj β-masking
+    # hook installed (force_state_readonly=True). We then toggle the
+    # per-wrapper flag OFF for the state-write condition and ON for the
+    # state-readonly condition — the same model instance serves all three.
+    model, cfg = build_model_from_ckpt(
+        args.ckpt,
+        force_state_readonly=True if args.state_readonly_3way else None)
     model = model.to("cuda").eval()
+    if args.state_readonly_3way:
+        # Default state for the non-SR conditions: OFF.
+        _set_state_readonly(model, False)
     has_gate = hasattr(model, "gate_head")
     thinking_token_id = getattr(model, "thinking_token_id", None)
     if thinking_token_id is None:
@@ -202,37 +233,72 @@ def main():
             no_think = _run_condition(
                 model, cfg, tok, problems,
                 use_thinking=False, generator="standard", **common)
+            # with-think (state-WRITE — the broken baseline).
+            if args.state_readonly_3way:
+                _set_state_readonly(model, False)
             with_think = _run_condition(
                 model, cfg, tok, problems,
                 use_thinking=True, generator=args.generator, **common)
+
+            with_think_sr = None
+            if args.state_readonly_3way:
+                # with-think + state-READONLY (β=0 at think positions).
+                _set_state_readonly(model, True)
+                with_think_sr = _run_condition(
+                    model, cfg, tok, problems,
+                    use_thinking=True, generator=args.generator, **common)
+                _set_state_readonly(model, False)
 
         delta = with_think["n_passed"] - no_think["n_passed"]
         rec = dict(
             n_steps=n, n=len(problems),
             no_think=no_think, with_think=with_think, delta=delta,
         )
+        if with_think_sr is not None:
+            rec["with_think_sr"] = with_think_sr
+            rec["delta_sr_vs_write"] = (
+                with_think_sr["n_passed"] - with_think["n_passed"])
+            rec["delta_sr_vs_nothink"] = (
+                with_think_sr["n_passed"] - no_think["n_passed"])
         results.append(rec)
-        print(f"  n_steps={n:>1}  n={len(problems):>3}  "
-              f"no_think={no_think['n_passed']:>3}/{no_think['n_total']} "
-              f"({no_think['pass_rate']:.3f})   "
-              f"with_think={with_think['n_passed']:>3}/{with_think['n_total']} "
-              f"({with_think['pass_rate']:.3f})   "
-              f"delta={delta:+d}   "
-              f"think_tok/prob={with_think['mean_think_tokens']:.1f}  "
-              f"({time.time()-t0:.0f}s)")
+        line = (f"  n_steps={n:>1}  n={len(problems):>3}  "
+                f"no_think={no_think['n_passed']:>3}/{no_think['n_total']} "
+                f"({no_think['pass_rate']:.3f})   "
+                f"with_think={with_think['n_passed']:>3}/{with_think['n_total']} "
+                f"({with_think['pass_rate']:.3f})")
+        if with_think_sr is not None:
+            line += (f"   with_think_sr="
+                     f"{with_think_sr['n_passed']:>3}/{with_think_sr['n_total']} "
+                     f"({with_think_sr['pass_rate']:.3f})")
+        line += (f"   delta={delta:+d}   "
+                 f"think_tok/prob={with_think['mean_think_tokens']:.1f}  "
+                 f"({time.time()-t0:.0f}s)")
+        print(line)
 
+    has_sr = args.state_readonly_3way
     print("\n=== HEADLINE: pass@1 with vs without thinking ===")
-    print(f"{'n_steps':>7} | {'n':>3} | {'no_think':>10} | "
-          f"{'with_think':>11} | {'delta':>6} | {'think_tok':>9}")
-    print("-" * 64)
+    hdr = (f"{'n_steps':>7} | {'n':>3} | {'no_think':>10} | "
+           f"{'with_think':>11}")
+    if has_sr:
+        hdr += f" | {'wt+state_ro':>12}"
+    hdr += f" | {'delta':>6} | {'think_tok':>9}"
+    print(hdr)
+    print("-" * (len(hdr)))
     for r in results:
-        print(f"{r['n_steps']:>7} | {r['n']:>3} | "
-              f"{r['no_think']['n_passed']:>3}/{r['no_think']['n_total']:<3} "
-              f"{r['no_think']['pass_rate']:>5.3f}" + " | "
-              f"{r['with_think']['n_passed']:>3}/{r['with_think']['n_total']:<3} "
-              f"{r['with_think']['pass_rate']:>5.3f}" + " | "
-              f"{r['delta']:>+6d} | "
-              f"{r['with_think']['mean_think_tokens']:>9.1f}")
+        row = (f"{r['n_steps']:>7} | {r['n']:>3} | "
+               f"{r['no_think']['n_passed']:>3}/{r['no_think']['n_total']:<3} "
+               f"{r['no_think']['pass_rate']:>5.3f}" + " | "
+               f"{r['with_think']['n_passed']:>3}/{r['with_think']['n_total']:<3} "
+               f"{r['with_think']['pass_rate']:>5.3f}")
+        if has_sr and "with_think_sr" in r:
+            row += (" | "
+                    f"{r['with_think_sr']['n_passed']:>4}/"
+                    f"{r['with_think_sr']['n_total']:<3} "
+                    f"{r['with_think_sr']['pass_rate']:>5.3f}")
+        row += (" | "
+                f"{r['delta']:>+6d} | "
+                f"{r['with_think']['mean_think_tokens']:>9.1f}")
+        print(row)
 
     out_path = pathlib.Path(args.out)
     with open(out_path, "w") as f:

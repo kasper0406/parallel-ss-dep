@@ -1,0 +1,238 @@
+{
+  "ckpt": "checkpoints/rl_grader_phase_c_v2_step300.pt",
+  "config": {
+    "ckpt": "checkpoints/rl_grader_phase_c_v2_step300.pt",
+    "rungs": "1,2,3,4,5,6",
+    "data_dir": "data",
+    "data_prefix": "synth_arith_ladder_n",
+    "max_problems": null,
+    "temperature": 0.0,
+    "max_gen": 96,
+    "max_think_per_step": 8,
+    "total_think_budget": 200,
+    "emit_threshold": 0.5,
+    "gate_floor": 0.0,
+    "min_emit_before_eos": 30,
+    "prompt_style": "code_fence",
+    "extract_code_block": true,
+    "generator": "retrieval_as_input",
+    "grader_timeout_s": 5,
+    "out": "THINKING_LADDER_STATE_READONLY_RESULTS.json",
+    "state_readonly_3way": true
+  },
+  "results": [
+    {
+      "n_steps": 1,
+      "n": 80,
+      "no_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 80
+        },
+        "mean_think_tokens": 0.0
+      },
+      "with_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 80
+        },
+        "mean_think_tokens": 60.475
+      },
+      "delta": 0,
+      "with_think_sr": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 80
+        },
+        "mean_think_tokens": 149.85
+      },
+      "delta_sr_vs_write": 0,
+      "delta_sr_vs_nothink": 0
+    },
+    {
+      "n_steps": 2,
+      "n": 80,
+      "no_think": {
+        "n_passed": 17,
+        "n_total": 80,
+        "pass_rate": 0.2125,
+        "tier_hist": {
+          "pass": 17,
+          "partial": 63
+        },
+        "mean_think_tokens": 0.0
+      },
+      "with_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 80
+        },
+        "mean_think_tokens": 103.7
+      },
+      "delta": -17,
+      "with_think_sr": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 80
+        },
+        "mean_think_tokens": 156.9875
+      },
+      "delta_sr_vs_write": 0,
+      "delta_sr_vs_nothink": -17
+    },
+    {
+      "n_steps": 3,
+      "n": 80,
+      "no_think": {
+        "n_passed": 13,
+        "n_total": 80,
+        "pass_rate": 0.1625,
+        "tier_hist": {
+          "pass": 13,
+          "partial": 67
+        },
+        "mean_think_tokens": 0.0
+      },
+      "with_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 80
+        },
+        "mean_think_tokens": 84.65
+      },
+      "delta": -13,
+      "with_think_sr": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 79,
+          "syntax_error": 1
+        },
+        "mean_think_tokens": 159.0125
+      },
+      "delta_sr_vs_write": 0,
+      "delta_sr_vs_nothink": -13
+    },
+    {
+      "n_steps": 4,
+      "n": 80,
+      "no_think": {
+        "n_passed": 1,
+        "n_total": 80,
+        "pass_rate": 0.0125,
+        "tier_hist": {
+          "partial": 79,
+          "pass": 1
+        },
+        "mean_think_tokens": 0.0
+      },
+      "with_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 80
+        },
+        "mean_think_tokens": 60.1375
+      },
+      "delta": -1,
+      "with_think_sr": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 76,
+          "syntax_error": 3,
+          "exec_error": 1
+        },
+        "mean_think_tokens": 143.8
+      },
+      "delta_sr_vs_write": 0,
+      "delta_sr_vs_nothink": -1
+    },
+    {
+      "n_steps": 5,
+      "n": 80,
+      "no_think": {
+        "n_passed": 4,
+        "n_total": 80,
+        "pass_rate": 0.05,
+        "tier_hist": {
+          "partial": 75,
+          "syntax_error": 1,
+          "pass": 4
+        },
+        "mean_think_tokens": 0.0
+      },
+      "with_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 80
+        },
+        "mean_think_tokens": 25.175
+      },
+      "delta": -4,
+      "with_think_sr": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 80
+        },
+        "mean_think_tokens": 161.325
+      },
+      "delta_sr_vs_write": 0,
+      "delta_sr_vs_nothink": -4
+    },
+    {
+      "n_steps": 6,
+      "n": 80,
+      "no_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 79,
+          "syntax_error": 1
+        },
+        "mean_think_tokens": 0.0
+      },
+      "with_think": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 80
+        },
+        "mean_think_tokens": 28.775
+      },
+      "delta": 0,
+      "with_think_sr": {
+        "n_passed": 0,
+        "n_total": 80,
+        "pass_rate": 0.0,
+        "tier_hist": {
+          "partial": 80
+        },
+        "mean_think_tokens": 185.25
+      },
+      "delta_sr_vs_write": 0,
+      "delta_sr_vs_nothink": 0
+    }
+  ]
+}

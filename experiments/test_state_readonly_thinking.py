@@ -294,3 +294,145 @@ def test_recall_preservation_with_state_readonly():
         f"vs state_readonly=False ({acc_off:.3f}) by a margin >= 0.10. "
         f"The architectural fix is not protecting the recurrent state."
     )
+
+
+# --------------------------------------------------------------------------
+# 4. DECODE-PATH β-masking (2026-05-28).
+#
+# GEMINI flagged that only the full-sequence forward path is wired for
+# state-readonly; the incremental decode path (prefill T>1 chunk kernel +
+# forward_step T=1 fused_recurrent kernel) may leave β unmasked at think
+# positions. These tests install a forward hook on the inner DeltaNet
+# `b_proj` Linear that records the PRE-sigmoid logits the kernel actually
+# saw, and assert they are clamped to a large-negative value (β≈0) at think
+# positions during BOTH decode sub-paths.
+# --------------------------------------------------------------------------
+
+def _attach_bproj_recorder(model: TinyLM):
+    """Register a forward hook on every block's inner b_proj that stores
+    the (post-state-readonly-hook) output logits. Returns (records, handles).
+
+    The state-readonly masking hook is registered FIRST (in __init__ via
+    enable_state_readonly_at_think), so a hook we register here runs AFTER
+    it and therefore observes the *already-masked* logits — exactly what
+    the kernel consumes. Returns one entry per b_proj call.
+    """
+    from experiments.layers import _FlaWrapper
+    records = []
+    handles = []
+
+    def _rec(_m, _inp, out):
+        records.append(out.detach().float().cpu())
+
+    for blk in model.blocks:
+        attn = blk.attn
+        if isinstance(attn, _FlaWrapper) and hasattr(attn.layer, "b_proj"):
+            handles.append(attn.layer.b_proj.register_forward_hook(_rec))
+    return records, handles
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="DeltaNet Triton kernels require CUDA")
+def test_decode_prefill_honors_state_readonly_at_think():
+    """In the prefill (T>1 chunk-kernel) decode path, β must be 0 at think
+    positions when state_readonly_at_think=True."""
+    model = _make_model(state_readonly=True, n_layers=1, seed=5).cuda().eval()
+    _set_thinking_id(model, THINK_ID)
+    model._film_bypass = True
+
+    B, T = 1, 16
+    x = torch.randint(VALUE_BASE, VALUE_BASE + 50, (B, T), device="cuda")
+    think_positions = [4, 5, 6]
+    for p in think_positions:
+        x[0, p] = THINK_ID
+
+    records, handles = _attach_bproj_recorder(model)
+    try:
+        with torch.no_grad():
+            model.prefill(x)
+    finally:
+        for h in handles:
+            h.remove()
+
+    assert len(records) >= 1, "b_proj hook never fired during prefill"
+    # The chunk path runs b_proj over the whole prompt at once → one record
+    # of shape (B, T, n_heads) (possibly flattened to (1, B*T, n_heads)).
+    logits = records[0]
+    flat = logits.reshape(-1, logits.shape[-1])  # (B*T, H)
+    # Positions correspond to row-major (b, t). With B=1 it's just t.
+    for p in think_positions:
+        assert (flat[p] <= -1e3).all(), (
+            f"prefill: think position {p} b_proj logits not masked: "
+            f"{flat[p].tolist()}")
+    # A non-think position must NOT be masked.
+    assert (flat[0] > -1e3).any(), "prefill: non-think pos wrongly masked"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="DeltaNet Triton kernels require CUDA")
+def test_decode_forward_step_honors_state_readonly_at_think():
+    """In the forward_step (T=1 fused_recurrent) decode path, β must be 0
+    at a think position when state_readonly_at_think=True. This is the
+    path GEMINI flagged as the open follow-up."""
+    model = _make_model(state_readonly=True, n_layers=1, seed=6).cuda().eval()
+    _set_thinking_id(model, THINK_ID)
+    model._film_bypass = True
+
+    B, T_prompt = 1, 8
+    prompt = torch.randint(VALUE_BASE, VALUE_BASE + 50, (B, T_prompt),
+                           device="cuda")
+    assert not (prompt == THINK_ID).any()
+
+    with torch.no_grad():
+        cache, _ = model.prefill(prompt)
+
+    # Now step with a THINK token and record b_proj logits at that step.
+    records, handles = _attach_bproj_recorder(model)
+    try:
+        think_tok = torch.full((B, 1), THINK_ID, device="cuda",
+                               dtype=torch.long)
+        with torch.no_grad():
+            model.forward_step(think_tok, cache)
+    finally:
+        for h in handles:
+            h.remove()
+
+    assert len(records) >= 1, "b_proj hook never fired during forward_step"
+    logits = records[0]
+    flat = logits.reshape(-1, logits.shape[-1])  # (B*1, H)
+    assert (flat <= -1e3).all(), (
+        f"forward_step: think position b_proj logits not masked (β not 0): "
+        f"{flat.tolist()}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="DeltaNet Triton kernels require CUDA")
+def test_decode_forward_step_emit_not_masked():
+    """Backwards-compat / sanity: a NON-think token in forward_step must
+    leave β unmasked even with state_readonly_at_think=True."""
+    model = _make_model(state_readonly=True, n_layers=1, seed=7).cuda().eval()
+    _set_thinking_id(model, THINK_ID)
+    model._film_bypass = True
+
+    B, T_prompt = 1, 8
+    prompt = torch.randint(VALUE_BASE, VALUE_BASE + 50, (B, T_prompt),
+                           device="cuda")
+    with torch.no_grad():
+        cache, _ = model.prefill(prompt)
+
+    records, handles = _attach_bproj_recorder(model)
+    try:
+        emit_tok = torch.randint(VALUE_BASE, VALUE_BASE + 50, (B, 1),
+                                 device="cuda")
+        assert not (emit_tok == THINK_ID).any()
+        with torch.no_grad():
+            model.forward_step(emit_tok, cache)
+    finally:
+        for h in handles:
+            h.remove()
+
+    assert len(records) >= 1
+    flat = records[0].reshape(-1, records[0].shape[-1])
+    assert (flat > -1e3).any(), (
+        "forward_step: emit position wrongly masked (β forced to 0 at a "
+        "non-think token)")

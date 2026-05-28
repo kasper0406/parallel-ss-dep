@@ -2321,10 +2321,14 @@ class TinyLM(nn.Module):
             x = x + self._compute_think_index_emb(input_ids)
 
         # Phase B think_mask — fires the ThinkAdapter at think positions
-        # during prefill (mirror of Block.forward path). Built only when
-        # the adapter is enabled and we know the thinking token id.
+        # during prefill (mirror of Block.forward path). Also drives the
+        # Phase-2 state-readonly β-masking on the inner DeltaNet b_proj
+        # (2026-05-28: previously only `use_think_adapter` built this mask,
+        # so the prefill chunk-kernel path left β UNMASKED at think
+        # positions — the decode-path bug GEMINI flagged). Built whenever
+        # either consumer is active and we know the thinking token id.
         prefill_think_mask = None
-        if (self.use_think_adapter
+        if ((self.use_think_adapter or self.state_readonly_at_think)
                 and self.thinking_token_id is not None):
             prefill_think_mask = (input_ids == int(self.thinking_token_id))
 
@@ -2488,31 +2492,48 @@ class TinyLM(nn.Module):
         inert at inference (caught by the v5 code review).
         """
         attn_in = blk.attn_norm(x)
-        # T==1 → use forward_step (fused_recurrent kernel; correct for
-        #         incremental decoding with a populated cache).
-        # T>1  → run the full chunk kernel with use_cache=True so the
-        #         cache slot is initialized from the whole prompt.
-        if x.shape[1] == 1 and past is not None:
-            attn_out, _ = blk.attn.forward_step(attn_in, past, layer_idx)
-        else:
-            with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
-                layer = blk.attn.layer
-                saved_layer_idx = getattr(layer, "layer_idx", None)
-                layer.layer_idx = int(layer_idx)
-                try:
-                    out = layer(
-                        hidden_states=attn_in,
-                        past_key_values=past,
-                        use_cache=(past is not None),
-                    )
-                finally:
-                    if saved_layer_idx is not None:
-                        layer.layer_idx = saved_layer_idx
-            if isinstance(out, tuple):
-                attn_out = out[0]
+        # State-readonly-at-think (Phase 2) in the decode path (2026-05-28).
+        # The b_proj forward-hook reads `_current_think_mask` off the
+        # `_FlaWrapper`; the full-sequence `forward` sets it, but the decode
+        # entry points (forward_step / chunk-with-cache) bypass `forward`
+        # entirely. Stash it here around the call so β is forced to 0 at
+        # think positions in BOTH decode sub-paths, then clear it. No-op
+        # when the wrapper isn't state-readonly (`_current_think_mask` stays
+        # None and the hook returns logits unchanged).
+        attn = blk.attn
+        sr_active = (think_mask is not None
+                     and getattr(attn, "state_readonly_at_think", False))
+        if sr_active:
+            attn._current_think_mask = think_mask
+        try:
+            # T==1 → use forward_step (fused_recurrent kernel; correct for
+            #         incremental decoding with a populated cache).
+            # T>1  → run the full chunk kernel with use_cache=True so the
+            #         cache slot is initialized from the whole prompt.
+            if x.shape[1] == 1 and past is not None:
+                attn_out, _ = blk.attn.forward_step(attn_in, past, layer_idx)
             else:
-                attn_out = out
-            attn_out = attn_out.to(x.dtype)
+                with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+                    layer = blk.attn.layer
+                    saved_layer_idx = getattr(layer, "layer_idx", None)
+                    layer.layer_idx = int(layer_idx)
+                    try:
+                        out = layer(
+                            hidden_states=attn_in,
+                            past_key_values=past,
+                            use_cache=(past is not None),
+                        )
+                    finally:
+                        if saved_layer_idx is not None:
+                            layer.layer_idx = saved_layer_idx
+                if isinstance(out, tuple):
+                    attn_out = out[0]
+                else:
+                    attn_out = out
+                attn_out = attn_out.to(x.dtype)
+        finally:
+            if sr_active:
+                attn._current_think_mask = None
         x = x + attn_out
         x = x + blk.mlp(blk.mlp_norm(x))
         # Phase B: apply ThinkAdapter at think positions, mirroring the
@@ -2734,9 +2755,14 @@ class TinyLM(nn.Module):
             if use_film_at_decode else set()
 
         # Phase B think_mask — fires the ThinkAdapter at think positions
-        # during forward_step (mirror of Block.forward path).
+        # during forward_step (mirror of Block.forward path). Also drives
+        # the Phase-2 state-readonly β-masking on the inner DeltaNet b_proj
+        # in the T=1 fused_recurrent decode path (2026-05-28 fix: this path
+        # previously left β unmasked at think positions, so an incremental
+        # decoder corrupted long-range bindings exactly like the broken
+        # full-forward path used to before Phase 2).
         step_think_mask = None
-        if (self.use_think_adapter
+        if ((self.use_think_adapter or self.state_readonly_at_think)
                 and self.thinking_token_id is not None):
             step_think_mask = (input_id == int(self.thinking_token_id))
 

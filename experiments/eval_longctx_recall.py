@@ -87,9 +87,12 @@ def main() -> int:
     p.add_argument("--tasks", type=str,
                    default="data/longctx_recall_heldout.jsonl")
     p.add_argument("--generator", type=str, default="standard",
-                   choices=["standard", "retrieval_as_input"],
-                   help="Use 'retrieval_as_input' for ckpts trained "
-                        "with --retrieval_as_input_thinking (v5+).")
+                   choices=["standard", "retrieval_as_input", "latent_think"],
+                   help="'latent_think' = unified hybrid (hidden + α·WM "
+                        "retrieval, β=0); 'retrieval_as_input' for v5+ ckpts.")
+    p.add_argument("--force_prefix_think", type=int, default=0,
+                   help="latent_think: force N think steps before the answer "
+                        "(matches latent_sft think-before-answer training).")
     p.add_argument("--wm_ablate", type=str, default="none",
                    choices=["none", "zero"],
                    help="'zero' zeroes memory.W_proj.weight. CONFOUNDED "
@@ -100,11 +103,21 @@ def main() -> int:
     p.add_argument("--gate_floor", type=float, default=0.0)
     p.add_argument("--max_problems", type=int, default=None)
     p.add_argument("--out_log", type=str, default=None)
+    # 3-way state-readonly probe (2026-05-28): test whether thinking that
+    # READS but never WRITES the recurrent state preserves recall vs
+    # thinking that writes (and corrupts) it.
+    p.add_argument("--force_state_readonly", action="store_true",
+                   help="Override the ckpt cfg: install the β=0 b_proj hook "
+                        "at think positions so thinks can't write the state.")
+    p.add_argument("--no_think", action="store_true",
+                   help="Disable thinking entirely (total_think_budget=0 → "
+                        "force-emit before any think token). The control "
+                        "baseline for the 3-way recall probe.")
     args = p.parse_args()
 
     from experiments.eval_bracket_structure import build_model_from_ckpt
     from experiments.eval_humaneval import (
-        generate, generate_with_retrieval_as_input)
+        generate, generate_with_retrieval_as_input, generate_latent_think)
     from experiments.sft_code import _flatten_to_oneline
     from transformers import AutoTokenizer
 
@@ -121,8 +134,16 @@ def main() -> int:
               f"(CONFOUNDED for retrieval-as-input — see module doc)")
 
     print(f"Loading checkpoint: {ckpt_path}")
-    model, cfg = build_model_from_ckpt(ckpt_path)
+    model, cfg = build_model_from_ckpt(
+        ckpt_path,
+        force_state_readonly=(True if (args.force_state_readonly
+                                       or args.generator == "latent_think")
+                              else None))
     model.eval()
+    # no-think → zero think budget forces emit before any think token.
+    eff_think_budget = 0 if args.no_think else args.total_think_budget
+    print(f"  think_mode={'NO-THINK' if args.no_think else ('THINK+state-readonly' if args.force_state_readonly else 'THINK+state-write')}"
+          f"  think_budget={eff_think_budget}")
     thinking_token_id = (getattr(model, "thinking_token_id", None)
                          or cfg.get("thinking_token_id"))
     if thinking_token_id is None:
@@ -163,12 +184,21 @@ def main() -> int:
         prompt_t = torch.tensor(prompt_ids, dtype=torch.long,
                                  device="cuda").unsqueeze(0)
         with torch.no_grad():
-            if args.generator == "retrieval_as_input":
+            if args.generator == "latent_think":
+                gen, diag = generate_latent_think(
+                    model, prompt_t, max_gen=args.max_gen,
+                    temperature=0.0, eos_token_id=tok.eos_token_id,
+                    thinking_token_id=thinking_token_id,
+                    total_think_budget=eff_think_budget,
+                    emit_threshold=args.emit_threshold,
+                    gate_floor=args.gate_floor,
+                    force_prefix_think=(0 if args.no_think else args.force_prefix_think))
+            elif args.generator == "retrieval_as_input":
                 gen, diag = generate_with_retrieval_as_input(
                     model, prompt_t, max_gen=args.max_gen,
                     temperature=0.0, eos_token_id=tok.eos_token_id,
                     thinking_token_id=thinking_token_id,
-                    total_think_budget=args.total_think_budget,
+                    total_think_budget=eff_think_budget,
                     emit_threshold=args.emit_threshold,
                     gate_floor=args.gate_floor,
                     additive=cfg.get("retrieval_input_additive", False))
@@ -178,7 +208,7 @@ def main() -> int:
                     temperature=0.0, eos_token_id=tok.eos_token_id,
                     use_thinking=True,
                     thinking_token_id=thinking_token_id,
-                    total_think_budget=args.total_think_budget,
+                    total_think_budget=eff_think_budget,
                     emit_threshold=args.emit_threshold,
                     gate_floor=args.gate_floor)
         gen_only = [t for t in gen[0, len(prompt_ids):].tolist()

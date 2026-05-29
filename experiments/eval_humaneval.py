@@ -504,6 +504,15 @@ def generate_latent_think(
             # embedding. The appended think token makes β=0 fire at this
             # position (state-readonly), so the recurrence is not written.
             latent = h[:, -1:, :].to(inputs_embeds.dtype)     # (B, 1, d)
+            # Unified hybrid (auto-detected via model.mem_alpha): augment the
+            # hidden-feedback thread with a learned-α WM retrieval so the model
+            # pulls in new info as it thinks (THINKING_MEMORY_PLAN D8/D11).
+            _ma = getattr(model, "mem_alpha", None)
+            if _ma is not None and hasattr(model, "memory"):
+                inj = getattr(model.memory, "_last_injection", None)
+                if inj is not None:
+                    latent = latent + _ma.to(inputs_embeds.dtype) * \
+                        inj[:, -1:, :].to(inputs_embeds.dtype)
             think_tok = torch.full((out.shape[0], 1), int(thinking_token_id),
                                    dtype=out.dtype, device=device)
             out = torch.cat([out, think_tok], dim=1)

@@ -212,6 +212,55 @@ retrieval + β0 (protect bindings) + full-FiLM-base / single-pass-FiLM-think —
 features compose and learn (hybrid=1.000).** Real-model wiring (S3) should adopt
 exactly this: `_film_bypass` during the think burst.
 
+**D12 (2026-05-29) — Real-model mechanism WIRED + shakedown OK, but first
+recall-SFT run was INVALID (trained the wrong regime). Honest negative.**
+Wired the unified hybrid (hidden + learned-α WM retrieval, β0, FiLM-bypass) into
+latent_sft (`--hybrid_mem`) + generate_latent_think (auto-detect mem_alpha) +
+eval_longctx_recall (`--generator latent_think`). Shakedown on real 287M phase_c:
+trains, loss drops, no OOM — the FiLM-bypass fix holds at scale. BUT the recall
+SFT run was invalid: (a) the completion is a FIXED 52-tok template with two
+copyable slots → memorized; (b) `max_len=1100` dropped ~65% of examples — the
+LONG-distance ones (prompts median 1356, max 2535 tok) → trained almost only on
+SHORT distances; (c) the answer is literally in the prompt → short-range recall =
+trivial copy. Result: train loss → 0.0000 by step ~150 (memorization, NOT
+mechanism), and the learned `mem_alpha` stayed at **0.101 ≈ its 0.1 init → the
+model never used WM** (didn't need to at short distance). **Lesson: train loss is
+uninformative here; the held-out per-distance recall DELTA (with-think vs
+no-think) is the only valid signal, and training must cover LONG distances where
+the recurrent state forgets.** FIX: retrain with `max_len` = model max_T (2048)
+so long examples are kept. Efficiency wall: the iterative full-forward think loop
+re-processes the long prompt every step → ~hours; for the RECALL/memory bet R=1
+(single WM read) suffices (recall is 1 hop, not multi-step), so use small R; true
+multi-step-thinking-on-long-context needs state-caching (prefill/forward_step) —
+a later engineering task.
+
+**D13 (2026-05-29) — REAL-MODEL VERDICT (honest NEGATIVE): thinking-reads-memory
+does NOT help long-context recall; it HURTS.** Retrained phase_c on long-distance
+recall (max_len 2048, 6192 long examples kept; thread stall fixed with
+OMP_NUM_THREADS=8). Held-out per-distance, same model, with-think vs no-think:
+- short (d64/d128): no-think 98.3% vs with-think 88.3%.
+- long (d512/d768, 100 scored): **no-think 58% vs with-think 44%.**
+No-think (recurrent) wins at BOTH short and long distance. The recurrent state
+degrades with distance (98%→58%) but thinking degrades it FURTHER (→44%), even
+with β=0 and WM available. `mem_alpha` stayed at init (0.100) across two runs →
+the model never leaned on WM retrieval. **Conclusion: on the real 287M, the
+unified thinking-reads-memory mechanism is net-negative for recall — the
+documented "thinking corrupts recall" reality, reconfirmed.** Caveats (don't
+over-rescue): with-think got half the training (no_think_frac 0.5); force_prefix
+=2 may be too few; d768 mostly truncated. But the direction is robust and matches
+HumanEval (thinking neutral/negative) and the whole project history.
+
+**SYNTHESIS across the session.** Thinking (latent) WORKS on controlled synthetic
+DEPTH tasks (pointer-chase floor→1.0; arith 0.15→1.0) — tasks that genuinely need
+sequential depth. It does NOT help the real tasks tested (HumanEval =
+capacity-bound; recall = storage-bound, thinking hurts). Memory (PKM/WM) is
+load-bearing on its OWN probes (recall 98% no-think, PKM −5 HumanEval) but
+thinking-USING-memory adds no value. **Thinking is a depth tool with no
+depth-bound real task yet in scope.** Path options: (a) find/build a real task
+that needs sequential depth (multi-step reasoning/agentic coding) to show
+thinking's value; (b) otherwise focus the super-coder on memory + scale +
+post-training, and keep thinking OFF for recall/short-coding.
+
 **D3 (2026-05-29) — Validate the user's "retrieval-as-input + FiLM-carries-state"
 design first, hybrid as fallback.** Decided: feed the *retrieval* as the think
 input (not the raw hidden) and rely on FiLM to carry the running computation

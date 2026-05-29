@@ -49,11 +49,17 @@ def latent_sft_loss(model, comment_ids, sol_ids, eos_id, R, thinking_id, device)
     cur_emb = model.embed(base_ids)
     think_tok = torch.full((1, 1), int(thinking_id), dtype=torch.long, device=device)
     P = len(comment_ids)
+    hybrid = getattr(model, "_hybrid_mem", False) and hasattr(model, "memory")
     for _ in range(R):
         _logits, h = model(cur_ids, inputs_embeds=cur_emb, return_hidden=True)
-        z = h[:, -1:, :].to(cur_emb.dtype)          # current last hidden
+        z = h[:, -1:, :].to(cur_emb.dtype)          # hidden carries the thread
+        if hybrid:
+            # Unified mechanism: augment the hidden-feedback thread with a
+            # learned-α WM retrieval (the model pulls in new info as it thinks).
+            inj = model.memory._last_injection_grad[:, -1:, :].to(cur_emb.dtype)
+            z = z + model.mem_alpha * inj
         cur_ids = torch.cat([cur_ids, think_tok], dim=1)
-        cur_emb = torch.cat([cur_emb, z], dim=1)    # think slot input = z
+        cur_emb = torch.cat([cur_emb, z], dim=1)    # think slot input
     sol_t = torch.tensor([sol_ids + [eos_id]], dtype=torch.long, device=device)
     full_ids = torch.cat([cur_ids, sol_t], dim=1)
     full_emb = torch.cat([cur_emb, model.embed(sol_t)], dim=1)
@@ -75,7 +81,14 @@ def train(args):
     torch.backends.cudnn.allow_tf32 = True
     model, cfg = build_model_from_ckpt(args.base, force_state_readonly=True)
     model = model.to(device).train()
-    model._film_bypass = True                  # speed: single-forward FiLM
+    model._film_bypass = True                  # single-forward FiLM (D11: also
+                                               # avoids the FiLM×WM multipass bug)
+    if args.hybrid_mem and getattr(model, "use_memory", False):
+        # Unified thinking-reads-memory: learned, no-WD retrieval-mix α (D8).
+        model._hybrid_mem = True
+        model.mem_alpha = torch.nn.Parameter(
+            torch.tensor(float(args.alpha_init), device=device))
+        print(f"  HYBRID memory thinking ON (α init {args.alpha_init})")
     thinking_id = cfg.get("thinking_token_id")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(
@@ -156,6 +169,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="checkpoints/sft_phase_c_combined.pt")
     ap.add_argument("--data", default="data/sft_phase_c_combined.jsonl")
+    ap.add_argument("--hybrid_mem", action="store_true",
+                    help="unified thinking-reads-memory: think input = hidden "
+                         "+ learned-α WM retrieval (D8/D11)")
+    ap.add_argument("--alpha_init", type=float, default=0.1)
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--accum", type=int, default=8)
     ap.add_argument("--max_R", type=int, default=4)

@@ -76,13 +76,14 @@ def make_distractor_chase_batch(B, N, K, D, device="cuda", generator=None):
 
 
 def build_model(vocab, N, d_model, n_layers, n_heads, d_head, max_T,
-                mem_size, use_film=True, use_mem=True, device="cuda"):
+                mem_size, use_film=True, use_mem=True, film_self_k=3,
+                device="cuda"):
     thinking_id = N + 1
     kw = {}
     if use_film:
         kw = dict(feedback_mode="film",
                   feedback_pairs=((1, n_layers - 1),),
-                  feedback_self_k=3)
+                  feedback_self_k=int(film_self_k))
     model = TinyLM(
         vocab_size=vocab, d_model=d_model, n_layers=n_layers,
         n_heads=n_heads, d_head=d_head, attention_cls=DeltaNetAttention,
@@ -113,7 +114,15 @@ def think_forward_mem(model, base_ids, R, thinking_id, mode="both",
 
     # mem_read_mask: 'both' reads at think positions (default → None lets the
     # model use input_ids==thinking_id); 'think_only' forces NO read.
+    # Optionally bypass the FiLM multipass during think steps (rely on
+    # hidden-feedback for think-depth; FiLM gives per-token depth and deploys
+    # single-forward anyway). Tests whether the FiLM multipass × cross-forward
+    # retrieval chaining is the FiLM×WM breaker (D9).
+    bypass = getattr(model, "_think_film_bypass", False)
+
     def fwd(ids_, emb_):
+        if bypass:
+            model._film_bypass = True
         if mode == "think_only":
             rm = torch.zeros(ids_.shape, dtype=emb_.dtype, device=device)
             return model(ids_, inputs_embeds=emb_, return_hidden=True,
@@ -197,11 +206,14 @@ def train(args):
     use_mem = not args.no_mem
     model, thinking_id = build_model(
         vocab, args.N, args.d_model, args.n_layers, args.n_heads, args.d_head,
-        max_T, mem_size, use_film=use_film, use_mem=use_mem, device=device)
+        max_T, mem_size, use_film=use_film, use_mem=use_mem,
+        film_self_k=args.film_self_k, device=device)
     if use_mem:
         # Learned, no-WD retrieval-mix scalar, init small (D8).
         model.mem_alpha = torch.nn.Parameter(
             torch.tensor(float(args.alpha_init), device=device))
+    if args.film_bypass_think:
+        model._think_film_bypass = True
     train_mode = "hybrid" if use_mem else "think_only"
     print(f"[latent-mem] N={args.N} K={args.K} mem_size={mem_size} "
           f"L={args.n_layers} d={args.d_model} "
@@ -282,6 +294,10 @@ def main():
                     help="ramp distractor length 0->distract over training")
     ap.add_argument("--alpha_init", type=float, default=0.1,
                     help="initial retrieval-mix α (learned, no WD)")
+    ap.add_argument("--film_bypass_think", action="store_true",
+                    help="bypass FiLM multipass during think steps (test fix)")
+    ap.add_argument("--film_self_k", type=int, default=3,
+                    help="FiLM self-feed passes (1 = single-pass, no multipass)")
     ap.add_argument("--no_film", action="store_true", help="disable FiLM (isolation)")
     ap.add_argument("--no_mem", action="store_true", help="disable WM (isolation)")
     ap.add_argument("--save", type=str, default="")

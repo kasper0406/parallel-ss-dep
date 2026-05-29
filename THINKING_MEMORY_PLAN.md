@@ -199,6 +199,19 @@ think-loop bug (try feedback_self_k=1 / skip multipass during think); (S3) wire
 the hybrid think-reads-memory mechanism into the real model where memory is
 already load-bearing, with a real long-context curriculum.**
 
+**D11 (2026-05-29) — FiLM×WM RESOLVED: bypass the FiLM multipass during think
+steps. ALL FOUR BETS NOW CO-TRAIN.** FiLM(K=3)+WM+thinking+β0 with
+`--film_bypass_think` → **hybrid=1.000** (was chance). Root cause: the FiLM K=3
+self-feed MULTIPASS, run on every think-step forward and chained across the
+iterative retrieval-feedback loop, breaks the gradient/optimization; bypassing it
+(single-pass FiLM during think) fixes it. Principled + deploy-faithful: full FiLM
+in the base/prompt forward (per-token depth), single-pass FiLM during think
+(think-depth comes from hidden-feedback iteration; FiLM deploys single-forward
+anyway). **Net: the unified mechanism = hidden-feedback thread + learned-α WM/PKM
+retrieval + β0 (protect bindings) + full-FiLM-base / single-pass-FiLM-think — all
+features compose and learn (hybrid=1.000).** Real-model wiring (S3) should adopt
+exactly this: `_film_bypass` during the think burst.
+
 **D3 (2026-05-29) — Validate the user's "retrieval-as-input + FiLM-carries-state"
 design first, hybrid as fallback.** Decided: feed the *retrieval* as the think
 input (not the raw hidden) and rely on FiLM to carry the running computation

@@ -283,6 +283,25 @@ WM mem_size=1536. Phase-0 probes (train_lm.py, v4 data, b=6) findings:
   mask empty → WM decorative); launcher must include --think_burst_prob.
 Launcher: `launch_pretrain_v8_wide.sh`. Awaiting user GO on the ~3.5-day commit.
 
+**D15 (2026-05-29) — Compile crashes ROOT-CAUSED (agent): both = one torch bug =
+user's approved PR. But the only build is ASAN (unusable for the run).** Both
+compile crashes (gist ViewMeta segfault; no-gist CUDA launch failure) are the
+SAME `_unsafe_view_ViewMeta` use-after-free in torch C++ functionalization
+serialization — verified by CUDA_LAUNCH_BLOCKING turning #2 into #1's segfault.
+NOT FLA, not our b_proj hook (red herring). Fix = user's commit 01bd41bc1b, PR
+#184774 (APPROVED, 4/4 CI, unmerged; bug still on main). `view_replay_for_aliased
+_outputs=False` can't help (UAF is in serialization, not reconstruction).
+BLOCKER: the built ~/ml/pytorch is an ASAN+UBSan build (RelWithDebInfo +
+-fsanitize=address) — too slow + needs LD_PRELOAD → can't run training. No
+Release build/wheel exists. So compile needs EITHER a clean Release build of the
+patched torch (multi-hour; must not clobber the user's ASAN build → separate
+checkout/build dir) OR waiting for PR #184774 to merge into a nightly
+(zero-build, timing unknown). Trainer imports neither torchvision nor torchaudio,
+so a torch swap's blast radius is just torch+FLA (low). DECISION PENDING (user):
+Release build vs nightly-wait vs run no-compile now. DDP (2x, bigger win than
+compile's 1.1x) is wireable now (train_lm.py free) but untestable until GPU 1
+frees.
+
 **D3 (2026-05-29) — Validate the user's "retrieval-as-input + FiLM-carries-state"
 design first, hybrid as fallback.** Decided: feed the *retrieval* as the think
 input (not the raw hidden) and rely on FiLM to carry the running computation

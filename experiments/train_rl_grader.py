@@ -87,6 +87,11 @@ from experiments.eval_bracket_structure import build_model_from_ckpt
 from experiments.iterative_repair import (
     build_repair_prompt, group_became_variance_bearing, select_repair_targets,
 )
+from experiments.rl_multiturn import (
+    JudgeCandidate, Trajectory, Turn, apply_judge_to_group,
+    assemble_flat_rollouts, compute_trajectory_reward,
+    group_is_variance_bearing,
+)
 
 
 def all_gather_object_list(obj, world_size: int) -> list:
@@ -548,6 +553,77 @@ def build_mbpp_prompt(problem: Problem) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Multi-turn trajectory rollout (RL_NEXT_DESIGN §2.1, §5)
+# ---------------------------------------------------------------------------
+
+def run_trajectories_for_group(
+    problem, prompt_text: str, *,
+    rollout_fn: Callable, grade_fn: Callable, extract_fn: Callable,
+    n_rollouts: int, max_turns: int, carry_history: bool,
+    pass_threshold: float = 0.5,
+) -> list[Trajectory]:
+    """Run N feedback-guided revision trajectories on one problem.
+
+    `rollout_fn(prompt_text, n_rollouts) -> list[Rollout]` does the (batched)
+    generation; `grade_fn(problem, code) -> GradingResult` grades; `extract_fn`
+    pulls the gradeable code from a rollout's text. These are injected so the
+    GPU/grader work stays in the trainer and this orchestration is testable.
+
+    Turn 0 generates N parallel rollouts (one batched call). Each subsequent
+    turn re-rolls ONLY the still-unsolved lineages, one at a time, with a
+    repair prompt built from the latest (or full, if carry_history) failure.
+
+    Returns N Trajectory objects (one per lineage). `max_turns == 1` produces
+    one-turn trajectories → byte-identical to the legacy single-shot path.
+    """
+    # Turn 0: N parallel rollouts.
+    rollouts0 = rollout_fn(prompt_text, n_rollouts)
+    trajectories: list[Trajectory] = []
+    for r in rollouts0:
+        code = extract_fn(r)
+        g = grade_fn(problem, code)
+        traj = Trajectory(problem_id=str(problem.task_id))
+        traj.turns.append(Turn(prompt_text=prompt_text, rollout=r,
+                               score=float(g.score), tier=g.tier,
+                               error_text=g.error_text))
+        # Stash the gradeable code on the turn for later judge use.
+        traj.turns[-1].__dict__["_code"] = code
+        trajectories.append(traj)
+
+    # Turns 1..max_turns-1: revise still-unsolved lineages.
+    for _turn_idx in range(1, max_turns):
+        any_open = False
+        for traj in trajectories:
+            if traj.passed(pass_threshold):
+                continue  # early-stop solved lineages (§6.2 item 2)
+            any_open = True
+            last = traj.turns[-1]
+            failed_code = last.__dict__.get("_code", "")
+            err_text = last.error_text or ""
+            if carry_history:
+                # Stack all prior failures into the prompt context.
+                base_prompt = prompt_text
+                for t in traj.turns:
+                    base_prompt = build_repair_prompt(
+                        base_prompt, t.__dict__.get("_code", ""),
+                        t.error_text or "")
+                repair_prompt = base_prompt
+            else:
+                repair_prompt = build_repair_prompt(
+                    prompt_text, failed_code, err_text)
+            rr = rollout_fn(repair_prompt, 1)[0]
+            code = extract_fn(rr)
+            g = grade_fn(problem, code)
+            traj.turns.append(Turn(prompt_text=repair_prompt, rollout=rr,
+                                   score=float(g.score), tier=g.tier,
+                                   error_text=g.error_text))
+            traj.turns[-1].__dict__["_code"] = code
+        if not any_open:
+            break
+    return trajectories
+
+
+# ---------------------------------------------------------------------------
 # Advantage computation (from scalar rewards)
 # ---------------------------------------------------------------------------
 
@@ -816,6 +892,179 @@ def compute_entropy_bonus(step: int, *, static: float, start: float,
 
 
 # ---------------------------------------------------------------------------
+# Multi-turn step orchestration (RL_NEXT_DESIGN §2, §5, §8)
+# ---------------------------------------------------------------------------
+
+def _run_multiturn_step(args, batch_problems, model_module, tok, device, *,
+                        thinking_token_id: int, warmup_scale: float,
+                        judge_backend=None):
+    """Run one multi-turn training step's rollout→grade→reward→advantage
+    pipeline (RL_NEXT_DESIGN §2, §5, §8). Returns the SAME downstream
+    structures the legacy single-shot path produces, so the rest of the
+    training loop (curriculum update, policy update, logging) is unchanged:
+
+        (all_rollouts, combined_groups, per_group_advantages,
+         first_pass_rewards_per_group, tier_hist, n_zero_var_before,
+         n_lift_to_var, repair_n, repair_pass_n, n_judge_fired)
+
+    `all_rollouts[gi]` are the FIRST-PASS (turn-0) rollouts per group — what
+    logging + the curriculum EMA consume (the model's unprompted behaviour).
+    `combined_groups[gi]` flattens every turn of every trajectory into the
+    GRPO group (separate-rows assembly, §5.3); `per_group_advantages[gi]` is
+    the duplicated trajectory advantage aligned 1:1 with combined_groups[gi].
+    """
+    rep_temp = (args.temperature if args.repair_temperature < 0
+                else args.repair_temperature)
+
+    def _extract(r: Rollout) -> str:
+        if args.extract_code_block:
+            extracted = extract_code_block(r.text)
+            return extracted if extracted is not None else r.text
+        return r.text
+
+    def _rollout_fn(prompt_text: str, n: int):
+        prompt_ids = tok(prompt_text, return_tensors="pt").input_ids.to(device)
+        temp = args.temperature if n > 1 else rep_temp  # turn-0 vs repair temp
+        return rollout_group_batched(
+            model_module, tok, prompt_ids, n_rollouts=n,
+            thinking_token_id=thinking_token_id, eos_token_id=tok.eos_token_id,
+            max_gen=args.max_gen, max_think_per_step=args.max_think_per_step,
+            total_think_budget=args.total_think_budget,
+            emit_threshold=args.emit_threshold, gate_floor=args.gate_floor,
+            temperature=temp, min_emit_before_eos=args.min_emit_before_eos,
+            stochastic_gate=args.stochastic_gate,
+            gate_sample_range_low=args.gate_sample_range_low,
+            gate_sample_range_high=args.gate_sample_range_high)
+
+    # The grader runs a subprocess per call; the orchestrator grades turns
+    # synchronously (per RL_NEXT_DESIGN §6.2: at grade_workers≥12 these stay
+    # off the critical path). We keep it a thin closure so the pure
+    # orchestration logic (run_trajectories_for_group) stays GPU/grader-free
+    # and unit-testable with mocks.
+    def _grade_fn(problem, code):
+        return grade(problem, code, timeout_s=5)
+
+    trajectories_per_group: list[list[Trajectory]] = []
+    for prob in batch_problems:
+        prompt_text = build_mbpp_prompt(prob)
+        trajs = run_trajectories_for_group(
+            prob, prompt_text,
+            rollout_fn=_rollout_fn, grade_fn=_grade_fn, extract_fn=_extract,
+            n_rollouts=args.grpo_n_group, max_turns=args.max_turns,
+            carry_history=args.carry_history)
+        trajectories_per_group.append(trajs)
+
+    # Per-trajectory improvement-shaped reward (§2.2).
+    for trajs in trajectories_per_group:
+        for traj in trajs:
+            traj.R_traj = compute_trajectory_reward(
+                [t.score for t in traj.turns],
+                lambda_improve=args.turn_improvement_weight,
+                turn_cost=args.turn_cost)
+
+    # Diagnostics + first-pass (turn-0) structures for logging/curriculum.
+    all_rollouts: list[list[Rollout]] = []
+    first_pass_rewards_per_group: list[list[float]] = []
+    tier_hist: dict[str, int] = {}
+    repair_n = 0
+    repair_pass_n = 0
+    for trajs in trajectories_per_group:
+        all_rollouts.append([traj.turns[0].rollout for traj in trajs])
+        first_pass_rewards_per_group.append(
+            [traj.turns[0].score for traj in trajs])
+        for traj in trajs:
+            for ti, turn in enumerate(traj.turns):
+                # Stamp grade results back onto the rollout for logging
+                # (reward_mean / tier_hist reflect first-pass behaviour).
+                turn.rollout.reward = float(turn.score)
+                turn.rollout.tier = turn.tier
+                tier_hist[turn.tier] = tier_hist.get(turn.tier, 0) + 1
+                if ti > 0:  # turns ≥1 are revisions ("repair")
+                    repair_n += 1
+                    if turn.tier == "pass":
+                        repair_pass_n += 1
+
+    # Per-group trajectory advantages + zero-variance hygiene (§1.2 C) +
+    # optional LLM-judge tie-break on tied groups (§8).
+    n_zero_var_before = 0
+    n_lift_to_var = 0
+    n_judge_fired = 0
+    n_var_bearing = 0
+    n_dropped_groups = 0
+    combined_groups: list[list[Rollout]] = []
+    per_group_advantages: list[torch.Tensor] = []
+    for trajs in trajectories_per_group:
+        if not trajs:
+            combined_groups.append([])
+            per_group_advantages.append(torch.zeros(0))
+            continue
+        traj_rewards = [traj.R_traj for traj in trajs]
+        traj_depths = [float(traj.total_depth) for traj in trajs]
+        # First-pass zero-variance bookkeeping (the model's unprompted signal).
+        fp = [traj.turns[0].score for traj in trajs]
+        fp_passes = sum(1 for r in fp if r >= 0.5)
+        if fp_passes == 0 or fp_passes == len(fp):
+            n_zero_var_before += 1
+            if group_is_variance_bearing(traj_rewards, 1e-9):
+                n_lift_to_var += 1  # multi-turn rescued an all-fail group
+
+        var_bearing = group_is_variance_bearing(
+            traj_rewards, args.group_var_floor)
+        used_judge = False
+        if (not var_bearing and judge_backend is not None
+                and len(trajs) >= 2):
+            # Execution-tied group → the judge is exactly its scope (§8.2).
+            cands = [
+                JudgeCandidate(
+                    code=traj.turns[-1].__dict__.get("_code", ""),
+                    error_text=traj.turns[-1].error_text,
+                    tier_base=traj.terminal_score)
+                for traj in trajs
+            ]
+            folded = apply_judge_to_group(
+                cands, judge_backend, build_mbpp_prompt(batch_problems[
+                    len(combined_groups)]),
+                eps_judge=args.judge_eps, tier_margin=args.judge_tier_margin)
+            if folded is not None:
+                traj_rewards = folded
+                var_bearing = group_is_variance_bearing(
+                    traj_rewards, 1e-9)
+                used_judge = True
+                n_judge_fired += 1
+
+        # Build the GRPO group as separate rows (one per turn), shared adv.
+        adv_t = compute_grpo_advantages_from_rewards(
+            torch.tensor([traj_rewards]), torch.tensor([traj_depths]),
+            ponder_cost=args.ponder_cost, ponder_shape=args.ponder_shape,
+            counterfactual=args.counterfactual,
+            ponder_warmup_scale=warmup_scale)[0]
+        # Zero-variance hygiene (§1.2 C): with a positive floor, drop the
+        # group from the update (zero advantage) if it is STILL flat after the
+        # optional judge. The judge (when it fired and produced a ranking) has
+        # already re-injected within-tier variance, so `var_bearing` reflects
+        # the post-judge state.
+        if var_bearing:
+            n_var_bearing += 1
+        if args.group_var_floor > 0.0 and not var_bearing:
+            adv_t = torch.zeros(len(trajs))
+            n_dropped_groups += 1
+
+        group_rollouts: list[Rollout] = []
+        group_advs: list[float] = []
+        for traj, a in zip(trajs, adv_t):
+            for turn in traj.turns:
+                group_rollouts.append(turn.rollout)
+                group_advs.append(float(a.item()))
+        combined_groups.append(group_rollouts)
+        per_group_advantages.append(torch.tensor(group_advs))
+
+    return (all_rollouts, combined_groups, per_group_advantages,
+            first_pass_rewards_per_group, tier_hist, n_zero_var_before,
+            n_lift_to_var, repair_n, repair_pass_n, n_judge_fired,
+            n_var_bearing, n_dropped_groups)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -967,6 +1216,72 @@ def main():
                          "with the grader's error_text as repair context. Both "
                          "rollouts contribute to the GRPO group → expanded "
                          "effective group size, fewer zero-variance groups.")
+    # ---- Multi-turn agentic revision (RL_NEXT_DESIGN §2, §5) ----
+    p.add_argument("--max_turns", type=int, default=1,
+                    help="Multi-turn revision depth (RL_NEXT_DESIGN §2). "
+                         "1 = byte-identical to today's single-shot trainer "
+                         "(default). >1 enables the agentic loop: after grading "
+                         "a non-passing rollout, build a feedback-augmented "
+                         "repair prompt from error_text and regenerate, up to "
+                         "N turns. Each turn becomes a SEPARATE ROW in the "
+                         "policy update sharing one trajectory advantage "
+                         "(§5.3). Recommended: 3.")
+    p.add_argument("--turn_improvement_weight", type=float, default=0.0,
+                    help="λ on the per-turn improvement bonus Σ max(0, Δ_turn) "
+                         "in the trajectory reward (RL_NEXT_DESIGN §2.2). "
+                         "0 = pure terminal reward (default, reproduces "
+                         "single-turn). The bonus is HARD-CAPPED at "
+                         "0.5·min_adjacent_gap so it can never cross a terminal "
+                         "tier (terminal-dominates clamp); it only breaks "
+                         "within-tier ties.")
+    p.add_argument("--turn_cost", type=float, default=0.0,
+                    help="Per-extra-turn penalty in the trajectory reward "
+                         "(gentle pressure to solve in fewer turns). "
+                         "0 = off (default). Recommended with max_turns>1: 0.02.")
+    p.add_argument("--carry_history",
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help="Carry the FULL turn history into each repair prompt "
+                         "vs only the latest failed attempt + its error "
+                         "(default off → bounded context, RL_NEXT_DESIGN §2.1).")
+    # ---- Zero-variance hygiene (RL_NEXT_DESIGN §1.2 filter C) ----
+    p.add_argument("--group_var_floor", type=float, default=0.0,
+                    help="Drop groups whose trajectory-reward std is below "
+                         "this floor from the policy update (RL_NEXT_DESIGN "
+                         "§1.2 C) so the GRPO +1e-8 epsilon never injects "
+                         "noise. 0 = off (default; legacy keeps every group, "
+                         "and flat groups already advantage→0). Recommended: "
+                         "1e-3.")
+    # ---- LLM-judge tie-breaker (RL_NEXT_DESIGN §8) ----
+    p.add_argument("--llm_judge",
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help="Enable the LLM tie-breaker (RL_NEXT_DESIGN §8, "
+                         "Phase 4). Fires ONLY on execution-tied groups that "
+                         "would otherwise be dropped by --group_var_floor; asks "
+                         "Qwen (vLLM) to listwise-rank the tied candidates by "
+                         "closeness-to-correct, folded into the reward via "
+                         "--judge_eps clamped by --judge_tier_margin so it "
+                         "CANNOT cross an execution tier. Default OFF. Requires "
+                         "a free second GPU (--judge_url) — never co-resident "
+                         "with the trainer on one card.")
+    p.add_argument("--judge_url", type=str, default=None,
+                    help="vLLM OpenAI-compatible server endpoint for the judge "
+                         "(Qwen on GPU 1). When set, the trainer POSTs ranking "
+                         "requests over HTTP. None → in-process vLLM (only if a "
+                         "GPU is genuinely free).")
+    p.add_argument("--judge_model", type=str,
+                    default="QuantTrio/Qwen3.6-35B-A3B-AWQ")
+    p.add_argument("--judge_eps", type=float, default=0.02,
+                    help="Within-tier judge perturbation magnitude "
+                         "(RL_NEXT_DESIGN §8.2; ≤0.04 hard cap to stay inside "
+                         "the smallest adjacent tier gap).")
+    p.add_argument("--judge_tier_margin", type=float, default=0.025,
+                    help="Clamp |reward − tier_base| so the judge provably "
+                         "can't cross a tier (= 0.5·min_adjacent_gap).")
+    p.add_argument("--judge_strip_comments",
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help="Strip comments/docstrings before sending code to the "
+                         "judge so it ranks behaviour-bearing code only "
+                         "(RL_NEXT_DESIGN §8.5 anti-hacking guardrail).")
     p.add_argument("--repair_max_per_group", type=int, default=2)
     p.add_argument("--repair_min_failed", type=int, default=1,
                     help="Skip repair when fewer than this many rollouts in the "
@@ -1164,6 +1479,18 @@ def main():
         if is_main(rank):
             print(f"[rl-grader] curriculum: no resume ({e}); starting fresh")
 
+    # ---- LLM-judge backend (RL_NEXT_DESIGN §8). Constructed lazily and only
+    # on the main rank — it needs a free second GPU / a vLLM server. The
+    # import is kept local so the unit tests never trigger vLLM.
+    judge_backend = None
+    if args.llm_judge and is_main(rank):
+        from experiments.rl_multiturn import VLLMJudgeBackend
+        print(f"[rl-grader] LLM judge ENABLED (url={args.judge_url}, "
+              f"eps={args.judge_eps}, tier_margin={args.judge_tier_margin})")
+        judge_backend = VLLMJudgeBackend(
+            model=args.judge_model, server_url=args.judge_url,
+            strip_comments_first=args.judge_strip_comments)
+
     # ---- Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                              weight_decay=0.01)
@@ -1195,169 +1522,201 @@ def main():
         # backward pass for no_grad rollouts (and so `prefill` /
         # `forward_step` attribute lookups work — DDP wrap masks them).
         model_module.eval()
-        all_rollouts: list[list[Rollout]] = []
-        for prob in batch_problems:
-            prompt_text = build_mbpp_prompt(prob)
-            prompt_ids = tok(prompt_text, return_tensors="pt").input_ids.to(device)
-            group = rollout_group_batched(
-                model_module, tok, prompt_ids,
-                n_rollouts=args.grpo_n_group,
-                thinking_token_id=thinking_token_id,
-                eos_token_id=tok.eos_token_id,
-                max_gen=args.max_gen,
-                max_think_per_step=args.max_think_per_step,
-                total_think_budget=args.total_think_budget,
-                emit_threshold=args.emit_threshold,
-                gate_floor=args.gate_floor,
-                temperature=args.temperature,
-                min_emit_before_eos=args.min_emit_before_eos,
-                stochastic_gate=args.stochastic_gate,
-                gate_sample_range_low=args.gate_sample_range_low,
-                gate_sample_range_high=args.gate_sample_range_high,
-            )
-            all_rollouts.append(group)
-        tier_hist = {}
-        first_pass_error_texts: list[list[str | None]] = [
-            [None] * len(group) for group in all_rollouts
-        ]
-        flat_jobs: list[tuple] = []
-        flat_index: list[tuple[int, int]] = []
-        for gi, (prob, group) in enumerate(zip(batch_problems, all_rollouts)):
-            for ri, r in enumerate(group):
-                if args.extract_code_block:
-                    extracted = extract_code_block(r.text)
-                    code = extracted if extracted is not None else r.text
-                else:
-                    code = build_mbpp_prompt(prob) + r.text
-                flat_jobs.append((prob, code))
-                flat_index.append((gi, ri))
-        grade_results = grade_in_parallel(
-            flat_jobs, timeout_s=5, max_workers=args.grade_workers)
-        for (gi, ri), g_res in zip(flat_index, grade_results):
-            r = all_rollouts[gi][ri]
-            r.reward = float(g_res.score)
-            r.tier = g_res.tier
-            r.n_passed = g_res.n_passed
-            r.n_tests = g_res.n_tests
-            tier_hist[g_res.tier] = tier_hist.get(g_res.tier, 0) + 1
-            first_pass_error_texts[gi][ri] = g_res.error_text
-
-        # Snapshot first-pass rewards BEFORE running repair — these are
-        # what feeds the curriculum EMA (the model's unprompted pass-rate;
-        # repair would inflate the estimate).
-        first_pass_rewards_per_group = [
-            [float(r.reward) for r in group] for group in all_rollouts]
-
-        # Iterative repair: for failed rollouts, do a second rollout
-        # with the grader's error_text as repair context. Repair rollouts
-        # join the same GRPO group (expanding N for that problem).
-        repair_groups: list[list[Rollout]] = [[] for _ in batch_problems]
+        warmup_scale = min(1.0, step / max(1, args.ponder_warmup_steps))
+        # Repair / multi-turn diagnostics shared by both code paths.
         repair_n = 0
         repair_pass_n = 0
         n_zero_var_before = 0
         n_lift_to_var = 0
-        if args.iterative_repair:
-            rep_temp = (args.temperature if args.repair_temperature < 0
-                        else args.repair_temperature)
-            repair_jobs: list[tuple] = []
-            repair_meta: list[tuple[int, str, Rollout]] = []
-            zero_var_per_group: list[bool] = [False] * len(batch_problems)
-            for gi, (prob, group) in enumerate(zip(batch_problems, all_rollouts)):
-                rewards_here = [float(r.reward) for r in group]
-                targets = select_repair_targets(
-                    rewards_here,
-                    max_per_group=args.repair_max_per_group,
-                    min_failed=args.repair_min_failed,
-                )
-                if not targets:
-                    continue
-                orig_passes = sum(1 for r in rewards_here if r >= 0.5)
-                orig_zero_var = orig_passes == 0 or orig_passes == len(group)
-                zero_var_per_group[gi] = orig_zero_var
-                if orig_zero_var:
-                    n_zero_var_before += 1
-                orig_prompt = build_mbpp_prompt(prob)
-                for ti in targets:
-                    failed_code = (extract_code_block(group[ti].text)
-                                   if args.extract_code_block
-                                   else group[ti].text) or group[ti].text
-                    err_text = first_pass_error_texts[gi][ti] or ""
-                    repair_prompt = build_repair_prompt(
-                        orig_prompt, failed_code, err_text)
-                    repair_ids = tok(repair_prompt,
-                                      return_tensors="pt").input_ids.to(device)
-                    single = rollout_group_batched(
-                        model_module, tok, repair_ids,
-                        n_rollouts=1,
-                        thinking_token_id=thinking_token_id,
-                        eos_token_id=tok.eos_token_id,
-                        max_gen=args.max_gen,
-                        max_think_per_step=args.max_think_per_step,
-                        total_think_budget=args.total_think_budget,
-                        emit_threshold=args.emit_threshold,
-                        gate_floor=args.gate_floor,
-                        temperature=rep_temp,
-                        min_emit_before_eos=args.min_emit_before_eos,
-                        stochastic_gate=args.stochastic_gate,
-                        gate_sample_range_low=args.gate_sample_range_low,
-                        gate_sample_range_high=args.gate_sample_range_high,
-                    )
-                    rr = single[0]
-                    if args.extract_code_block:
-                        extracted = extract_code_block(rr.text)
-                        code = extracted if extracted is not None else rr.text
-                    else:
-                        code = repair_prompt + rr.text
-                    repair_jobs.append((prob, code))
-                    repair_meta.append((gi, repair_prompt, rr))
-            if repair_jobs:
-                rep_grade_results = grade_in_parallel(
-                    repair_jobs, timeout_s=5,
-                    max_workers=args.grade_workers)
-                per_group_repair_rewards: list[list[float]] = [
-                    [] for _ in batch_problems]
-                for (gi, _, rr), g_res in zip(repair_meta, rep_grade_results):
-                    rr.reward = float(g_res.score)
-                    rr.tier = g_res.tier
-                    rr.n_passed = g_res.n_passed
-                    rr.n_tests = g_res.n_tests
-                    per_group_repair_rewards[gi].append(rr.reward)
-                    repair_n += 1
-                    if g_res.tier == "pass":
-                        repair_pass_n += 1
-                    repair_groups[gi].append(rr)
-                for gi, group in enumerate(all_rollouts):
-                    if not zero_var_per_group[gi]:
-                        continue
-                    rewards_here = [float(r.reward) for r in group]
-                    if group_became_variance_bearing(
-                            rewards_here, per_group_repair_rewards[gi]):
-                        n_lift_to_var += 1
+        n_judge_fired = 0
+        n_var_bearing = 0
+        n_dropped_groups = 0
 
-        # Combined (per-group ragged) rollout sets for advantage computation.
-        combined_groups: list[list[Rollout]] = [
-            list(orig) + list(rep)
-            for orig, rep in zip(all_rollouts, repair_groups)
-        ]
-        warmup_scale = min(1.0, step / max(1, args.ponder_warmup_steps))
-
-        # Per-group advantages: each group may have a different N after
-        # repair, so we compute (1, K) tensors group-by-group.
-        per_group_advantages: list[torch.Tensor] = []
-        for group in combined_groups:
-            if not group:
-                per_group_advantages.append(torch.zeros(0))
-                continue
-            rew = torch.tensor([[r.reward for r in group]])
-            dep = torch.tensor([[float(r.depth) for r in group]])
-            adv = compute_grpo_advantages_from_rewards(
-                rew, dep,
-                ponder_cost=args.ponder_cost,
-                ponder_shape=args.ponder_shape,
-                counterfactual=args.counterfactual,
-                ponder_warmup_scale=warmup_scale,
+        if args.max_turns > 1:
+            # ===== Multi-turn trajectory path (RL_NEXT_DESIGN §2, §5) =====
+            (all_rollouts, combined_groups, per_group_advantages,
+             first_pass_rewards_per_group, tier_hist, n_zero_var_before,
+             n_lift_to_var, repair_n, repair_pass_n, n_judge_fired,
+             n_var_bearing, n_dropped_groups) = \
+                _run_multiturn_step(
+                    args, batch_problems, model_module, tok, device,
+                    thinking_token_id=thinking_token_id,
+                    warmup_scale=warmup_scale, judge_backend=judge_backend)
+        else:
+            # ===== Legacy single-shot path (byte-identical to pre-change) =====
+            all_rollouts: list[list[Rollout]] = []
+            for prob in batch_problems:
+                prompt_text = build_mbpp_prompt(prob)
+                prompt_ids = tok(prompt_text, return_tensors="pt").input_ids.to(device)
+                group = rollout_group_batched(
+                    model_module, tok, prompt_ids,
+                    n_rollouts=args.grpo_n_group,
+                    thinking_token_id=thinking_token_id,
+                    eos_token_id=tok.eos_token_id,
+                    max_gen=args.max_gen,
+                    max_think_per_step=args.max_think_per_step,
+                    total_think_budget=args.total_think_budget,
+                    emit_threshold=args.emit_threshold,
+                    gate_floor=args.gate_floor,
+                    temperature=args.temperature,
+                    min_emit_before_eos=args.min_emit_before_eos,
+                    stochastic_gate=args.stochastic_gate,
+                    gate_sample_range_low=args.gate_sample_range_low,
+                gate_sample_range_high=args.gate_sample_range_high,
             )
-            per_group_advantages.append(adv[0])
+                all_rollouts.append(group)
+            tier_hist = {}
+            first_pass_error_texts: list[list[str | None]] = [
+                [None] * len(group) for group in all_rollouts
+            ]
+            flat_jobs: list[tuple] = []
+            flat_index: list[tuple[int, int]] = []
+            for gi, (prob, group) in enumerate(zip(batch_problems, all_rollouts)):
+                for ri, r in enumerate(group):
+                    if args.extract_code_block:
+                        extracted = extract_code_block(r.text)
+                        code = extracted if extracted is not None else r.text
+                    else:
+                        code = build_mbpp_prompt(prob) + r.text
+                    flat_jobs.append((prob, code))
+                    flat_index.append((gi, ri))
+            grade_results = grade_in_parallel(
+                flat_jobs, timeout_s=5, max_workers=args.grade_workers)
+            for (gi, ri), g_res in zip(flat_index, grade_results):
+                r = all_rollouts[gi][ri]
+                r.reward = float(g_res.score)
+                r.tier = g_res.tier
+                r.n_passed = g_res.n_passed
+                r.n_tests = g_res.n_tests
+                tier_hist[g_res.tier] = tier_hist.get(g_res.tier, 0) + 1
+                first_pass_error_texts[gi][ri] = g_res.error_text
+
+            # Snapshot first-pass rewards BEFORE running repair — these are
+            # what feeds the curriculum EMA (the model's unprompted pass-rate;
+            # repair would inflate the estimate).
+            first_pass_rewards_per_group = [
+                [float(r.reward) for r in group] for group in all_rollouts]
+
+            # Iterative repair: for failed rollouts, do a second rollout
+            # with the grader's error_text as repair context. Repair rollouts
+            # join the same GRPO group (expanding N for that problem).
+            repair_groups: list[list[Rollout]] = [[] for _ in batch_problems]
+            if args.iterative_repair:
+                rep_temp = (args.temperature if args.repair_temperature < 0
+                            else args.repair_temperature)
+                repair_jobs: list[tuple] = []
+                repair_meta: list[tuple[int, str, Rollout]] = []
+                zero_var_per_group: list[bool] = [False] * len(batch_problems)
+                for gi, (prob, group) in enumerate(zip(batch_problems, all_rollouts)):
+                    rewards_here = [float(r.reward) for r in group]
+                    targets = select_repair_targets(
+                        rewards_here,
+                        max_per_group=args.repair_max_per_group,
+                        min_failed=args.repair_min_failed,
+                    )
+                    if not targets:
+                        continue
+                    orig_passes = sum(1 for r in rewards_here if r >= 0.5)
+                    orig_zero_var = orig_passes == 0 or orig_passes == len(group)
+                    zero_var_per_group[gi] = orig_zero_var
+                    if orig_zero_var:
+                        n_zero_var_before += 1
+                    orig_prompt = build_mbpp_prompt(prob)
+                    for ti in targets:
+                        failed_code = (extract_code_block(group[ti].text)
+                                       if args.extract_code_block
+                                       else group[ti].text) or group[ti].text
+                        err_text = first_pass_error_texts[gi][ti] or ""
+                        repair_prompt = build_repair_prompt(
+                            orig_prompt, failed_code, err_text)
+                        repair_ids = tok(repair_prompt,
+                                          return_tensors="pt").input_ids.to(device)
+                        single = rollout_group_batched(
+                            model_module, tok, repair_ids,
+                            n_rollouts=1,
+                            thinking_token_id=thinking_token_id,
+                            eos_token_id=tok.eos_token_id,
+                            max_gen=args.max_gen,
+                            max_think_per_step=args.max_think_per_step,
+                            total_think_budget=args.total_think_budget,
+                            emit_threshold=args.emit_threshold,
+                            gate_floor=args.gate_floor,
+                            temperature=rep_temp,
+                            min_emit_before_eos=args.min_emit_before_eos,
+                            stochastic_gate=args.stochastic_gate,
+                            gate_sample_range_low=args.gate_sample_range_low,
+                            gate_sample_range_high=args.gate_sample_range_high,
+                        )
+                        rr = single[0]
+                        if args.extract_code_block:
+                            extracted = extract_code_block(rr.text)
+                            code = extracted if extracted is not None else rr.text
+                        else:
+                            code = repair_prompt + rr.text
+                        repair_jobs.append((prob, code))
+                        repair_meta.append((gi, repair_prompt, rr))
+                if repair_jobs:
+                    rep_grade_results = grade_in_parallel(
+                        repair_jobs, timeout_s=5,
+                        max_workers=args.grade_workers)
+                    per_group_repair_rewards: list[list[float]] = [
+                        [] for _ in batch_problems]
+                    for (gi, _, rr), g_res in zip(repair_meta, rep_grade_results):
+                        rr.reward = float(g_res.score)
+                        rr.tier = g_res.tier
+                        rr.n_passed = g_res.n_passed
+                        rr.n_tests = g_res.n_tests
+                        per_group_repair_rewards[gi].append(rr.reward)
+                        repair_n += 1
+                        if g_res.tier == "pass":
+                            repair_pass_n += 1
+                        repair_groups[gi].append(rr)
+                    for gi, group in enumerate(all_rollouts):
+                        if not zero_var_per_group[gi]:
+                            continue
+                        rewards_here = [float(r.reward) for r in group]
+                        if group_became_variance_bearing(
+                                rewards_here, per_group_repair_rewards[gi]):
+                            n_lift_to_var += 1
+
+            # Combined (per-group ragged) rollout sets for advantage computation.
+            combined_groups: list[list[Rollout]] = [
+                list(orig) + list(rep)
+                for orig, rep in zip(all_rollouts, repair_groups)
+            ]
+
+            # Per-group advantages: each group may have a different N after
+            # repair, so we compute (1, K) tensors group-by-group.
+            per_group_advantages: list[torch.Tensor] = []
+            for group in combined_groups:
+                if not group:
+                    per_group_advantages.append(torch.zeros(0))
+                    continue
+                rew = torch.tensor([[r.reward for r in group]])
+                dep = torch.tensor([[float(r.depth) for r in group]])
+                adv = compute_grpo_advantages_from_rewards(
+                    rew, dep,
+                    ponder_cost=args.ponder_cost,
+                    ponder_shape=args.ponder_shape,
+                    counterfactual=args.counterfactual,
+                    ponder_warmup_scale=warmup_scale,
+                )
+                per_group_advantages.append(adv[0])
+
+        # ---- Zero-variance hygiene (RL_NEXT_DESIGN §1.2 C) for the SINGLE-SHOT
+        # legacy path: drop near-flat groups from the policy update so the GRPO
+        # +1e-8 epsilon never injects noise. group_var_floor=0 (default) is a
+        # no-op. The multi-turn path already computed n_var_bearing /
+        # n_dropped_groups internally (against the trajectory reward), so we
+        # only run this for max_turns<=1.
+        if args.max_turns <= 1:
+            for gi, group in enumerate(combined_groups):
+                rews = [float(r.reward) for r in group]
+                if group_is_variance_bearing(rews, args.group_var_floor):
+                    n_var_bearing += 1
+                elif args.group_var_floor > 0.0:
+                    per_group_advantages[gi] = torch.zeros(len(group))
+                    n_dropped_groups += 1
 
         # Flattened (B, N_orig) tensors kept for logging (depth_mean,
         # think_rate, reward_mean reflect the FIRST-PASS distribution,
@@ -1482,6 +1841,18 @@ def main():
                                 if repair_n_g > 0 else 0.0)
             repair_lift = (n_lift_to_var_g / n_zero_var_before_g
                            if n_zero_var_before_g > 0 else 0.0)
+            # Multi-turn / hygiene / judge diagnostics (RL_NEXT_DESIGN
+            # §1, §2, §8). frac_var_bearing is the §7 Phase-0 gate metric.
+            n_var_bearing_g = all_reduce_sum_int(int(n_var_bearing), world_size)
+            n_dropped_g = all_reduce_sum_int(int(n_dropped_groups), world_size)
+            n_judge_fired_g = all_reduce_sum_int(int(n_judge_fired), world_size)
+            n_groups_g = all_reduce_sum_int(len(combined_groups), world_size)
+            frac_var_bearing = (n_var_bearing_g / n_groups_g
+                                if n_groups_g > 0 else 0.0)
+            mt_str = ""
+            if args.max_turns > 1 or args.group_var_floor > 0 or args.llm_judge:
+                mt_str = (f"  mt(var={frac_var_bearing:.2f}, "
+                          f"drop={n_dropped_g}, judge={n_judge_fired_g})")
             gate_str = ""
             sigma_hist_line = ""
             if args.stochastic_gate:
@@ -1535,7 +1906,7 @@ def main():
                       f"p={cur_mean_p_g:.2f}, "
                       f"band={cur_pct_in_band_g:.2f}{cur_target_p_str})  "
                       f"rep(n={repair_n_g}, pass={repair_pass_rate:.2f}, "
-                      f"lift={repair_lift:.2f})  "
+                      f"lift={repair_lift:.2f}){mt_str}  "
                       f"{tier_str:>30}")
                 if sigma_hist_line:
                     print(sigma_hist_line)

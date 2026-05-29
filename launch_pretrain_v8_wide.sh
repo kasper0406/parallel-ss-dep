@@ -11,25 +11,25 @@
 #
 # IMPORTANT FLAGS / KNOWN ISSUES (Phase-0):
 #  * --no-compile is MANDATORY on the current .venv nightly torch: compile trips
-#    (a) the gist-loss AOTAutograd _unsafe_view_ViewMeta segfault and (b) a CUDA
-#    "unspecified launch failure" at ~step 60. --no-compile clears both (~10%
-#    slower). Re-enable --compile + gist ONLY after the ~/ml/pytorch ViewMeta fix
-#    is installed in this .venv and re-probed.
-#  * gist loss is OFF (it is the (a) trigger and is optional).
+#    the gist-loss AOTAutograd _unsafe_view_ViewMeta segfault. RESOLVED (D16):
+#    the patched torch at ~/ml/pytorch-release (2.13.0a0+viewmetafix, the user's
+#    PR #184774) fixes it. We use that build via PYTHONPATH (no .venv mutation),
+#    so --compile + gist are ON. Validated end-to-end past K=3 (~27k tok/s).
 #  * OMP_NUM_THREADS=8 is MANDATORY (avoids the 115-thread futex stall).
 #  * think-burst injection is ON so WorkingMemory receives gradient (without
 #    think positions WM is decorative).
 #
-# Single-GPU (train_lm.py has no DDP). 8.2B tokens (Chinchilla for ~408M
-# active-dense) ~= 3-3.5 days on one 5090.
+# Single-GPU as written (~3.2 days w/ compile). DDP across both 5090s (NCCL is
+# in the patched build) ~halves it — wire separately once GPU 1 frees.
 #
-# PHASE-0 GATE (run this FIRST, ~10 min, before the full run):
-#   append `--steps 130 --feedback_self_k_warmup_steps 50` and confirm it crosses
-#   step ~60 (K=3) stable with peak mem < 28 GiB. Then launch the full run below.
+# PHASE-0 GATE (already validated D16): the wide config + compile + gist crossed
+# K=3 stable at peak ~21 GiB, ~27k tok/s.
 
 set -euo pipefail
 export OMP_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Use the patched torch (ViewMeta fix) so --compile + gist don't segfault.
+export PYTHONPATH=/home/knielsen/ml/pytorch-release:${PYTHONPATH:-}
 GPU=${GPU:-0}
 
 CUDA_VISIBLE_DEVICES=$GPU PYTHONUNBUFFERED=1 PYTHONPATH=$PYTHONPATH:. nohup .venv/bin/python -u experiments/train_lm.py \
@@ -44,10 +44,11 @@ CUDA_VISIBLE_DEVICES=$GPU PYTHONUNBUFFERED=1 PYTHONPATH=$PYTHONPATH:. nohup .ven
   --pkm_use_output_gate --pkm_value_init_std 1.0 --pkm_score_norm layer --pkm_diversity_weight 0.01 \
   --pkm_epsilon_start 0.5 --pkm_epsilon_warmup_steps 3000 \
   --pkm_alpha_floor_start 0.3 --pkm_alpha_floor_warmup_steps 3000 --pkm_value_lr_mult 100.0 \
+  --gist_loss_weight 0.1 --gist_horizons "16,64,256" \
   --data_mix configs/pretrain_mix_v4.yaml --tokenizer HuggingFaceTB/SmolLM2-135M \
   --think_burst_prob 0.25 --think_max_bursts 1 --think_max_burst_depth 4 \
   --T 2048 --batch 8 --grad_accum 16 \
-  --activation_checkpointing --bf16 --tf32 --no-compile --bf16_optim_state \
+  --activation_checkpointing --bf16 --tf32 --compile --bf16_optim_state \
   --alpha_wd 0.0 --wd 0.01 --grad_clip 1.0 --z_loss 1e-4 --mask_eos_in_targets \
   --optimizer muon --lr 1.4e-3 --lr_muon 5e-3 --lr_schedule wsd --warmup_steps 600 --lr_decay_frac 0.15 \
   --steps 31000 --val_every 400 --log_every 50 \

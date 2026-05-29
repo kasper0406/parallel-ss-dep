@@ -302,6 +302,37 @@ Release build vs nightly-wait vs run no-compile now. DDP (2x, bigger win than
 compile's 1.1x) is wireable now (train_lm.py free) but untestable until GPU 1
 frees.
 
+**D16 (2026-05-29) — COMPILE UNBLOCKED: patched torch built + validated
+end-to-end.** Built a Release CUDA torch from the user's fix commit at
+~/ml/pytorch-release (`2.13.0a0+viewmetafix`, sm_120, NCCL 2.29.7, no ASAN) —
+importable via PYTHONPATH=~/ml/pytorch-release with ZERO .venv mutation (build
+agent self-fixed an OpenMP libgomp/libomp mismatch; ~18min w/ warm ccache).
+End-to-end probe on the REAL wide model + `--compile` + gist ON: **STABLE past
+K=3, no ViewMeta segfault**, ~27k tok/s at K=3 (vs ~24.5k no-compile, the +10%),
+peak 21.2 GiB, PKM alive, gist running. So the optimized stack = patched torch +
+compile + gist works. NCCL available → DDP ready. Launch via
+`PYTHONPATH=~/ml/pytorch-release` + `--compile` + gist. NEXT: wire DDP (NCCL
+present; untestable until GPU 1 frees) → optimized ~1.8-day Chinchilla run.
+
+**D17 (2026-05-29) — DDP wired (batch-parallel, grads-only) + v8-wide LAUNCHED
+single-GPU.** Wired DDP into `train_lm.py`, guarded so `WORLD_SIZE==1` is
+byte-identical to the legacy path: env-detected rank/world; `set_device` +
+`init_process_group(nccl)` early; raw `model` kept for attribute reads
+(`_last_gate`, `pkm_layer`, …) while a `ddp_model` wrapper (find_unused=True,
+broadcast_buffers=False, gradient_as_bucket_view=True) carries ONLY the
+loss-bearing forward (threaded via `_nonthink_forward_loss(fwd_model=…)`);
+`no_sync()` on non-final grad-accum microbatches; per-rank data-shard seed
+offset; rank-0-only TB / val / HumanEval-probe / ckpt-save; `tokens_seen ×=
+world_size`; barrier+destroy at end. Thinking-token-queue path raises under DDP
+(per-rank queues desync). **Untested on 2 GPUs** — GPU 1 holds the user's own
+30 GB process; needs a `torchrun --nproc_per_node=2 … --steps 20` smoke before a
+real DDP run. v8-wide launched SINGLE-GPU on the free GPU 0 (compile+gist+patched
+torch): **GPU 99% util, 19.7 GB, ~32.5k tok/s at K=1**, loss descending, PKM
+alive, gist running. Also added HF-stream open retry/backoff to `data_mix.py`
+(a transient 504 had killed the first launch). Mid-eval ckpts land every 500M
+tokens → can resume into DDP from a checkpoint once GPU 1 frees (≈ halves
+wall-clock) with no lost progress.
+
 **D3 (2026-05-29) — Validate the user's "retrieval-as-input + FiLM-carries-state"
 design first, hybrid as fallback.** Decided: feed the *retrieval* as the think
 input (not the raw hidden) and rely on FiLM to carry the running computation

@@ -307,16 +307,30 @@ def _open_stream(src: SourceConfig, seed: int = 0):
     if src.jsonl_path:
         return _jsonl_stream(src.jsonl_path, seed=seed,
                              skip_first=src.skip_first)
+    import time as _time
+
     from datasets import load_dataset
     kw = dict(streaming=True)
     if src.hf_extra:
         kw.update(src.hf_extra)
-    try:
-        ds = load_dataset(src.dataset_id, split=src.split, **kw)
-    except Exception as e:
+    # HF hub returns transient 5xx / gateway timeouts under load; a single one
+    # must not kill a multi-day streaming run. Retry with exponential backoff.
+    last_exc = None
+    for attempt in range(8):
+        try:
+            ds = load_dataset(src.dataset_id, split=src.split, **kw)
+            break
+        except Exception as e:  # noqa: BLE001 — retry any open failure
+            last_exc = e
+            wait = min(60.0, 2.0 * (2 ** attempt))
+            print(f"[data_mix] open {src.dataset_id} failed "
+                  f"(attempt {attempt + 1}/8): {e}; retrying in {wait:.0f}s",
+                  flush=True)
+            _time.sleep(wait)
+    else:
         raise RuntimeError(
             f"failed to open dataset {src.dataset_id} (split={src.split}, "
-            f"hf_extra={src.hf_extra}): {e}"
+            f"hf_extra={src.hf_extra}) after 8 attempts: {last_exc}"
         )
     ds = ds.shuffle(seed=seed, buffer_size=1024)
     if src.skip_first > 0:

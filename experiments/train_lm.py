@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import pathlib
 import sys
 import time
@@ -99,7 +100,7 @@ def _block_update_ratios(model, snapshot) -> list[float]:
 
 
 def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
-                           doc_ids=None, gist_horizons=None):
+                           doc_ids=None, gist_horizons=None, fwd_model=None):
     """Forward + LM loss for the non-thinking-token (pretrain) path.
 
     Returns (logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss,
@@ -118,13 +119,18 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
     ⇒ gate trained to close (think). Costs nothing extra — no second
     forward, just turns the gate into a free predictive-uncertainty head.
     """
+    # `fwd_model` is the (possibly DDP-wrapped) callable used for the
+    # loss-bearing forward so DDP's grad-sync hooks fire; `model` stays the raw
+    # module for attribute reads (_last_gate, pkm_layer, …) which DDP doesn't
+    # proxy. Default fwd_model=model preserves the single-GPU path exactly.
+    fwd_model = fwd_model if fwd_model is not None else model
     want_gist = (gist_horizons is not None
                  and getattr(args, "gist_loss_weight", 0.0) > 0.0)
     if args.aux_brackets:
         if want_gist:
             raise SystemExit("--gist_loss_weight is not supported "
                              "together with --aux_brackets.")
-        logits, aux_logits = model(x, return_aux=True, doc_ids=doc_ids)
+        logits, aux_logits = fwd_model(x, return_aux=True, doc_ids=doc_ids)
         depth = bracket_depth(x, bracket_deltas).clamp(0, args.aux_max_depth)
         aux_loss = F.cross_entropy(
             aux_logits.reshape(-1, args.aux_max_depth + 1),
@@ -135,10 +141,10 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
         # The model computes the gist loss inside the (compiled) forward
         # and returns it as a scalar — see TinyLM._finalize. This keeps
         # the hidden state from ever crossing the compile boundary.
-        logits, gist_loss = model(x, doc_ids=doc_ids)
+        logits, gist_loss = fwd_model(x, doc_ids=doc_ids)
         aux_loss = logits.new_zeros(())
     else:
-        logits = model(x, doc_ids=doc_ids)
+        logits = fwd_model(x, doc_ids=doc_ids)
         aux_loss = logits.new_zeros(())
         gist_loss = logits.new_zeros(())
     V = logits.shape[-1]
@@ -268,6 +274,35 @@ def main():
     from experiments.train_lm_args import build_parser
     p = build_parser()
     args = p.parse_args()
+
+    # --- DDP (batch-parallel, grads-only all-reduce; no NVLink needed) -------
+    # Activated when launched under torchrun (WORLD_SIZE>1). Each rank holds a
+    # full model copy on its own GPU and processes a disjoint data shard; only
+    # gradients cross the PCIe bus (NCCL all-reduce). world_size==1 (plain
+    # `python ...`) is byte-identical to the legacy single-GPU path.
+    import os as _os
+    ddp_world_size = int(_os.environ.get("WORLD_SIZE", "1"))
+    ddp_rank = int(_os.environ.get("RANK", "0"))
+    ddp_local_rank = int(_os.environ.get("LOCAL_RANK", "0"))
+    is_ddp = ddp_world_size > 1
+    is_main = ddp_rank == 0
+    if is_ddp:
+        if args.enable_thinking_token:
+            raise SystemExit(
+                "DDP (WORLD_SIZE>1) is wired for the non-thinking-token "
+                "(pretrain) path only; the thinking-token queue path is not "
+                "DDP-safe (per-rank dynamic queues desync). Run it single-GPU."
+            )
+        torch.cuda.set_device(ddp_local_rank)
+        torch.distributed.init_process_group(backend="nccl")
+        print(f"[ddp] rank {ddp_rank}/{ddp_world_size} "
+              f"local_rank={ddp_local_rank} device=cuda:{ddp_local_rank}",
+              flush=True)
+
+    def _mainprint(*a, **k):
+        if is_main:
+            print(*a, **k)
+
     if args.enable_thinking_token and args.output_gate:
         raise SystemExit(
             "--enable_thinking_token and --output_gate are mutually exclusive. "
@@ -388,7 +423,8 @@ def main():
             think_burst_prob=args.think_burst_prob,
             think_max_bursts=args.think_max_bursts,
             think_max_burst_depth=args.think_max_burst_depth,
-            base_seed=args.seed,
+            # Per-rank seed offset → each DDP rank streams a disjoint shard.
+            base_seed=args.seed + ddp_rank * 100_003,
             mask_eos_in_targets=bool(args.mask_eos_in_targets),
             emit_doc_ids=True,
         )
@@ -501,6 +537,24 @@ def main():
         print(f"  trunk gist loss ON: horizons={gist_horizons} "
               f"weight={args.gist_loss_weight}")
 
+    # DDP wrap: AFTER compile (apply_speed_knobs replaced model.forward) and
+    # gist-head attach, BEFORE the optimizer (which reads model.parameters() —
+    # DDP shares the same parameter tensors, so the optimizer is built on the
+    # raw model and `ddp_model` is used ONLY for the loss-bearing forward).
+    #   * find_unused_parameters=True: the FiLM K-warmup bypass and the gate /
+    #     PKM / gist heads make the set of grad-receiving params vary per step;
+    #     DDP errors without this.
+    #   * broadcast_buffers=False: no BN running stats to sync (PKM uses LN).
+    ddp_model = model
+    if is_ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        ddp_model = DDP(model, device_ids=[ddp_local_rank],
+                        output_device=ddp_local_rank,
+                        find_unused_parameters=True,
+                        broadcast_buffers=False,
+                        gradient_as_bucket_view=True)
+        print(f"[ddp] wrapped model on cuda:{ddp_local_rank}", flush=True)
+
     # Optimizer construction — see experiments/optim_utils.py.
     from experiments.optim_utils import build_optimizer
     opts, scheds = build_optimizer(
@@ -577,8 +631,9 @@ def main():
     if pad_token_id is None:
         pad_token_id = tok.bos_token_id if tok.bos_token_id is not None else 0
 
-    # TensorBoard writer — no-op context when --tb_dir is not set.
-    if args.tb_dir:
+    # TensorBoard writer — no-op context when --tb_dir is not set. Under DDP
+    # only rank 0 writes (multiple ranks → the same event file would corrupt).
+    if args.tb_dir and is_main:
         from torch.utils.tensorboard import SummaryWriter
         tb = SummaryWriter(log_dir=args.tb_dir)
         print(f"TensorBoard logging → {args.tb_dir}")
@@ -1316,31 +1371,39 @@ def main():
                     x, y, *_rest = batch
                     x, y = x.to("cuda"), y.to("cuda")
                     doc_ids = _rest[0].to("cuda") if _rest else None
-                logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss, \
-                    gist_loss = _nonthink_forward_loss(
-                        model, x, y, args, step, bracket_deltas,
-                        doc_ids=doc_ids, gist_horizons=gist_horizons)
-                loss = lm_loss + args.aux_weight * aux_loss
-                loss = loss + _z_loss_term(logits, args.z_loss)
-                if args.output_gate and args.gate_entropy_aux_weight > 0.0:
-                    loss = loss + args.gate_entropy_aux_weight * gate_aux_loss
-                if args.gist_loss_weight > 0.0:
-                    loss = loss + args.gist_loss_weight * gist_loss
-                # PKM diversity-bonus: -H(slot-selection distribution) per
-                # head, averaged across batch and heads. We MAXIMISE entropy
-                # so the auxiliary loss is NEGATIVE entropy. This is the
-                # direct fix for v5-pkm's "4 % of slots cover 95 % of mass"
-                # failure mode. The slot indices are detached upstream so the
-                # router itself isn't trained to produce high entropy — we
-                # only nudge the *distribution* (via the value-table grad
-                # this implies for diverse retrievals).
-                if (getattr(args, "use_pkm", False)
-                        and getattr(args, "pkm_diversity_weight", 0.0) > 0.0):
-                    div_loss = _pkm_diversity_loss(model.pkm_layer)
-                    loss = loss + args.pkm_diversity_weight * div_loss
-                # Snapshot the main-forward gate for the emit-CE diagnostic.
-                main_gate = getattr(model, "_last_gate", None)
-                (loss / n_micro).backward()
+                # DDP: only all-reduce grads on the LAST microbatch; no_sync()
+                # suppresses the reduce on the intermediates (correctness +
+                # avoids n_micro× redundant comms). nullcontext when single-GPU.
+                _is_last_micro = (micro == n_micro - 1)
+                _sync_ctx = (ddp_model.no_sync() if (is_ddp and not _is_last_micro)
+                             else contextlib.nullcontext())
+                with _sync_ctx:
+                    logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss, \
+                        gist_loss = _nonthink_forward_loss(
+                            model, x, y, args, step, bracket_deltas,
+                            doc_ids=doc_ids, gist_horizons=gist_horizons,
+                            fwd_model=ddp_model)
+                    loss = lm_loss + args.aux_weight * aux_loss
+                    loss = loss + _z_loss_term(logits, args.z_loss)
+                    if args.output_gate and args.gate_entropy_aux_weight > 0.0:
+                        loss = loss + args.gate_entropy_aux_weight * gate_aux_loss
+                    if args.gist_loss_weight > 0.0:
+                        loss = loss + args.gist_loss_weight * gist_loss
+                    # PKM diversity-bonus: -H(slot-selection distribution) per
+                    # head, averaged across batch and heads. We MAXIMISE entropy
+                    # so the auxiliary loss is NEGATIVE entropy. This is the
+                    # direct fix for v5-pkm's "4 % of slots cover 95 % of mass"
+                    # failure mode. The slot indices are detached upstream so the
+                    # router itself isn't trained to produce high entropy — we
+                    # only nudge the *distribution* (via the value-table grad
+                    # this implies for diverse retrievals).
+                    if (getattr(args, "use_pkm", False)
+                            and getattr(args, "pkm_diversity_weight", 0.0) > 0.0):
+                        div_loss = _pkm_diversity_loss(model.pkm_layer)
+                        loss = loss + args.pkm_diversity_weight * div_loss
+                    # Snapshot the main-forward gate for the emit-CE diagnostic.
+                    main_gate = getattr(model, "_last_gate", None)
+                    (loss / n_micro).backward()
         _log_this_step = (step % args.log_every == 0 or step == args.steps)
         # Per-layer diagnostics: grad norms must be read before clip; the
         # weight snapshot must be taken before opt.step().
@@ -1526,7 +1589,30 @@ def main():
                          f"row={rn_ratio:.3f},"
                          f"slots/H={unique_hit}/{n_slots},top={top_share:.3f},"
                          f"ε={eps:.2f},φ={floor:.2f})")
-            print(line)
+            # WorkingMemory (dynamic RAG) liveness. WM is read/injected ONLY at
+            # think positions; the supervised gradient comes from the LAST think
+            # in each burst predicting the next REAL token (that target is NOT
+            # masked). inj = mean ‖injection‖ at think positions (0 ⇒ WM inert /
+            # no think tokens in batch), think% = fraction of think positions in
+            # the batch, Wproj = ‖W_proj.weight‖ (drifts from init as WM learns).
+            if (getattr(args, "use_memory", False)
+                    and hasattr(model, "memory")
+                    and getattr(model.memory, "_last_injection", None) is not None):
+                with torch.no_grad():
+                    inj = model.memory._last_injection                   # (B,T,d)
+                    tmask = (x == int(thinking_token_id))                # (B,T)
+                    n_think = int(tmask.sum())
+                    if n_think > 0:
+                        inj_norm = float(
+                            inj[tmask].float().norm(dim=-1).mean())
+                    else:
+                        inj_norm = 0.0
+                    think_frac = float(tmask.float().mean())
+                    wproj = float(model.memory.W_proj.weight.float().norm())
+                line += (f"  wm(inj={inj_norm:.3f},think%={think_frac*100:.1f},"
+                         f"Wproj={wproj:.2f})")
+            if is_main:
+                print(line)
             if tb is not None:
                 tb.add_scalar("train/loss", tloss_avg, step)
                 tb.add_scalar("train/ppl", float(torch.tensor(tloss_avg).exp()), step)
@@ -1623,7 +1709,9 @@ def main():
             last_log = now
             last_log_step = step
 
-        if step % args.val_every == 0 or step == args.steps:
+        # DDP: rank 0 owns validation (collective-free; other ranks just wait
+        # at the next backward all-reduce until rank 0 rejoins).
+        if (step % args.val_every == 0 or step == args.steps) and is_main:
             model.eval()
             val_loss = 0.0
             n_val = 0
@@ -1656,7 +1744,7 @@ def main():
             model.train()
             torch.cuda.empty_cache()
 
-        if (args.probe_humaneval_every_tokens > 0
+        if (args.probe_humaneval_every_tokens > 0 and is_main
                 and tokens_seen - tokens_at_last_probe
                     >= args.probe_humaneval_every_tokens):
             from experiments.probe_humaneval import run_humaneval_probe
@@ -1692,8 +1780,10 @@ def main():
         # loop so far. At every `mid_eval_every_tokens` boundary, save a
         # ckpt, shell out to eval_humaneval.py, log pass-rate to TB,
         # append to controller, optionally stop.
-        tokens_seen = step * args.batch * args.T * args.grad_accum
-        if (mid_eval_controller is not None
+        # Under DDP every rank consumes batch*T*grad_accum tokens per step, so
+        # the global token count scales with world size.
+        tokens_seen = step * args.batch * args.T * args.grad_accum * ddp_world_size
+        if (mid_eval_controller is not None and is_main
                 and tokens_seen >= next_eval_at):
             # Snapshot to a numbered ckpt — kept for the curve plot.
             stem = pathlib.Path(args.save_ckpt or "checkpoints/pretrain.pt").stem
@@ -1814,7 +1904,7 @@ def main():
     if tb is not None:
         tb.close()
 
-    if args.save_ckpt:
+    if args.save_ckpt and is_main:
         ckpt = {
             "state_dict": model.state_dict(),
             "step": locals().get("step", 0),
@@ -1882,6 +1972,10 @@ def main():
         pathlib.Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)
         torch.save(ckpt, args.save_ckpt)
         print(f"Checkpoint saved to {args.save_ckpt}")
+
+    if is_ddp:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

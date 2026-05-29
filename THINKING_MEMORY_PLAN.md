@@ -261,6 +261,28 @@ that needs sequential depth (multi-step reasoning/agentic coding) to show
 thinking's value; (b) otherwise focus the super-coder on memory + scale +
 post-training, and keep thinking OFF for recall/short-coding.
 
+**D14 (2026-05-29) — Scale-up plan (workflow) + Phase-0 feasibility on the real
+trainer.** Workflow designed a WIDTH-scaled competence run: d_model=1280, 10L,
+n_heads=20, d_head=64 (600M), FiLM dense pairs K=3, PKM n_keys=384 (590k slots),
+WM mem_size=1536. Phase-0 probes (train_lm.py, v4 data, b=6) findings:
+- **Builds at 600.3M** (matches estimate); optimizer/α-WD/PKM-LR splits correct.
+- **Fits with room**: peak **19.5 GiB / 32** at b=6 (plan over-estimated 26) →
+  headroom for b≈8-10 (better util).
+- **Two nightly-torch crashes, both on the COMPILE path**: (a) gist-loss +
+  compile → AOTAutograd `_unsafe_view_ViewMeta` segfault (the user has a fix at
+  ~/ml/pytorch branch kn/fix-viewmeta-replay-garbage-shape, BUILT but NOT
+  installed in the .venv nightly; swapping risks the torchvision/torchaudio/FLA
+  ABI set, so deferred); (b) no-gist + compile → CUDA `unspecified launch
+  failure` at ~step 60 (different bug). **`--no-compile` clears BOTH** (~10%
+  speed cost — fine for a 3-4 day run).
+- **STABLE config (verified to step 120+, past K=3): no-gist + --no-compile.**
+  ~25.5k tok/s at K=3, loss 10.5→6.3, PKM alive (118-131k/147k slots, row
+  climbing), gate becoming selective. No DDP in train_lm.py → single-GPU
+  **~3-3.5 days for 8.2B tokens (Chinchilla)**.
+- **WM gradient REQUIRES think-burst injection** (no think positions → WM read
+  mask empty → WM decorative); launcher must include --think_burst_prob.
+Launcher: `launch_pretrain_v8_wide.sh`. Awaiting user GO on the ~3.5-day commit.
+
 **D3 (2026-05-29) — Validate the user's "retrieval-as-input + FiLM-carries-state"
 design first, hybrid as fallback.** Decided: feed the *retrieval* as the think
 input (not the raw hidden) and rely on FiLM to carry the running computation

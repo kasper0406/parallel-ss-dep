@@ -74,8 +74,11 @@ def forward_slot_hits(model, pkm: PKMLayer, x: torch.Tensor) -> dict:
         sk2 = pkm.subkeys[:, 1].float()
         s1 = torch.einsum("bthd,hkd->bthk", q[:, :, :, 0], sk1)
         s2 = torch.einsum("bthd,hkd->bthk", q[:, :, :, 1], sk2)
-        s1 = pkm.bn_s1(s1.reshape(B * T * H, K)).reshape(B, T, H, K)
-        s2 = pkm.bn_s2(s2.reshape(B * T * H, K)).reshape(B, T, H, K)
+        # v7.1 PKM uses LayerNorm (ln_s*); older v5 used BatchNorm (bn_s*).
+        _n1 = getattr(pkm, "ln_s1", None) or getattr(pkm, "bn_s1")
+        _n2 = getattr(pkm, "ln_s2", None) or getattr(pkm, "bn_s2")
+        s1 = _n1(s1.reshape(B * T * H, K)).reshape(B, T, H, K)
+        s2 = _n2(s2.reshape(B * T * H, K)).reshape(B, T, H, K)
         s1k, i1 = s1.topk(tk, dim=-1)
         s2k, i2 = s2.topk(tk, dim=-1)
         full = s1k.unsqueeze(-1) + s2k.unsqueeze(-2)

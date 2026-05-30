@@ -31,11 +31,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Use the patched torch (ViewMeta fix) so --compile + gist don't segfault.
 export PYTHONPATH=/home/knielsen/ml/pytorch-release:${PYTHONPATH:-}
 GPU=${GPU:-0}
+# Optional resume: CKPT=<ckpt> START=<step> bash launch_pretrain_v8_wide.sh
+RESUME_ARGS=""
+if [ -n "${CKPT:-}" ]; then RESUME_ARGS="--load_ckpt ${CKPT} --start_step ${START:-0}"; fi
 
 CUDA_VISIBLE_DEVICES=$GPU PYTHONUNBUFFERED=1 PYTHONPATH=$PYTHONPATH:. nohup .venv/bin/python -u experiments/train_lm.py \
   --arch deltanet --d_model 1280 --n_layers 10 --d_head 64 --n_heads 20 \
   --feedback film --feedback_pairs "0,5;1,6;2,7;3,8;4,9" \
-  --feedback_self_k 3 --feedback_self_k_warmup_steps 1500 \
+  --feedback_self_k 3 --feedback_self_k_warmup_steps ${WARMUP:-1500} \
   --output_gate --gate_entropy_aux_weight 0.1 --gate_entropy_aux_temperature 2.0 \
   --gate_floor_min 0.5 --gate_warmup_steps 20000 \
   --state_readonly_at_think \
@@ -48,10 +51,10 @@ CUDA_VISIBLE_DEVICES=$GPU PYTHONUNBUFFERED=1 PYTHONPATH=$PYTHONPATH:. nohup .ven
   --data_mix configs/pretrain_mix_v4.yaml --tokenizer HuggingFaceTB/SmolLM2-135M \
   --think_burst_prob 0.25 --think_max_bursts 1 --think_max_burst_depth 4 \
   --T 2048 --batch 8 --grad_accum 16 \
-  --activation_checkpointing --bf16 --tf32 --compile --bf16_optim_state \
+  --activation_checkpointing --bf16 --tf32 ${COMPILE:---compile} --bf16_optim_state \
   --alpha_wd 0.0 --wd 0.01 --grad_clip 1.0 --z_loss 1e-4 --mask_eos_in_targets \
   --optimizer muon --lr 1.4e-3 --lr_muon 5e-3 --lr_schedule wsd --warmup_steps 600 --lr_decay_frac 0.15 \
-  --steps 31000 --val_every 400 --log_every 50 \
+  --steps 31000 $RESUME_ARGS --val_every 400 --log_every 50 \
   --mid_eval_every_tokens 500000000 --mid_eval_save_only \
   --save_ckpt checkpoints/pretrain_v8_wide.pt --tb_dir runs/tb/pretrain_v8_wide \
   > runs/pretrain_v8_wide.log 2>&1 &

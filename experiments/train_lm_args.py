@@ -624,6 +624,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "over 200 steps). Does NOT save peak GPU memory "
                         "from gradients (autograd allocates fp32 "
                         "intermediates regardless of grad_dtype).")
+    p.add_argument("--ddp_no_bf16_compress", action="store_true",
+                   help="Disable the bf16 gradient-compression DDP comm hook. "
+                        "By default (DDP only), grads are cast fp32→bf16 "
+                        "before all-reduce to halve cross-GPU bytes on a "
+                        "P2P-less PCIe link (~4 GB/s on this rig). No effect "
+                        "single-GPU.")
     p.add_argument("--alpha_wd", type=float, default=0.0,
                    help="Weight-decay applied to FiLM α scalars (matched by "
                         "name suffix '.alpha' inside any feedback container). "

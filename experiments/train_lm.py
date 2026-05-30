@@ -550,9 +550,27 @@ def main():
         from torch.nn.parallel import DistributedDataParallel as DDP
         ddp_model = DDP(model, device_ids=[ddp_local_rank],
                         output_device=ddp_local_rank,
-                        find_unused_parameters=True,
+                        find_unused_parameters=False,
                         broadcast_buffers=False,
                         gradient_as_bucket_view=True)
+        # static_graph: REQUIRED with --activation_checkpointing. Reentrant
+        # checkpoint fires each param's grad hook twice per backward; DDP's
+        # default reducer rejects the second mark ("marked ready twice",
+        # e.g. gate_head.bias). static_graph tells DDP the param-usage set is
+        # fixed across iterations (true at K=3 steady state), so it tolerates
+        # the double-fire and also subsumes find_unused_parameters.
+        ddp_model._set_static_graph()
+        # bf16 gradient compression: this rig has NO P2P (GPU0<->GPU1 is PHB /
+        # chipset-not-supported), so all-reduce is host-staged at ~4 GB/s.
+        # Compressing grads fp32->bf16 halves the per-step all-reduce bytes
+        # (~570ms -> ~300ms for the 600M-param grad), recovering most of the
+        # 2x. Lossless enough for grad sync (bf16 has fp32 exponent range).
+        if not args.ddp_no_bf16_compress:
+            from torch.distributed.algorithms.ddp_comm_hooks.default_hooks \
+                import bf16_compress_hook
+            ddp_model.register_comm_hook(state=None, hook=bf16_compress_hook)
+            print("[ddp] bf16_compress_hook registered (PCIe-bound link)",
+                  flush=True)
         print(f"[ddp] wrapped model on cuda:{ddp_local_rank}", flush=True)
 
     # Optimizer construction — see experiments/optim_utils.py.
@@ -1435,8 +1453,10 @@ def main():
 
         if step % args.log_every == 0 or step == args.steps:
             now = time.perf_counter()
+            # ×ddp_world_size so this is GLOBAL throughput (all ranks), directly
+            # comparable to the single-GPU baseline. Per-rank does batch*T*ga.
             tok_per_sec = ((step - last_log_step) * args.batch * args.T
-                           * args.grad_accum / (now - last_log))
+                           * args.grad_accum * ddp_world_size / (now - last_log))
             tloss_avg = sum(losses[-args.log_every:]) / max(1, len(losses[-args.log_every:]))
             line = (f"{step:>6d}  {tok_per_sec:>8.0f}  "
                     f"{tloss_avg:>8.4f}  "

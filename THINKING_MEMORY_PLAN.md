@@ -314,6 +314,36 @@ compile + gist works. NCCL available → DDP ready. Launch via
 `PYTHONPATH=~/ml/pytorch-release` + `--compile` + gist. NEXT: wire DDP (NCCL
 present; untestable until GPU 1 frees) → optimized ~1.8-day Chinchilla run.
 
+**D19 (2026-05-30) — Multi-token prediction (DeepSeek MTP) deferred to v9, NOT
+injected into the live v8 run.** MTP (predict next-N tokens via aux heads;
+heads double as speculative-decode) is a real win for DeepSeek. Decision: do NOT
+change v8 mid-run (we're ~1.7B/8.2B tokens in; mid-run arch changes are the
+exact perturbation class that cost us the DDP/resume afternoon; MTP heads added
+now only train on the remaining tokens). Also we ALREADY have most of MTP's
+denser-signal benefit via the trunk **multi-horizon gist loss** (predict pooled
+future hidden at horizons 16/64/256) + future-emb prediction. **Why:** MTP's
+headline win (spec-decode) is inference-speed, orthogonal to the competence
+bottleneck; incremental value over gist is unmeasured. **How to apply:** finish
+v8 clean, then evaluate MTP as a v9 candidate via a small **iso-token ablation**
+against the current gist/future-emb losses (repo mandate: validate small before
+scaling); if it wins, bake into v9 from day 1.
+
+**D18 (2026-05-30) — Gate collapses to always-think under RL sampling; fix =
+calibration teacher + RL shaping.** RL-rollout smoke (τ=0.7) on
+`rl_grader_phase_c_step300`: `think_rate=1.0`, `depth_mean` pinned at the
+`total_think_budget` ceiling — thinking is NOT selective (still produces partials,
+so not broken, just wasteful). Root causes: (1) no per-position "does thinking
+help here" teacher (entropy-aux proxy ≠ thinking-helps; RL reward too sparse),
+(2) gate OOD under sampling, (3) state-readonly latent think is "free" w.r.t.
+correctness → no pressure to stop. Fix is 3 layers, core = re-add a
+**gate-calibration loss for latent thinking** (target = `1{Δlogp_after_R_latent_thinks > margin}`,
+symmetric BCE, dense per-position, co-trained in SFT) + RL supports we already
+have (`--ponder_shape quadratic --counterfactual`, `--stochastic_gate
+--gate_entropy_bonus`). Note: `max_gen` counts EMIT tokens only (thinks have
+their own budget) → 384 is generous, generation length is NOT the bottleneck.
+Full design: `THINKING_GATE_SELECTIVITY_2026_05_30.md`. Build the calibration
+loss before the v8 SFT→RL phase.
+
 **D17 (2026-05-29) — DDP wired (batch-parallel, grads-only) + v8-wide LAUNCHED
 single-GPU.** Wired DDP into `train_lm.py`, guarded so `WORLD_SIZE==1` is
 byte-identical to the legacy path: env-detected rank/world; `set_device` +

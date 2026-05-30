@@ -387,7 +387,7 @@ class VLLMJudgeBackend(JudgeBackend):
                  max_model_len: int = 8192,
                  gpu_mem_fraction: float = 0.9,
                  temperature: float = 0.0,
-                 max_new_tokens: int = 64) -> None:
+                 max_new_tokens: int = 128) -> None:
         self.model = model
         self.server_url = server_url
         self.strip_comments_first = strip_comments_first
@@ -418,17 +418,40 @@ class VLLMJudgeBackend(JudgeBackend):
     @staticmethod
     def _parse_ranking(text: str, n: int) -> list[int]:
         """Parse a best-first JSON list of 1-based candidate numbers into a
-        0-based permutation. Raises on any malformation (caller → abstain)."""
-        start = text.find("[")
-        end = text.rfind("]")
-        if start < 0 or end < 0 or end <= start:
-            raise ValueError(f"no JSON list in judge response: {text!r}")
-        arr = json.loads(text[start:end + 1])
-        order = [int(x) - 1 for x in arr]
-        if sorted(order) != list(range(n)):
-            raise ValueError(
-                f"judge ranking is not a permutation of 1..{n}: {arr!r}")
-        return order
+        0-based permutation. Raises on any malformation (caller → abstain).
+
+        Robust to REASONING-model output: the default judge (Qwen3.6) is a
+        thinking model that emits a ``<think>...</think>`` block which can
+        itself contain ``[`` brackets. A naive first-``[``..last-``]`` scan
+        would grab the reasoning brackets and fail every call. So we (1) strip
+        any think block, then (2) scan all flat ``[...]`` spans and accept the
+        LAST one that parses as a valid 1..n permutation — the model's final
+        answer is emitted last. Thinking is also disabled at generation time,
+        but this keeps the parser correct even if a server ignores that.
+        """
+        import re
+        cleaned = re.sub(r"<think>.*?</think>", " ", text, flags=re.DOTALL)
+        # If a closing tag exists (possibly without our regex matching a
+        # well-formed pair), keep only what follows the last one.
+        if "</think>" in cleaned:
+            cleaned = cleaned.rsplit("</think>", 1)[-1]
+        spans = re.findall(r"\[[^\[\]]*\]", cleaned)
+        for span in reversed(spans):
+            try:
+                arr = json.loads(span)
+            except Exception:
+                continue
+            if not isinstance(arr, list):
+                continue
+            try:
+                order = [int(x) - 1 for x in arr]
+            except (TypeError, ValueError):
+                continue
+            if sorted(order) == list(range(n)):
+                return order
+        raise ValueError(
+            f"no valid best-first permutation of 1..{n} in judge "
+            f"response: {text!r}")
 
     def rank(self, problem_prompt: str,
              candidates: Sequence[JudgeCandidate]) -> list[int]:
@@ -443,16 +466,34 @@ class VLLMJudgeBackend(JudgeBackend):
         return self._parse_ranking(text, n)
 
     def _rank_in_process(self, user: str) -> str:
-        from experiments.distill_solutions import _build_chat_template_prompt
         from vllm import SamplingParams
         messages = [{"role": "system", "content": self._SYSTEM},
                     {"role": "user", "content": user}]
-        prompt = self._tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
+        # Disable the thinking trace — we want a fast, parseable ranking, not a
+        # reasoning dump (Qwen3.6 is a thinking model by default). Fall back
+        # gracefully for tokenizers that don't accept the kwarg.
+        try:
+            prompt = self._tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=False)
+        except TypeError:
+            prompt = self._tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
         sp = SamplingParams(temperature=self.temperature,
                             max_tokens=self.max_new_tokens)
         out = self._llm.generate([prompt], sp)
         return out[0].outputs[0].text
+
+    def _chat_endpoint(self) -> str:
+        """Normalize ``server_url`` to the OpenAI chat-completions endpoint, so
+        a base URL (``http://host:8000``), a ``/v1`` URL, or the full path all
+        work."""
+        u = self.server_url.rstrip("/")
+        if u.endswith("/chat/completions"):
+            return u
+        if u.endswith("/v1"):
+            return u + "/chat/completions"
+        return u + "/v1/chat/completions"
 
     def _rank_via_server(self, user: str) -> str:
         import urllib.request
@@ -462,9 +503,12 @@ class VLLMJudgeBackend(JudgeBackend):
                          {"role": "user", "content": user}],
             "temperature": self.temperature,
             "max_tokens": self.max_new_tokens,
+            # Disable Qwen3.6's thinking trace server-side (vLLM honors this);
+            # the parser also strips <think> blocks if the server ignores it.
+            "chat_template_kwargs": {"enable_thinking": False},
         }).encode()
         req = urllib.request.Request(
-            self.server_url, data=payload,
+            self._chat_endpoint(), data=payload,
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             body = json.loads(resp.read().decode())

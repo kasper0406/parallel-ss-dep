@@ -81,6 +81,7 @@ from experiments.code_grader import (
     Problem, grade, load_mbpp, load_synth_reasoning,
     truncate_at_stop, _STOP_SEQUENCES, LOADERS,
 )
+from experiments.bf16_optim import BF16StateAdamW
 from experiments.curriculum import ProblemDifficultyEMA, merge_rank_updates
 from experiments.distill_solutions import extract_code_block
 from experiments.eval_bracket_structure import build_model_from_ckpt
@@ -484,6 +485,543 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
     return out_rollouts
 
 
+def _merge_prefill_caches(caches: list[dict], group_sizes: list[int],
+                          prompt_lens: list[int]) -> dict:
+    """Concatenate B per-problem prefill caches (each already tiled to that
+    problem's N rows) into ONE batched cache over R = sum(group_sizes) rows,
+    for a single joint `forward_step` decode loop.
+
+    Correctness contract — each per-problem cache was built by `prefill` over
+    ONLY that problem's prompt (NO cross-problem padding), so the DeltaNet
+    recurrent state is byte-identical to the single-problem path. Merging only
+    stacks along the batch dim, which is independent across rows in every
+    consumer (FLA recurrent kernel, WM read, pos-embed). The two things that
+    legitimately differ per row — absolute position (`seen`) and WM buffer
+    width — are handled explicitly:
+
+      * `seen_per_row`  (R,) long: each row's true prompt length, so
+        `forward_step` indexes `pos_embed` per row (model.py change).
+      * WM buffer: per-problem buffers have DIFFERENT widths (= prompt_len_i).
+        We LEFT-pad each to the common max width with `gate=0, value=0,
+        tok=pad, pos=+SENTINEL`. The sentinel makes the causal mask
+        (`buf_pos >= new_pos_val`) exclude pad slots with a true `-inf`
+        (NOT a finite log-gate penalty), and only the RELATIVE order of
+        `pos` values matters for the causal comparison — so this is
+        bit-identical to the per-problem buffer (proof in the module note).
+    """
+    from fla.models.utils import Cache as FLACache
+
+    R = sum(group_sizes)
+    # --- FLA recurrent cache: concat each layer's state along batch dim. ---
+    # Use the PUBLIC cache interface (`cache[L]` -> per-layer state dict,
+    # `from_legacy_cache(tuple_of_state_dicts)` to rebuild). This is robust to
+    # the FLA Cache implementation (new `.layers` FLALayer vs legacy `.states`)
+    # — both expose `__getitem__`, `__len__`, and `from_legacy_cache`.
+    n_layers = max(len(c["fla_cache"]) for c in caches)
+
+    def _cat_field(states_for_layer, key):
+        vals = [st.get(key) for st in states_for_layer]
+        if any(v is None for v in vals):
+            return None
+        if isinstance(vals[0], (tuple, list)):
+            return tuple(torch.cat([v[j] for v in vals], dim=0)
+                         for j in range(len(vals[0])))
+        return torch.cat(vals, dim=0)
+
+    merged_state_dicts = []
+    for L in range(n_layers):
+        states_for_layer = [c["fla_cache"][L] for c in caches]
+        merged_state_dicts.append(dict(
+            recurrent_state=_cat_field(states_for_layer, "recurrent_state"),
+            attn_state=_cat_field(states_for_layer, "attn_state"),
+            conv_state=_cat_field(states_for_layer, "conv_state"),
+            ffn_state=_cat_field(states_for_layer, "ffn_state"),
+        ))
+    seen_tokens = max(int(c["fla_cache"]._seen_tokens) for c in caches)
+    merged_fla = FLACache.from_legacy_cache(
+        tuple(merged_state_dicts), seen_tokens=seen_tokens)
+
+    # Resolve a device for the small bookkeeping tensors below.
+    _rec0 = merged_state_dicts[0].get("recurrent_state")
+    if _rec0 is not None:
+        cache_device = (_rec0[0] if isinstance(_rec0, (tuple, list)) else _rec0).device
+    elif caches[0].get("wm_buf") is not None:
+        cache_device = caches[0]["wm_buf"]["gate"].device
+    else:
+        cache_device = torch.device("cpu")
+
+    # --- WM buffer: left-pad each problem's buffer to common width. ---
+    wm_buf = None
+    if caches[0].get("wm_buf") is not None:
+        widths = [c["wm_buf"]["gate"].shape[1] for c in caches]
+        T_max = max(widths)
+        SENT = 10 ** 9  # pos sentinel: always >= any real new_pos_val
+        device = caches[0]["wm_buf"]["gate"].device
+        gate_rows, val_rows, pos_rows, tok_rows = [], [], [], []
+        for c in caches:
+            b = c["wm_buf"]
+            w = b["gate"].shape[1]
+            pad = T_max - w
+            Bi = b["gate"].shape[0]
+            d_mem = b["value"].shape[-1]
+            if pad > 0:
+                gpad = torch.zeros(Bi, pad, dtype=b["gate"].dtype, device=device)
+                vpad = torch.zeros(Bi, pad, d_mem, dtype=b["value"].dtype,
+                                   device=device)
+                ppad = torch.full((Bi, pad), SENT, dtype=b["pos"].dtype,
+                                  device=device)
+                tpad = torch.zeros(Bi, pad, dtype=b["tok"].dtype, device=device)
+                gate_rows.append(torch.cat([gpad, b["gate"]], dim=1))
+                val_rows.append(torch.cat([vpad, b["value"]], dim=1))
+                pos_rows.append(torch.cat([ppad, b["pos"]], dim=1))
+                tok_rows.append(torch.cat([tpad, b["tok"]], dim=1))
+            else:
+                gate_rows.append(b["gate"]); val_rows.append(b["value"])
+                pos_rows.append(b["pos"]);   tok_rows.append(b["tok"])
+        wm_buf = {
+            "gate": torch.cat(gate_rows, dim=0),
+            "value": torch.cat(val_rows, dim=0),
+            "pos": torch.cat(pos_rows, dim=0),
+            "tok": torch.cat(tok_rows, dim=0),
+        }
+
+    # --- think_run_len (Phase 3): concat per-row counters if present. ---
+    think_run_len = None
+    if any(c.get("think_run_len") is not None for c in caches):
+        parts = []
+        for c, gs in zip(caches, group_sizes):
+            tr = c.get("think_run_len")
+            if tr is None:
+                tr = torch.zeros(gs, dtype=torch.int64, device=cache_device)
+            parts.append(tr)
+        think_run_len = torch.cat(parts, dim=0)
+
+    # FiLM lagged_sources: only present when _film_bypass is False. The
+    # production generators run with film bypass OFF here? No — rollout keeps
+    # FiLM ON (see rollout_group_batched note). lagged_sources are per-row
+    # (B_i, 1, d) so they concat the same way.
+    lagged_sources = None
+    if caches[0].get("lagged_sources") is not None:
+        lagged_sources = {}
+        src_layers = caches[0]["lagged_sources"].keys()
+        for L in src_layers:
+            lagged_sources[L] = torch.cat(
+                [c["lagged_sources"][L] for c in caches], dim=0)
+
+    seen_per_row = torch.tensor(
+        [pl for pl, gs in zip(prompt_lens, group_sizes) for _ in range(gs)],
+        dtype=torch.long, device=cache_device,
+    )
+    return {
+        "fla_cache": merged_fla,
+        "seen": int(max(prompt_lens)),       # scalar fallback (unused when
+                                             # seen_per_row is set)
+        "seen_per_row": seen_per_row,
+        "lagged_sources": lagged_sources,
+        "wm_buf": wm_buf,
+        "think_run_len": think_run_len,
+        "_group_sizes": list(group_sizes),
+        "_prompt_lens": list(prompt_lens),
+    }
+
+
+@torch.no_grad()
+def rollout_turn0_batched_across_problems(
+        model, tokenizer, prompt_ids_list: list[torch.Tensor], *,
+        n_rollouts: int,
+        budgets_per_problem: list,
+        thinking_token_id: int,
+        eos_token_id: int | None,
+        max_gen: int,
+        max_think_per_step: int,
+        emit_threshold: float,
+        gate_floor: float,
+        temperature: float,
+        min_emit_before_eos: int,
+        stochastic_gate: bool = False,
+        gate_sample_range_low: float = 0.0,
+        gate_sample_range_high: float = 1.0,
+) -> list[tuple[int, Rollout]]:
+    """Turn-0 rollouts for ALL B problems in a SINGLE batched decode loop.
+
+    This is the cross-problem extension of `rollout_group_batched`. Instead of
+    B separate decode loops of N rows each, it runs ONE decode loop over
+    R = B*N rows. DeltaNet decode is memory-bandwidth-bound, so the single
+    R-row loop costs ~the same wall-time as one N-row loop → ~B× speedup on
+    the dominant (turn-0) phase.
+
+    `prompt_ids_list[b]` is `(1, T_b)` — problems have DIFFERENT prompt
+    lengths. `budgets_per_problem[b]` is the per-row think-budget list of
+    length N for problem b (from `compute_think_budget_spread`).
+
+    Correctness — leakage-free by construction. Two decode paths:
+
+      * Incremental (production, model has prefill/forward_step): each problem
+        is prefilled OVER ITS OWN PROMPT ONLY (no cross-problem padding → the
+        DeltaNet recurrent state is byte-identical to the single-problem
+        path). The B caches are concatenated along the batch dim
+        (`_merge_prefill_caches`) and ONE joint `forward_step` loop advances
+        all R rows. Per-row absolute position uses `cache["seen_per_row"]`.
+
+      * Full-forward fallback (test models / no incremental support): rows are
+        RIGHT-padded to a common width and each row keeps its own `frontier`
+        column (= prompt_len + tokens appended). Logits are read at
+        `frontier-1` and the new token written at `frontier`. Causal
+        attention means a row's real tokens never attend to the right-pad that
+        follows its frontier → each row's logits are bit-identical to
+        forwarding that row alone (no leakage).
+
+    Returns a FLAT list of `(problem_index, Rollout)` so the caller can
+    regroup into `trajectories_per_group`. Within a problem the N rollouts
+    appear in row order (rollout r of problem b uses `budgets_per_problem[b][r]`).
+    """
+    device = prompt_ids_list[0].device
+    B = len(prompt_ids_list)
+    N = int(n_rollouts)
+    R = B * N
+    pad_id = int(eos_token_id) if eos_token_id is not None else 0
+
+    # Per-row metadata: which problem, that problem's prompt length, the row's
+    # think budget.
+    prob_of_row: list[int] = []
+    prompt_len_of_row: list[int] = []
+    budget_of_row: list[int] = []
+    prompt_lens = [int(p.shape[1]) for p in prompt_ids_list]
+    for b in range(B):
+        bl = budgets_per_problem[b]
+        if isinstance(bl, (int,)):
+            bl = [int(bl)] * N
+        if len(bl) != N:
+            raise ValueError(
+                f"budgets_per_problem[{b}] length {len(bl)} != n_rollouts {N}")
+        for r in range(N):
+            prob_of_row.append(b)
+            prompt_len_of_row.append(prompt_lens[b])
+            budget_of_row.append(int(bl[r]))
+    budget_per_row = torch.tensor(budget_of_row, dtype=torch.long, device=device)
+    prompt_len_t = torch.tensor(prompt_len_of_row, dtype=torch.long,
+                                device=device)
+    budget_ceiling = int(budget_per_row.max().item())
+
+    # Per-row bookkeeping (identical semantics to rollout_group_batched).
+    emit_counts = torch.zeros(R, dtype=torch.long, device=device)
+    think_counts_this_step = torch.zeros(R, dtype=torch.long, device=device)
+    think_totals = torch.zeros(R, dtype=torch.long, device=device)
+    finished = torch.zeros(R, dtype=torch.bool, device=device)
+
+    emit_token_ids_per_row: list[list[int]] = [[] for _ in range(R)]
+    emit_log_probs_per_row: list[list[float]] = [[] for _ in range(R)]
+    emit_positions_per_row: list[list[int]] = [[] for _ in range(R)]
+    gate_decisions_per_row: list[list[bool]] = [[] for _ in range(R)]
+    gate_log_probs_per_row: list[list[float]] = [[] for _ in range(R)]
+    gate_positions_per_row: list[list[int]] = [[] for _ in range(R)]
+    gate_sigma_buckets_per_row: list[list[int]] = [[0, 0, 0, 0] for _ in range(R)]
+    gate_n_sampled_per_row: list[int] = [0 for _ in range(R)]
+    gate_n_decisive_per_row: list[int] = [0 for _ in range(R)]
+    # full token sequence per row (row-local: prompt + emits + thinks, NO pad).
+    full_ids_per_row: list[list[int]] = [
+        prompt_ids_list[prob_of_row[i]][0].cpu().tolist() for i in range(R)
+    ]
+
+    can_incremental = (hasattr(model, "forward_step")
+                       and hasattr(model, "prefill"))
+
+    autocast = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    max_iter = max_gen + budget_ceiling + 4
+
+    if can_incremental:
+        # ---- Per-problem isolated prefill, then concat into one cache. ----
+        # Each problem is prefilled over ONLY its own prompt (tiled to N rows),
+        # so its DeltaNet recurrent state is byte-identical to the single-
+        # problem path. The B caches are concatenated along the batch dim.
+        caches = []
+        first_logits_per_row = []
+        first_gate_per_row = []   # step-0 gate per row (from prefill)
+        with autocast:
+            for b in range(B):
+                ids_b = prompt_ids_list[b].expand(N, -1).contiguous()
+                cache_b, last_logits_b = model.prefill(ids_b)
+                caches.append(cache_b)
+                # (N, T_b, V) -> last prompt position per row (N, V).
+                first_logits_per_row.append(last_logits_b[:, -1, :])
+                # The gate that drives step-0 is the prompt's LAST-position
+                # gate. `prefill` stashes it on `model._last_gate` (N, T_b);
+                # capture it NOW (before the next problem's prefill overwrites
+                # the stash) so the merged step-0 gate is per-row correct.
+                g_b = getattr(model, "_last_gate", None)
+                if g_b is not None:
+                    first_gate_per_row.append(g_b[:, -1:].detach().clone())
+                else:
+                    first_gate_per_row.append(torch.ones(N, 1, device=device))
+            cache = _merge_prefill_caches(caches, [N] * B, prompt_lens)
+        pending = torch.cat(first_logits_per_row, dim=0)   # (R, V)
+        step0_gate = torch.cat(first_gate_per_row, dim=0)   # (R, 1)
+
+        with autocast:
+            first_step = True
+            for _ in range(max_iter):
+                if bool(finished.all().item()):
+                    break
+                next_logits = pending.float()    # (R, V)
+                # Step 0 reads the merged prefill gate (model._last_gate holds
+                # only the LAST problem's prefill stash); later steps read the
+                # (R,1) gate that forward_step correctly set for all rows.
+                gate_for_step = step0_gate if first_step else None
+                first_step = False
+                _decode_one_step(
+                    model, next_logits, gate_full=gate_for_step,
+                    R=R, device=device, thinking_token_id=thinking_token_id,
+                    eos_token_id=eos_token_id, gate_floor=gate_floor,
+                    emit_threshold=emit_threshold, temperature=temperature,
+                    min_emit_before_eos=min_emit_before_eos,
+                    max_gen=max_gen, max_think_per_step=max_think_per_step,
+                    budget_per_row=budget_per_row,
+                    stochastic_gate=stochastic_gate,
+                    gate_sample_range_low=gate_sample_range_low,
+                    gate_sample_range_high=gate_sample_range_high,
+                    emit_counts=emit_counts,
+                    think_counts_this_step=think_counts_this_step,
+                    think_totals=think_totals, finished=finished,
+                    emit_token_ids_per_row=emit_token_ids_per_row,
+                    emit_log_probs_per_row=emit_log_probs_per_row,
+                    emit_positions_per_row=emit_positions_per_row,
+                    gate_decisions_per_row=gate_decisions_per_row,
+                    gate_log_probs_per_row=gate_log_probs_per_row,
+                    gate_positions_per_row=gate_positions_per_row,
+                    gate_sigma_buckets_per_row=gate_sigma_buckets_per_row,
+                    gate_n_sampled_per_row=gate_n_sampled_per_row,
+                    gate_n_decisive_per_row=gate_n_decisive_per_row,
+                    full_ids_per_row=full_ids_per_row,
+                    frontier=None,
+                )
+                # Advance the cache with the just-appended row of tokens.
+                appended = torch.tensor(
+                    [full_ids_per_row[i][-1] for i in range(R)],
+                    dtype=torch.long, device=device).unsqueeze(1)
+                pending_logits, cache = model.forward_step(appended, cache)
+                pending = pending_logits[:, -1, :]
+    else:
+        # ---- Full-forward fallback: right-padded joint tensor + per-row
+        # frontier. Leakage-free (causal attn never reads a row's right-pad). ----
+        T0 = max(prompt_lens)
+        ids = torch.full((R, T0), pad_id, dtype=torch.long, device=device)
+        for i in range(R):
+            pl = prompt_len_of_row[i]
+            ids[i, :pl] = torch.tensor(full_ids_per_row[i], dtype=torch.long,
+                                       device=device)
+        frontier = prompt_len_t.clone()   # (R,) next write column per row
+        with autocast:
+            for _ in range(max_iter):
+                if bool(finished.all().item()):
+                    break
+                logits = model(ids)                          # (R, T_cur, V)
+                if isinstance(logits, tuple):
+                    logits = logits[0]
+                # Read each row's logits at frontier-1.
+                idx = (frontier - 1).clamp(min=0)
+                next_logits = logits[torch.arange(R, device=device), idx, :].float()
+                gate_full = getattr(model, "_last_gate", None)
+                appended = _decode_one_step(
+                    model, next_logits,
+                    R=R, device=device, thinking_token_id=thinking_token_id,
+                    eos_token_id=eos_token_id, gate_floor=gate_floor,
+                    emit_threshold=emit_threshold, temperature=temperature,
+                    min_emit_before_eos=min_emit_before_eos,
+                    max_gen=max_gen, max_think_per_step=max_think_per_step,
+                    budget_per_row=budget_per_row,
+                    stochastic_gate=stochastic_gate,
+                    gate_sample_range_low=gate_sample_range_low,
+                    gate_sample_range_high=gate_sample_range_high,
+                    emit_counts=emit_counts,
+                    think_counts_this_step=think_counts_this_step,
+                    think_totals=think_totals, finished=finished,
+                    emit_token_ids_per_row=emit_token_ids_per_row,
+                    emit_log_probs_per_row=emit_log_probs_per_row,
+                    emit_positions_per_row=emit_positions_per_row,
+                    gate_decisions_per_row=gate_decisions_per_row,
+                    gate_log_probs_per_row=gate_log_probs_per_row,
+                    gate_positions_per_row=gate_positions_per_row,
+                    gate_sigma_buckets_per_row=gate_sigma_buckets_per_row,
+                    gate_n_sampled_per_row=gate_n_sampled_per_row,
+                    gate_n_decisive_per_row=gate_n_decisive_per_row,
+                    full_ids_per_row=full_ids_per_row,
+                    frontier=frontier,
+                    gate_full=gate_full,
+                )
+                # Write each row's appended token at its frontier column,
+                # growing the tensor if any frontier reached the width.
+                if int(frontier.max().item()) >= ids.shape[1]:
+                    grow = torch.full((R, 1), pad_id, dtype=torch.long,
+                                      device=device)
+                    ids = torch.cat([ids, grow], dim=1)
+                ids[torch.arange(R, device=device), frontier] = appended
+                frontier = frontier + 1
+
+    # Build Rollout objects tagged with problem index.
+    out: list[tuple[int, Rollout]] = []
+    for i in range(R):
+        text = tokenizer.decode(emit_token_ids_per_row[i])
+        r = Rollout(
+            prompt_len=prompt_len_of_row[i],
+            emit_token_ids=emit_token_ids_per_row[i],
+            emit_log_probs=emit_log_probs_per_row[i],
+            emit_positions=emit_positions_per_row[i],
+            full_ids=full_ids_per_row[i],
+            depth=int(think_totals[i].item()),
+            text=text,
+            gate_decisions=(gate_decisions_per_row[i] if stochastic_gate else None),
+            gate_log_probs=(gate_log_probs_per_row[i] if stochastic_gate else None),
+            gate_positions=(gate_positions_per_row[i] if stochastic_gate else None),
+            gate_sigma_bucket_counts=(
+                list(gate_sigma_buckets_per_row[i]) if stochastic_gate else None),
+            gate_n_sampled=(gate_n_sampled_per_row[i] if stochastic_gate else 0),
+            gate_n_decisive=(gate_n_decisive_per_row[i] if stochastic_gate else 0),
+        )
+        out.append((prob_of_row[i], r))
+    return out
+
+
+def _decode_one_step(
+        model, next_logits, *, R, device,
+        thinking_token_id, eos_token_id, gate_floor, emit_threshold,
+        temperature, min_emit_before_eos, max_gen, max_think_per_step,
+        budget_per_row, stochastic_gate, gate_sample_range_low,
+        gate_sample_range_high, emit_counts, think_counts_this_step,
+        think_totals, finished, emit_token_ids_per_row, emit_log_probs_per_row,
+        emit_positions_per_row, gate_decisions_per_row, gate_log_probs_per_row,
+        gate_positions_per_row, gate_sigma_buckets_per_row,
+        gate_n_sampled_per_row, gate_n_decisive_per_row, full_ids_per_row,
+        frontier, gate_full=None):
+    """One emit/think decision + record step, shared by both decode paths.
+
+    Mirrors the inner body of `rollout_group_batched` EXACTLY (same gate /
+    sampling / bookkeeping logic) but operates on R rows with PER-ROW prompt
+    lengths: each row's recorded `emit_positions` / `gate_positions` are
+    indices into THAT ROW's own `full_ids` (row-local), so they are identical
+    to what the single-problem path records and re-fetchable by the offline
+    policy forward.
+
+    For the incremental path, `gate_full` is read from `model._last_gate`
+    (shape (R, 1)); for the full-forward path the caller passes the (R, T)
+    gate and we take the per-row frontier-1 column. Appends the chosen token
+    to each row's `full_ids_per_row[i]` and returns the (R,) appended tensor.
+    """
+    N_rows = R
+    if gate_full is None:
+        gate_t = getattr(model, "_last_gate", None)
+        if gate_t is None:
+            gate = torch.ones(N_rows, device=device)
+        else:
+            gate = gate_t[:, -1]
+    else:
+        if frontier is not None:
+            idx = (frontier - 1).clamp(min=0)
+            gate = gate_full[torch.arange(N_rows, device=device), idx]
+        else:
+            gate = gate_full[:, -1]
+
+    gate_clamped = (gate if gate_floor <= 0 else gate.clamp_min(gate_floor))
+    force_emit = (
+        (think_counts_this_step >= max_think_per_step)
+        | (think_totals >= budget_per_row)
+        | finished
+    )
+    if stochastic_gate:
+        p_emit = gate_clamped.clamp(1e-6, 1.0 - 1e-6)
+        in_sample_range = (p_emit > gate_sample_range_low) & \
+                          (p_emit < gate_sample_range_high)
+        sampled_emit = torch.bernoulli(p_emit).to(torch.bool)
+        det_emit = gate_clamped >= emit_threshold
+        chosen_emit = torch.where(in_sample_range, sampled_emit, det_emit)
+        want_emit = chosen_emit | force_emit
+        gate_lp_emit = torch.log(p_emit)
+        gate_lp_think = torch.log(1.0 - p_emit)
+        gate_lp = torch.where(sampled_emit, gate_lp_emit, gate_lp_think)
+    else:
+        want_emit = (gate_clamped >= emit_threshold) | force_emit
+        gate_lp = None
+        sampled_emit = None
+        in_sample_range = None
+        p_emit = None
+
+    next_logits[:, thinking_token_id] = -float("inf")
+    if min_emit_before_eos > 0 and eos_token_id is not None:
+        mask = emit_counts < min_emit_before_eos
+        if mask.any():
+            next_logits_clone = next_logits.clone()
+            next_logits_clone[mask, int(eos_token_id)] = -float("inf")
+            next_logits = next_logits_clone
+
+    if temperature <= 0.0:
+        emit_toks = next_logits.argmax(dim=-1)
+    else:
+        probs = F.softmax(next_logits / temperature, dim=-1)
+        emit_toks = torch.multinomial(probs, num_samples=1).squeeze(-1)
+    log_probs_full = F.log_softmax(next_logits / max(temperature, 1e-8), dim=-1)
+    emit_lp = log_probs_full.gather(1, emit_toks.unsqueeze(1)).squeeze(1)
+
+    think_tok_t = torch.full_like(emit_toks, int(thinking_token_id))
+    appended = torch.where(want_emit, emit_toks, think_tok_t)
+
+    # Per-row record + append to row-local full_ids. `new_pos` is the index
+    # the appended token WILL occupy in this row's own full_ids — identical to
+    # the single-problem path (where full_ids has no cross-problem padding).
+    for i in range(N_rows):
+        if bool(finished[i].item()):
+            # Finished rows still "append" in the incremental cache lock-step,
+            # but we do NOT record them and do NOT grow their full_ids (so the
+            # rollout's full_ids stays exactly what the single-problem path
+            # produced). The cache advance feeds garbage for these rows; their
+            # logits are never read again.
+            continue
+        new_pos = len(full_ids_per_row[i])   # row-local index of next token
+        if stochastic_gate and not bool(force_emit[i].item()):
+            p_emit_i = float(p_emit[i].item())
+            if p_emit_i < 0.1:
+                gate_sigma_buckets_per_row[i][0] += 1
+            elif p_emit_i < 0.5:
+                gate_sigma_buckets_per_row[i][1] += 1
+            elif p_emit_i < 0.9:
+                gate_sigma_buckets_per_row[i][2] += 1
+            else:
+                gate_sigma_buckets_per_row[i][3] += 1
+            in_range_i = bool(in_sample_range[i].item())
+            if in_range_i:
+                gate_decisions_per_row[i].append(bool(sampled_emit[i].item()))
+                gate_log_probs_per_row[i].append(float(gate_lp[i].item()))
+                gate_positions_per_row[i].append(int(new_pos))
+                gate_n_sampled_per_row[i] += 1
+            else:
+                gate_n_decisive_per_row[i] += 1
+        if bool(want_emit[i].item()):
+            tok = int(emit_toks[i].item())
+            is_eos = (eos_token_id is not None and tok == int(eos_token_id))
+            if is_eos:
+                finished[i] = True
+                # Still append so the cache lock-step has a token, but mark
+                # finished so it isn't recorded. Match single-problem path:
+                # there, the EOS token IS appended to ids (the row's full_ids
+                # would include it) but not to emit_*. To stay byte-identical
+                # to rollout_group_batched's full_ids (which DOES keep the
+                # appended emit token at the EOS step), append it here too.
+                full_ids_per_row[i].append(tok)
+                continue
+            emit_token_ids_per_row[i].append(tok)
+            emit_log_probs_per_row[i].append(float(emit_lp[i].item()))
+            emit_positions_per_row[i].append(int(new_pos))
+            full_ids_per_row[i].append(tok)
+            emit_counts[i] = emit_counts[i] + 1
+            think_counts_this_step[i] = 0
+            if int(emit_counts[i].item()) >= max_gen:
+                finished[i] = True
+        else:
+            full_ids_per_row[i].append(int(thinking_token_id))
+            think_counts_this_step[i] = think_counts_this_step[i] + 1
+            think_totals[i] = think_totals[i] + 1
+
+    return appended
+
+
 @torch.no_grad()
 def rollout_one(model, tokenizer, prompt_ids: torch.Tensor, *,
                  thinking_token_id: int,
@@ -626,6 +1164,8 @@ def run_trajectories_for_group(
     rollout_fn: Callable, grade_fn: Callable, extract_fn: Callable,
     n_rollouts: int, max_turns: int, carry_history: bool,
     pass_threshold: float = 0.5,
+    grade_batch_fn: Callable | None = None,
+    precomputed_turn0: list | None = None,
 ) -> list[Trajectory]:
     """Run N feedback-guided revision trajectories on one problem.
 
@@ -638,15 +1178,32 @@ def run_trajectories_for_group(
     turn re-rolls ONLY the still-unsolved lineages, one at a time, with a
     repair prompt built from the latest (or full, if carry_history) failure.
 
+    `precomputed_turn0` (optional): a list of N Rollout objects for turn 0,
+    already generated by the cross-problem batched decode
+    (`rollout_turn0_batched_across_problems`). When provided, `rollout_fn` is
+    NOT called for turn 0 — the rollouts are used as-is. Turns ≥1 still call
+    `rollout_fn`. This is the only behavioural difference and it is exactly
+    semantics-preserving: the supplied turn-0 rollouts are byte-identical (on
+    the production incremental path, by construction) to what `rollout_fn`
+    would have produced per-problem.
+
     Returns N Trajectory objects (one per lineage). `max_turns == 1` produces
     one-turn trajectories → byte-identical to the legacy single-shot path.
     """
-    # Turn 0: N parallel rollouts.
-    rollouts0 = rollout_fn(prompt_text, n_rollouts)
+    # Turn 0: N parallel rollouts. Grade all N in parallel (each grade() forks
+    # a subprocess, so threads give real parallelism) when a batch grader is
+    # supplied — otherwise serial via grade_fn (keeps the function mock-testable).
+    if precomputed_turn0 is not None:
+        rollouts0 = precomputed_turn0
+    else:
+        rollouts0 = rollout_fn(prompt_text, n_rollouts)
+    codes0 = [extract_fn(r) for r in rollouts0]
+    if grade_batch_fn is not None:
+        grades0 = grade_batch_fn([(problem, c) for c in codes0])
+    else:
+        grades0 = [grade_fn(problem, c) for c in codes0]
     trajectories: list[Trajectory] = []
-    for r in rollouts0:
-        code = extract_fn(r)
-        g = grade_fn(problem, code)
+    for r, code, g in zip(rollouts0, codes0, grades0):
         traj = Trajectory(problem_id=str(problem.task_id))
         traj.turns.append(Turn(prompt_text=prompt_text, rollout=r,
                                score=float(g.score), tier=g.tier,
@@ -1013,14 +1570,57 @@ def _run_multiturn_step(args, batch_problems, model_module, tok, device, *,
     def _grade_fn(problem, code):
         return grade(problem, code, timeout_s=5)
 
+    def _grade_batch_fn(jobs):
+        # Grade the N turn-0 rollouts concurrently (subprocess fork/wait).
+        return grade_in_parallel(jobs, timeout_s=5, max_workers=8)
+
+    # --- Turn-0 rollouts for ALL problems in ONE batched decode loop. ---
+    # DeltaNet decode is memory-bandwidth-bound, so a single B*N-row loop costs
+    # ~the same wall-time as one N-row loop → ~B× speedup on the dominant
+    # (turn-0) phase. Turns ≥1 (revision) stay per-trajectory below. The
+    # per-row rollouts are byte-identical (on the incremental path, by
+    # construction: each problem is prefilled over ONLY its own prompt) to what
+    # the per-problem `_rollout_fn` would have produced. `--no_batch_turn0`
+    # falls back to the legacy per-problem turn-0 path.
+    prompt_texts = [build_mbpp_prompt(prob) for prob in batch_problems]
+    precomputed_per_group: list[list | None] = [None] * len(batch_problems)
+    if (getattr(args, "batch_turn0", True)
+            and len(batch_problems) > 1):
+        prompt_ids_list = [
+            tok(pt, return_tensors="pt").input_ids.to(device)
+            for pt in prompt_texts
+        ]
+        budgets_per_problem = [
+            compute_think_budget_spread(
+                args.total_think_budget, args.grpo_n_group,
+                args.think_budget_diversity)
+            for _ in batch_problems
+        ]
+        flat = rollout_turn0_batched_across_problems(
+            model_module, tok, prompt_ids_list,
+            n_rollouts=args.grpo_n_group,
+            budgets_per_problem=budgets_per_problem,
+            thinking_token_id=thinking_token_id, eos_token_id=tok.eos_token_id,
+            max_gen=args.max_gen, max_think_per_step=args.max_think_per_step,
+            emit_threshold=args.emit_threshold, gate_floor=args.gate_floor,
+            temperature=args.temperature,
+            min_emit_before_eos=args.min_emit_before_eos,
+            stochastic_gate=args.stochastic_gate,
+            gate_sample_range_low=args.gate_sample_range_low,
+            gate_sample_range_high=args.gate_sample_range_high)
+        precomputed_per_group = [[] for _ in batch_problems]
+        for pi, r in flat:
+            precomputed_per_group[pi].append(r)
+
     trajectories_per_group: list[list[Trajectory]] = []
-    for prob in batch_problems:
-        prompt_text = build_mbpp_prompt(prob)
+    for prob, prompt_text, pre in zip(
+            batch_problems, prompt_texts, precomputed_per_group):
         trajs = run_trajectories_for_group(
             prob, prompt_text,
             rollout_fn=_rollout_fn, grade_fn=_grade_fn, extract_fn=_extract,
             n_rollouts=args.grpo_n_group, max_turns=args.max_turns,
-            carry_history=args.carry_history)
+            carry_history=args.carry_history, grade_batch_fn=_grade_batch_fn,
+            precomputed_turn0=pre)
         trajectories_per_group.append(trajs)
 
     # Per-trajectory improvement-shaped reward (§2.2).
@@ -1228,6 +1828,19 @@ def main():
                          "(otherwise the CoT prose breaks exec). Required "
                          "when --load_ckpt is a Qwen-distilled SFT ckpt — "
                          "without it HumanEval is structurally 0/164.")
+    p.add_argument("--batch_turn0", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="EXPERIMENTAL (default OFF until a rollout-level GPU "
+                         "equivalence diff confirms the real-kernel cache "
+                         "merge; CPU-equivalent + temp-0 A/B was inconclusive). "
+                         "Generate turn-0 rollouts for ALL B problems in ONE "
+                         "B*N-row decode loop (vs B separate N-row loops). "
+                         "DeltaNet decode is bandwidth-bound so this is a "
+                         "~B× speedup on the dominant rollout phase, and is "
+                         "byte-identical to the per-problem path on the "
+                         "incremental decode path (each problem is prefilled "
+                         "over only its own prompt). --no-batch_turn0 reverts "
+                         "to the legacy per-problem turn-0 loop.")
     p.add_argument("--smoke", action="store_true",
                     help="Run a tiny end-to-end smoke (2 steps, B=N=2, max_gen=32).")
     p.add_argument("--state_readonly_at_think", action="store_true",
@@ -1479,7 +2092,10 @@ def main():
                   f" (frozen, kl_coef={args.kl_coef})")
         ref_model, _ = build_model_from_ckpt(args.load_ckpt,
                                              force_state_readonly=_force_sr)
-        ref_model = ref_model.to(device).eval()
+        # bf16 reference params: halves the resident KL-ref copy (~1.2GB). The
+        # ref only supplies detached log-probs for a soft KL penalty, so bf16
+        # precision is ample. (The policy stays fp32-master under autocast.)
+        ref_model = ref_model.to(device).eval().bfloat16()
         for _p in ref_model.parameters():
             _p.requires_grad = False
 
@@ -1575,9 +2191,11 @@ def main():
             model=args.judge_model, server_url=args.judge_url,
             strip_comments_first=args.judge_strip_comments)
 
-    # ---- Optimizer
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
-                             weight_decay=0.01)
+    # ---- Optimizer. BF16StateAdamW stores exp_avg/exp_avg_sq in bf16 (math
+    # in fp32, lift→step→cast back) — lossless vs stock AdamW, saves ~half the
+    # optimizer state (~2.4GB for 600M) → headroom for the co-resident judge.
+    opt = BF16StateAdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
+                         weight_decay=0.01)
 
     # ---- Loop
     rng = torch.Generator().manual_seed(args.seed + rank)

@@ -613,6 +613,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gist_horizons", type=str, default="16,64,256",
                    help="Comma-separated future-window sizes K for the "
                         "gist loss (one prediction head per horizon).")
+    # --- v9: latent-thinking CO-TRAINING (make thinking USEFUL from day 1) ---
+    p.add_argument("--latent_cotrain_weight", type=float, default=0.0,
+                   help="Weight on the latent-thinking co-training loss "
+                        "(grad CE on the post-R-latent-think prediction). "
+                        "0 disables (default). Gives the trunk gradient to do "
+                        "useful sequential computation during thinking. "
+                        "Requires --state_readonly_at_think + --output_gate.")
+    p.add_argument("--latent_cotrain_R", type=int, default=4,
+                   help="Number of state-readonly latent think steps in the "
+                        "co-training loss.")
+    p.add_argument("--latent_cotrain_sample_frac", type=float, default=0.05,
+                   help="Fraction of clean positions co-trained per step.")
+    p.add_argument("--latent_cotrain_max_positions", type=int, default=32,
+                   help="Hard cap on latent-cotrain positions per step "
+                        "(grad through R forwards — keep small for memory).")
     p.add_argument("--bf16_optim_state", action="store_true",
                    help="Store optimizer state (AdamW exp_avg/exp_avg_sq, "
                         "Muon momentum_buffer) in bf16 instead of fp32. "

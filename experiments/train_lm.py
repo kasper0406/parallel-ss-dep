@@ -44,6 +44,7 @@ from experiments.thinking import (
     choose_explore_actions,
     choose_think_actions,
     cross_entropy_masking_token,
+    latent_cotrain_loss,
     mask_token_logit,
 )
 
@@ -1379,6 +1380,7 @@ def main():
             # --grad_accum microbatches, one optimizer step per `step`.
             # The gate/plain-loss branches live in _nonthink_forward_loss.
             n_micro = max(1, args.grad_accum)
+            _latent_cotrain_diag = None
             for micro in range(n_micro):
                 if micro > 0:
                     try:
@@ -1401,12 +1403,43 @@ def main():
                             model, x, y, args, step, bracket_deltas,
                             doc_ids=doc_ids, gist_horizons=gist_horizons,
                             fwd_model=ddp_model)
+                    # Snapshot the MAIN-forward gate NOW, before any aux loss
+                    # (latent_cotrain) runs an extra forward that clobbers
+                    # model._last_gate — the documented 2026-05-27 footgun.
+                    main_gate = getattr(model, "_last_gate", None)
                     loss = lm_loss + args.aux_weight * aux_loss
                     loss = loss + _z_loss_term(logits, args.z_loss)
                     if args.output_gate and args.gate_entropy_aux_weight > 0.0:
                         loss = loss + args.gate_entropy_aux_weight * gate_aux_loss
                     if args.gist_loss_weight > 0.0:
                         loss = loss + args.gist_loss_weight * gist_loss
+                    # v9: latent-thinking co-training — grad CE on the
+                    # post-R-latent-think prediction so the trunk learns to do
+                    # useful computation during thinking. Logs mean Δlogp (the
+                    # "is thinking becoming useful" signal: climbs from ≈-7
+                    # toward 0/positive). Requires --no-compile (extra forwards).
+                    # Fire ONCE per optimizer step (last microbatch only): the
+                    # latent loss runs ~5 extra eager forwards, so doing it on
+                    # every microbatch was the main throughput killer. A single
+                    # 24-position sample per step is plenty of signal. Scale by
+                    # n_micro so the per-step gradient still matches
+                    # --latent_cotrain_weight after the (loss / n_micro).backward().
+                    if (getattr(args, "latent_cotrain_weight", 0.0) > 0.0
+                            and _is_last_micro
+                            and thinking_token_id is not None
+                            and int(thinking_token_id) != int(pad_token_id)):
+                        _lc = latent_cotrain_loss(
+                            model, x, y, R=args.latent_cotrain_R,
+                            thinking_token_id=int(thinking_token_id),
+                            sample_frac=args.latent_cotrain_sample_frac,
+                            max_positions=args.latent_cotrain_max_positions,
+                            max_prefix_len=128,
+                            pad_id=int(pad_token_id))
+                        if _lc is not None:
+                            _lc_loss, _lc_delta, _lc_n = _lc
+                            loss = loss + (n_micro * args.latent_cotrain_weight) \
+                                * _lc_loss
+                            _latent_cotrain_diag = (_lc_delta, _lc_n)
                     # PKM diversity-bonus: -H(slot-selection distribution) per
                     # head, averaged across batch and heads. We MAXIMISE entropy
                     # so the auxiliary loss is NEGATIVE entropy. This is the
@@ -1419,8 +1452,6 @@ def main():
                             and getattr(args, "pkm_diversity_weight", 0.0) > 0.0):
                         div_loss = _pkm_diversity_loss(model.pkm_layer)
                         loss = loss + args.pkm_diversity_weight * div_loss
-                    # Snapshot the main-forward gate for the emit-CE diagnostic.
-                    main_gate = getattr(model, "_last_gate", None)
                     (loss / n_micro).backward()
         _log_this_step = (step % args.log_every == 0 or step == args.steps)
         # Per-layer diagnostics: grad norms must be read before clip; the
@@ -1463,6 +1494,10 @@ def main():
                     f"{scheduler.get_last_lr()[0]:>9.2e}")
             if args.gist_loss_weight > 0.0:
                 line += f"  gist={gist_loss.item():.4f}"
+            if getattr(args, "latent_cotrain_weight", 0.0) > 0.0 and \
+                    _latent_cotrain_diag is not None:
+                _d, _n = _latent_cotrain_diag
+                line += f"  latent(Δlogp={_d:+.3f},n={_n})"
             if args.feedback != "none" or fb_xattn_pairs:
                 alphas = model.feedback_alphas()
                 if not alphas:

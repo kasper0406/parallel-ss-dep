@@ -529,6 +529,142 @@ except Exception:  # pragma: no cover
     pass
 
 
+# ---------------------------------------------------------------------------
+# Latent thinking CO-TRAINING loss (v9 — make thinking USEFUL from day 1).
+#
+# The measurement primitive above is @no_grad. CO-TRAINING needs gradient to
+# flow through the R latent steps INTO the trunk, so the trunk learns to do
+# useful sequential computation during thinking. On v8 (no latent co-training)
+# the probe showed latent thinking HURTS (Δlogp ≈ -7). This loss trains the
+# trunk so the post-R-latent-think prediction of the TRUE next token is good —
+# the direct analog of the validated latent_think.py final-answer supervision,
+# applied to real pretrain text. Co-trained alongside the normal no-think LM
+# loss, the gate can then learn WHERE thinking helps.
+# ---------------------------------------------------------------------------
+
+
+def _latent_think_logits_grad(model, prefixes: torch.Tensor, *, R: int,
+                              thinking_token_id: int) -> torch.Tensor:
+    """Grad-enabled twin of `_latent_think_logits` — gradient flows through the
+    R latent steps into the trunk. Returns logits (N, V) at the think slot."""
+    base_emb = model.embed(prefixes)
+    N = prefixes.shape[0]
+    think_col = torch.full((N, 1), int(thinking_token_id),
+                           dtype=prefixes.dtype, device=prefixes.device)
+    ids = torch.cat([prefixes, think_col], dim=1)
+    _l0, h0 = _logits_hidden(model(prefixes, return_hidden=True))
+    z = h0[:, -1:, :]
+    last_logits = None
+    for _ in range(max(1, int(R))):
+        ie = torch.cat([base_emb, z.to(base_emb.dtype)], dim=1)
+        logits, h = _logits_hidden(model(ids, inputs_embeds=ie,
+                                         return_hidden=True))
+        z = h[:, -1:, :]
+        last_logits = logits[:, -1, :]
+    return last_logits
+
+
+def _latent_clean_mask(input_ids, targets, *, thinking_token_id, pad_id, eos_id):
+    valid = targets != -100
+    valid = valid & (targets != int(thinking_token_id)) & (targets != int(pad_id))
+    valid = valid & (input_ids != int(thinking_token_id)) & (input_ids != int(pad_id))
+    if eos_id is not None:
+        valid = valid & (targets != int(eos_id))
+    valid[:, input_ids.shape[1] - 1] = False  # need a t+1 target
+    return valid
+
+
+def latent_cotrain_loss(model, input_ids: torch.Tensor, targets: torch.Tensor,
+                        *, R: int, thinking_token_id: int,
+                        sample_frac: float = 0.05, max_positions: int = 32,
+                        max_prefix_len: int = 256,
+                        pad_id: int = 0, eos_id: int | None = None,
+                        generator: torch.Generator | None = None):
+    """Grad CE on the post-R-latent-think prediction at sampled positions.
+
+    Returns (loss, mean_delta_logp, n_positions) where ``mean_delta_logp`` is
+    the (detached) diagnostic Δlogp = logp_after_R_thinks(true) −
+    logp_no_think(true): the v9 validation signal — it should climb from v8's
+    ≈ -7 toward 0/positive as the trunk learns to use thinking. ``None`` if no
+    positions sampled.
+    """
+    assert int(thinking_token_id) != int(pad_id), "think id must differ from pad"
+    B, T = input_ids.shape
+    valid = _latent_clean_mask(input_ids, targets,
+                               thinking_token_id=thinking_token_id,
+                               pad_id=pad_id, eos_id=eos_id)
+    bsel, tsel = torch.nonzero(valid, as_tuple=True)
+    P = bsel.numel()
+    # FIXED-SHAPE for torch.compile: the latent extra forward must have a
+    # CONSTANT shape (max_positions, max_prefix_len+1) so the compiled
+    # model.forward specializes ONCE instead of recompiling/Inductor-asserting
+    # on every new (n, L). So: require >= max_positions valid positions, sample
+    # EXACTLY that many, and always use the full max_prefix_len window. Skip
+    # (None) when a microbatch has too few valid positions — it's a sampled
+    # aux loss, dropping the occasional microbatch costs nothing. (sample_frac
+    # is unused in fixed-shape mode; kept for signature compatibility.)
+    del sample_frac
+    if P < max_positions:
+        return None
+    gdev = generator.device if generator is not None else bsel.device
+    perm = torch.randperm(P, generator=generator,
+                          device=gdev)[:max_positions].to(bsel.device)
+    bsel, tsel = bsel[perm], tsel[perm]
+    true_next = targets[bsel, tsel]                              # (max_positions,)
+    Lmax = int(max_prefix_len)
+    rows = []
+    for j in range(bsel.numel()):
+        b, t = int(bsel[j].item()), int(tsel[j].item())
+        pref = input_ids[b, : t + 1][-Lmax:]
+        if pref.numel() < Lmax:
+            pad = torch.full((Lmax - pref.numel(),), pad_id, dtype=pref.dtype,
+                             device=input_ids.device)
+            pref = torch.cat([pad, pref], dim=0)                 # LEFT pad
+        rows.append(pref)
+    prefixes = torch.stack(rows, dim=0)
+
+    # The extra forwards below clobber the model's per-step diagnostic stashes
+    # (_last_gate*, memory._last_*), which the main training loop indexes with
+    # the MAIN-batch shape. Save them and restore at the end so this loss is
+    # transparent to every downstream diagnostic (the documented 2026-05-27
+    # footgun, generalized).
+    mem = getattr(model, "memory", None)
+    _saved = {a: getattr(model, a, None)
+              for a in ("_last_gate", "_last_gate_logits")}
+    _saved_mem = ({a: getattr(mem, a, None)
+                   for a in ("_last_injection", "_last_write_gate")}
+                  if mem is not None else {})
+    try:
+        logits = _latent_think_logits_grad(model, prefixes, R=R,
+                                           thinking_token_id=thinking_token_id)
+        loss = F.cross_entropy(logits.float(), true_next)
+        with torch.no_grad():
+            lpR = F.log_softmax(logits.float(), dim=-1).gather(
+                1, true_next.view(-1, 1)).squeeze(1)
+            base = _logits_hidden(model(prefixes, return_hidden=True))[0]
+            lp0 = F.log_softmax(base[:, -1, :].float(), dim=-1).gather(
+                1, true_next.view(-1, 1)).squeeze(1)
+            mean_delta = float((lpR - lp0).mean().item())
+    finally:
+        for a, v in _saved.items():
+            setattr(model, a, v)
+        for a, v in _saved_mem.items():
+            setattr(mem, a, v)
+    return loss, mean_delta, int(bsel.numel())
+
+
+# Keep the variable-shape, return_hidden latent extra-forward OUT of the
+# compiled graph: handing `hidden` out of a compiled forward trips
+# AOTAutograd's output-alias replay (the gist-loss-inside-forward workaround
+# exists for the same reason). dynamo.disable runs this eager while the main
+# training forward stays compiled (the bulk of the speedup). The fixed-shape
+# sampling above is the additional safety net against recompile storms.
+try:  # pragma: no cover - depends on torch build
+    latent_cotrain_loss = torch._dynamo.disable(latent_cotrain_loss)  # type: ignore
+except Exception:  # pragma: no cover
+    pass
+
+
 def build_replay_batch(
     items: list[ThinkReplay],
     block_size: int,

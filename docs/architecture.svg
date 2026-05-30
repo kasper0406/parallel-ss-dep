@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 880" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 z" fill="#5f6368"/>
+    </marker>
+    <marker id="fbarrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 z" fill="#ea4335"/>
+    </marker>
+    <marker id="sidearrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 z" fill="#f9ab00"/>
+    </marker>
+  </defs>
+
+  <style>
+    .t   { fill:#202124; }
+    .mut { fill:#5f6368; }
+    .lbl { font-size:13px; font-weight:600; }
+    .sub { font-size:11px; }
+    .ttl { font-size:20px; font-weight:700; }
+    .flow{ stroke:#5f6368; stroke-width:2; fill:none; }
+    .fb  { stroke:#ea4335; stroke-width:2; fill:none; stroke-dasharray:5 4; }
+    .side{ stroke:#f9ab00; stroke-width:2; fill:none; }
+    .core  { fill:#e8f0fe; stroke:#4285f4; stroke-width:1.5; }
+    .mem   { fill:#fef7e0; stroke:#f9ab00; stroke-width:1.5; }
+    .head  { fill:#e6f4ea; stroke:#34a853; stroke-width:1.5; }
+    .plain { fill:#f1f3f4; stroke:#9aa0a6; stroke-width:1.5; }
+  </style>
+
+  <text x="430" y="34" text-anchor="middle" class="t ttl">Small Super-coder — model architecture</text>
+  <text x="430" y="54" text-anchor="middle" class="mut sub">DeltaNet linear-RNN backbone · shallow-wide trunk · sparse FiLM feedback · PKM + Working Memory · emit/think gate</text>
+
+  <!-- Input -->
+  <rect x="330" y="74" width="200" height="34" rx="6" class="plain"/>
+  <text x="430" y="96" text-anchor="middle" class="t lbl">Input token ids</text>
+
+  <!-- Embedding -->
+  <line x1="430" y1="108" x2="430" y2="126" class="flow" marker-end="url(#arrow)"/>
+  <rect x="320" y="126" width="220" height="44" rx="6" class="core"/>
+  <text x="430" y="146" text-anchor="middle" class="t lbl">Embedding</text>
+  <text x="430" y="162" text-anchor="middle" class="mut sub">token table + [THINK] row (init = embed mean)</text>
+
+  <!-- Trunk -->
+  <line x1="430" y1="170" x2="430" y2="190" class="flow" marker-end="url(#arrow)"/>
+  <rect x="290" y="190" width="280" height="338" rx="8" class="core"/>
+  <text x="430" y="214" text-anchor="middle" class="t lbl">DeltaNet trunk &#183; 10 wide blocks (d=1280)</text>
+
+  <!-- block rows -->
+  <g>
+    <rect x="312" y="226" width="236" height="26" rx="4" fill="#ffffff" stroke="#4285f4" stroke-width="1"/>
+    <text x="430" y="243" text-anchor="middle" class="t sub">Block 0  (early)</text>
+    <rect x="312" y="256" width="236" height="26" rx="4" fill="#ffffff" stroke="#4285f4" stroke-width="1"/>
+    <text x="430" y="273" text-anchor="middle" class="t sub">Block 1 &#8230; 4</text>
+    <rect x="312" y="286" width="236" height="34" rx="4" fill="#fff8e1" stroke="#f9ab00" stroke-width="1.2"/>
+    <text x="430" y="303" text-anchor="middle" class="t sub">Block 5   &#8594; PKM side-table</text>
+    <text x="430" y="316" text-anchor="middle" class="mut sub">chunk_delta_rule · GLU-FFN · residual</text>
+    <rect x="312" y="324" width="236" height="26" rx="4" fill="#ffffff" stroke="#4285f4" stroke-width="1"/>
+    <text x="430" y="341" text-anchor="middle" class="t sub">Block 6 &#8230; 8</text>
+    <rect x="312" y="354" width="236" height="26" rx="4" fill="#ffffff" stroke="#4285f4" stroke-width="1"/>
+    <text x="430" y="371" text-anchor="middle" class="t sub">Block 9  (late)</text>
+  </g>
+
+  <text x="430" y="402" text-anchor="middle" class="mut sub">per block: DeltaNet linear-attention &#8594; GLU-FFN (pre-norm residual)</text>
+  <text x="430" y="420" text-anchor="middle" class="mut sub">bounded recurrent state &#183; O(T) &#183; no KV-cache</text>
+  <rect x="312" y="432" width="236" height="40" rx="5" fill="#fce8e6" stroke="#ea4335" stroke-width="1"/>
+  <text x="430" y="449" text-anchor="middle" class="t sub">state-readonly @ think  (DeltaNet &#946;=0)</text>
+  <text x="430" y="463" text-anchor="middle" class="mut sub">think tokens read state, never corrupt it</text>
+  <text x="430" y="500" text-anchor="middle" class="mut sub">cross-document isolation via cu_seqlens(doc_ids)</text>
+  <text x="430" y="517" text-anchor="middle" class="mut sub">activation checkpointing &#183; bf16 + tf32</text>
+
+  <!-- FiLM feedback loop (left) -->
+  <path d="M 290 360 C 210 360 210 250 290 250" class="fb" marker-end="url(#fbarrow)"/>
+  <text x="150" y="300" text-anchor="middle" class="t sub" fill="#c5221f">Sparse FiLM</text>
+  <text x="150" y="316" text-anchor="middle" class="mut sub">feedback</text>
+  <text x="150" y="334" text-anchor="middle" class="mut sub">late &#8594; early</text>
+  <text x="150" y="350" text-anchor="middle" class="mut sub">&#945;-gated, K=3</text>
+  <text x="150" y="366" text-anchor="middle" class="mut sub">self-feed</text>
+  <text x="150" y="384" text-anchor="middle" class="mut sub">(&#8722;3&#8211;5% PPL)</text>
+
+  <!-- PKM (right) -->
+  <path d="M 548 303 L 612 303" class="side" marker-end="url(#sidearrow)"/>
+  <path d="M 612 312 L 548 312" class="side" marker-end="url(#sidearrow)"/>
+  <rect x="612" y="270" width="220" height="68" rx="8" class="mem"/>
+  <text x="722" y="292" text-anchor="middle" class="t lbl">Product-Key Memory</text>
+  <text x="722" y="309" text-anchor="middle" class="mut sub">multi-head learned KV side-table</text>
+  <text x="722" y="325" text-anchor="middle" class="mut sub">~262k slots, top-k retrieve (after L5)</text>
+
+  <!-- out_norm -->
+  <line x1="430" y1="528" x2="430" y2="548" class="flow" marker-end="url(#arrow)"/>
+  <rect x="330" y="548" width="200" height="34" rx="6" class="plain"/>
+  <text x="430" y="570" text-anchor="middle" class="t lbl">out_norm</text>
+
+  <!-- Working Memory (right) -->
+  <path d="M 530 565 L 612 565" class="side" marker-end="url(#sidearrow)"/>
+  <path d="M 612 574 L 530 574" class="side" marker-end="url(#sidearrow)"/>
+  <rect x="612" y="540" width="220" height="68" rx="8" class="mem"/>
+  <text x="722" y="562" text-anchor="middle" class="t lbl">Working Memory</text>
+  <text x="722" y="579" text-anchor="middle" class="mut sub">write-gated bounded buffer of past</text>
+  <text x="722" y="595" text-anchor="middle" class="mut sub">hidden states &#183; soft-read @ think</text>
+
+  <!-- to heads -->
+  <line x1="430" y1="582" x2="430" y2="618" class="flow" marker-end="url(#arrow)"/>
+  <line x1="170" y1="618" x2="690" y2="618" class="flow"/>
+  <line x1="170" y1="618" x2="170" y2="642" class="flow" marker-end="url(#arrow)"/>
+  <line x1="430" y1="618" x2="430" y2="642" class="flow" marker-end="url(#arrow)"/>
+  <line x1="690" y1="618" x2="690" y2="642" class="flow" marker-end="url(#arrow)"/>
+
+  <!-- heads -->
+  <rect x="78" y="642" width="184" height="58" rx="8" class="head"/>
+  <text x="170" y="664" text-anchor="middle" class="t lbl">lm_head</text>
+  <text x="170" y="681" text-anchor="middle" class="mut sub">next-token logits</text>
+  <text x="170" y="695" text-anchor="middle" class="mut sub">(tied embeddings)</text>
+
+  <rect x="338" y="642" width="184" height="58" rx="8" class="head"/>
+  <text x="430" y="664" text-anchor="middle" class="t lbl">gate head</text>
+  <text x="430" y="681" text-anchor="middle" class="mut sub">per-position &#963;</text>
+  <text x="430" y="695" text-anchor="middle" class="mut sub">emit vs. think</text>
+
+  <rect x="598" y="642" width="184" height="58" rx="8" class="head"/>
+  <text x="690" y="664" text-anchor="middle" class="t lbl">gist heads</text>
+  <text x="690" y="681" text-anchor="middle" class="mut sub">multi-horizon future</text>
+  <text x="690" y="695" text-anchor="middle" class="mut sub">hidden (aux loss)</text>
+
+  <!-- legend -->
+  <line x1="40" y1="736" x2="820" y2="736" stroke="#dadce0" stroke-width="1"/>
+  <g transform="translate(70,756)">
+    <rect x="0" y="0" width="16" height="16" rx="3" class="core"/>
+    <text x="24" y="13" class="mut sub">linear-RNN trunk</text>
+    <rect x="170" y="0" width="16" height="16" rx="3" class="mem"/>
+    <text x="194" y="13" class="mut sub">external memory</text>
+    <rect x="350" y="0" width="16" height="16" rx="3" class="head"/>
+    <text x="374" y="13" class="mut sub">output heads</text>
+    <line x1="520" y1="8" x2="556" y2="8" class="fb"/>
+    <text x="564" y="13" class="mut sub">FiLM feedback</text>
+  </g>
+  <text x="430" y="806" text-anchor="middle" class="mut sub">Validated lifts: FiLM (&#8722;3&#8211;5% PPL) &#183; PKM (&#8722;5 HumanEval in ablation) &#183; WM (98% long-context recall).</text>
+  <text x="430" y="824" text-anchor="middle" class="mut sub">Execution-grounded GRPO (code-grader reward) is the post-pretrain capability lever. Thinking gate: active research.</text>
+</svg>

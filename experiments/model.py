@@ -2699,8 +2699,20 @@ class TinyLM(nn.Module):
                 tm, prior_run + 1, torch.zeros_like(prior_run))
 
         if self.max_T > 0:
-            pos = torch.tensor([cache["seen"]], device=device, dtype=torch.long)
-            x = x + self.pos_embed(pos)
+            # Per-row absolute position. When `cache["seen_per_row"]` is set
+            # (cross-problem batched decode: rows have DIFFERENT prompt
+            # lengths, so a single scalar `seen` would give every row the
+            # wrong positional embedding), index pos_embed per row. The
+            # legacy scalar `cache["seen"]` path is unchanged (all rows share
+            # one prompt length, e.g. `rollout_group_batched`).
+            seen_per_row = cache.get("seen_per_row")
+            if seen_per_row is not None:
+                pos = seen_per_row.to(device=device, dtype=torch.long)  # (B,)
+                x = x + self.pos_embed(pos).unsqueeze(1)                # (B,1,d)
+            else:
+                pos = torch.tensor([cache["seen"]], device=device,
+                                   dtype=torch.long)
+                x = x + self.pos_embed(pos)
 
         fla_cache = cache["fla_cache"]
         use_film_at_decode = (self.feedback_pairs
@@ -2771,6 +2783,8 @@ class TinyLM(nn.Module):
             self._last_gate = g
 
         cache["seen"] = int(cache["seen"]) + 1
+        if cache.get("seen_per_row") is not None:
+            cache["seen_per_row"] = cache["seen_per_row"] + 1
 
         if return_hidden:
             return lm_logits, h_normed, cache

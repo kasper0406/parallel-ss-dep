@@ -1,346 +1,106 @@
 # state-dep-parallel
 
-## Current direction — "Small super-coder"
+A **small, efficient code model** built to punch above its weight on coding
+benchmarks under tight compute (2× RTX 5090, 32 GB each, no NVLink).
+Architectural research feeds that target. Engineering details and the running
+work log live in [`GEMINI.md`](GEMINI.md); project framing in
+[`THESIS.md`](THESIS.md).
 
-The active goal of this repo is to build a **small, efficient code model that competes with much larger models on coding benchmarks** under tight compute (2× RTX 5090). The architectural research below feeds into that target.
+## Architecture
 
-Stack as of 2026-05-18:
-- **DeltaNet** backbone (`--arch deltanet`) — bounded-state linear RNN, no KV-cache cost. *Note: `gated_deltanet` is broken on sm_120 RTX 5090 (FLA Triton kernel bug); plain `deltanet` works.*
-- **Shallow-wide trunk (v7.1, validated 2026-05-18)** — **10 layers × 896 d_model + 5 dense reverse FiLM pairs (0,5)(1,6)(2,7)(3,8)(4,9) + K=3 self-feed**. Iso-param swap of the 30L × 576d production trunk inspired by the "shallow + heavy feedback" structure of biological cortex. Trains **18 % faster wall-clock** at the same step budget and beats the deep baseline on final VAL ppl (5.83 vs 5.89 at 9300 steps / 2.13 B tokens). Cross-layer-attention sister run available (`--feedback_xattn`, `film_sigmoid` form with per-token gates and no_grad pass-1).
-- **Working memory** ([`experiments/model.py::WorkingMemory`](experiments/model.py)) — write-gated bounded buffer of past hidden states, read via soft attention at "think" positions. **+11.1 pp recall** on saturated MQAR (T=512 / K=128) vs DeltaNet alone.
-- **Product-Key Memory side-table (v7.1, validated 2026-05-18)** ([`experiments/memory_layer.py::PKMLayer`](experiments/memory_layer.py)) — 4 heads × 256² = 262 k learned KV slots dropped in after one block, sub-linear lookup via factorised sub-keys (Lample 2019). Original v5-pkm training was structurally broken (post-hoc probe: 97 % of value rows still at random init after 2.13 B tokens, only 4 % of slots ever used). **The v7.1 5-fix bootstrap package makes PKM actually learn**: output gate α with sign-preserving floor, ε-greedy slot exploration warmup, value-init at residual scale, LayerNorm-on-scores, slot-diversity bonus + 100× value-LR. Per-source PKM-toggle Δ on the final ckpt is **always positive** — wikipedia +0.099 CE, cybernative +0.063, bigvul +0.044 (fact-heavy wins largest, as Lample predicted). Full design: [`PKM_PLAN.md`](PKM_PLAN.md); fixes documented in [`CLAUDE.md`](CLAUDE.md).
-- **Output / thinking gate** with **entropy-grounded auxiliary target** (`--gate_entropy_aux_weight 0.1`) — supervises the gate logit with `target = exp(-H_t / T)` derived from the same forward's logits (detached). Confident position → emit, uncertain → think. Free signal, single forward.
-- **Mixed-corpus pretrain** (`experiments/data_mix.py`, `configs/pretrain_mix_v*.yaml`) — 11 weighted HuggingFace streams (code, instruct, CS textbooks, Wikipedia, BigVul + CyberNative CVE data). Cross-document state isolation via `cu_seqlens` from the per-position `doc_ids` (no recurrent-state leak across packed documents).
-- **Speed knobs**: `--bf16 --tf32 --compile` (strict-mode dynamo, no silent fallback — added 2026-05-18); `--bf16_optim_state` stores AdamW/Muon state in bf16; `BF16StateAdamW(compile_step=True)` fuses the optim-step Python loop into a torch-compiled kernel; `--activation_checkpointing` lets `--batch 14` fit at T=2048; FiLM K-self-feed K=3 warmup curriculum (`--feedback_self_k_warmup_steps`); xattn pass-1 runs `no_grad` (added 2026-05-18) so cross-layer attention costs the same as FiLM K=3 instead of ~2× more.
-- **Training-methodology fixes** — `--wd 0.01` (was 0.1, fixes residual-stream collapse); `--lr_schedule wsd` (warmup-stable-decay, replaces cosine); Muon for ≥2D hidden matrices + AdamW for tables / 1D / embeddings; FiLM α gets weight_decay = 0. Diagnostic tooling in [`diag_ckpt.py`](experiments/diag_ckpt.py), [`probe_v5_pkm_utilization.py`](experiments/probe_v5_pkm_utilization.py), [`probe_pkm_per_source.py`](experiments/probe_pkm_per_source.py).
-- **Execution-grounded RL** ([`experiments/train_rl_grader.py`](experiments/train_rl_grader.py)) — GRPO with the dense `code_grader` score (tier ladder: `syntax_error` 0.0 → `exec_error` 0.05 → `runtime_error` 0.2 → `partial` 0.2-0.9 → `pass` 1.0) as reward, MBPP problems, PPO clipped policy. First validated lift on v5-pkm-SFT base: gate evolves from "always emit" to selective, pass-rate climbs from 1/16 at step 14 to 14 cumulative passes in 82 steps. **Where future capability lives** — pretrain VAL ppl plateaus around 5.8 at our scale; HumanEval is 0/50 on every pretrain-only ckpt we've measured (v4, v5-pkm, v7.1). RL is the lever, with v7.1-pkm-film as the strongest base to start from.
+![Model architecture](docs/architecture.svg)
 
-Recent runs (2026-05-18):
-- **v7.1-pkm-film** (`launch_pretrain_mix_v7_pkm_film.sh`, 287 M params, 13.3 h on 1× RTX 5090) — **final VAL ppl 5.83**. Ckpt: `checkpoints/pretrain_mix_v7_pkm_film.pt`. The current SOTA pretrain base.
-- **v7.1-pkm-xattn** (`launch_pretrain_mix_v7_pkm_xattn.sh`, 287 M params, 13.0 h on 1× RTX 5090) — final VAL ppl 5.94.
-- **v4** (`launch_pretrain_mix_v4.sh`, 217 M params, 16.3 h) — final VAL ppl 5.89. Deep-trunk reference.
+## Stack
 
-Project framing: [`THESIS.md`](THESIS.md).
-Post-pretrain RL plan: [`PHASE_C_RL.md`](PHASE_C_RL.md).
-Architectural write-up: [`WORKING_MEMORY_FINDINGS.md`](WORKING_MEMORY_FINDINGS.md).
+- **DeltaNet** backbone — bounded-state linear RNN, no KV-cache cost.
+  (`gated_deltanet` is broken on sm_120; plain `deltanet` works.)
+- **Shallow-wide trunk** — 10L × 896d + 5 dense reverse-FiLM pairs + K=3
+  self-feed. Iso-param swap of the 30L × 576d trunk; ~18 % faster wall-clock,
+  matches/beats it on VAL ppl.
+- **Sparse FiLM feedback** — the headline architectural finding (below).
+- **Working Memory** — write-gated bounded buffer, read at think positions.
+  +11 pp on saturated MQAR recall; 98 % long-context recall.
+- **Product-Key Memory** — 262 k learned KV slots after one block. Load-bearing
+  on HumanEval (−5 in ablation) once the v7.1 bootstrap-fix package is used.
+- **Thinking gate** — per-position emit/think head. *Status below.*
+- **Mixed-corpus pretrain** with cross-document state isolation (`cu_seqlens`
+  from per-position `doc_ids`).
+- **Execution-grounded RL** ([`train_rl_grader.py`](experiments/train_rl_grader.py))
+  — GRPO with a dense `code_grader` reward. The post-pretrain capability lever.
 
----
+## Current status (honest)
 
-## Architecture-research background
+- **Best HumanEval pass@1: 16/164** (`rl_grader_phase_c_v2_step300`, KL-stable
+  GRPO on the Chinchilla-completed 287 M base).
+- **Validated primitives**: FiLM (−3–5 % PPL), PKM (−5 HumanEval ablation),
+  WM (98 % recall). These earn their place on their own metrics.
+- **The open question — does *thinking* improve task correctness?** Currently
+  **no** at this scale, and on a weak base it actively *hurts*: a held-out
+  probe shows discrete-token thinking gives negative next-token Δlogp, and a
+  thinking-on vs thinking-off HumanEval split is 3 vs 8 — the model thinks
+  where it's *uncertain*, but uncertainty ≠ "thinking helps". Latent
+  (high-bandwidth, Coconut-style) thinking works on synthetic reasoning tasks
+  but, bolted onto a converged trunk, costs base quality without a measured
+  win. The standing conclusion: a thinking mechanism has to be **co-trained
+  into a strong base**, not added post-hoc — and we **require a measured
+  thinking contribution before scaling on it**. Full trail in `GEMINI.md`.
+- Dead ends documented so they aren't repeated: discrete-token thinking
+  (never amplifies on this trunk), gate aux loss targeting the wrong
+  mechanism, latent thinking as a post-hoc bolt-on (regresses VAL),
+  continuation SFT/DPO on off-distribution data (regresses).
 
-Mapping the design space of **state-dependent, parallelizable RNN cells**
-— with a specific finding: in a DeltaNet stack, a *single*
-sparse late-to-early FiLM connection (a minimal-form descendant of
-GF-RNN-style top-down feedback) gives a robust **~3-5 % PPL lift**
-over the underlying linear-RNN cell that survives a **3.3× parameter
-scale-up** (217 M → 708 M) and an optimizer change (AdamW → Muon).
-Mechanistically characterized (Phase 14b–g) — multiplicative form +
-non-softmax aggregation finds a previously-unreported optimization
-basin — and extrapolates cleanly to 16× training context.
+## Headline architecture finding
 
-**Architectural lift over DeltaNet, all three scales:**
+**A single sparse late-to-early FiLM connection in a DeltaNet stack gives a
+robust ~3–5 % PPL lift that survives a 3.3× param scale-up and an optimizer
+change.** One late-layer output (lagged 1 token) modulates an early layer via
+FiLM with one learnable scalar α (+0.3 % params).
 
-| Scale / optimizer | DN baseline | + Sparse FiLM | Δ | α |
-|---|---|---|---|---|
-| 217 M / AdamW / 5 K | 51.00 | 49.40 | **−3.1 %** | −0.054 |
-| 360 M / Muon  / 15 K | 22.79 | 21.57 | **−5.4 %** | +0.158 |
-| 708 M / Muon  / 15 K | 35.38 | 34.26 | **−3.2 %** | −0.198 |
+| Setup | DN baseline | + Sparse FiLM | Δ |
+|---|---|---|---|
+| 217 M / AdamW / 5 K  | 51.00 | 49.40 (2,28) | **−3.1 %** |
+| 360 M / Muon / 15 K  | 22.79 | 21.57 (2,28) | **−5.4 %** |
+| 708 M / Muon / 15 K  | 35.38 | 34.26 (2,34) | **−3.2 %** |
 
-**Cross-architecture scoreboard** (codeparrot, Muon-tuned, T=512):
+3-seed reproducibility at 217 M: 49.40 ± 0.31 (σ < 1 %). K=3 self-feeding
+closes the train/inference gap → −1.5 % lift at **1× decode cost**, with RNN
+inference state 74× smaller than a matched Transformer's KV cache.
 
-```
-Vanilla Transformer @ 360M:                   18.78 PPL  ← strongest at this scale
-Sparse-(2, 34)-FiLM DeltaNet @ 708M:           34.26 PPL  ← deployment-memory-fair
-DeltaNet @ 708M:                               35.38 PPL
-```
+**Mechanism**: the lift comes from a negative-α subtractive basin reachable
+*iff* (i) modulation is multiplicative (FiLM-form, not Q-K-V additive) and
+(ii) cross-source aggregation is non-softmax (sum or sigmoid; softmax dilutes
+by 1/K). 20+ controlled ablations; either condition failing breaks the basin.
 
-The 708 M RNN is sized so its inference-time state is comparable to
-a 360 M Transformer's KV cache (deployment-memory parity). At this
-token budget (~30 M, far below Chinchilla-optimal for 708 M) the
-Transformer still wins on raw quality — we do **not** close the
-cross-class gap. What we do show is that the **architectural lift
-of sparse-FiLM over DeltaNet is robust** across 217 M → 360 M →
-708 M; the comparative claim against Transformer is scale- and
-optimizer-dependent.
-
-**Inference cost.** Originally the architecture required a 2-pass
-forward at both training and decode time (pass 1 produces the FiLM
-input, pass 2 is the actual model output) — and a naïve "lagged-
-cached" inference shortcut breaks quality (PPL 36.97, worse than
-plain DN at 35.38; see [`LATENCY_REPORT.md`](LATENCY_REPORT.md)).
-**Phase 21c–d fixes this**: training with K=3 self-feeding (the
-model's own lagged source-layer output as FiLM input) closes the
-train/inference gap entirely. At 708M, K=3 self-feeding gives PPL
-**34.85 at 1× decode cost** (vs std-2-pass 34.26 at 2× decode cost,
-or std-2-pass lagged-cached 36.97 — broken). The deployment story:
-
-| Variant @ 708M | PPL | Decode cost | vs DN baseline 35.38 |
-|---|---:|---:|---:|
-| Std-2-pass FiLM (2-pass eval) | 34.26 | 2× | −3.2 % |
-| **K=3 self-feeding FiLM (lagged-cached)** | **34.85** | **1×** | **−1.5 %** ⭐ |
-| Std-2-pass FiLM (lagged-cached, broken) | 36.97 | 1× | +4.5 % |
-
-The deployment-memory advantage is intact: the RNN inference state
-is **74× smaller** than a 360M Transformer's KV cache at 8K context
-(9.8 MB vs 720 MB). The honest deployment-fair claim is **−1.5 %
-lift at 1× decode cost** with K=3 self-feeding training.
-
-The high-level idea of upper-to-lower-layer feedback in stacked RNNs
-is not new — see *Related work* below — but the **specific minimal
-form, the modern linear-RNN context, and the mechanism analysis are.**
-
-- [`THESIS.md`](THESIS.md) — project framing: why methodology-stacking
-  at small scale is the bet, what the claim is and isn't
-- [`PHASE_C_RL.md`](PHASE_C_RL.md) — prediction-as-RL-signal proposal:
-  reward code that's both correct *and* whose behaviour the model
-  predicted; the RL plan for after Phase A pretrain + Phase B SFT
-- [`RESULTS.md`](RESULTS.md) — full empirical writeup, Phases 1-16
-- [`NEXT_DIRECTIONS.md`](NEXT_DIRECTIONS.md) — current research plan
-- [`HISTORY.md`](HISTORY.md) — earlier hybrid + Lean + Triton-kernel
-  work that preceded the architectural finding (Phases 1-13)
-- [`SESSION_FINDINGS.md`](SESSION_FINDINGS.md) — chronological session log
-- [`StateDep/`](StateDep/) — Lean project (13 monoids proved associative)
-- [`kernels/`](kernels/) — Triton kernels for sm_120
-- [`experiments/`](experiments/) — training drivers and architecture modules
-
-## Headline finding
-
-**A single sparse late-to-early FiLM connection in a DeltaNet stack
-gives a robust ~3-5 % PPL lift over the underlying linear-RNN cell.
-The lift survives 3.3× parameter scale-up and an optimizer change.**
-
-| Setup | DN baseline | + Sparse FiLM | Δ | α |
-|---|---|---|---|---|
-| 217 M / AdamW / 5 K steps  | 51.00 | 49.40 (2, 28) | **−3.1 %** | −0.054 |
-| 360 M / Muon  / 15 K steps | 22.79 | 21.57 (2, 28) | **−5.4 %** | +0.158 |
-| 708 M / Muon  / 15 K steps | 35.38 | 34.26 (2, 34) | **−3.2 %** | −0.198 |
-
-The architecture: a **single FiLM-style cross-layer connection** from
-a late layer's output (lagged by 1 token) to layer 2's input, with one
-learnable scalar α. +0.3 % extra parameters. The network discovers α
-from data; sign and magnitude depend on optimizer + scale (sign is
-*not* monotone in scale — see Phase 20), but the architectural lift
-holds across all three configurations we tested. Pair index scales
-with depth (`(2, 28)/30 ≈ (2, 34)/36`).
-
-3-seed reproducibility on the 217 M variant: **49.40 ± 0.31** (σ < 1 %).
-
-**Honest cross-architecture framing.** At 217 M / AdamW sparse-FiLM
-beat vanilla Transformer by 23 %; at 360 M with Muon (which was
-*designed* for Transformer attention matrices), Transformer wins.
-The 708 M run was sized for **deployment-memory parity** with a
-360 M Transformer (RNN state ≈ Transformer KV cache budget):
-
-```
-Vanilla Transformer @ 360M Muon:                    18.78 PPL
-Sparse-(2, 34)-FiLM DeltaNet @ 708M Muon:            34.26 PPL  ← deployment-memory-fair
-DeltaNet @ 708M Muon:                                35.38 PPL
-```
-
-At ~30 M training tokens (well below Chinchilla-optimal for 708 M),
-deployment-memory parity does **not** close the cross-class gap.
-What survives at scale is the architectural lift *within* the
-linear-RNN family. Honest framing: *sparse-FiLM is the strongest
-known modification within the linear-RNN family at the scales we
-can afford to train; the cross-architecture comparison would need a
-Chinchilla-scale or frontier-finetune follow-up*.
-
-```python
-                     pass-1 (vanilla forward)
-   x → L0 → L1 → L2 → ... → L28 → ... → L29 → out
-                      ↑                ↓
-                      └── lag(t-1) ────┤
-                          FiLM α≈−0.054 │
-                                         pass-2 input
-```
-
-## Current Frontier: Execution-grounded RL on the v5-pkm base
-
-### What's working (2026-05-16)
-
-- **PKM is a real token-efficiency win.** v5-pkm pretrain (218 M params, 884 M tokens, FiLM + WM + PKM) beats v3-long (no-PKM, 2.13 B tokens) on **every long-tail factual stream** (wikipedia −0.37 CE, bigvul −0.13, cybernative −0.12, python_codes −0.22) and ties overall CE — at 2.4× fewer tokens. PKM also broke the bigvul/cybernative monotonic upward drift that plagued v2/v3 pretrains. Per-head specialisation is concrete: single 1-in-262 k slots get hit 30-40× across 60-token generations.
-- **The thinking gate did learn an uncertainty signal during pretrain** — even though it was clamped at deploy. Inspection probe ([`experiments/inspect_v5_pkm.py`](experiments/inspect_v5_pkm.py)) on v5-pkm with `gate_floor=0.0` shows think_rate 83% on Wikipedia / Roman Empire prompts vs 7-10% on familiar code. WorkingMemory reads sharply (+53 to +63% below uniform, attending −40 to −200 tokens back into prompt). What pretrain *didn't* teach is using thinking *productively*: bursts increase but outputs degrade. That's an RL question, not a pretrain question.
-- **Execution-grounded RL is producing real capability lift.** [`train_rl_grader.py`](experiments/train_rl_grader.py) on the v5-pkm-SFT base with the dense `code_grader` reward, MBPP problems, ponder-cost shaping (`quadratic`, `counterfactual`, `warmup_steps=50`): pass-rate climbing from 1/16 rollouts at step 14 to 14 cumulative passes by step 82. The gate evolves from "always emit" toward "selective" (`think_rate` 0.69-1.00 in recent steps, `depth_mean` dropping after warmup) — exactly the design hypothesis: the dense reward + ponder cost teaches the model to think less but better.
-
-### Open follow-ups
-
-1. **Bigger SFT data** to cross 0/50 HumanEval baseline (currently the SFT'd v5-pkm scores 0/50; per memory this is a data-scale issue, not architecture).
-2. **Incremental decoding for rollouts** ([`experiments/layers.py::_FlaWrapper.forward_step`](experiments/layers.py) foundation shipped; FiLM K=3 + WorkingMemory buffer integration deferred).
-3. **Intra-document hard-token think-burst injection** at pretrain (currently only chunk boundaries) — the cleanest pretrain lever to teach "thinking should improve outputs" before RL.
-
-See [`PHASE_C_RL.md`](PHASE_C_RL.md) and [`NEXT_DIRECTIONS.md`](NEXT_DIRECTIONS.md).
-
-## Validation matrix
-
-| Metric | Result | Reference |
-|---|---|---|
-| Reproducibility (3 seeds) | 49.40 ± 0.31 (σ < 1 %) | RESULTS Phase 14 pre-flight |
-| Depth ablation | beats DN at 8L / 15L / 30L (−2.6 % / −0.8 % / −3.1 %) | Phase 14 |
-| TinyStories | −1.6 % vs DN (not code-specific) | Phase 14 |
-| 16× T extrapolation | stable −4–5 % at T=512 → 8192 | Phase 14 |
-| 8× T extrapolation, all SOTA baselines | wins at every T tested | Phase 16 |
-| Mechanism: 7+ controlled ablations | direction/target/source/aggregation/form all matter | Phase 14b–g |
-| Mechanism: cross-layer attention forms tested | sparse single-pair = FiLM-sum = sigmoid-attn (basin tied) | Phase 14d–g |
-
-## Mechanism
-
-The negative-α basin is reached **iff** two conditions hold:
-
-1. **Multiplicative output form** (FiLM-shaped `x · (1 + α·s) + α·t`,
-   not additive Q-K-V residual). The gradient on α flows through an
-   `x · scale` term that gives a strong, x-correlated direction. Pure
-   additive residuals lack this.
-2. **Non-softmax aggregation** across sources. Sum (`film_sum`) and
-   independent sigmoid gates (`film_sigmoid`) both work; softmax
-   routing causes 1/K-dilution at init that forces α toward 0.
-
-Either failure mode alone is sufficient to break the basin. With
-both conditions met, multiple architectures converge to PPL ≈ 49.4 at
-@30L:
-- Sparse single-pair (2, 28) FiLM
-- Multi-source FiLM-sum 3-source
-- Sigmoid-gated cross-layer attention
-- Distributed multi-pair (2, 28)+(4, 24)+(8, 20)
-
-## Related work — honest novelty accounting
-
-The high-level construct (top-down feedback in stacked RNNs) is not
-new. Three prior works are direct antecedents and must be cited:
-
-| Paper | What's theirs | What's still ours |
-|---|---|---|
-| **[GF-RNN][gfrnn]** (Chung, Gulcehre, Cho, Bengio, ICML 2015) | The *idea* of top-down feedback from upper RNN layers to lower layers, with learnable gates per layer pair. Tested with tanh / LSTM / GRU on character LM and Python program eval. | They use *gated additive* updates (not multiplicative FiLM); feedback at *all* layer pairs (not single sparse pair); sequential RNNs (not parallel-scan-friendly); no mechanism characterization (no negative-α basin observation); small scale. |
-| **[BRIMs][brims]** (Mittal, Lamb, Goyal et al., ICML 2020) | The *t−1 lag trick* for parallel-scan friendliness with this kind of feedback — the higher-layer-to-lower-layer signal looks at the previous timestep precisely to preserve causality. | Attention-based (not FiLM); modular RIM cells; every adjacent layer pair (not sparse single-pair); small models. |
-| **[SparX][sparx]** (Lou, Cao et al., AAAI 2025) | The *"sparse cross-layer connection"* terminology and a sparse adjacency pattern in the Mamba/Transformer family. | They do **forward** DenseNet-style feature aggregation in a vision backbone (not late→early feedback in language); cross-attention with channel-wise routing (not FiLM); vision domain only. |
-
-Adjacent but mechanically distinct:
-**Feedback Transformer** ([Fan et al. 2020][feedbackt]),
-**Staircase Attention** ([Ju et al. 2021][staircase]),
-**TransformerFAM** ([Hwang et al. 2024][fam]) — feedback/memory
-mechanisms in Transformer blocks, mostly within-block or temporal
-rather than cross-layer in stacked RNN.
-**Universal Transformer** ([Dehghani et al. 2019][ut]),
-**Loop-Residual** ([Loop-Residual NN][loopres]),
-**Depth-Recurrent Transformer** — depth-recurrence with parameter
-sharing rather than a fixed sparse inter-layer connection.
-**PredNet** ([Lotter, Kreiman, Cox 2017][prednet]) — predictive
-coding for video with conv layers; theoretical inspiration only.
-The predictive coding lineage from Rao & Ballard (1999) onward is the
-theoretical frame the negative-α basin matches.
-
-### What's actually new here
-
-What the prior art does not have, that this project contributes:
-
-1. **The "minimal form" empirical finding.** Among the family of
-   GF-RNN-style top-down feedbacks, the *minimum* useful structure
-   for a linear-RNN coding LM is a single sparse pair `(2, 28)` with
-   FiLM modulation. Multi-pair, all-pair, attention-routed, dense-
-   feedback, and cross-attention variants all *fail* to beat this —
-   in many cases they fail to find the basin at all.
-2. **The mechanism characterization.** 20+ controlled ablations
-   identify that a previously-unreported *negative-α subtractive
-   basin* exists, and is reachable iff (i) the modulation is
-   *multiplicative* (FiLM-form, not Q-K-V additive) and (ii)
-   aggregation across sources is *non-softmax* (sum or independent
-   sigmoid; softmax dilutes by 1/K and forces α toward 0). Either
-   failure alone breaks the basin.
-3. **Modern linear-RNN, matched-everything-except-attention vs SOTA.**
-   Identical block structure across Sparse-FiLM / DeltaNet / Mamba2
-   / vanilla Transformer, sole variable is the attention class, at
-   217 M params on Python code; sparse-FiLM beats by 23 / 12.5 / 3.1 %.
-4. **Long-T extrapolation comparison** across all four architectures.
-   Sparse-FiLM wins at every T from 512 to 4096 (8×); Transformer
-   with absolute-position embeddings can't extrapolate at all.
-
-So the claim shifts from "novel architecture" to **"minimal-form
-empirical demonstration plus mechanism, of an idea that has been
-around since GF-RNN 2015, in a modern linear-RNN coding LM where it
-hasn't been tested."** That's still publishable, just honest.
-
-## What's next
-
-- **Generalize the cell** — swap DeltaNet for **DeltaProduct**
-  ([Yang et al. NeurIPS 2025][deltaproduct]) or **PD-SSM** as the
-  base RNN cell, test if the sparse cross-layer feedback gives the
-  same architectural lift on top of stronger linear-RNN cells.
-- **Scale-up validation** — train at 350-500 M params on 5-10 B
-  tokens to check the architectural ordering doesn't flip with more
-  data.
-- **Distillation revisit** — initial Qwen3.6 distillation (Phase 15)
-  was a negative result due to teacher–data misalignment; a coder-
-  aligned teacher (DeepSeek-Coder, Qwen3-Coder-Next) might change
-  this.
+**Honest framing**: cross-architecture (vs Transformer) the comparison is
+scale/optimizer-dependent — Transformer wins at 360 M/Muon. What's robust is
+the lift *within* the linear-RNN family. The top-down-feedback idea isn't new
+([GF-RNN][gfrnn] 2015, [BRIMs][brims] 2020); the contribution is the
+*minimal-form demonstration + mechanism* in a modern linear-RNN coding LM.
 
 ## Build
 
-Lean library — requires `elan`, `lake`, network access:
 ```bash
-cd StateDep
-source $HOME/.elan/env
-lake exe cache get
-lake build
-```
-
-Python environment (uv + cu132 nightly torch + triton + flash-linear-attention):
-```bash
+# Python (uv + cu132 nightly torch + local flash-linear-attention fork)
 uv venv .venv && source .venv/bin/activate
 uv pip install torch --index-url https://download.pytorch.org/whl/nightly/cu132
-uv pip install numpy flash-linear-attention
-```
+uv pip install numpy
+uv pip install -e /home/knielsen/ml/flash-linear-attention   # Blackwell fixes
+export PYTHONPATH=$PYTHONPATH:.
 
-For the distillation pipeline (vLLM teacher in a separate venv):
-```bash
-uv venv .venv-vllm
-VIRTUAL_ENV=$(pwd)/.venv-vllm uv pip install vllm transformers datasets
+# Lean library (StateDep/) — requires elan + lake
+cd StateDep && source $HOME/.elan/env && lake exe cache get && lake build
 ```
 
 ## Reproduce the headline finding
 
 ```bash
-# DeltaNet baseline
+# DeltaNet baseline vs Sparse-(2,28) FiLM (codeparrot, T=512, batch=8, lr=3e-4)
 python experiments/train_lm.py --arch deltanet --feedback none \
   --steps 5000 --d_model 576 --n_heads 9 --d_head 64 --n_layers 30
-
-# Sparse (2, 28) FiLM
 python experiments/train_lm.py --arch deltanet --feedback film \
   --feedback_pairs "2,28" --steps 5000 --d_model 576 --n_heads 9 \
   --d_head 64 --n_layers 30
-
-# Vanilla Transformer baseline (needs --max_T because softmax attention
-# is permutation-invariant without positional info)
-python experiments/train_lm.py --arch transformer --max_T 512 \
-  --feedback none --steps 5000 --d_model 576 --n_heads 9 --d_head 64 \
-  --n_layers 30
-
-# Mamba2 baseline
-python experiments/train_lm.py --arch mamba2 --feedback none \
-  --steps 5000 --d_model 576 --n_heads 9 --d_head 64 --n_layers 30
 ```
 
-All runs use codeparrot/codeparrot-clean, T=512, batch=8, lr=3e-4
-cosine.
-
-## Earlier work
-
-The cell-level architectural exploration that preceded the sparse-
-feedback finding (hybrid `[ortho, deltanet]` stack, AUSSM concurrent
-prior art, Lean library, Triton kernels) is documented in
-[`HISTORY.md`](HISTORY.md). That work led to the empirical observation
-that motivated this finding: cell-level architecture saturates before
-the inter-cell information flow. Sparse cross-layer feedback is the
-inter-cell flow that turned out to matter.
-
-[grazzi]: https://arxiv.org/abs/2411.12537
-[zoology]: https://arxiv.org/abs/2312.04927
-[aussm]: https://arxiv.org/abs/2507.05238
-[deltaproduct]: https://arxiv.org/abs/2502.10297
 [gfrnn]: https://arxiv.org/abs/1502.02367
 [brims]: https://arxiv.org/abs/2006.16981
-[sparx]: https://arxiv.org/abs/2409.09649
-[feedbackt]: https://arxiv.org/abs/2002.09402
-[staircase]: https://arxiv.org/abs/2106.04279
-[fam]: https://arxiv.org/abs/2404.09173
-[ut]: https://arxiv.org/abs/1807.03819
-[loopres]: https://arxiv.org/abs/2409.14199
-[prednet]: https://arxiv.org/abs/1605.08104

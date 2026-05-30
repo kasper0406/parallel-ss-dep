@@ -30,6 +30,7 @@ from experiments.rl_multiturn import (
     JudgeCandidate,
     Trajectory,
     Turn,
+    VLLMJudgeBackend,
     apply_judge_to_group,
     assemble_flat_rollouts,
     compute_trajectory_reward,
@@ -147,6 +148,44 @@ def test_run_trajectories_single_turn_is_one_turn():
     assert all(t.n_turns == 1 for t in trajs)
     # Exactly 4 grade calls (no repair).
     assert len(grader.calls) == 4
+
+
+def test_precomputed_turn0_bypasses_rollout_fn_and_is_equivalent():
+    """When `precomputed_turn0` is supplied (the cross-problem batched decode),
+    turn-0 must NOT call rollout_fn, and the resulting turn-0 trajectories must
+    match the path that DID call rollout_fn with the same rollouts."""
+    pre = [_make_rollout(emit_ids=(1, 2)), _make_rollout(emit_ids=(3, 4)),
+           _make_rollout(emit_ids=(5,)), _make_rollout(emit_ids=(6, 7, 8))]
+
+    # Reference: rollout_fn yields the same 4 rollouts.
+    grader_ref = _ScriptedGrader([_MockGrade(0.2, "partial")] * 4)
+    seq = iter([r for r in pre])
+    trajs_ref = run_trajectories_for_group(
+        _problem(), "# p\n",
+        rollout_fn=lambda prompt, n: [next(seq) for _ in range(n)],
+        grade_fn=grader_ref, extract_fn=lambda r: r.text,
+        n_rollouts=4, max_turns=1, carry_history=False)
+
+    # Precomputed: rollout_fn MUST NOT be called for turn 0.
+    grader_pre = _ScriptedGrader([_MockGrade(0.2, "partial")] * 4)
+    called = {"n": 0}
+
+    def _boom(prompt, n):
+        called["n"] += 1
+        raise AssertionError("rollout_fn must not be called for turn 0")
+
+    trajs_pre = run_trajectories_for_group(
+        _problem(), "# p\n",
+        rollout_fn=_boom, grade_fn=grader_pre, extract_fn=lambda r: r.text,
+        n_rollouts=4, max_turns=1, carry_history=False,
+        precomputed_turn0=pre)
+
+    assert called["n"] == 0
+    assert len(trajs_pre) == len(trajs_ref) == 4
+    for tp, tr in zip(trajs_pre, trajs_ref):
+        assert tp.turns[0].rollout.emit_token_ids == \
+            tr.turns[0].rollout.emit_token_ids
+        assert tp.turns[0].score == tr.turns[0].score
 
 
 # ---------------------------------------------------------------------------
@@ -400,3 +439,52 @@ def test_strip_comments_survives_unparseable_code():
     broken = "def f(x)\n    return x +"
     out = strip_comments(broken)
     assert isinstance(out, str)
+
+
+# ---------------------------------------------------------------------------
+# VLLMJudgeBackend response parsing — must survive reasoning-model output.
+# (Instantiating with server_url set never imports vLLM, so this is CPU-safe;
+# _parse_ranking is a staticmethod and needs no instance at all.)
+# ---------------------------------------------------------------------------
+
+def test_parse_ranking_plain_list():
+    assert VLLMJudgeBackend._parse_ranking("[2,1]", 2) == [1, 0]
+    assert VLLMJudgeBackend._parse_ranking("[3,1,4,2]", 4) == [2, 0, 3, 1]
+
+
+def test_parse_ranking_strips_think_block_with_brackets():
+    # The reasoning model emits a <think> block that itself contains brackets;
+    # a naive first-[..last-] scan would fail. The answer list is emitted last.
+    text = ("<think>Candidate [1] is close but [2] has an off-by-one; "
+            "I'll rank [3] highest.</think>\nFinal ranking: [2, 1, 3]")
+    assert VLLMJudgeBackend._parse_ranking(text, 3) == [1, 0, 2]
+
+
+def test_parse_ranking_takes_last_valid_list():
+    text = "Comparing the options [1, 2, 3] ... my answer is [3, 1, 2]"
+    assert VLLMJudgeBackend._parse_ranking(text, 3) == [2, 0, 1]
+
+
+def test_parse_ranking_unterminated_think_no_answer_raises():
+    # Output truncated mid-think (the max_tokens bug) → no answer list → abstain.
+    with pytest.raises(ValueError):
+        VLLMJudgeBackend._parse_ranking("<think>let me consider [1] and", 2)
+
+
+def test_parse_ranking_non_permutation_raises():
+    with pytest.raises(ValueError):
+        VLLMJudgeBackend._parse_ranking("[1, 1]", 2)
+
+
+def test_parse_ranking_no_list_raises():
+    with pytest.raises(ValueError):
+        VLLMJudgeBackend._parse_ranking("the best one is candidate two", 2)
+
+
+def test_chat_endpoint_normalization():
+    for given in ("http://localhost:8000",
+                  "http://localhost:8000/",
+                  "http://localhost:8000/v1",
+                  "http://localhost:8000/v1/chat/completions"):
+        b = VLLMJudgeBackend(server_url=given)  # server_url set → no vLLM import
+        assert b._chat_endpoint() == "http://localhost:8000/v1/chat/completions"

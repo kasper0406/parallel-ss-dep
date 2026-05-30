@@ -955,7 +955,6 @@ class WorkingMemory(nn.Module):
         mem_size: int,
         thinking_token_id: int,
         pad_token_id: int | None = None,
-        write_only_at_think: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -963,20 +962,6 @@ class WorkingMemory(nn.Module):
         self.mem_size = int(mem_size)
         self.thinking_token_id = int(thinking_token_id)
         self.pad_token_id = pad_token_id
-        # FIX A (added 2026-05-18): when True, only think-token positions are
-        # eligible to win a buffer slot. The write-gate g is masked to a
-        # large negative value at non-think positions before topk, so the
-        # buffer always holds think-position content (modulo when n_think
-        # < K_eff, in which case the lowest-g non-think positions fill the
-        # remaining slots but contribute negligible log-gate bias and so
-        # effectively don't affect retrieval).
-        # Diagnostic from 2026-05-18 (diag_thinking_machinery.py) showed
-        # that the v7.1-distilled SFT model writes uniformly across think
-        # and emit positions, so the read-time sharp queries hit a buffer
-        # of arbitrary content. This flag mechanically forces the buffer
-        # to hold think-content; reads then retrieve actual intermediate
-        # computations.
-        self.write_only_at_think = bool(write_only_at_think)
 
         # Write side
         self.W_write = nn.Linear(d_model, 1, bias=True)
@@ -1019,15 +1004,6 @@ class WorkingMemory(nn.Module):
         if self.pad_token_id is not None:
             is_pad = input_ids == int(self.pad_token_id)          # (B, T)
             g = g.masked_fill(is_pad, 0.0)
-
-        # FIX A (write-only-at-think): mask g at non-think positions to a
-        # large negative value so topk preferentially selects think
-        # positions. -1.0 is well below σ()-range [0, 1] so any think
-        # position outranks any emit position; among think positions the
-        # learned gate values still rank them.
-        if self.write_only_at_think:
-            is_think_pos = input_ids == self.thinking_token_id    # (B, T)
-            g = torch.where(is_think_pos, g, torch.full_like(g, -1.0))
 
         K_eff = min(T, self.mem_size)
 
@@ -1272,19 +1248,6 @@ class TinyLM(nn.Module):
         thinking_token_id: int | None = None,  # Required when use_memory=True.
         pad_token_id: int | None = None,      # Optional; used to keep padding
                                               # rows out of the memory.
-        mem_write_only_at_think: bool = False,  # FIX A (2026-05-18): when
-                                              # True, the WorkingMemory buffer
-                                              # is filled ONLY from think-
-                                              # position writes (non-think
-                                              # positions are masked to a
-                                              # very negative g before topk).
-                                              # Diagnostic showed write gate
-                                              # was firing uniformly across
-                                              # think/emit; this forces the
-                                              # buffer to hold think-content
-                                              # so sharp read queries finally
-                                              # retrieve intermediate
-                                              # computations.
         layer_drop_max: float = 0.0,          # Stochastic Depth: linearly
                                               # increasing per-block drop
                                               # prob 0 → layer_drop_max
@@ -1608,7 +1571,6 @@ class TinyLM(nn.Module):
                 mem_size=int(mem_size),
                 thinking_token_id=int(thinking_token_id),
                 pad_token_id=pad_token_id,
-                write_only_at_think=bool(mem_write_only_at_think),
             )
             # Re-init the thinking-token embedding row to the mean of the
             # other rows. PyTorch's default init makes it random noise, which
@@ -2566,9 +2528,6 @@ class TinyLM(nn.Module):
         if mem.pad_token_id is not None:
             is_pad = input_ids == int(mem.pad_token_id)
             g = g.masked_fill(is_pad, 0.0)
-        if mem.write_only_at_think:
-            is_think_pos = input_ids == mem.thinking_token_id
-            g = torch.where(is_think_pos, g, torch.full_like(g, -1.0))
 
         pos = torch.arange(T, device=device).unsqueeze(0).expand(B, T).contiguous()
         return {
@@ -2594,9 +2553,6 @@ class TinyLM(nn.Module):
         if mem.pad_token_id is not None:
             is_pad = input_ids_new == int(mem.pad_token_id)
             g_new = g_new.masked_fill(is_pad, 0.0)
-        if mem.write_only_at_think:
-            is_think_pos = input_ids_new == mem.thinking_token_id
-            g_new = torch.where(is_think_pos, g_new, torch.full_like(g_new, -1.0))
 
         B = h_normed_new.shape[0]
         cur_T = int(buf["gate"].shape[1])

@@ -67,9 +67,9 @@ import torch.nn.functional as F
 
 
 # pad id used to build the batched extra-forward. MUST differ from the
-# thinking token id (pad-as-think silently triggers state_readonly /
-# mem_write_only_at_think on padding positions, corrupting the
-# after-forward's recurrent state). See CLAUDE.md "Pad-id MUST differ".
+# thinking token id (pad-as-think silently triggers state_readonly_at_think on
+# padding positions, corrupting the after-forward's recurrent state). See
+# CLAUDE.md "Pad-id MUST differ".
 PAD_ID = 0
 
 
@@ -113,7 +113,7 @@ def baseline_forward(model, input_ids: torch.Tensor):
 @torch.no_grad()
 def post_think_logp(model, prefixes: torch.Tensor, true_next: torch.Tensor,
                     K: int, thinking_token_id: int):
-    """Batched post-think next-token logp.
+    """Batched DISCRETE-token post-think next-token logp.
 
     `prefixes` (N, Lmax) is LEFT-padded with PAD_ID so every row has the same
     length; the *real* prefix for row i ends at its last column (column
@@ -138,6 +138,26 @@ def post_think_logp(model, prefixes: torch.Tensor, true_next: torch.Tensor,
     last_think = Lmax + K - 1                                 # last think slot
     lp = F.log_softmax(logits[:, last_think, :], dim=-1)      # (N, V)
     return lp.gather(1, true_next.view(-1, 1)).squeeze(1)     # (N,)
+
+
+@torch.no_grad()
+def latent_post_think_logp(model, prefixes: torch.Tensor,
+                           true_next: torch.Tensor, R: int,
+                           thinking_token_id: int, wm_off: bool = False):
+    """Batched LATENT-thinking post-think next-token logp.
+
+    Thin wrapper over the CANONICAL primitive
+    ``thinking.latent_think_logp`` — kept so the probe's call sites / tests
+    have a stable name, but there is now ONE implementation of the latent
+    forward (the standardization that fixed the discrete-vs-latent divergence;
+    see THINKING_GATE_SELECTIVITY_2026_05_30.md). `prefixes` (N, Lmax) is
+    LEFT-padded with PAD_ID; `wm_off` suppresses WorkingMemory injection.
+    Returns lpR: (N,).
+    """
+    from experiments.thinking import latent_think_logp
+    return latent_think_logp(
+        model, prefixes, true_next, R=R,
+        thinking_token_id=thinking_token_id, pad_id=PAD_ID, wm_off=wm_off)
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +188,15 @@ def _clean_position_mask(input_ids: torch.Tensor, targets: torch.Tensor,
 def collect_one_batch(model, input_ids: torch.Tensor, targets: torch.Tensor,
                       *, K: int, thinking_token_id: int, eos_id: int,
                       max_positions_per_batch: int, margin: float,
-                      think_batch: int, device, generator):
+                      think_batch: int, device, generator,
+                      mechanism: str = "discrete", latent_R: int = 4,
+                      wm_off: bool = False):
     """Run the baseline + extra forwards for ONE (B,T) batch.
+
+    `mechanism`: "discrete" (append K [THINK] tokens) or "latent" (append one
+    think slot fed the trunk's own hidden for `latent_R` iterations — the
+    validated high-bandwidth mechanism). `wm_off` (latent only) suppresses
+    WorkingMemory injection to isolate the trunk.
 
     Returns dict of CPU tensors: h (M,d), lp0 (M,), lpK (M,), delta (M,),
     y (M,), gate_sigma (M,) — M = number of sampled positions this batch.
@@ -221,8 +248,13 @@ def collect_one_batch(model, input_ids: torch.Tensor, targets: torch.Tensor,
             rows.append(pref)
         chunk_pref = torch.stack(rows, dim=0)                 # (e-s, Lmax)
         chunk_true = true_next[s:e]
-        lpK[s:e] = post_think_logp(model, chunk_pref, chunk_true, K,
-                                   thinking_token_id)
+        if mechanism == "latent":
+            lpK[s:e] = latent_post_think_logp(
+                model, chunk_pref, chunk_true, latent_R, thinking_token_id,
+                wm_off=wm_off)
+        else:
+            lpK[s:e] = post_think_logp(model, chunk_pref, chunk_true, K,
+                                       thinking_token_id)
 
     delta = lpK - lp0
     y = (delta > margin).float()
@@ -367,7 +399,8 @@ def _build_stream(cfg, *, block_size: int, base_seed: int):
 def run_probe(ckpt_path: str, *, n_positions: int, K: int, margin: float,
               block_size: int, batch: int, max_positions_per_batch: int,
               think_batch: int, fit_steps: int, test_frac: float,
-              base_seed: int):
+              base_seed: int, mechanism: str = "discrete", latent_R: int = 4,
+              wm_off: bool = False):
     from experiments.eval_bracket_structure import build_model_from_ckpt
 
     print(f"[probe] loading ckpt: {ckpt_path}")
@@ -380,7 +413,12 @@ def run_probe(ckpt_path: str, *, n_positions: int, K: int, margin: float,
         f"({PAD_ID})")
     print(f"[probe] device={device}  thinking_token_id={thinking_token_id}  "
           f"state_readonly_at_think={getattr(model, 'state_readonly_at_think', '?')}  "
-          f"output_gate={getattr(model, 'output_gate', '?')}")
+          f"output_gate={getattr(model, 'output_gate', '?')}  "
+          f"use_memory={getattr(model, 'use_memory', '?')}")
+    if mechanism == "latent":
+        print(f"[probe] MECHANISM=latent  latent_R={latent_R}  wm_off={wm_off}")
+    else:
+        print(f"[probe] MECHANISM=discrete  K={K}")
 
     stream, tok, _, eos_id = _build_stream(cfg, block_size=block_size,
                                            base_seed=base_seed)
@@ -401,7 +439,8 @@ def run_probe(ckpt_path: str, *, n_positions: int, K: int, margin: float,
             model, input_ids, targets, K=K,
             thinking_token_id=thinking_token_id, eos_id=eos_id,
             max_positions_per_batch=max_positions_per_batch, margin=margin,
-            think_batch=think_batch, device=device, generator=gen)
+            think_batch=think_batch, device=device, generator=gen,
+            mechanism=mechanism, latent_R=latent_R, wm_off=wm_off)
         n_batches += 1
         if res is None:
             continue
@@ -412,7 +451,10 @@ def run_probe(ckpt_path: str, *, n_positions: int, K: int, margin: float,
               f"(total {n_have}/{n_positions})")
 
     data = {k: torch.cat(v, 0)[:n_positions] for k, v in chunks.items()}
-    _report(data, cfg=cfg, K=K, margin=margin, test_frac=test_frac)
+    mech_label = (f"latent R={latent_R}{' wm_off' if wm_off else ''}"
+                  if mechanism == "latent" else f"discrete K={K}")
+    _report(data, cfg=cfg, K=K, margin=margin, test_frac=test_frac,
+            mech_label=mech_label)
 
     if fit_steps > 0 and getattr(model, "output_gate", False):
         print("\n[probe] === gate-head-only calibration fit ===")
@@ -423,12 +465,13 @@ def run_probe(ckpt_path: str, *, n_positions: int, K: int, margin: float,
     return data
 
 
-def _report(data, *, cfg, K, margin, test_frac):
+def _report(data, *, cfg, K, margin, test_frac, mech_label="discrete"):
     delta = data["delta"]; y = data["y"]; h = data["h"]
     sigma = data["gate_sigma"]
     N = y.numel()
     print("\n" + "=" * 64)
-    print(f"GATE-CALIBRATION PROBE  (N={N}, K={K}, margin={margin})")
+    print(f"GATE-CALIBRATION PROBE  (N={N}, mechanism={mech_label}, "
+          f"margin={margin})")
     print("=" * 64)
 
     # --- SIGNAL ---
@@ -481,7 +524,19 @@ def main():
     p.add_argument("--ckpt", required=True)
     p.add_argument("--n_positions", type=int, default=4000)
     p.add_argument("--K", type=int, default=4,
-                   help="number of think tokens appended in the extra forward")
+                   help="number of think tokens appended in the extra forward "
+                        "(discrete mechanism only)")
+    p.add_argument("--mechanism", choices=["discrete", "latent"],
+                   default="discrete",
+                   help="discrete: append K [THINK] tokens (default, original "
+                        "probe). latent: append one think slot and feed the "
+                        "trunk's own hidden back for --latent_R iterations "
+                        "(the validated high-bandwidth mechanism).")
+    p.add_argument("--latent_R", type=int, default=4,
+                   help="number of latent refinement iterations (latent only)")
+    p.add_argument("--wm_off", action="store_true",
+                   help="latent only: suppress WorkingMemory injection (zero "
+                        "mem_read_mask) to isolate the trunk's latent compute")
     p.add_argument("--margin", type=float, default=0.0,
                    help="y_t = 1{Delta_logp > margin}")
     p.add_argument("--block_size", type=int, default=512,
@@ -502,7 +557,9 @@ def main():
               margin=args.margin, block_size=args.block_size, batch=args.batch,
               max_positions_per_batch=args.max_positions_per_batch,
               think_batch=args.think_batch, fit_steps=args.fit_steps,
-              test_frac=args.test_frac, base_seed=args.base_seed)
+              test_frac=args.test_frac, base_seed=args.base_seed,
+              mechanism=args.mechanism, latent_R=args.latent_R,
+              wm_off=args.wm_off)
     return 0
 
 

@@ -85,7 +85,7 @@ def test_returns_result_and_bounds_count():
     gen = torch.Generator().manual_seed(0)
     res = compute_gate_calibration_loss(
         m, input_ids, targets, snap,
-        thinking_token_id=THINK_ID, K=4, eos_id=EOS_ID,
+        thinking_token_id=THINK_ID, latent_R=4, eos_id=EOS_ID,
         sample_frac=1.0, max_positions=8, generator=gen)
     assert isinstance(res, GateCalibrationResult)
     # max_positions caps the count.
@@ -195,20 +195,20 @@ def test_bce_drives_gate_toward_target():
     for p in m.gate_head.parameters():
         p.requires_grad_(True)
 
-    # Deterministic separable target: even absolute position -> helps.
-    orig = gc_mod._post_think_logp
+    # Deterministic separable target: alternate rows helps / doesn't.
+    orig = gc_mod.latent_think_logp
 
-    def fake_post_think(model, prefixes, true_next, *, K, thinking_token_id):
+    def fake_latent_logp(model, prefixes, true_next, *, R, thinking_token_id,
+                         pad_id=0):
         # Return a logp whose value (vs the baseline lp0 ~ -log V) makes
         # Δ>margin on exactly half the rows. We can't see absolute position
-        # here, so encode the target in the prefix LENGTH parity is not
-        # available; instead alternate by row index within the chunk.
+        # here, so alternate by row index within the chunk.
         n = prefixes.shape[0]
         out = torch.full((n,), -1.0)  # high logp -> Δ>0 -> y=1
         out[1::2] = -1e3              # very low logp -> Δ<0 -> y=0
         return out
 
-    gc_mod._post_think_logp = fake_post_think
+    gc_mod.latent_think_logp = fake_latent_logp
     try:
         opt = torch.optim.Adam(m.gate_head.parameters(), lr=0.05)
         # Capture the y labels once (deterministic) by running a single call
@@ -234,4 +234,4 @@ def test_bce_drives_gate_toward_target():
         # The BCE loss must drop substantially as the gate fits the target.
         assert loss1 < loss0 - 0.05
     finally:
-        gc_mod._post_think_logp = orig
+        gc_mod.latent_think_logp = orig

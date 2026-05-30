@@ -612,13 +612,6 @@ def main() -> int:
                    help="Max depth per inserted burst.")
     p.add_argument("--mem_size", type=int, default=1024)
     p.add_argument("--mem_dim", type=int, default=0)
-    p.add_argument("--mem_write_only_at_think", action="store_true",
-                   help="FIX A: force WorkingMemory writes to come only "
-                        "from think positions. See train_lm_args.py for "
-                        "full rationale. When the loaded ckpt was trained "
-                        "without this flag, retraining a few epochs with "
-                        "it on lets the model adapt its write-gate to "
-                        "actually be selective at think positions.")
     p.add_argument("--retrieval_as_input_thinking", action="store_true",
                    help="Replace the discrete [THINKING] token's input "
                         "embedding with the WorkingMemory retrieval at the "
@@ -656,17 +649,6 @@ def main() -> int:
     p.add_argument("--wm_gist_horizons", type=str, default="16,64,256",
                    help="Comma-separated future-window sizes K for the "
                         "trunk gist loss (one head per horizon).")
-    # Deprecated flags — kept so older launchers still parse.
-    p.add_argument("--wm_future_pred_weight", type=float, default=0.0,
-                   help="DEPRECATED since v7 (WM gist supervision "
-                        "removed). Ignored.")
-    p.add_argument("--wm_future_pred_T", type=int, default=4,
-                   help="DEPRECATED (v5 single-offset embed target). "
-                        "Ignored.")
-    p.add_argument("--future_emb_T_max", type=int, default=8,
-                   help="DEPRECATED (v5 lexical-target ramp). Ignored.")
-    p.add_argument("--future_emb_T_ramp_frac", type=float, default=0.3,
-                   help="DEPRECATED (v5 lexical-target ramp). Ignored.")
     # --- Phase 1a: gist-at-think compression (THINKING_PLAN.md) -------
     # CoT-thinking rows route through build_example_with_cot_compression
     # (instead of build_example_with_cot_thinking) when these are set:
@@ -746,9 +728,10 @@ def main() -> int:
                    help="Weight of the gate-calibration BCE aux loss. 0 = OFF "
                         "(byte-identical to today). Recommended sweep "
                         "0.025–0.05. Requires the ckpt to have an output gate.")
-    p.add_argument("--gate_calibration_K", type=int, default=4,
-                   help="Think tokens appended in the calibration extra "
-                        "forward (state-readonly).")
+    p.add_argument("--gate_calibration_latent_R", type=int, default=4,
+                   help="Number of state-readonly LATENT think steps in the "
+                        "calibration extra forward (hidden-feedback mechanism; "
+                        "see thinking.latent_think_logp).")
     p.add_argument("--gate_calibration_margin", type=float, default=0.0,
                    help="y = 1{Δlogp > margin} for the calibration target.")
     p.add_argument("--gate_calibration_sample_frac", type=float, default=0.1,
@@ -837,13 +820,6 @@ def main() -> int:
             if thinking_token_id is None:
                 # Fall back to "last vocab slot" if cfg didn't store it.
                 thinking_token_id = int(cfg["vocab_size"]) - 1
-            # FIX A: honour the new flag even on a pre-built model — flip
-            # the bit on the already-constructed WorkingMemory module.
-            if bool(args.mem_write_only_at_think):
-                model.memory.write_only_at_think = True
-                cfg["mem_write_only_at_think"] = True
-                print(f"  FIX A enabled: WorkingMemory.write_only_at_think = True "
-                      "(non-think positions masked to -1.0 before topk)")
             # Phase-2 override: force state_readonly_at_think on (safe to
             # flip post-construction — it's a plain bool the forward
             # checks each step). The Block-level hook is installed in
@@ -929,7 +905,6 @@ def main() -> int:
             mem_size=int(args.mem_size),
             mem_dim=int(args.mem_dim) if args.mem_dim > 0 else int(cfg["d_model"]),
             thinking_token_id=thinking_token_id,
-            mem_write_only_at_think=bool(args.mem_write_only_at_think),
             use_think_adapter=bool(args.use_think_adapter),
             think_adapter_hidden_mult=int(args.think_adapter_hidden_mult),
             attention_cls=DeltaNetAttention,
@@ -943,7 +918,6 @@ def main() -> int:
         cfg["vocab_size"] = new_vocab
         cfg["mem_size"] = int(args.mem_size)
         cfg["mem_dim"] = int(args.mem_dim) if args.mem_dim > 0 else int(cfg["d_model"])
-        cfg["mem_write_only_at_think"] = bool(args.mem_write_only_at_think)
         cfg["sft_with_thinking"] = True
     else:
         # Original path: load whatever was saved, leave memory inert if present.
@@ -1109,9 +1083,6 @@ def main() -> int:
         print(f"  trunk-gist heads (v7 Fix C): d_model={d_model}, "
               f"horizons={gist_horizons}, "
               f"weight={args.future_emb_loss_weight}")
-    if args.wm_future_pred_weight > 0:
-        print("  NOTE: --wm_future_pred_weight is deprecated since v7 "
-              "(WM gist supervision removed) — ignored.")
 
     # Phase 1a: per-think gist head (separate from the v7 trunk gist
     # heads). Single Linear(d_model, d_model) that projects student
@@ -1188,7 +1159,8 @@ def main() -> int:
                 f"thinking_token_id ({thinking_token_id}); pad-as-think "
                 "corrupts the state-readonly mask")
             print(f"  [gate-calibration] ON weight={args.gate_calibration_weight} "
-                  f"K={args.gate_calibration_K} frac={args.gate_calibration_sample_frac} "
+                  f"latent_R={args.gate_calibration_latent_R} "
+                  f"frac={args.gate_calibration_sample_frac} "
                   f"max_pos={args.gate_calibration_max_positions}")
     for epoch in range(args.epochs):
         # Shuffle each epoch.
@@ -1280,7 +1252,7 @@ def main() -> int:
                             gc_res = compute_gate_calibration_loss(
                                 model, x, y, gate_logits_snap,
                                 thinking_token_id=int(thinking_token_id),
-                                K=args.gate_calibration_K,
+                                latent_R=args.gate_calibration_latent_R,
                                 margin=args.gate_calibration_margin,
                                 sample_frac=args.gate_calibration_sample_frac,
                                 max_positions=args.gate_calibration_max_positions,

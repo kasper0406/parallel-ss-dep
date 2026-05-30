@@ -425,6 +425,110 @@ def build_continuation_batch(
     )
 
 
+# ---------------------------------------------------------------------------
+# Canonical latent-thinking primitive.
+#
+# This is THE single implementation of "run R state-readonly latent think
+# steps and read the resulting next-token distribution". Every consumer — the
+# gate-calibration loss, the gate-calibration probe, eval generators — MUST
+# import this rather than re-deriving an append-and-forward, so the mechanism
+# can never silently diverge again. (It diverged once: the gate teacher + probe
+# were built on the DISCRETE-token append `[THINK]*K` mechanism, which is the
+# validated `mode="token"` baseline that does NOT help, while the validated
+# breakthrough is the LATENT mechanism below — feed the trunk's own hidden
+# state back as the think-slot input embedding. See latent_think.py and
+# THINKING_GATE_SELECTIVITY_2026_05_30.md.)
+#
+# Mechanism (Coconut-style, state-readonly): append ONE think slot whose input
+# embedding is the trunk's own last hidden state, iterate R times. The model is
+# expected to be built with `state_readonly_at_think=True` so the DeltaNet
+# write-gate β=0 at the think slot — the think READS the recurrent state but
+# never WRITES, so long-range bindings are preserved.
+# ---------------------------------------------------------------------------
+
+
+def _logits_hidden(out):
+    """Extract (logits, hidden) from a `model(..., return_hidden=True)` return.
+
+    With `return_aux=False, return_gate=False` the forward returns
+    `(logits, hidden)` — or `(logits, hidden, gist_scalar)` in training mode
+    with the trunk-gist loss enabled (the scalar is appended LAST). So hidden
+    is always index 1. A bare-tensor return (no hidden) is a caller error here.
+    """
+    return out[0], out[1]
+
+
+@torch.no_grad()
+def _latent_think_logits(model, prefixes: torch.Tensor, *, R: int,
+                         thinking_token_id: int,
+                         wm_off: bool = False) -> torch.Tensor:
+    """Logits (N, V) at the think slot after R latent (hidden-feedback) steps.
+
+    ``prefixes`` (N, Lmax) is the (left-padded) context. We append one think
+    slot, initialise its latent from the prefix's final hidden state, and feed
+    that latent back as the slot's input embedding for R iterations. ``input_ids``
+    still carry the think-token id at the slot (so state-readonly / working-
+    memory masks fire there), while ``inputs_embeds`` overrides the embedding —
+    exactly latent_think.think_forward(mode="latent").
+
+    ``wm_off``: pass an all-zero ``mem_read_mask`` so WorkingMemory never
+    injects — isolates the trunk's latent computation from the WM-injection
+    confound (a use_memory model injects WM at the think slot by default).
+    """
+    base_emb = model.embed(prefixes)                             # (N, Lmax, d)
+    N = prefixes.shape[0]
+    think_col = torch.full((N, 1), int(thinking_token_id),
+                           dtype=prefixes.dtype, device=prefixes.device)
+    ids = torch.cat([prefixes, think_col], dim=1)                # (N, Lmax+1)
+    mem_read_mask = (torch.zeros(ids.shape, dtype=torch.float32,
+                                 device=prefixes.device)
+                     if wm_off else None)
+    _logits0, h0 = _logits_hidden(model(prefixes, return_hidden=True))
+    z = h0[:, -1:, :]                                            # (N, 1, d)
+    last_logits = None
+    for _ in range(max(1, int(R))):
+        ie = torch.cat([base_emb, z.to(base_emb.dtype)], dim=1)  # (N, Lmax+1, d)
+        logits, h = _logits_hidden(model(ids, inputs_embeds=ie,
+                                         return_hidden=True,
+                                         mem_read_mask=mem_read_mask))
+        z = h[:, -1:, :]
+        last_logits = logits[:, -1, :]                           # think slot
+    return last_logits
+
+
+def latent_think_logp(model, prefixes: torch.Tensor, true_next: torch.Tensor,
+                      *, R: int, thinking_token_id: int,
+                      pad_id: int = 0, wm_off: bool = False) -> torch.Tensor:
+    """log p(true_next | prefix + R latent thinks) at the think slot. (N,)
+
+    The canonical measurement of "does latent thinking help here": compare this
+    against the no-think baseline log p(true_next | prefix). The return is a
+    pure target (computed under no_grad) — callers detach it and let gradient
+    flow through the gate logits, not through this forward.
+
+    ``wm_off`` suppresses WorkingMemory injection (diagnostic isolation; see
+    ``_latent_think_logits``).
+    """
+    assert int(thinking_token_id) != int(pad_id), (
+        f"thinking_token_id ({thinking_token_id}) must differ from pad_id "
+        f"({pad_id}) — pad-as-think corrupts the state-readonly mask")
+    logits = _latent_think_logits(
+        model, prefixes, R=R, thinking_token_id=thinking_token_id,
+        wm_off=wm_off).float()
+    lp = F.log_softmax(logits, dim=-1)                            # (N, V)
+    return lp.gather(1, true_next.view(-1, 1)).squeeze(1)         # (N,)
+
+
+# torch.compile-safety: the variable-length extra forward tripped an Inductor
+# symbolic-shape assertion in prior work. Disabling dynamo around the primitive
+# keeps a compiled training run from crashing; the @no_grad already means there
+# is nothing to compile through for the backward.
+try:  # pragma: no cover - depends on torch build
+    latent_think_logp = torch._dynamo.disable(latent_think_logp)  # type: ignore
+except Exception:  # pragma: no cover
+    pass
+
+
 def build_replay_batch(
     items: list[ThinkReplay],
     block_size: int,

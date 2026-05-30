@@ -7,33 +7,42 @@ much uncertainty is irreducible. This module gives the gate a DENSE,
 PER-POSITION teacher of where a think actually improves the next-token
 prediction.
 
-Mechanism (the training-time twin of ``probe_gate_calibration.collect_one_batch``):
+Mechanism (the training-time twin of ``probe_gate_calibration``):
 
-  1. From the MAIN forward we already have per-position next-token logp
-     (``lp0_t = log p(true_{t+1} | prefix_0..t)``) and the gate logit
-     ``g_t`` (snapshotted from ``model._last_gate_logits`` BEFORE any extra
-     forward clobbers it — this exact bug bit the 2026-05-27 wiring).
-  2. Sample a fraction of clean positions. For each, run an EXTRA forward
-     over ``[prefix_0..t, K * THINK_ID]`` (state-readonly at think, beta=0)
-     and read ``lpK_t = log p(true_{t+1} | prefix, K thinks)`` at the last
-     think slot.
-  3. ``Delta_t = lpK_t - lp0_t``; target ``y_t = 1{Delta_t > margin}``.
+  1. From the MAIN forward we already have the gate logit ``g_t`` (snapshotted
+     from ``model._last_gate_logits`` BEFORE any extra forward clobbers it —
+     this exact bug bit the 2026-05-27 wiring).
+  2. Sample a fraction of clean positions. For each, measure whether LATENT
+     thinking helps: run ``R`` state-readonly LATENT think steps on
+     ``prefix_0..t`` (the validated Coconut-style hidden-feedback mechanism,
+     ``thinking.latent_think_logp``) and compare
+     ``Delta_t = logp_after_R_latent_thinks(true_{t+1}) - logp_no_think(true_{t+1})``.
+  3. target ``y_t = 1{Delta_t > margin}``.
   4. Loss ``+= BCE_with_logits(g_t, y_t)`` — SYMMETRIC: pushes sigma UP where
      thinking helps, DOWN where it doesn't.
 
-Cost is ~2x forward on the sampled fraction only (bounded by
+IMPORTANT — mechanism. The "does thinking help" measurement uses LATENT
+thinking (feed the trunk's own hidden state back as the think-slot input
+embedding), NOT discrete ``[THINK]*K`` token appends. Discrete-token thinking
+is the validated ``mode="token"`` baseline that does NOT help (0.09 vs 1.00 on
+the latent-think validation task); calibrating the gate against it taught the
+gate to suppress thinking. The single shared primitive lives in
+``thinking.latent_think_logp`` so this loss and the probe can never diverge on
+mechanism again.
+
+Cost is ~R forwards on the sampled fraction only (bounded by
 ``sample_frac x max_positions``). Default weight 0.0 = OFF (byte-identical to
 no-aux SFT).
 
-torch.compile note: the extra forward crashed Inductor in prior work
-(2026-05-27 — an Inductor symbolic-shape assertion at the first variable-length
-extra forward). The extra-forward helper is wrapped in ``torch._dynamo.disable``
-so a compiled SFT run does not crash; ``--no-compile`` is the documented
-fallback if the disable boundary is insufficient on a given torch build.
+torch.compile note: the variable-length extra forward crashed Inductor in
+prior work (2026-05-27). ``thinking.latent_think_logp`` is wrapped in
+``torch._dynamo.disable`` so a compiled SFT run does not crash; ``--no-compile``
+is the documented fallback if the disable boundary is insufficient.
 
 GPU-free testable: every function takes a model exposing the TinyLM contract
-(``model(input_ids, return_hidden=...)`` + ``model._last_gate_logits``) and runs
-on whatever device the inputs live on, so the CPU tests pass a tiny fake model.
+(``model(input_ids, return_hidden=...)`` + ``model._last_gate_logits`` +
+``model.embed`` + ``inputs_embeds=``) and runs on whatever device the inputs
+live on, so the CPU tests pass a tiny fake model.
 """
 from __future__ import annotations
 
@@ -42,11 +51,13 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from experiments.thinking import latent_think_logp
+
 
 # pad id used to build the batched extra forward. MUST differ from the
-# thinking token id (pad-as-think silently triggers state_readonly /
-# mem_write_only_at_think on padding positions, corrupting the after-forward's
-# recurrent state). See CLAUDE.md "Pad-id MUST differ" + probe_gate_calibration.
+# thinking token id (pad-as-think silently triggers state_readonly_at_think on
+# padding positions, corrupting the after-forward's recurrent state). See
+# CLAUDE.md "Pad-id MUST differ" + probe_gate_calibration.
 PAD_ID = 0
 
 
@@ -66,45 +77,6 @@ def _unwrap_logits(out):
     if isinstance(out, (tuple, list)):
         return out[0]
     return out
-
-
-@torch.no_grad()
-def _post_think_logp(model, prefixes: torch.Tensor, true_next: torch.Tensor,
-                     *, K: int, thinking_token_id: int) -> torch.Tensor:
-    """Batched post-think next-token logp.
-
-    ``prefixes`` (N, Lmax) is LEFT-padded with PAD_ID. We append K think tokens
-    to every row and read the logp of the true next token at the LAST think
-    slot. DeltaNet is a causal linear RNN, so leading PAD_ID tokens prepend
-    benign state before the real prefix; the appended think tokens are the only
-    state-readonly positions (PAD_ID != think id asserted below).
-
-    Wrapped in ``torch.no_grad`` AND a ``torch._dynamo.disable`` boundary (see
-    module docstring) so the variable-length extra forward never enters the
-    compiled graph. The returned Delta is detached and only forms the BCE
-    TARGET; the gradient flows through the snapshotted gate logits, not here.
-    """
-    assert thinking_token_id != PAD_ID, (
-        "thinking_token_id must differ from PAD_ID (pad-as-think corrupts the "
-        "state-readonly mask)")
-    N, Lmax = prefixes.shape
-    think_block = torch.full((N, K), int(thinking_token_id),
-                             dtype=prefixes.dtype, device=prefixes.device)
-    seq = torch.cat([prefixes, think_block], dim=1)            # (N, Lmax+K)
-    logits = _unwrap_logits(model(seq)).float()
-    last_think = Lmax + K - 1                                  # last think slot
-    lp = F.log_softmax(logits[:, last_think, :], dim=-1)       # (N, V)
-    return lp.gather(1, true_next.view(-1, 1)).squeeze(1)      # (N,)
-
-
-# torch.compile-safety: the extra forward over variable-length prefixes tripped
-# an Inductor symbolic-shape assertion in prior work. Disabling dynamo around
-# this helper keeps a compiled SFT run from crashing; the no_grad block already
-# means there is nothing to compile through for the backward.
-try:  # pragma: no cover - depends on torch build
-    _post_think_logp = torch._dynamo.disable(_post_think_logp)  # type: ignore
-except Exception:  # pragma: no cover
-    pass
 
 
 def _clean_position_mask(input_ids: torch.Tensor, targets: torch.Tensor,
@@ -132,7 +104,7 @@ def compute_gate_calibration_loss(
     gate_logits_snapshot: torch.Tensor,
     *,
     thinking_token_id: int,
-    K: int = 4,
+    latent_R: int = 4,
     margin: float = 0.0,
     sample_frac: float = 0.1,
     max_positions: int = 256,
@@ -156,7 +128,9 @@ def compute_gate_calibration_loss(
         This is the tensor the BCE gradient flows into; it MUST be the
         grad-carrying gate logits, not a detached copy.
       thinking_token_id: the [THINKING] token id. Asserted != PAD_ID.
-      K: number of state-readonly think tokens appended in the extra forward.
+      latent_R: number of state-readonly LATENT think steps in the extra
+        forward (the validated hidden-feedback mechanism; see
+        ``thinking.latent_think_logp``).
       margin: ``y = 1{Delta_logp > margin}``.
       sample_frac, max_positions: bound the number of scored positions per
         batch to ``min(sample_frac * n_valid, max_positions)``.
@@ -216,9 +190,10 @@ def compute_gate_calibration_loss(
         lp0 = F.log_softmax(base_logits[bsel, tsel, :], dim=-1).gather(
             1, true_next.view(-1, 1)).squeeze(1)              # (P,)
 
-    # Post-think lpK in chunks (left-padded prefixes).
+    # Post-latent-think lpR in chunks (left-padded prefixes). Each chunk runs
+    # R state-readonly latent think steps via the shared primitive.
     Lmax = int(tsel.max().item()) + 1
-    lpK = torch.empty(P, device=device)
+    lpR = torch.empty(P, device=device)
     for s in range(0, P, think_batch):
         e = min(s + think_batch, P)
         rows = []
@@ -233,10 +208,11 @@ def compute_gate_calibration_loss(
                 pref = torch.cat([pad, pref], dim=0)          # LEFT pad
             rows.append(pref)
         chunk_pref = torch.stack(rows, dim=0)
-        lpK[s:e] = _post_think_logp(model, chunk_pref, true_next[s:e],
-                                    K=K, thinking_token_id=thinking_token_id)
+        lpR[s:e] = latent_think_logp(
+            model, chunk_pref, true_next[s:e], R=latent_R,
+            thinking_token_id=thinking_token_id, pad_id=PAD_ID)
 
-    delta = (lpK - lp0).detach()
+    delta = (lpR - lp0).detach()
     y = (delta > margin).float()
 
     # The BCE target is detached; the gradient flows ONLY through the

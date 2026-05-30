@@ -6,6 +6,37 @@
 
 Hard compute constraint: 2× RTX 5090 (32 GB each, no NVLink). Training-token budgets should be planned accordingly — Chinchilla-optimal for a 217 M model is ~4 B tokens; budget accordingly.
 
+## Deprecation cleanup (2026-05-30) — read this before trusting older bullets
+
+A cleanup pass removed several deprecated/confusing mechanisms. Where an older
+bullet below conflicts with this list, THIS LIST WINS:
+
+- **Thinking measurement/loss is standardized on LATENT thinking.** The single
+  canonical primitive is `experiments/thinking.py::latent_think_logp` (run R
+  state-readonly latent hidden-feedback steps → logp(true_next)). It is the
+  ONLY way "does thinking help here" is measured. The previous DISCRETE-token
+  append (`[THINK]*K`) measurement is the validated `mode="token"` baseline
+  that does NOT help (0.09 vs 1.00) — calibrating against it taught the gate to
+  suppress thinking. Don't reintroduce discrete-token thinking measurement.
+- **`gate_calibration.compute_gate_calibration_loss` now uses the latent
+  primitive** (param `K`→`latent_R`). It is wired into `sft_code.py` ONLY (flag
+  `--gate_calibration_latent_R`), NOT into `train_lm.py`.
+- **Process-reward aux loss is REMOVED** — `experiments/process_reward.py` no
+  longer exists; its "Process-reward auxiliary loss" bullet below is historical
+  only.
+- **`--mem_write_only_at_think` (FIX A) is REMOVED end-to-end** (model.py /
+  sft_code.py / eval_bracket_structure.py / tests). It was an empirically
+  rejected mechanism.
+- **Deprecated no-op SFT flags removed**: `--wm_future_pred_weight`,
+  `--wm_future_pred_T`, `--future_emb_T_max`, `--future_emb_T_ramp_frac`.
+- **`launch_pretrain_v2_thinking.sh` removed.** It referenced many flags
+  (`--process_reward_*`, `--gate_calibration_*`, `--use_think_adapter`,
+  `--use_refinement_head`, `--think_index_emb_size`) that `train_lm.py` never
+  exposed, so it was non-runnable. The INTENT stands: co-training the thinking
+  stack from day 1 in pretrain requires first WIRING those think-modules + the
+  latent gate-calibration loss into `train_lm.py` / `train_lm_args.py`. That
+  wiring is the prerequisite TODO; until then there is no v2-thinking launcher.
+
 ## Current architectural stack
 
 Backbone is **DeltaNet** (`--arch deltanet`, plain `chunk_delta_rule` from FLA — efficient linear-RNN, bounded state). Validated lifts to keep:
@@ -14,7 +45,7 @@ Backbone is **DeltaNet** (`--arch deltanet`, plain `chunk_delta_rule` from FLA �
 - **K=3 self-feeding** for FiLM: closes train/inference gap so deployment uses a single forward at 1× decode cost.
 - **Bounded working memory** (`experiments/model.py::WorkingMemory`, validated 2026-05-12): write-gated buffer of past hidden states, read at "think" / query positions via soft attention. **+11.1 pp recall** on saturated MQAR (T=512, K=128) vs DeltaNet alone. Read cost O(T·K·d), no O(T²) attention. Enable with `--use_memory --mem_size 1024`.
 - **State-readonly thinking** (`--state_readonly_at_think`, plain-DeltaNet only, validated 2026-05-26). Forces the DeltaNet per-token write-gate β to 0 at think positions via a forward-hook on the inner FLA layer's `b_proj` (pre-sigmoid logits clamped to -1e4). Think tokens still READ from the recurrent state (so the local h_t carries useful info for the gate / WM / lm_head) but never WRITE to it — preserves long-range bindings across multi-think bursts, the documented "thinking corrupts recall" failure mode (100% → 20% at distance 512). Default OFF (backwards-compat). Threaded as `think_mask=(input_ids==thinking_token_id)` through `Block.forward → _FlaWrapper.forward`; `b_proj` parameter names are unchanged so existing ckpts load byte-identically. Synthetic 1-layer DeltaNet probe: train with a 4-think burst, eval with 32 thinks → ON 0.88 recall, OFF 0.41 (`experiments/test_state_readonly_thinking.py`). Phase 2 of `THINKING_PLAN.md`. Only the full-sequence forward path is wired; the per-token `forward_step` decode path leaves β unmasked (open follow-up — non-trivial because the cache state would also need a sentinel for "this step is a think").
-- **Process-reward auxiliary loss** (Phase A of THINKING_PLAN v5, `--process_reward_weight`, default 0.0 = off, added 2026-05-26). SFT-only aux loss that finally gives the trunk + WM gradient through the *consequence* of thinking. On a sampled fraction of positions where σ(gate) > `--process_reward_apply_min_sigma` (default 0.3), an extra forward over `[prefix, K * THINK_ID]` (K from `--process_reward_K`, default 4) computes log p_after(true_next_token) and the loss is `mean(log p_before - log p_after)` — minimising this pushes thinks to put more probability mass on the truth. Bounded by `--process_reward_sample_frac` × `--process_reward_max_positions`. Helper at `experiments/process_reward.py::compute_process_reward_loss`; wired in `sft_code.py` legacy forward path. **Probe** (`experiments/probe_process_reward.py`) on the SFT base `sft_phase_c_combined.pt` confirms the canonical "thinks aren't productive" baseline: mean Δlogp = -0.165, only 30.5 % of high-gate positions benefit from K=4 thinks. This is exactly what Phase A is trained to flip. **Pad-id MUST differ from `thinking_token_id`** (the helper asserts this) — pad-as-think silently triggers `state_readonly_at_think` / `mem_write_only_at_think` on padding positions, corrupting the after-forward's recurrent state. Caller uses `pad_id=0`. Tests in `experiments/test_process_reward.py` (13).
+- **Process-reward auxiliary loss** [REMOVED 2026-05-30 — `process_reward.py` deleted; bullet kept for history] (Phase A of THINKING_PLAN v5, `--process_reward_weight`, default 0.0 = off, added 2026-05-26). SFT-only aux loss that finally gives the trunk + WM gradient through the *consequence* of thinking. On a sampled fraction of positions where σ(gate) > `--process_reward_apply_min_sigma` (default 0.3), an extra forward over `[prefix, K * THINK_ID]` (K from `--process_reward_K`, default 4) computes log p_after(true_next_token) and the loss is `mean(log p_before - log p_after)` — minimising this pushes thinks to put more probability mass on the truth. Bounded by `--process_reward_sample_frac` × `--process_reward_max_positions`. Helper at `experiments/process_reward.py::compute_process_reward_loss`; wired in `sft_code.py` legacy forward path. **Probe** (`experiments/probe_process_reward.py`) on the SFT base `sft_phase_c_combined.pt` confirms the canonical "thinks aren't productive" baseline: mean Δlogp = -0.165, only 30.5 % of high-gate positions benefit from K=4 thinks. This is exactly what Phase A is trained to flip. **Pad-id MUST differ from `thinking_token_id`** (the helper asserts this) — pad-as-think silently triggers `state_readonly_at_think` / `mem_write_only_at_think` on padding positions, corrupting the after-forward's recurrent state. Caller uses `pad_id=0`. Tests in `experiments/test_process_reward.py` (13).
 - **ThinkAdapter** (Phase B of THINKING_PLAN v5, `--use_think_adapter`, default off, added 2026-05-26). Small 2-layer MLP per Block (`d_model → hidden_mult·d_model → d_model`, GELU) + learnable scalar α (init 0). Applied as `h_out = h_in + α · think_mask · ThinkAdapter(h_in)` at think positions only. The trunk now has parameters DEDICATED to thinking-time computation — previously every block ran identical computation at think vs emit positions, only differing by the input embedding. Wired in `Block.forward` AND `TinyLM.prefill` AND `TinyLM._step_block` (the v5 code review caught that the incremental-decode path was bypassing `Block.forward` entirely — fixed by threading `think_mask` through `_step_block`, regression test in `test_think_adapter.py::test_adapter_fires_during_incremental_decode`). Adapter weights + α route to AdamW via `optim_utils._is_think_adapter` predicate (NOT Muon). α init 0 → ckpts trained without it load byte-identical; α init 0 + non-zero MLP weights → α moves first under loss gradient, MLP weights follow once α drifts off zero (FiLM-α pattern). `eval_bracket_structure.build_model_from_ckpt` auto-detects adapter from state_dict; pass `force_use_think_adapter=True` to attach a fresh adapter to a pretrain ckpt during SFT (`sft_code.py --use_think_adapter --think_adapter_hidden_mult 2`). Tests in `experiments/test_think_adapter.py` (11).
 - **Soft-mixture decode** (Phase C of THINKING_PLAN v5, `--gate_mode soft`, default `hard`, added 2026-05-26). Eval-only mechanism in `experiments/eval_humaneval.py::generate_soft_mixture`: at each emit step run BOTH branches (emit and think) and mix the resulting probabilities by σ(gate): `p_mix = σ · p_emit + (1-σ) · p_think`, sample from p_mix. The emit-branch FLA cache / WM buffer / FiLM lagged sources / per-row think-run counter are the canonical state; the think-branch runs on a deep-cloned cache that is discarded. Cache-clone helpers `_clone_cache` / `_clone_fla_cache` isolate all mutable state per call. Cost: ~2× per step. **The reason this is novel, not a "closing of train/eval gap"**: at training time the gate is a soft loss-weight (`g·CE_real + (1-g)·λ_ponder`), NOT a soft mixture of emit/think outputs — the think-path computation never enters training-time loss anywhere. Soft-mixture decode is the first time the gate's continuous σ has actually mixed real outputs at any point in the pipeline. Tests in `experiments/test_soft_mixture_decode.py` (8).
 - **Per-position think-index embedding** (`--think_index_emb_size N`, default 0 = off, added 2026-05-26). Small zero-init `nn.Embedding(N, d_model)` added on top of the [THINKING] input embedding, indexed by the token's position within its consecutive-think burst (clamped to N-1 for bursts longer than N). Phase 3 of `THINKING_PLAN.md`: directly attacks the multi-think homogenization failure (8 consecutive thinks share one input embedding → median pairwise cos +0.146 vs +0.060 at emit, effective rank ~210 vs ~560; `diag_think_position_diversity.py`). Zero-init means a cold-start / freshly-loaded ckpt is byte-identical to the pre-Phase-3 path; the model opts in via gradient only if the diversity is actually useful. The per-position index is computed via a vectorized cumsum-reset (`c = cumsum(think_mask)`; `reset = cummax(c * (1-think_mask))`; `burst_idx = (c - reset - 1).clamp(0)`) — no Python loop, GPU-friendly. Wired in `TinyLM.forward` AND `prefill` AND `forward_step` (the latter maintains a per-row running-counter in `cache["think_run_len"]` so incremental decoding gets the same index a one-shot forward would). Applied AFTER any caller-supplied `inputs_embeds` (retrieval-as-input mode also benefits — the additive index breaks homogeneity regardless of how the base embedding was built). Tests in `experiments/test_think_index_emb.py` (8: default-off no-param, default-off byte-identical, index assignment, burst clamp, isolated-think → index 0, distinct vectors across burst, state-dict round-trip, non-zero table changes output).
@@ -229,10 +260,10 @@ WM-reads being sharper at think.
     `experiments/diag_think_position_diversity.py`, 2026-05-19). FIX A
     fills the WM buffer with this low-rank pool; sharp read queries can
     only retrieve from a homogeneous information manifold.
-  - **Don't enable `--mem_write_only_at_think` for further work** —
-    the flag survives as code (with its own tests) but the empirical
-    answer is no. Solve the homogeneity problem at the source instead
-    (next section).
+  - **`--mem_write_only_at_think` (FIX A) was REMOVED (2026-05-30)** —
+    empirically rejected; the flag, its WorkingMemory masking branch, the
+    cfg plumbing, and its tests are all gone. Solve the homogeneity
+    problem at the source instead (next section).
 
 ### What we're building next: retrieval-as-input thinking tokens
 Instead of appending a discrete `[THINKING]` token (homogeneous input

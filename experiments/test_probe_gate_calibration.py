@@ -22,6 +22,7 @@ from experiments.probe_gate_calibration import (
     linear_probe_auc,
     baseline_forward,
     post_think_logp,
+    latent_post_think_logp,
     collect_one_batch,
     gate_head_calibration_fit,
 )
@@ -193,6 +194,71 @@ def test_collect_skips_when_no_valid_positions():
         max_positions_per_batch=64, margin=0.0, think_batch=16,
         device=torch.device("cpu"), generator=torch.Generator().manual_seed(0))
     assert res is None
+
+
+# ---------------------------------------------------------------------------
+# Latent mechanism (the 2026-05-28 high-bandwidth thinking primitive).
+# ---------------------------------------------------------------------------
+
+def test_latent_post_think_pad_equals_think_asserts():
+    m = _tiny_model()
+    prefixes = torch.randint(2, VOCAB - 8, (3, 6))
+    true_next = torch.randint(2, VOCAB - 8, (3,))
+    with pytest.raises(AssertionError):
+        latent_post_think_logp(m, prefixes, true_next, R=2,
+                               thinking_token_id=PAD_ID)
+    out = latent_post_think_logp(m, prefixes, true_next, R=2,
+                                 thinking_token_id=THINK_ID)
+    assert out.shape == (3,)
+
+
+def test_latent_post_think_shapes_and_valid_logp():
+    m = _tiny_model()
+    prefixes = torch.randint(2, VOCAB - 8, (4, 7))
+    true_next = torch.randint(2, VOCAB - 8, (4,))
+    for R in (1, 2, 4):
+        lpR = latent_post_think_logp(m, prefixes, true_next, R=R,
+                                     thinking_token_id=THINK_ID)
+        assert lpR.shape == (4,)
+        assert torch.isfinite(lpR).all()
+        assert (lpR <= 1e-4).all()  # valid log-probs
+
+
+def test_latent_differs_from_discrete():
+    # The latent mechanism (hidden fed back) should produce a different
+    # next-token logp than the discrete-token mechanism — they are distinct
+    # computations, so the probe is genuinely measuring a different thing.
+    m = _tiny_model()
+    g = torch.Generator().manual_seed(11)
+    prefixes = torch.randint(2, VOCAB - 8, (5, 9), generator=g)
+    true_next = torch.randint(2, VOCAB - 8, (5,), generator=g)
+    lp_disc = post_think_logp(m, prefixes, true_next, K=4,
+                              thinking_token_id=THINK_ID)
+    lp_lat = latent_post_think_logp(m, prefixes, true_next, R=4,
+                                    thinking_token_id=THINK_ID)
+    assert not torch.allclose(lp_disc, lp_lat, atol=1e-3)
+
+
+def test_collect_one_batch_latent_mechanism():
+    m = _tiny_model()
+    B, T = 3, 24
+    g = torch.Generator().manual_seed(7)
+    input_ids = torch.randint(2, VOCAB - 8, (B, T), generator=g)
+    targets = input_ids[:, 1:].clone()
+    targets = torch.cat([targets, torch.full((B, 1), -100)], dim=1)
+    res = collect_one_batch(
+        m, input_ids, targets, K=4, thinking_token_id=THINK_ID, eos_id=EOS_ID,
+        max_positions_per_batch=64, margin=0.0, think_batch=16,
+        device=torch.device("cpu"), generator=g,
+        mechanism="latent", latent_R=3)
+    assert res is not None
+    M = res["y"].numel()
+    assert M > 0
+    assert res["h"].shape == (M, D_MODEL)
+    for k in ("lp0", "lpK", "delta", "y", "gate_sigma"):
+        assert res[k].shape == (M,)
+    assert torch.allclose(res["delta"], res["lpK"] - res["lp0"], atol=1e-5)
+    assert torch.isfinite(res["lpK"]).all()
 
 
 def test_gate_head_calibration_fit_moves_toward_target():

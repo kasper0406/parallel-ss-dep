@@ -125,3 +125,68 @@ from sparse reward. They are complementary, not alternatives.
    co-train in a gate-tuning SFT pass.
 3. Confirm the validation target (think_rate 0.1–0.3, reward holds) on held-out
    MBPP/HumanEval.
+
+## STANDARDIZATION (2026-05-30, later) — mechanism unified on LATENT
+
+We caught that the gate-calibration LOSS and PROBE were both measuring "does
+thinking help" with the DISCRETE-token append (`[THINK]*K`) — the validated
+`mode="token"` baseline that does NOT help (0.09 vs 1.00). Calibrating the gate
+against discrete thinking is why it learned to suppress thinking. Root cause:
+the validated latent mechanism lived only in `latent_think.py` as a standalone
+harness and was never wired into the production measurement/loss stack, so each
+consumer re-implemented append-and-forward and they silently diverged.
+
+Fix — ONE canonical primitive, every consumer imports it:
+- `thinking.latent_think_logp(model, prefixes, true_next, *, R,
+  thinking_token_id, pad_id)` — the single implementation of "run R
+  state-readonly LATENT think steps, return logp(true_next) at the think slot"
+  (refactored from the validated `latent_think.think_forward(mode="latent")`,
+  `@no_grad` + `torch._dynamo.disable`).
+- `gate_calibration.compute_gate_calibration_loss` now calls it (param renamed
+  `K`→`latent_R`); the discrete `_post_think_logp` is deleted. SFT flag renamed
+  `--gate_calibration_K`→`--gate_calibration_latent_R`.
+- `probe_gate_calibration.py` ported to a latent path (reconciled to import the
+  shared primitive).
+
+So Layer-1's "re-implement for latent thinking" (step 2 above) is DONE. Whether
+the latent calibration loss should be ENABLED on v8 depends on the probe below.
+
+## PROBE VERDICT (2026-05-30) — thinking is UNPRODUCTIVE on the v8 trunk
+
+`probe_gate_calibration.py --mechanism {discrete,latent}` on
+`pretrain_v8_wide_step7630_tok2000158720.pt` (N=4000, WM on unless noted):
+
+| mechanism | % helps (Δ>0) | mean Δlogp | linear-probe AUC | gate σ-vs-y AUC |
+|---|---|---|---|---|
+| discrete K=4 | 6.6% | -3.78 | 0.647 | 0.376 |
+| latent R=1 | 4.1% | -4.84 | 0.661 | 0.403 |
+| latent R=2 | 2.2% | -6.98 | 0.633 | 0.386 |
+| latent R=4 | 2.0% | -7.61 | 0.602 | 0.355 |
+| latent R=8 | 2.0% | -7.70 | 0.600 | 0.362 |
+| latent R=4, WM-off | 4.9% | -4.48 | 0.703 | 0.326 |
+
+**Neither mechanism helps the v8 trunk.** Latent thinking HURTS next-token
+logp at every R and *monotonically worse with depth* — the exact inverse of the
+validated from-scratch result (where acc rises with R≈K). v8 never co-trained
+the latent-feedback mechanism, so feeding hidden states back is pure
+distribution-shift corruption. WM-off confirms the harm is trunk-intrinsic, not
+WM-injection noise. The current gate is mildly ANTI-selective (σ-vs-y AUC 0.36
+< 0.5).
+
+**Strategic consequence.** "Selective thinking at beneficial locations"
+presupposes beneficial locations exist; on the v8 pretrain trunk they basically
+don't (next-token-wise). So gate calibration is NOT the v8 bottleneck — *making
+thinking productive at all* is. Two implications:
+1. **Do NOT enable the gate-calibration loss on v8 SFT for either mechanism** —
+   there is no useful "thinking helps here" target on this trunk. (The 2026-05-27
+   smoke that showed Δlogp +3..+8 was on a ckpt being actively co-trained with
+   process-reward; that productivity has to be TRAINED IN, it isn't free.)
+2. **Latent thinking must be CO-TRAINED from day 1** (v9 / a thinking-SFT pass),
+   not bolted onto v8 post-hoc. This requires wiring the latent mechanism + its
+   training signal into the pretrain/SFT loss — the prerequisite recorded in
+   CLAUDE.md's deprecation-cleanup TODO.
+3. **RL is the exception**: grader-RL rewards working CODE, not next-token logp,
+   so it can make thinking *instrumentally* useful even where the probe says it
+   doesn't help next-token. The prior arc reached 16/164 this way. So the v8 →
+   SFT → grader-RL path still stands; what's ruled out is the *next-token
+   gate-calibration teacher* on v8.

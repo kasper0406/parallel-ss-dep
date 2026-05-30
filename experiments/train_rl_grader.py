@@ -168,6 +168,47 @@ class Rollout:
     gate_n_decisive: int = 0
 
 
+def compute_think_budget_spread(budget: int, n: int,
+                                diversity: float) -> list[int]:
+    """Per-rollout think budgets for a GRPO group of size ``n``.
+
+    Within-group think-budget diversity (FIX 2, THINKING_GATE_SELECTIVITY):
+    the N rollouts of one problem get a SPREAD of think budgets so the group
+    contains "thought less" and "thought more" variants of the SAME problem.
+    With the existing counterfactual ponder shaping, the group-relative
+    advantage then directly compares depth levels — a rollout that thought
+    less but scored the same gets higher advantage, so the gate learns to
+    think less where thinking doesn't pay.
+
+    Scheme: linearly spaced budgets in ``[max(1, round(budget*(1-diversity))),
+    budget]`` (inclusive, ascending). ``diversity == 0`` -> all budgets equal
+    to ``budget`` (byte-identical to the pre-change single-scalar behavior).
+    ``diversity`` clamped to [0, 1]; the floor is clamped to >= 1 so no rollout
+    gets a zero (or negative) budget. With ``diversity == 1`` the lowest
+    rollout gets budget 1 (think at most once) and the highest gets the full
+    ``budget``.
+
+    Returns a list of ``n`` ints, each in ``[1, budget]``.
+    """
+    n = int(n)
+    budget = int(budget)
+    if n <= 0:
+        return []
+    d = float(max(0.0, min(1.0, diversity)))
+    if d == 0.0 or n == 1:
+        return [budget] * n
+    lo = max(1, int(round(budget * (1.0 - d))))
+    hi = max(lo, budget)
+    if hi == lo:
+        return [lo] * n
+    out = []
+    for i in range(n):
+        frac = i / (n - 1)                       # 0 .. 1 ascending
+        b = int(round(lo + frac * (hi - lo)))
+        out.append(max(1, min(budget, b)))
+    return out
+
+
 @torch.no_grad()
 def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
                            n_rollouts: int,
@@ -175,7 +216,7 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
                            eos_token_id: int | None,
                            max_gen: int,
                            max_think_per_step: int,
-                           total_think_budget: int,
+                           total_think_budget,
                            emit_threshold: float,
                            gate_floor: float,
                            temperature: float,
@@ -193,6 +234,13 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
     or EOS) append a harmless pad token (we re-use EOS) on every subsequent
     iteration, but we don't record those appendages for the policy update.
 
+    `total_think_budget` is either an int (broadcast to every row — the
+    pre-change behavior) OR a per-row sequence/tensor of length N (FIX 2,
+    within-group think-budget diversity: each rollout of the group can get a
+    DIFFERENT budget so the group contains "thought less" / "thought more"
+    variants of the same problem). Only the per-row force-emit cutoff changes;
+    the advantage/loss path is untouched.
+
     Returns a list of N Rollout objects, one per row.
     """
     device = prompt_ids.device
@@ -201,6 +249,23 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
     ids = prompt_ids.expand(N, -1).contiguous()
     prompt_len = ids.shape[1]
     pad_id = int(eos_token_id) if eos_token_id is not None else 0
+    # Per-row think budget (FIX 2). Accept a scalar (broadcast) or a length-N
+    # sequence/tensor. Built as a (N,) long tensor for the vectorized
+    # force-emit comparison; `budget_ceiling` bounds the iteration cap.
+    if isinstance(total_think_budget, torch.Tensor):
+        budget_per_row = total_think_budget.to(device=device,
+                                               dtype=torch.long).reshape(-1)
+    elif isinstance(total_think_budget, (list, tuple)):
+        budget_per_row = torch.tensor([int(b) for b in total_think_budget],
+                                      dtype=torch.long, device=device)
+    else:
+        budget_per_row = torch.full((N,), int(total_think_budget),
+                                    dtype=torch.long, device=device)
+    if budget_per_row.numel() != N:
+        raise ValueError(
+            f"total_think_budget length {budget_per_row.numel()} != "
+            f"n_rollouts {N}")
+    budget_ceiling = int(budget_per_row.max().item())
     # DO NOT set `_film_bypass = True`. The supposed "decode speedup"
     # (single-pass FiLM at T=1) catastrophically breaks the model at
     # temperature sampling. Diagnosed 2026-05-23: with bypass=True at
@@ -248,7 +313,7 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
     autocast = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
     # Cap total iterations: even worst case, N*(max_gen + total_think_budget)
     # bounded by max_gen + total_think_budget (each iteration adds 1 token).
-    max_iter = max_gen + total_think_budget + 4
+    max_iter = max_gen + budget_ceiling + 4
     with autocast:
         for _ in range(max_iter):
             if bool(finished.all().item()):
@@ -270,7 +335,7 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
                             else gate.clamp_min(gate_floor))
             force_emit = (
                 (think_counts_this_step >= max_think_per_step)
-                | (think_totals >= total_think_budget)
+                | (think_totals >= budget_per_row)
                 | finished  # finished rows always "emit" pad
             )
             if stochastic_gate:
@@ -925,11 +990,15 @@ def _run_multiturn_step(args, batch_problems, model_module, tok, device, *,
     def _rollout_fn(prompt_text: str, n: int):
         prompt_ids = tok(prompt_text, return_tensors="pt").input_ids.to(device)
         temp = args.temperature if n > 1 else rep_temp  # turn-0 vs repair temp
+        # Within-group budget diversity only applies to the full turn-0 group
+        # (n > 1); single repair rollouts (n == 1) keep the base budget.
+        budget = compute_think_budget_spread(
+            args.total_think_budget, n, args.think_budget_diversity)
         return rollout_group_batched(
             model_module, tok, prompt_ids, n_rollouts=n,
             thinking_token_id=thinking_token_id, eos_token_id=tok.eos_token_id,
             max_gen=args.max_gen, max_think_per_step=args.max_think_per_step,
-            total_think_budget=args.total_think_budget,
+            total_think_budget=budget,
             emit_threshold=args.emit_threshold, gate_floor=args.gate_floor,
             temperature=temp, min_emit_before_eos=args.min_emit_before_eos,
             stochastic_gate=args.stochastic_gate,
@@ -1096,6 +1165,15 @@ def main():
                          "Below ~256 truncates valid MBPP solutions.")
     p.add_argument("--max_think_per_step", type=int, default=4)
     p.add_argument("--total_think_budget", type=int, default=120)
+    p.add_argument("--think_budget_diversity", type=float, default=0.0,
+                   help="Within-group think-budget diversity (FIX 2). 0 = OFF "
+                        "(all N rollouts share --total_think_budget, "
+                        "byte-identical to today). >0 spreads the N rollouts' "
+                        "budgets linearly over [max(1, budget*(1-d)), budget] "
+                        "so the group compares 'thought less' vs 'thought "
+                        "more' variants; with the counterfactual ponder this "
+                        "sharpens the cut-short signal toward selective "
+                        "thinking. Clamped to [0,1].")
     p.add_argument("--emit_threshold", type=float, default=0.5)
     p.add_argument("--gate_floor", type=float, default=0.0,
                     help="Gate output floor before emit threshold compare. "
@@ -1428,6 +1506,12 @@ def main():
         print(f"  thinking_token_id={thinking_token_id}  "
               f"vocab={cfg['vocab_size']}  "
               f"params={sum(p.numel() for p in model_module.parameters())/1e6:.1f}M")
+        if args.think_budget_diversity > 0.0:
+            spread = compute_think_budget_spread(
+                args.total_think_budget, args.grpo_n_group,
+                args.think_budget_diversity)
+            print(f"  think-budget diversity ON (d={args.think_budget_diversity}): "
+                  f"per-rollout budgets = {spread}")
 
     # ---- Load problems
     if args.dataset_jsonl is not None:
@@ -1548,6 +1632,9 @@ def main():
             for prob in batch_problems:
                 prompt_text = build_mbpp_prompt(prob)
                 prompt_ids = tok(prompt_text, return_tensors="pt").input_ids.to(device)
+                group_budget = compute_think_budget_spread(
+                    args.total_think_budget, args.grpo_n_group,
+                    args.think_budget_diversity)
                 group = rollout_group_batched(
                     model_module, tok, prompt_ids,
                     n_rollouts=args.grpo_n_group,
@@ -1555,7 +1642,7 @@ def main():
                     eos_token_id=tok.eos_token_id,
                     max_gen=args.max_gen,
                     max_think_per_step=args.max_think_per_step,
-                    total_think_budget=args.total_think_budget,
+                    total_think_budget=group_budget,
                     emit_threshold=args.emit_threshold,
                     gate_floor=args.gate_floor,
                     temperature=args.temperature,

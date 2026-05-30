@@ -56,6 +56,7 @@ from experiments.gist_loss import (
     build_gist_heads, trunk_gist_loss, parse_horizons,
     build_think_gist_head, think_gist_loss,
 )
+from experiments.gate_calibration import compute_gate_calibration_loss
 
 
 def _flatten_to_oneline(s: str) -> str:
@@ -737,6 +738,29 @@ def main() -> int:
     p.add_argument("--refinement_head_alpha_init", type=float, default=0.3,
                    help="Phase D: refinement-head alpha init (default 0.3 "
                         "based on v10 lesson — α=0 stays inert).")
+    # --- Gate-calibration aux loss (Layer 1, THINKING_GATE_SELECTIVITY) ----
+    # Per-position teacher of "does a think help here": extra forward over
+    # [prefix, K*THINK] (state-readonly), target = 1{Δlogp>margin}, BCE on the
+    # gate logit. Default weight 0.0 = OFF (byte-identical to no-aux SFT).
+    p.add_argument("--gate_calibration_weight", type=float, default=0.0,
+                   help="Weight of the gate-calibration BCE aux loss. 0 = OFF "
+                        "(byte-identical to today). Recommended sweep "
+                        "0.025–0.05. Requires the ckpt to have an output gate.")
+    p.add_argument("--gate_calibration_K", type=int, default=4,
+                   help="Think tokens appended in the calibration extra "
+                        "forward (state-readonly).")
+    p.add_argument("--gate_calibration_margin", type=float, default=0.0,
+                   help="y = 1{Δlogp > margin} for the calibration target.")
+    p.add_argument("--gate_calibration_sample_frac", type=float, default=0.1,
+                   help="Fraction of valid positions scored per step.")
+    p.add_argument("--gate_calibration_max_positions", type=int, default=256,
+                   help="Hard cap on calibration positions scored per step.")
+    p.add_argument("--gate_calibration_sigma_low", type=float, default=0.0,
+                   help="Restrict calibration to positions with σ>low "
+                        "(default 0 = no lower bound).")
+    p.add_argument("--gate_calibration_sigma_high", type=float, default=1.0,
+                   help="Restrict calibration to positions with σ<high "
+                        "(default 1 = no upper bound).")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1148,6 +1172,24 @@ def main() -> int:
     # ~hundred steps; a frozen/dead signal stays flat. Printed every
     # log_every steps when use_phase_1a is on.
     last_gist_loss = None
+    # Gate-calibration diagnostics (last-step snapshot for the log line).
+    last_gc = None
+    if args.gate_calibration_weight > 0.0:
+        if not (args.with_thinking and thinking_token_id is not None):
+            print("  [gate-calibration] WARNING: --gate_calibration_weight>0 "
+                  "but --with_thinking is off / no thinking_token_id — "
+                  "calibration loss will NOT fire.")
+        elif not getattr(model, "output_gate", False):
+            print("  [gate-calibration] WARNING: ckpt has no output gate — "
+                  "calibration loss will NOT fire.")
+        else:
+            assert int(thinking_token_id) != int(pad_id), (
+                f"gate-calibration requires pad_id ({pad_id}) != "
+                f"thinking_token_id ({thinking_token_id}); pad-as-think "
+                "corrupts the state-readonly mask")
+            print(f"  [gate-calibration] ON weight={args.gate_calibration_weight} "
+                  f"K={args.gate_calibration_K} frac={args.gate_calibration_sample_frac} "
+                  f"max_pos={args.gate_calibration_max_positions}")
     for epoch in range(args.epochs):
         # Shuffle each epoch.
         idx = torch.randperm(len(encoded), generator=rng).tolist()
@@ -1224,6 +1266,34 @@ def main() -> int:
                     if future_gist_heads is not None:
                         loss = loss + args.future_emb_loss_weight * (
                             trunk_gist_loss(h, future_gist_heads, gist_horizons))
+                    # --- Gate-calibration aux loss (Layer 1) -----------------
+                    # Snapshot the gate logits from THIS (main) forward BEFORE
+                    # the calibration extra forward clobbers
+                    # model._last_gate_logits (the 2026-05-27 footgun). The
+                    # snapshot must carry grad — the BCE flows into the gate.
+                    if (args.gate_calibration_weight > 0.0
+                            and getattr(model, "output_gate", False)
+                            and args.with_thinking
+                            and thinking_token_id is not None):
+                        gate_logits_snap = getattr(model, "_last_gate_logits", None)
+                        if gate_logits_snap is not None:
+                            gc_res = compute_gate_calibration_loss(
+                                model, x, y, gate_logits_snap,
+                                thinking_token_id=int(thinking_token_id),
+                                K=args.gate_calibration_K,
+                                margin=args.gate_calibration_margin,
+                                sample_frac=args.gate_calibration_sample_frac,
+                                max_positions=args.gate_calibration_max_positions,
+                                sigma_low=args.gate_calibration_sigma_low,
+                                sigma_high=args.gate_calibration_sigma_high,
+                                eos_id=pad_id if pad_id != int(thinking_token_id)
+                                else None,
+                                generator=rng,
+                            )
+                            if gc_res is not None:
+                                loss = loss + (args.gate_calibration_weight
+                                               * gc_res.loss)
+                                last_gc = gc_res
                 # ====== Phase 1a path: gist-at-think supervision ============
                 # Run the student forward over the compressed sequence and
                 # the teacher forward (no_grad) over the full CoT sequence.
@@ -1298,6 +1368,11 @@ def main() -> int:
                 extra = ""
                 if use_phase_1a and last_gist_loss is not None:
                     extra = f"  gist={last_gist_loss:.4f}"
+                if last_gc is not None:
+                    extra += (f"  gc(n={last_gc.n_positions}, "
+                              f"tgt1={last_gc.target_frac_pos:.2f}, "
+                              f"σ={last_gc.mean_sigma:.2f}, "
+                              f"Δlogp={last_gc.mean_delta:+.2f})")
                 print(f"  step {step:>5}/{n_steps}  loss={loss.item():.4f}  "
                       f"ppl={ppl:.2f}  lr={lr:.2e}  tok/s={tok_s:.0f}{extra}")
 

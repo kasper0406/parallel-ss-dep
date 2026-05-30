@@ -922,3 +922,62 @@ grading order) is verified deterministically.
 **Rejected.** Inlining the turn loop into `main()` (untestable without a model);
 making `run_trajectories_for_group` import the grader directly (couples the pure
 logic to a subprocess-spawning dependency).
+
+### RD8 (2026-05-30) — Gate-calibration aux loss (SFT Layer 1) + dynamo-disable
+**Decision.** Re-implement the removed `compute_gate_calibration_loss` as a new
+GPU-free-testable module `experiments/gate_calibration.py`, wired into
+`experiments/sft_code.py` behind `--gate_calibration_weight` (default 0.0 = OFF,
+byte-identical to today). For a sampled fraction of clean positions
+(`--gate_calibration_sample_frac` 0.1 × `--gate_calibration_max_positions` 256,
+optionally restricted to a σ band via `--gate_calibration_sigma_low/high`), an
+EXTRA forward over `[prefix, K*THINK]` (state-readonly) measures
+`Δlogp = lpK − lp0`; target `y = 1{Δlogp > margin}`; loss
+`+= BCE_with_logits(gate_logit, y)`. SYMMETRIC: pushes σ up where a think helps,
+down where it doesn't — the dense per-position teacher RL's sparse reward can't
+give. The gate-logit snapshot is taken from the MAIN forward BEFORE the extra
+forward clobbers `model._last_gate_logits` (the exact 2026-05-27 footgun; the
+test `test_uses_snapshot_not_post_extra_forward_gate` pins it). Pad-id (0) ≠
+thinking_token_id is asserted (pad-as-think corrupts the state-readonly mask).
+**Why dynamo-disable.** The variable-length extra forward crashed Inductor with a
+symbolic-shape assertion in prior work (2026-05-27). The extra-forward helper
+`_post_think_logp` is wrapped in `torch._dynamo.disable` so a compiled SFT run
+doesn't crash; `--no-compile` is the documented fallback. (sft_code.py itself
+does not currently call torch.compile, so this is forward-insurance for when it
+does / for callers that compile the model.)
+**Rejected.** Using the entropy proxy `exp(-H/T)` alone (uncertainty ≠
+thinking-helps — the documented root cause of the over-think collapse); training
+the trunk through the extra forward (we confine the gradient to the gate logit
+so the BCE only re-calibrates WHERE to think, not the trunk's thinking ability).
+**Risk to double-check before the real SFT run.** In retrieval-as-input mode the
+helper's internal baseline forward uses table embeddings (not the retrieval
+injection), so its lp0 is a slight approximation of the main forward's lp0; the
+calibration target is still directionally correct but worth a sanity check on a
+retrieval-as-input ckpt.
+
+### RD9 (2026-05-30) — Within-group think-budget diversity (RL Layer 2 cut-short)
+**Decision.** Add `--think_budget_diversity` (default 0.0 = OFF, byte-identical
+to today) to `experiments/train_rl_grader.py`. When >0, the N rollouts of each
+GRPO group get a SPREAD of think budgets via `compute_think_budget_spread(budget,
+n, d)` — linearly spaced (ascending) over `[max(1, round(budget*(1-d))), budget]`
+— so the group contains "thought less" and "thought more" variants of the SAME
+problem. `rollout_group_batched.total_think_budget` now accepts a scalar
+(broadcast — old behavior) OR a length-N per-row sequence/tensor; only the
+per-row force-emit cutoff changes (`think_totals >= budget_per_row`), the
+advantage/loss path is untouched. Repair rollouts (n=1) keep the base budget.
+**Why within-group (vs across-step).** The group-relative GRPO advantage compares
+rollouts of the SAME problem, so a per-group budget spread makes the advantage
+DIRECTLY contrast depth levels: with the existing counterfactual ponder
+(`--counterfactual`, task reward clamped at the depth-0 baseline so a think can
+never worsen task reward but the depth cost always applies), cutting a USELESS
+think → same task reward, lower ponder → higher advantage → gate learns to emit
+there; cutting a USEFUL think → task-reward drop outweighs ponder savings → keep
+thinking there. This reveals where thinking helps for FREE (no extra forward,
+unlike RD8's Layer 1). An across-step schedule (budget annealed over training
+steps) gives no within-group contrast and reproduces the v1-style global "think
+less" collapse (depth 120→30 took the output format down) without the
+counterfactual's per-position discrimination.
+**Rejected.** Sampling each rollout's budget i.i.d. (loses the guaranteed
+endpoint coverage — a deterministic linear spread always includes the full-budget
+and the floor variant in every group); cutting at the gate level mid-rollout
+(more invasive — touches the advantage/credit path; budget-at-rollout-start keeps
+the change to one tensor).

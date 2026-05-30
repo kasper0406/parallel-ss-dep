@@ -42,7 +42,7 @@ CUDA_VISIBLE_DEVICES=${GPU:-0} nohup .venv/bin/python -u experiments/train_rl_gr
     --kl_coef 0.1 --kl_target 0.15 --kl_coef_min 0.02 --kl_coef_max 0.6 \
     --ponder_cost 0.0 --ponder_shape quadratic --counterfactual --ponder_warmup_steps 50 \
     --max_turns 2 --no-batch_turn0 \
-    --progressive_curriculum --curriculum_target_start 0.7 --curriculum_target_end 0.2 \
+    --progressive_curriculum --no-adaptive_curriculum --curriculum_target_start 0.7 --curriculum_target_end 0.2 \
     --grad_clip 1.0 --log_every 1 --save_every 50 --seed 0 \
     > runs/rl_grader_v8_strong.log 2>&1 &
 echo "Launched 'make-it-strong' RL on v8 SFT base, GPU ${GPU:-0} (PID $!)"

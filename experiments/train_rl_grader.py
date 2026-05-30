@@ -404,60 +404,81 @@ def rollout_group_batched(model, tokenizer, prompt_ids: torch.Tensor, *,
                 pending_logits, cache = model.forward_step(
                     appended.unsqueeze(1), cache)
 
-            # Update per-row bookkeeping (host loop — small N).
+            # Update per-row bookkeeping. VECTORIZED (2026-05-30): the previous
+            # body was a Python `for i in range(N)` loop with ~10 `.item()`
+            # calls per row per iteration — each forces a GPU→CPU sync, so the
+            # host loop serialized N×max_iter syncs and starved the decode
+            # kernels. Now ALL per-row decisions are computed as boolean/int
+            # tensors on-device, and the host pulls every scalar it needs for
+            # the Python-list appends in a SINGLE batched `.tolist()` transfer
+            # per iteration (one sync moves all N rows at once). The resulting
+            # rollouts are bit-identical to the old loop (proven by the CPU
+            # equivalence tests, which compare emit ids/positions/log_probs).
+            was_finished = finished.clone()          # rows that were already done
+            active = ~was_finished                   # rows that act this iter
+            is_eos = (
+                torch.zeros(N, dtype=torch.bool, device=device)
+                if eos_token_id is None
+                else (emit_toks == int(eos_token_id)))
+            # An ACTIVE row records an emit iff it wanted to emit a NON-eos
+            # token; it finishes iff (wanted emit AND eos) OR (emit_count hits
+            # max_gen after this emit). Think rows just bump the think counters.
+            do_emit = active & want_emit & (~is_eos)
+            do_eos = active & want_emit & is_eos
+            do_think = active & (~want_emit)
+            # Stochastic-gate decision recording: only on active rows that had
+            # a real policy CHOICE (not forced, inside the sample range).
+            if stochastic_gate:
+                gate_active = active & (~force_emit)
+                gate_recorded = gate_active & in_sample_range  # appended decisions
+                gate_decisive = gate_active & (~in_sample_range)
+                # σ-histogram bucket: <0.1 -> 0, [0.1,0.5) -> 1, [0.5,0.9)
+                # -> 2, >=0.9 -> 3. Compared in float64 against the
+                # python-double bounds to reproduce the OLD per-row
+                # `float(p_emit[i].item()) < 0.9` semantics bit-identically
+                # even at float32 boundary values. Diagnostic-only histogram.
+                pe64 = p_emit.double()
+                sig_bucket = ((pe64 >= 0.1).long() + (pe64 >= 0.5).long()
+                              + (pe64 >= 0.9).long())
+
+            # --- Apply the on-device counter updates (no syncs). ---
+            emit_counts = emit_counts + do_emit.long()
+            think_counts_this_step = torch.where(
+                do_emit, torch.zeros_like(think_counts_this_step),
+                think_counts_this_step + do_think.long())
+            think_totals = think_totals + do_think.long()
+            hit_max = do_emit & (emit_counts >= max_gen)
+            finished = finished | do_eos | hit_max
+
+            # --- ONE batched host transfer for the list appends. ---
+            # Only the per-row scalars actually consumed by the Python-side
+            # record logic are moved. `do_emit`/`do_think`/etc. are bool masks;
+            # the loop below is pure Python over already-resident lists (no
+            # tensor indexing, hence no further syncs).
+            do_emit_l = do_emit.tolist()
+            emit_toks_l = emit_toks.tolist()
+            emit_lp_l = emit_lp.tolist()
+            if stochastic_gate:
+                gate_recorded_l = gate_recorded.tolist()
+                gate_decisive_l = gate_decisive.tolist()
+                gate_active_l = gate_active.tolist()
+                sampled_emit_l = sampled_emit.tolist()
+                gate_lp_l = gate_lp.tolist()
+                sig_bucket_l = sig_bucket.tolist()
             for i in range(N):
-                if bool(finished[i].item()):
-                    continue
-                # Record stochastic gate decision BEFORE the EOS-finalize
-                # short-circuit. Only when the model actually had a choice
-                # (force_emit positions are masked out — no gradient there).
-                # Phase A: ALSO mask out decisive positions (σ outside the
-                # sample range) — those used the deterministic threshold,
-                # no policy choice happened there either.
-                if stochastic_gate and not bool(force_emit[i].item()):
-                    p_emit_i = float(p_emit[i].item())
-                    # σ histogram bucket (4-bin: <0.1, [0.1,0.5), [0.5,0.9), >=0.9).
-                    if p_emit_i < 0.1:
-                        gate_sigma_buckets_per_row[i][0] += 1
-                    elif p_emit_i < 0.5:
-                        gate_sigma_buckets_per_row[i][1] += 1
-                    elif p_emit_i < 0.9:
-                        gate_sigma_buckets_per_row[i][2] += 1
-                    else:
-                        gate_sigma_buckets_per_row[i][3] += 1
-                    in_range_i = bool(in_sample_range[i].item())
-                    if in_range_i:
-                        gate_decisions_per_row[i].append(
-                            bool(sampled_emit[i].item()))
-                        gate_log_probs_per_row[i].append(float(gate_lp[i].item()))
+                if stochastic_gate and gate_active_l[i]:
+                    gate_sigma_buckets_per_row[i][sig_bucket_l[i]] += 1
+                    if gate_recorded_l[i]:
+                        gate_decisions_per_row[i].append(bool(sampled_emit_l[i]))
+                        gate_log_probs_per_row[i].append(float(gate_lp_l[i]))
                         gate_positions_per_row[i].append(int(new_pos))
                         gate_n_sampled_per_row[i] += 1
-                    else:
+                    elif gate_decisive_l[i]:
                         gate_n_decisive_per_row[i] += 1
-                if bool(want_emit[i].item()):
-                    tok = int(emit_toks[i].item())
-                    is_eos = (eos_token_id is not None
-                              and tok == int(eos_token_id))
-                    if is_eos:
-                        # Finish without recording the EOS token (avoids the
-                        # "<|endoftext|>" -> syntax_error bug we hit before).
-                        # Roll back: replace the appended EOS with a pad
-                        # token so the batch stays clean — but actually,
-                        # we're going to keep appending pad on finished rows
-                        # anyway, and the appended token at this position is
-                        # not used downstream for this row, so leave as-is.
-                        finished[i] = True
-                        continue
-                    emit_token_ids_per_row[i].append(tok)
-                    emit_log_probs_per_row[i].append(float(emit_lp[i].item()))
+                if do_emit_l[i]:
+                    emit_token_ids_per_row[i].append(int(emit_toks_l[i]))
+                    emit_log_probs_per_row[i].append(float(emit_lp_l[i]))
                     emit_positions_per_row[i].append(int(new_pos))
-                    emit_counts[i] = emit_counts[i] + 1
-                    think_counts_this_step[i] = 0
-                    if int(emit_counts[i].item()) >= max_gen:
-                        finished[i] = True
-                else:
-                    think_counts_this_step[i] = think_counts_this_step[i] + 1
-                    think_totals[i] = think_totals[i] + 1
 
     # Build Rollout objects.
     out_rollouts = []
@@ -963,61 +984,85 @@ def _decode_one_step(
     think_tok_t = torch.full_like(emit_toks, int(thinking_token_id))
     appended = torch.where(want_emit, emit_toks, think_tok_t)
 
-    # Per-row record + append to row-local full_ids. `new_pos` is the index
-    # the appended token WILL occupy in this row's own full_ids — identical to
-    # the single-problem path (where full_ids has no cross-problem padding).
+    # Per-row record + append to row-local full_ids. VECTORIZED (2026-05-30):
+    # all per-row decisions are computed as on-device masks and the host pulls
+    # the scalars for the variable-length list appends in ONE batched
+    # `.tolist()` per call (one sync, not ~10 per row). Bit-identical to the
+    # old `.item()`-per-row body (CPU equivalence tests verify exact ids /
+    # positions / log_probs vs the single-problem path). `new_pos` is the
+    # row-local index the appended token WILL occupy in that row's full_ids.
+    was_finished = finished.clone()
+    active = ~was_finished
+    is_eos_t = (
+        torch.zeros(N_rows, dtype=torch.bool, device=device)
+        if eos_token_id is None else (emit_toks == int(eos_token_id)))
+    do_emit = active & want_emit & (~is_eos_t)
+    do_eos = active & want_emit & is_eos_t
+    do_think = active & (~want_emit)
+    if stochastic_gate:
+        gate_active = active & (~force_emit)
+        gate_recorded = gate_active & in_sample_range
+        gate_decisive = gate_active & (~in_sample_range)
+        # See rollout_group_batched: float64 compare reproduces the old
+        # per-row `float(p_emit[i].item()) < 0.x` bucketing bit-identically.
+        pe64 = p_emit.double()
+        sig_bucket = ((pe64 >= 0.1).long() + (pe64 >= 0.5).long()
+                      + (pe64 >= 0.9).long())
+
+    # On-device counter updates. The caller passes `emit_counts`,
+    # `think_counts_this_step`, `think_totals`, `finished` in by reference and
+    # reuses them across iterations — so EVERY update here MUST be in place
+    # (`+=`, `|=`, `.copy_`), never a rebind. (`think_counts_this_step` resets
+    # to 0 on emit, +1 on think — done via copy_ from a torch.where.)
+    emit_counts += do_emit.long()
+    new_think_counts = torch.where(
+        do_emit, torch.zeros_like(think_counts_this_step),
+        think_counts_this_step + do_think.long())
+    think_counts_this_step.copy_(new_think_counts)
+    think_totals += do_think.long()
+    hit_max = do_emit & (emit_counts >= max_gen)
+    finished |= do_eos | hit_max
+
+    # ONE batched host transfer.
+    active_l = active.tolist()
+    do_emit_l = do_emit.tolist()
+    do_eos_l = do_eos.tolist()
+    emit_toks_l = emit_toks.tolist()
+    emit_lp_l = emit_lp.tolist()
+    if stochastic_gate:
+        gate_active_l = gate_active.tolist()
+        gate_recorded_l = gate_recorded.tolist()
+        gate_decisive_l = gate_decisive.tolist()
+        sampled_emit_l = sampled_emit.tolist()
+        gate_lp_l = gate_lp.tolist()
+        sig_bucket_l = sig_bucket.tolist()
     for i in range(N_rows):
-        if bool(finished[i].item()):
-            # Finished rows still "append" in the incremental cache lock-step,
-            # but we do NOT record them and do NOT grow their full_ids (so the
-            # rollout's full_ids stays exactly what the single-problem path
-            # produced). The cache advance feeds garbage for these rows; their
-            # logits are never read again.
+        if not active_l[i]:
+            # Finished rows: no record, no full_ids growth (cache lock-step
+            # uses the returned `appended` tensor instead).
             continue
         new_pos = len(full_ids_per_row[i])   # row-local index of next token
-        if stochastic_gate and not bool(force_emit[i].item()):
-            p_emit_i = float(p_emit[i].item())
-            if p_emit_i < 0.1:
-                gate_sigma_buckets_per_row[i][0] += 1
-            elif p_emit_i < 0.5:
-                gate_sigma_buckets_per_row[i][1] += 1
-            elif p_emit_i < 0.9:
-                gate_sigma_buckets_per_row[i][2] += 1
-            else:
-                gate_sigma_buckets_per_row[i][3] += 1
-            in_range_i = bool(in_sample_range[i].item())
-            if in_range_i:
-                gate_decisions_per_row[i].append(bool(sampled_emit[i].item()))
-                gate_log_probs_per_row[i].append(float(gate_lp[i].item()))
+        if stochastic_gate and gate_active_l[i]:
+            gate_sigma_buckets_per_row[i][sig_bucket_l[i]] += 1
+            if gate_recorded_l[i]:
+                gate_decisions_per_row[i].append(bool(sampled_emit_l[i]))
+                gate_log_probs_per_row[i].append(float(gate_lp_l[i]))
                 gate_positions_per_row[i].append(int(new_pos))
                 gate_n_sampled_per_row[i] += 1
-            else:
+            elif gate_decisive_l[i]:
                 gate_n_decisive_per_row[i] += 1
-        if bool(want_emit[i].item()):
-            tok = int(emit_toks[i].item())
-            is_eos = (eos_token_id is not None and tok == int(eos_token_id))
-            if is_eos:
-                finished[i] = True
-                # Still append so the cache lock-step has a token, but mark
-                # finished so it isn't recorded. Match single-problem path:
-                # there, the EOS token IS appended to ids (the row's full_ids
-                # would include it) but not to emit_*. To stay byte-identical
-                # to rollout_group_batched's full_ids (which DOES keep the
-                # appended emit token at the EOS step), append it here too.
-                full_ids_per_row[i].append(tok)
-                continue
+        if do_eos_l[i]:
+            # EOS: append the token to full_ids (byte-identical to
+            # rollout_group_batched's full_ids) but do NOT record an emit.
+            full_ids_per_row[i].append(int(emit_toks_l[i]))
+        elif do_emit_l[i]:
+            tok = int(emit_toks_l[i])
             emit_token_ids_per_row[i].append(tok)
-            emit_log_probs_per_row[i].append(float(emit_lp[i].item()))
+            emit_log_probs_per_row[i].append(float(emit_lp_l[i]))
             emit_positions_per_row[i].append(int(new_pos))
             full_ids_per_row[i].append(tok)
-            emit_counts[i] = emit_counts[i] + 1
-            think_counts_this_step[i] = 0
-            if int(emit_counts[i].item()) >= max_gen:
-                finished[i] = True
         else:
             full_ids_per_row[i].append(int(thinking_token_id))
-            think_counts_this_step[i] = think_counts_this_step[i] + 1
-            think_totals[i] = think_totals[i] + 1
 
     return appended
 
@@ -1339,10 +1384,55 @@ def policy_loss_for_rollouts_batched(
     # on the underlying module, accessed via .module (forward propagates it).
     inner = getattr(model, "module", model)
     new_gate = getattr(inner, "_last_gate", None)        # (R, T_max) post-sigmoid
-    ref_logits = None
+
+    # --- KL reference log-probs, computed ONLY at emit positions. ---
+    # The KL term only needs ref logits at each rollout's `emit_positions − 1`
+    # (the prefix positions that PREDICTED the emit tokens) — a few hundred
+    # positions per step, not all R·T. Materializing the full (R, T, V) ref
+    # logit tensor (~0.4-0.9 GB at V≈49k) and then slicing a sliver of it is
+    # wasteful in both memory AND lm_head FLOPs. Instead: run the ref model
+    # with `return_hidden=True` to get the post-out_norm/-memory hidden h
+    # (R, T, d) — the EXACT tensor `_finalize` feeds into `lm_head` — gather
+    # only the needed (row, pred_idx) hidden vectors into a compact (M, d)
+    # tensor, then apply `lm_head` once on M positions. `lm_head(h[i, p]) ==
+    # full_logits[i, p]` by construction (it's the same Linear on the same h),
+    # so this is numerically identical, just cheaper.
+    #   ref_emit_logits: dict[rollout_index] -> (n_emit_i, V) fp32, or None.
+    ref_emit_logits: dict[int, torch.Tensor] | None = None
     if ref_model is not None and kl_coef > 0.0:
-        with torch.no_grad(), autocast:
-            ref_logits = ref_model(padded)          # bf16; small slices cast to fp32 below
+        # Build the flat list of (rollout_index, pred_idx tensor) up front so we
+        # can gather all needed positions in ONE pass.
+        flat_rows: list[int] = []
+        flat_cols: list[int] = []
+        counts: list[tuple[int, int]] = []   # (rollout_index, n_emit)
+        for i, r in enumerate(rollouts):
+            if not r.emit_token_ids:
+                continue
+            n_emit = len(r.emit_positions)
+            counts.append((i, n_emit))
+            for p in r.emit_positions:
+                flat_rows.append(i)
+                flat_cols.append(p - 1)
+        ref_emit_logits = {}
+        if flat_rows:
+            rows_t = torch.tensor(flat_rows, dtype=torch.long, device=device)
+            cols_t = torch.tensor(flat_cols, dtype=torch.long, device=device)
+            ref_inner = getattr(ref_model, "module", ref_model)
+            with torch.no_grad(), autocast:
+                ref_h = ref_model(padded, return_hidden=True)
+                # forward returns (logits, hidden, ...) when return_hidden=True;
+                # hidden is the 2nd element. Plain `model(...)` (no other flags)
+                # gives a 2-tuple (logits, hidden).
+                if isinstance(ref_h, (tuple, list)):
+                    ref_h = ref_h[1]
+                # Gather the M needed hidden vectors, then lm_head once.
+                sel_h = ref_h[rows_t, cols_t]            # (M, d) bf16
+                sel_logits = ref_inner.lm_head(sel_h).float()   # (M, V)
+            # Slice back into per-rollout chunks.
+            off = 0
+            for i, n_emit in counts:
+                ref_emit_logits[i] = sel_logits[off:off + n_emit]
+                off += n_emit
     # Per-rollout, extract log-probs at emit positions.
     all_surrs = []
     all_ratios = []
@@ -1408,8 +1498,8 @@ def policy_loss_for_rollouts_batched(
             all_gate_entropies.append(ent.mean())
             # Fire rate = fraction of decisions that emitted (decoded; for logging).
             all_gate_emit_shares.append(dec_bool.float().mean().detach())
-        if ref_logits is not None:
-            ref_pred_logits = ref_logits[i, pred_idx, :].float()
+        if ref_emit_logits is not None and i in ref_emit_logits:
+            ref_pred_logits = ref_emit_logits[i].clone()   # (n_emit, V) fp32
             ref_pred_logits[:, thinking_token_id] = -float("inf")
             ref_log_probs = F.log_softmax(
                 ref_pred_logits / max(temperature, 1e-8), dim=-1)

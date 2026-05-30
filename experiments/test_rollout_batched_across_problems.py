@@ -314,6 +314,82 @@ def test_per_row_budget_routing():
 #     RNG interleaving differs between batched and per-problem paths).
 # ---------------------------------------------------------------------------
 
+def test_deterministic_stochastic_gate_equivalence_no_rng_divergence():
+    """The inconclusive earlier A/B couldn't separate a real batching bug from
+    RNG-stream divergence (the batched path draws one R-row Bernoulli, the
+    per-problem path draws B separate N-row Bernoullis → different RNG
+    consumption order). Here we DELIBERATELY remove the RNG variable: with
+    stochastic_gate=True but every gate value placed STRICTLY OUTSIDE the
+    sample range [low, high], EVERY decision is the deterministic threshold
+    (no `torch.bernoulli` draw is recorded), so the two paths must produce
+    BIT-IDENTICAL rollouts including gate bookkeeping. A failure here would be
+    a genuine batching/cache-merge bug, not RNG noise.
+
+    Content-dependent HistoryStubLM + greedy emit → any padding leakage in the
+    full-forward joint tensor would also surface as a token mismatch."""
+    m = HistoryStubLM(64)
+    tok = StubTokenizer()
+    torch.manual_seed(101)
+    prompts = [torch.randint(7, 50, (1, L)) for L in (3, 10, 6, 4)]
+    n = 3
+    budgets = [compute_think_budget_spread(6, n, 0.4) for _ in prompts]
+    kw = dict(
+        thinking_token_id=THINK_ID, eos_token_id=EOS_ID,
+        max_gen=10, max_think_per_step=4, emit_threshold=0.5, gate_floor=0.0,
+        temperature=0.0, min_emit_before_eos=4,
+        stochastic_gate=True,
+        # HistoryStubLM gate values are 0.2 or 0.9; a [0.3, 0.85] window puts
+        # BOTH outside the sample range → all decisions are deterministic.
+        gate_sample_range_low=0.3, gate_sample_range_high=0.85,
+    )
+    ref = _per_problem_reference(m, tok, prompts, n, budgets, **kw)
+    flat = rollout_turn0_batched_across_problems(
+        m, tok, prompts, n_rollouts=n, budgets_per_problem=budgets, **kw)
+    grouped = [[] for _ in prompts]
+    for pi, r in flat:
+        grouped[pi].append(r)
+    for b in range(len(prompts)):
+        for r_batched, r_ref in zip(grouped[b], ref[b]):
+            assert _rollouts_equal(r_batched, r_ref), \
+                (b, r_batched.emit_token_ids, r_ref.emit_token_ids,
+                 r_batched.gate_n_decisive, r_ref.gate_n_decisive)
+            # No Bernoulli draws should have been recorded (all decisive).
+            assert r_batched.gate_n_sampled == 0
+            assert r_batched.gate_decisions == []
+
+
+def test_incremental_deterministic_gate_equivalence_no_rng_divergence():
+    """Same RNG-free stochastic_gate equivalence, on the INCREMENTAL
+    (prefill + merged-cache + forward_step) production decode path. This is
+    the path the 3× cross-problem batching speedup runs on — proving the
+    merged cache is byte-identical to per-problem caches here is the safety
+    net the earlier temp>0 A/B could not provide."""
+    m = FakeIncrementalLM(64)
+    tok = StubTokenizer()
+    torch.manual_seed(202)
+    prompts = [torch.randint(7, 50, (1, L)) for L in (4, 9, 5, 7)]
+    n = 2
+    budgets = [compute_think_budget_spread(6, n, 0.5) for _ in prompts]
+    kw = dict(
+        thinking_token_id=THINK_ID, eos_token_id=EOS_ID,
+        max_gen=10, max_think_per_step=4, emit_threshold=0.5, gate_floor=0.0,
+        temperature=0.0, min_emit_before_eos=4,
+        stochastic_gate=True,
+        gate_sample_range_low=0.3, gate_sample_range_high=0.85,
+    )
+    ref = _per_problem_reference(m, tok, prompts, n, budgets, **kw)
+    flat = rollout_turn0_batched_across_problems(
+        m, tok, prompts, n_rollouts=n, budgets_per_problem=budgets, **kw)
+    grouped = [[] for _ in prompts]
+    for pi, r in flat:
+        grouped[pi].append(r)
+    for b in range(len(prompts)):
+        for r_batched, r_ref in zip(grouped[b], ref[b]):
+            assert _rollouts_equal(r_batched, r_ref, check_full_prefix=False), \
+                (b, r_batched.emit_token_ids, r_ref.emit_token_ids)
+            assert r_batched.gate_n_sampled == 0
+
+
 def test_stochastic_gate_records_decisions_per_problem():
     m = StubLM(64, gate_value=0.5)   # σ=0.5 → Bernoulli draws recorded
     tok = StubTokenizer()

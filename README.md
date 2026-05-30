@@ -3,7 +3,7 @@
 A **small, efficient code model** built to punch above its weight on coding
 benchmarks under tight compute (2× RTX 5090, 32 GB each, no NVLink).
 Architectural research feeds that target. Engineering details and the running
-work log live in [`GEMINI.md`](GEMINI.md); project framing in
+work log live in [`AGENTS.md`](AGENTS.md); project framing in
 [`THESIS.md`](THESIS.md).
 
 ## Architecture
@@ -43,7 +43,7 @@ work log live in [`GEMINI.md`](GEMINI.md); project framing in
   but, bolted onto a converged trunk, costs base quality without a measured
   win. The standing conclusion: a thinking mechanism has to be **co-trained
   into a strong base**, not added post-hoc — and we **require a measured
-  thinking contribution before scaling on it**. Full trail in `GEMINI.md`.
+  thinking contribution before scaling on it**. Full trail in `AGENTS.md`.
 - Dead ends documented so they aren't repeated: discrete-token thinking
   (never amplifies on this trunk), gate aux loss targeting the wrong
   mechanism, latent thinking as a post-hoc bolt-on (regresses VAL),

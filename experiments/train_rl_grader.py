@@ -1796,7 +1796,23 @@ def main():
                         "0.05 is v2/v3's validated value for ~200-step "
                         "runs. For 500+ step runs, increase to 0.15 (v7b "
                         "showed 0.08 was outrun at 500 steps; v8 with "
-                        "0.15 stayed bounded).")
+                        "0.15 stayed bounded). When --kl_target>0 this is just "
+                        "the INITIAL coefficient; the controller then adapts it.")
+    p.add_argument("--kl_target", type=float, default=0.0,
+                   help="Adaptive KL: target KL divergence to hold the policy "
+                        "at (PPO/R1-style controller). 0 = OFF (fixed "
+                        "--kl_coef). When >0, --kl_coef is the starting value "
+                        "and the coefficient is auto-tuned each step toward the "
+                        "target (x1.5 if KL>1.5*target, /1.5 if KL<target/1.5), "
+                        "clamped to [--kl_coef_min, --kl_coef_max]. This gives "
+                        "'don't collapse' WITHOUT 'can't move' — the policy can "
+                        "evolve as far as the reward signal supports, instead "
+                        "of being throttled by a fixed penalty as KL grows. "
+                        "Recommended 0.1-0.2 for a base RL should actually climb.")
+    p.add_argument("--kl_coef_min", type=float, default=0.005,
+                   help="Lower clamp for the adaptive KL coefficient.")
+    p.add_argument("--kl_coef_max", type=float, default=1.0,
+                   help="Upper clamp for the adaptive KL coefficient.")
     p.add_argument("--ponder_cost", type=float, default=0.001,
                     help="Per-thinking-token penalty. 0 = always-think gate "
                          "collapse (v7b). 0.005 = catastrophic shutdown of "
@@ -2199,6 +2215,14 @@ def main():
 
     # ---- Loop
     rng = torch.Generator().manual_seed(args.seed + rank)
+    # Adaptive KL: --kl_coef is the starting value; the controller below
+    # auto-tunes `cur_kl_coef` toward --kl_target each step. Fixed when
+    # --kl_target == 0 (cur_kl_coef stays == args.kl_coef).
+    cur_kl_coef = args.kl_coef
+    if args.kl_target > 0.0 and is_main(rank):
+        print(f"[rl-grader] ADAPTIVE KL: target={args.kl_target}, "
+              f"init_coef={args.kl_coef}, clamp=[{args.kl_coef_min},"
+              f"{args.kl_coef_max}]")
     t0 = time.time()
     if is_main(rank):
         print(f"\n{'step':>5}  {'reward_mean':>10}  {'reward_max':>10}  "
@@ -2486,7 +2510,7 @@ def main():
                     temperature=args.temperature,
                     pad_id=int(tok.eos_token_id) if tok.eos_token_id is not None else 0,
                     ref_model=ref_model,
-                    kl_coef=args.kl_coef,
+                    kl_coef=cur_kl_coef,
                     stochastic_gate=args.stochastic_gate,
                     gate_entropy_bonus=effective_entropy_bonus,
                 )
@@ -2502,6 +2526,15 @@ def main():
             loss_val = float(loss.item())
             ratio_val = float(mean_ratio.item())
             kl_val = float(mean_kl.item())
+            # Adaptive-KL controller (PPO/R1 style): hold realized KL near
+            # --kl_target by nudging the coefficient. Lets the policy evolve as
+            # far as the reward supports instead of being throttled by a fixed
+            # penalty as KL grows. No-op when --kl_target == 0.
+            if args.kl_target > 0.0 and not math.isnan(kl_val):
+                if kl_val > args.kl_target * 1.5:
+                    cur_kl_coef = min(cur_kl_coef * 1.5, args.kl_coef_max)
+                elif kl_val < args.kl_target / 1.5:
+                    cur_kl_coef = max(cur_kl_coef / 1.5, args.kl_coef_min)
         elif any_has_rollouts and world_size > 1:
             # Some other rank has rollouts; we must still participate in
             # the all-reduce. Do a trivial forward+backward that produces
@@ -2606,7 +2639,9 @@ def main():
                       f"{reward_max_g:>10.4f}  {depth_mean_g:>10.2f}  "
                       f"{think_rate_g:>10.3f}  {pass_n_g:>6d}  "
                       f"{ratio_val:>6.3f}  {loss_val:>8.4f}  "
-                      f"kl={kl_val:+.4f}{gate_str}  "
+                      f"kl={kl_val:+.4f}"
+                      f"{f'(c={cur_kl_coef:.3f})' if args.kl_target > 0 else ''}"
+                      f"{gate_str}  "
                       f"cur(n={cur_stats['n_seen']}, "
                       f"p={cur_mean_p_g:.2f}, "
                       f"band={cur_pct_in_band_g:.2f}{cur_target_p_str})  "

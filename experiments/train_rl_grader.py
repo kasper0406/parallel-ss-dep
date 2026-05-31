@@ -1171,15 +1171,44 @@ def rollout_one(model, tokenizer, prompt_ids: torch.Tensor, *,
 # Prompt construction
 # ---------------------------------------------------------------------------
 
+def _mbpp_signature(entry_point: str, first_test: str) -> str:
+    """`# Function signature: def {name}({params}):`; arity inferred from the
+    first test's call to entry_point. Returns '' if it can't infer (caller then
+    omits the line). The base was SFT'd to emit FULL functions and is ~6x
+    better when the signature is in context (HumanEval) than when it must
+    invent it (bare MBPP description). Surfacing the signature is VALIDATED to
+    collapse syntax errors 58%->9% under temp-0.6 sampling and move rollouts off
+    the all-0.0 floor into graded exec/partial/pass tiers -> GRPO reward
+    variance. Matches the eval regime (HumanEval also provides the signature)."""
+    import ast as _ast
+    if not entry_point:
+        return ""
+    n = None
+    try:
+        for node in _ast.walk(_ast.parse((first_test or "").strip())):
+            if (isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name)
+                    and node.func.id == entry_point):
+                n = len(node.args)
+                break
+    except Exception:
+        n = None
+    names = ["a", "b", "c", "d", "e", "g", "h", "i", "j", "k"]
+    params = ("*args" if not n else
+              ", ".join(names[i] if i < len(names) else f"a{i}"
+                        for i in range(n)))
+    return f"# Function signature: def {entry_point}({params}):"
+
+
 def build_mbpp_prompt(problem: Problem) -> str:
     """Build a self-explanatory prompt for an MBPP problem.
 
     Format matches the SFT training format (sft_code.build_example):
         # {one-line description}
-        {solution code}
-    We additionally surface the first test as a Python-comment example
-    so the model knows the function name and signature shape it should
-    commit to (without seeing the answer).
+        # Example: {first test}
+        # Function signature: def {name}(...):
+    We surface the first test as a comment example AND the function signature
+    so the model knows the exact name/arity to commit to (without seeing the
+    answer) — the signature is the load-bearing part for syntax-valid output.
     """
     desc = problem.prompt.strip().replace("\n", " ")
     # First test line, as a hint:
@@ -1196,6 +1225,9 @@ def build_mbpp_prompt(problem: Problem) -> str:
     parts = [f"# {desc}"]
     if first_test:
         parts.append(f"# Example: {first_test}")
+    sig = _mbpp_signature(problem.entry_point, first_test)
+    if sig:
+        parts.append(sig)
     parts.append("")  # trailing newline
     return "\n".join(parts)
 
@@ -1377,62 +1409,68 @@ def policy_loss_for_rollouts_batched(
         L = len(r.full_ids)
         padded[i, :L] = torch.tensor(r.full_ids, dtype=torch.long, device=device)
 
-    autocast = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-    with autocast:
-        logits = model(padded)                      # (R, T_max, V) bf16
-    # Grab the per-position gate stash. With DDP, `model._last_gate` is set
-    # on the underlying module, accessed via .module (forward propagates it).
-    inner = getattr(model, "module", model)
-    new_gate = getattr(inner, "_last_gate", None)        # (R, T_max) post-sigmoid
+    # --- T-axis memory win: never materialize the full (R, T, V) logits. ---
+    # The PPO surrogate + KL only need lm_head at each rollout's
+    # `emit_positions − 1` (the prefix positions that PREDICTED the emit
+    # tokens) — M positions total, M = #emit tokens, which does NOT grow with
+    # prompt/think length. The full (R, T, V) logit tensor (V≈49k ≫ d) is the
+    # single largest activation in the policy update AND grows linearly in
+    # rollout length T — exactly the thing that caps how many rollouts/turns
+    # fit. So: forward with `skip_lm_head=True` to get the pre-lm_head hidden
+    # h (R, T, d) — the EXACT tensor `_finalize` feeds to `lm_head` — gather
+    # only the needed (row, pred_idx) vectors into a compact (M, d) tensor,
+    # then apply `lm_head` ONCE on M positions. `lm_head(h[i, p]) ==
+    # full_logits[i, p]` by construction (same Linear on the same h), so the
+    # surrogate + KL are numerically identical to the full-logits path —
+    # just without the (R, T, V) tensor and its backward graph. Done for the
+    # GRAD policy forward AND the no_grad ref forward (both via skip_lm_head).
+    flat_rows: list[int] = []
+    flat_cols: list[int] = []
+    counts: list[tuple[int, int]] = []   # (rollout_index, n_emit)
+    for i, r in enumerate(rollouts):
+        if not r.emit_token_ids:
+            continue
+        counts.append((i, len(r.emit_positions)))
+        for p in r.emit_positions:
+            flat_rows.append(i)
+            flat_cols.append(p - 1)
+    have_pos = len(flat_rows) > 0
+    rows_t = (torch.tensor(flat_rows, dtype=torch.long, device=device)
+              if have_pos else None)
+    cols_t = (torch.tensor(flat_cols, dtype=torch.long, device=device)
+              if have_pos else None)
 
-    # --- KL reference log-probs, computed ONLY at emit positions. ---
-    # The KL term only needs ref logits at each rollout's `emit_positions − 1`
-    # (the prefix positions that PREDICTED the emit tokens) — a few hundred
-    # positions per step, not all R·T. Materializing the full (R, T, V) ref
-    # logit tensor (~0.4-0.9 GB at V≈49k) and then slicing a sliver of it is
-    # wasteful in both memory AND lm_head FLOPs. Instead: run the ref model
-    # with `return_hidden=True` to get the post-out_norm/-memory hidden h
-    # (R, T, d) — the EXACT tensor `_finalize` feeds into `lm_head` — gather
-    # only the needed (row, pred_idx) hidden vectors into a compact (M, d)
-    # tensor, then apply `lm_head` once on M positions. `lm_head(h[i, p]) ==
-    # full_logits[i, p]` by construction (it's the same Linear on the same h),
-    # so this is numerically identical, just cheaper.
-    #   ref_emit_logits: dict[rollout_index] -> (n_emit_i, V) fp32, or None.
+    autocast = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    inner = getattr(model, "module", model)
+    # Policy forward WITHOUT lm_head: grad-bearing hidden (R, T, d).
+    with autocast:
+        h_pol = model(padded, skip_lm_head=True)         # (R, T_max, d) bf16
+    # Per-position gate stash. With DDP, `_last_gate` is on the inner module.
+    new_gate = getattr(inner, "_last_gate", None)         # (R, T_max) post-σ
+    # Policy logits ONLY at emit positions (grad).
+    emit_logits: dict[int, torch.Tensor] = {}
+    if have_pos:
+        with autocast:
+            sel_h = h_pol[rows_t, cols_t]                 # (M, d) grad
+            sel_logits = inner.lm_head(sel_h).float()     # (M, V) grad
+        off = 0
+        for i, n_emit in counts:
+            emit_logits[i] = sel_logits[off:off + n_emit]
+            off += n_emit
+
+    # KL reference logits at the SAME emit positions (no_grad).
     ref_emit_logits: dict[int, torch.Tensor] | None = None
-    if ref_model is not None and kl_coef > 0.0:
-        # Build the flat list of (rollout_index, pred_idx tensor) up front so we
-        # can gather all needed positions in ONE pass.
-        flat_rows: list[int] = []
-        flat_cols: list[int] = []
-        counts: list[tuple[int, int]] = []   # (rollout_index, n_emit)
-        for i, r in enumerate(rollouts):
-            if not r.emit_token_ids:
-                continue
-            n_emit = len(r.emit_positions)
-            counts.append((i, n_emit))
-            for p in r.emit_positions:
-                flat_rows.append(i)
-                flat_cols.append(p - 1)
+    if ref_model is not None and kl_coef > 0.0 and have_pos:
+        ref_inner = getattr(ref_model, "module", ref_model)
+        with torch.no_grad(), autocast:
+            ref_h = ref_model(padded, skip_lm_head=True)  # (R, T, d) bf16
+            sel_rh = ref_h[rows_t, cols_t]                # (M, d)
+            sel_rl = ref_inner.lm_head(sel_rh).float()    # (M, V)
         ref_emit_logits = {}
-        if flat_rows:
-            rows_t = torch.tensor(flat_rows, dtype=torch.long, device=device)
-            cols_t = torch.tensor(flat_cols, dtype=torch.long, device=device)
-            ref_inner = getattr(ref_model, "module", ref_model)
-            with torch.no_grad(), autocast:
-                ref_h = ref_model(padded, return_hidden=True)
-                # forward returns (logits, hidden, ...) when return_hidden=True;
-                # hidden is the 2nd element. Plain `model(...)` (no other flags)
-                # gives a 2-tuple (logits, hidden).
-                if isinstance(ref_h, (tuple, list)):
-                    ref_h = ref_h[1]
-                # Gather the M needed hidden vectors, then lm_head once.
-                sel_h = ref_h[rows_t, cols_t]            # (M, d) bf16
-                sel_logits = ref_inner.lm_head(sel_h).float()   # (M, V)
-            # Slice back into per-rollout chunks.
-            off = 0
-            for i, n_emit in counts:
-                ref_emit_logits[i] = sel_logits[off:off + n_emit]
-                off += n_emit
+        off = 0
+        for i, n_emit in counts:
+            ref_emit_logits[i] = sel_rl[off:off + n_emit]
+            off += n_emit
     # Per-rollout, extract log-probs at emit positions.
     all_surrs = []
     all_ratios = []
@@ -1445,11 +1483,10 @@ def policy_loss_for_rollouts_batched(
         if not r.emit_token_ids:
             continue
         adv = float(advantages[i])
-        positions = torch.tensor(r.emit_positions, dtype=torch.long,
-                                  device=device)
-        # logits that PREDICTED the token at position p are at logits[i, p-1, :].
-        pred_idx = positions - 1
-        pred_logits = logits[i, pred_idx, :].float()   # (n_emit, V), bf16 → fp32 for softmax
+        # Gathered policy logits at this rollout's emit-prediction positions
+        # (lm_head was applied only here — see the T-axis note above). Clone so
+        # the in-place think-token mask doesn't touch the shared sel_logits.
+        pred_logits = emit_logits[i].clone()           # (n_emit, V) fp32, grad
         pred_logits[:, thinking_token_id] = -float("inf")
         new_log_probs = F.log_softmax(
             pred_logits / max(temperature, 1e-8), dim=-1)
@@ -1631,7 +1668,7 @@ def _run_multiturn_step(args, batch_problems, model_module, tok, device, *,
     def _extract(r: Rollout) -> str:
         if args.extract_code_block:
             extracted = extract_code_block(r.text)
-            return extracted if extracted is not None else r.text
+            return extracted if extracted is not None else truncate_at_stop(r.text)
         return r.text
 
     def _rollout_fn(prompt_text: str, n: int):
@@ -1846,6 +1883,18 @@ def main():
     p.add_argument("--grpo_n_group", type=int, default=4,
                     help="Rollouts per problem (N). v5 crashed at 8 → 4 is "
                          "the validated upper bound.")
+    p.add_argument("--policy_micro_chunk", type=int, default=0,
+                    help="Microbatch the policy update over this many rollout "
+                         "ROWS per forward, accumulating gradients before "
+                         "opt.step(). 0 = process ALL rollouts in one forward "
+                         "(current behavior; peak memory ∝ total rollouts). "
+                         "Set e.g. 4 to cap peak activation memory at one chunk "
+                         "while keeping the SAME effective batch — decouples "
+                         "'how many rollouts/turns' from peak memory, so you "
+                         "can raise --batch / --max_turns without OOM. The "
+                         "per-chunk loss is weighted by chunk_rows/total_rows "
+                         "so the accumulated gradient equals the full-batch "
+                         "mean gradient (exact for the PPO surrogate).")
     p.add_argument("--lr", type=float, default=1.5e-6,
                     help="Learning rate. v3 used 2e-6 (peak 17/164); v8 "
                          "ran 500 steps stably at 1e-6. 1.5e-6 is the "
@@ -2095,7 +2144,7 @@ def main():
                     action=argparse.BooleanOptionalAction, default=True,
                     help="Wrap each Block's loss-bearing forward in "
                          "torch.utils.checkpoint during the policy update. "
-                         "Trades ~30% extra compute for ~Nlayers× activation "
+                         "Trades ~30%% extra compute for ~Nlayers× activation "
                          "memory reduction → enables higher --batch. Rollouts "
                          "use torch.no_grad so they're unaffected.")
     p.add_argument("--stochastic_gate",
@@ -2394,7 +2443,7 @@ def main():
                 for ri, r in enumerate(group):
                     if args.extract_code_block:
                         extracted = extract_code_block(r.text)
-                        code = extracted if extracted is not None else r.text
+                        code = extracted if extracted is not None else truncate_at_stop(r.text)
                     else:
                         code = build_mbpp_prompt(prob) + r.text
                     flat_jobs.append((prob, code))
@@ -2469,7 +2518,8 @@ def main():
                         rr = single[0]
                         if args.extract_code_block:
                             extracted = extract_code_block(rr.text)
-                            code = extracted if extracted is not None else rr.text
+                            code = (extracted if extracted is not None
+                                    else truncate_at_stop(rr.text))
                         else:
                             code = repair_prompt + rr.text
                         repair_jobs.append((prob, code))
@@ -2593,18 +2643,46 @@ def main():
                 if ref_model is not None:
                     ref_model._film_bypass = True
             try:
-                loss, mean_ratio, mean_kl, gate_stats = policy_loss_for_rollouts_batched(
-                    flat_rollouts, flat_advantages, model,
-                    clip_eps=args.clip_eps,
-                    thinking_token_id=thinking_token_id,
-                    temperature=args.temperature,
-                    pad_id=int(tok.eos_token_id) if tok.eos_token_id is not None else 0,
-                    ref_model=ref_model,
-                    kl_coef=cur_kl_coef,
-                    stochastic_gate=args.stochastic_gate,
-                    gate_entropy_bonus=effective_entropy_bonus,
-                )
-                loss.backward()
+                # Microbatch the policy update: forward+backward each chunk of
+                # rollout rows, ACCUMULATING gradients (no zero between chunks),
+                # then a SINGLE opt.step() below. Peak activation memory is one
+                # chunk's forward, not all rollouts. Each chunk's loss is
+                # weighted by chunk_rows/total_rows, so the accumulated gradient
+                # equals the full-batch MEAN gradient — exact for the PPO
+                # surrogate + KL (means over rollouts); the gate/entropy aux
+                # terms are weighted by rollout count (benign approximation).
+                # --policy_micro_chunk 0 => one chunk == prior behavior.
+                _n_total = len(flat_rollouts)
+                _micro = (args.policy_micro_chunk
+                          if args.policy_micro_chunk > 0 else _n_total)
+                _micro = max(1, _micro)
+                loss_val = 0.0
+                ratio_val = 0.0
+                kl_val = 0.0
+                gate_stats = {"gate_ratio": float("nan"),
+                              "gate_entropy": float("nan"),
+                              "gate_emit_share": float("nan")}
+                for _c0 in range(0, _n_total, _micro):
+                    _sr = flat_rollouts[_c0:_c0 + _micro]
+                    _sa = flat_advantages[_c0:_c0 + _micro]
+                    _w = len(_sr) / _n_total
+                    loss_c, ratio_c, kl_c, gate_c = \
+                        policy_loss_for_rollouts_batched(
+                            _sr, _sa, model,
+                            clip_eps=args.clip_eps,
+                            thinking_token_id=thinking_token_id,
+                            temperature=args.temperature,
+                            pad_id=int(tok.eos_token_id) if tok.eos_token_id is not None else 0,
+                            ref_model=ref_model,
+                            kl_coef=cur_kl_coef,
+                            stochastic_gate=args.stochastic_gate,
+                            gate_entropy_bonus=effective_entropy_bonus,
+                        )
+                    (loss_c * _w).backward()
+                    loss_val += float(loss_c.item()) * _w
+                    ratio_val += float(ratio_c.item()) * _w
+                    kl_val += float(kl_c.item()) * _w
+                    gate_stats = gate_c
             finally:
                 if args.policy_film_bypass:
                     model_module._film_bypass = prev_film_bypass_policy
@@ -2613,9 +2691,6 @@ def main():
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
-            loss_val = float(loss.item())
-            ratio_val = float(mean_ratio.item())
-            kl_val = float(mean_kl.item())
             # Adaptive-KL controller (PPO/R1 style): hold realized KL near
             # --kl_target by nudging the coefficient. Lets the policy evolve as
             # far as the reward supports instead of being throttled by a fixed

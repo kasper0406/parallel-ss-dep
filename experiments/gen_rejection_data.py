@@ -141,7 +141,7 @@ def main() -> int:
 
     with open(out_path, "w") as f:
         for i, prob in enumerate(problems):
-            prompt = build_mbpp_prompt(prob)
+            prompt = build_mbpp_prompt(prob)  # now includes the signature line
             prompt_ids = tok.encode(prompt, add_special_tokens=False)
             prompt_t = torch.tensor(prompt_ids, dtype=torch.long,
                                      device="cuda").unsqueeze(0)

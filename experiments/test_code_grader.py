@@ -54,6 +54,26 @@ def test_partial_none():
     assert abs(res.score - 0.2) < 1e-9  # 0.2 + 0.7 * 0.0
 
 
+def test_error_text_shows_got_expected():
+    # Richer hint for the multi-turn repair prompt: a failed `== ` assert
+    # reports the actual returned value vs the expected one.
+    res = grade(_problem(_FOUR_ASSERT_CHECK), "def f(x):\n    return -1\n")
+    assert res.tier == "partial"
+    assert "got -1, expected 2" in (res.error_text or ""), res.error_text
+
+
+def test_error_text_exotic_assert_falls_back():
+    # Non-`==` assert shapes must NOT crash the grader and must fall back to a
+    # bare AssertionError (no `(got ...)` enrichment), per the guarded helper.
+    check = ("def check(candidate):\n"
+             "    assert candidate(1) in [5, 6]\n"
+             "    assert candidate(2) > 100\n")
+    res = grade(_problem(check), "def f(x):\n    return x\n")
+    assert res.tier == "partial"
+    assert "AssertionError" in (res.error_text or "")
+    assert "(got " not in (res.error_text or "")  # not enriched, but no crash
+
+
 def test_syntax_error():
     res = grade(_problem(_FOUR_ASSERT_CHECK), "def f(x)\n    return x + 1\n")
     assert res.tier == "syntax_error"

@@ -123,6 +123,35 @@ def truncate_at_stop(text: str) -> str:
     return text[:earliest]
 
 
+def _assert_detail(test: ast.expr, ns: dict) -> str:
+    """Best-effort ``(got X, expected Y)`` suffix for a failed
+    ``assert LHS == RHS``. Returns '' for any assert shape we can't cleanly
+    introspect (so the caller falls back to a bare ``AssertionError``). The
+    operands are re-eval'd in the test namespace — fully guarded, since a
+    side-effecting / raising / slow operand must never break grading. Only
+    plain ``==`` comparisons are enriched; everything else falls back."""
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)):
+        return ""
+    try:
+        got = eval(ast.unparse(test.left), ns)            # noqa: re-runs call
+        expected = eval(ast.unparse(test.comparators[0]), ns)
+    except Exception:
+        return ""
+
+    def _short(v: object) -> str:
+        try:
+            s = repr(v)
+        except Exception:
+            return ""
+        return s if len(s) <= 120 else s[:117] + "..."
+
+    g, e = _short(got), _short(expected)
+    if not g and not e:
+        return ""
+    return f" (got {g}, expected {e})"
+
+
 def _run_check_granular(check_fn: ast.FunctionDef, ns: dict, candidate):
     """Run a `check(candidate)` body statement-by-statement so a single
     failing assert doesn't mask the rest. Returns (tier, error, n_tests,
@@ -151,7 +180,9 @@ def _run_check_granular(check_fn: ast.FunctionDef, ns: dict, candidate):
             except TimeoutError:
                 raise
             except AssertionError:
-                failures.append(f"  {src}  ->  AssertionError")
+                failures.append(
+                    f"  {src}  ->  AssertionError"
+                    f"{_assert_detail(stmt.test, local_ns)}")
             except Exception as exc:
                 failures.append(f"  {src}  ->  {type(exc).__name__}: {exc}")
         else:

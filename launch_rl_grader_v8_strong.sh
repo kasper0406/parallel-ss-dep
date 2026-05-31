@@ -23,6 +23,17 @@
 #
 # No LLM judge: it never fired on this setup (partial-credit + curriculum keep
 # groups variance-bearing). batch 2 fits max_turns-2 on one 5090.
+#
+# SCALE-UP path (decouple effective batch from peak memory): the policy update
+# now microbatches over rollout ROWS via --policy_micro_chunk. Peak activation
+# memory = ONE chunk's forward, not all rollouts, and the weighted-accumulated
+# gradient EQUALS the full-batch gradient (test_policy_microbatch.py). So to run
+# a larger effective batch without OOM:
+#     BATCH=8 MICRO=4 ./launch_rl_grader_v8_strong.sh
+# grpo_n_group stays 4 (the GRPO baseline floor); raise --batch (more problems)
+# for a better gradient estimate, and MICRO caps the policy-update memory.
+# NOTE: generation TIME still scales with total rollouts — microbatch only frees
+# the policy-update MEMORY, not the decode wall-clock.
 
 set -e
 cd /home/knielsen/ml/parallel-ss-dep
@@ -34,7 +45,8 @@ CUDA_VISIBLE_DEVICES=${GPU:-0} nohup .venv/bin/python -u experiments/train_rl_gr
     --load_ckpt checkpoints/sft_v8_combined.pt \
     --save_ckpt checkpoints/rl_grader_v8_strong.pt \
     --dataset mbpp_combined --extract_code_block --activation_checkpointing \
-    --steps 600 --batch 2 --grpo_n_group 4 --lr 2e-6 \
+    --steps 600 --batch ${BATCH:-2} --grpo_n_group 4 --lr 2e-6 \
+    --policy_micro_chunk ${MICRO:-0} \
     --max_gen 320 --max_think_per_step 4 --total_think_budget 120 \
     --think_budget_diversity 0.7 --stochastic_gate --gate_entropy_bonus 0.01 \
     --emit_threshold 0.5 --gate_floor 0.0 --temperature 0.7 --min_emit_before_eos 30 \

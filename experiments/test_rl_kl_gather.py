@@ -64,17 +64,21 @@ class HiddenStubLM(nn.Module):
         self._last_gate = None
         self._last_gate_logits = None
 
-    def forward(self, ids: torch.Tensor, return_hidden: bool = False):
+    def forward(self, ids: torch.Tensor, return_hidden: bool = False,
+                skip_lm_head: bool = False):
         B, T = ids.shape
         emb = self.content(ids)                       # (B, T, d)
         # Causal running mean -> hidden depends on the row's own prefix.
         csum = torch.cumsum(emb, dim=1)
         denom = torch.arange(1, T + 1, device=ids.device).float().view(1, T, 1)
         hidden = csum / denom                          # (B, T, d)
-        logits = self.lm_head(hidden)                  # (B, T, V)
         g = torch.full((B, T), float(self._gate_value), device=ids.device)
         self._last_gate = g
         self._last_gate_logits = torch.logit(g.clamp(1e-6, 1 - 1e-6))
+        if skip_lm_head:
+            # Mirror TinyLM: return pre-lm_head hidden, gate stash still set.
+            return hidden
+        logits = self.lm_head(hidden)                  # (B, T, V)
         if return_hidden:
             return logits, hidden
         return logits

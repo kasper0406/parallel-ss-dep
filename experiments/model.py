@@ -1783,7 +1783,8 @@ class TinyLM(nn.Module):
                   return_gate: bool,
                   maybe_gate,
                   extra: tuple = (),
-                  doc_ids: torch.Tensor | None = None):
+                  doc_ids: torch.Tensor | None = None,
+                  skip_lm_head: bool = False):
         """Shared exit-tail for every forward branch:
         out_norm → memory → lm_head → (aux, hidden, gate) packing.
 
@@ -1803,6 +1804,16 @@ class TinyLM(nn.Module):
         h = self.out_norm(h_raw)
         h = self._apply_memory(h, input_ids, read_mask=mem_read_mask,
                                doc_ids=doc_ids)
+        if skip_lm_head:
+            # Memory-lean RL policy-update path: return the pre-lm_head hidden
+            # (post out_norm + memory) so the caller applies lm_head ONLY at the
+            # positions it needs (emit-prediction indices), avoiding the full
+            # (B, T, V) logits tensor AND its backward graph — V≈49k ≫ d, so
+            # that tensor dominates the policy-update activation memory and
+            # grows with rollout length T. The gate side-effect still fires so
+            # `_last_gate` is populated for the stochastic-gate policy gradient.
+            maybe_gate(h)
+            return h
         lm_logits = self.lm_head(h)
         outs = (lm_logits,)
         if return_aux and self.aux_dim > 0:
@@ -1835,6 +1846,7 @@ class TinyLM(nn.Module):
                 mem_read_mask: torch.Tensor | None = None,
                 doc_ids: torch.Tensor | None = None,
                 inputs_embeds: torch.Tensor | None = None,
+                skip_lm_head: bool = False,
                 ) -> torch.Tensor | tuple:
         """
         inputs_embeds (B, T, d_model) | None: when provided, BYPASSES the
@@ -1923,7 +1935,8 @@ class TinyLM(nn.Module):
                                     think_mask=think_mask)
             return self._finalize(x, input_ids, mem_read_mask,
                                    return_aux, return_hidden, return_gate,
-                                   _maybe_gate, doc_ids=doc_ids)
+                                   _maybe_gate, doc_ids=doc_ids,
+                                   skip_lm_head=skip_lm_head)
 
         if self.feedback_xattn_pairs:
             # Pass 1: vanilla. Collect outputs at every layer that any target
@@ -1978,7 +1991,8 @@ class TinyLM(nn.Module):
                                     think_mask=think_mask)
             return self._finalize(h, input_ids, mem_read_mask,
                                    return_aux, return_hidden, return_gate,
-                                   _maybe_gate, doc_ids=doc_ids)
+                                   _maybe_gate, doc_ids=doc_ids,
+                                   skip_lm_head=skip_lm_head)
         if self.feedback_pairs:
             source_layers = set(s for _, s in self.feedback_pairs)
 
@@ -2111,7 +2125,8 @@ class TinyLM(nn.Module):
                     self._last_alpha_t_per_target = {}
                 return self._finalize(h, input_ids, mem_read_mask,
                                        return_aux, return_hidden, return_gate,
-                                       _maybe_gate, doc_ids=doc_ids)
+                                       _maybe_gate, doc_ids=doc_ids,
+                                       skip_lm_head=skip_lm_head)
             # ----------------------------------------------------------------
             # Standard 2-pass sparse FiLM (existing path).
             # ----------------------------------------------------------------
@@ -2144,7 +2159,8 @@ class TinyLM(nn.Module):
                     h = self.sparse_feedback[str(L)](h, state_above_lagged)
             return self._finalize(h, input_ids, mem_read_mask,
                                    return_aux, return_hidden, return_gate,
-                                   _maybe_gate, doc_ids=doc_ids)
+                                   _maybe_gate, doc_ids=doc_ids,
+                                   skip_lm_head=skip_lm_head)
         # Pass 1: vanilla forward, collect each layer's output.
         pass1_outs: list[torch.Tensor] = []
         h = x
@@ -2179,7 +2195,7 @@ class TinyLM(nn.Module):
 
         return self._finalize(h, input_ids, mem_read_mask,
                                return_aux, return_hidden, return_gate,
-                               _maybe_gate)
+                               _maybe_gate, skip_lm_head=skip_lm_head)
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

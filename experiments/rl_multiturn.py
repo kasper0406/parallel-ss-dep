@@ -387,7 +387,7 @@ class VLLMJudgeBackend(JudgeBackend):
                  max_model_len: int = 8192,
                  gpu_mem_fraction: float = 0.9,
                  temperature: float = 0.0,
-                 max_new_tokens: int = 128) -> None:
+                 max_new_tokens: int = 256) -> None:
         self.model = model
         self.server_url = server_url
         self.strip_comments_first = strip_comments_first
@@ -449,6 +449,23 @@ class VLLMJudgeBackend(JudgeBackend):
                 continue
             if sorted(order) == list(range(n)):
                 return order
+        # Fallback: small instruct models (e.g. the 3B judge) often emit the
+        # ranking as PROSE or bare numbers ("Candidate 3 is closest, then 1,
+        # then 2") rather than a JSON list, so the bracketed-span scan above
+        # finds nothing and we'd abstain on every call. Extract integers in
+        # order, keep the FIRST occurrence of each value in 1..n; accept if
+        # they form a complete permutation. A bounded tie-break (judge_eps),
+        # so an imperfect-but-plausible order is acceptable; an INCOMPLETE one
+        # still abstains.
+        seen: list[int] = []
+        for tok in re.findall(r"\d+", cleaned):
+            v = int(tok) - 1
+            if 0 <= v < n and v not in seen:
+                seen.append(v)
+            if len(seen) == n:
+                break
+        if sorted(seen) == list(range(n)):
+            return seen
         raise ValueError(
             f"no valid best-first permutation of 1..{n} in judge "
             f"response: {text!r}")

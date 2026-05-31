@@ -41,25 +41,32 @@ class StubLM(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self._gate_value = gate_value
-        # Trivial param so .parameters() / .device-lookup work.
-        self.dummy = nn.Linear(1, 1)
+        self.d_model = 4
+        # lm_head whose product with the constant ones-hidden reproduces the
+        # old fixed logits (token 5 = 5.0, rest 0). The policy loss now applies
+        # lm_head only at gathered emit positions (skip_lm_head path), so the
+        # stub must expose a real hidden + lm_head rather than canned logits.
+        self.lm_head = nn.Linear(self.d_model, vocab_size, bias=False)
+        with torch.no_grad():
+            self.lm_head.weight.zero_()
+            self.lm_head.weight[5, :] = 5.0 / self.d_model
         self._last_gate: torch.Tensor | None = None
         self._last_gate_logits: torch.Tensor | None = None
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, ids: torch.Tensor, skip_lm_head: bool = False):
         B, T = ids.shape
         device = ids.device
-        # Deterministic logits: token 5 always wins (so emit sampling is
-        # predictable). Vocab > 5 + thinking_token_id assumed by callers.
-        logits = torch.zeros(B, T, self.vocab_size, device=device,
-                             dtype=torch.float32)
-        logits[..., 5] = 5.0
+        # Constant hidden -> lm_head(hidden) gives token-5-wins logits.
+        hidden = torch.ones(B, T, self.d_model, device=device,
+                            dtype=torch.float32)
         # Stash gate as a (B, T) tensor at the requested value.
         g = torch.full((B, T), float(self._gate_value), device=device,
                        dtype=torch.float32)
         self._last_gate = g
         self._last_gate_logits = torch.logit(g.clamp(1e-6, 1 - 1e-6))
-        return logits
+        if skip_lm_head:
+            return hidden
+        return self.lm_head(hidden)
 
 
 class StubTokenizer:

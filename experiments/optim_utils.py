@@ -53,6 +53,17 @@ def _is_think_adapter(name: str) -> bool:
     return ".think_adapter." in name or name.endswith(".think_adapter.alpha")
 
 
+def _is_latent_feedback_adapter(name: str) -> bool:
+    """LatentFeedbackAdapter params (2026-06-01). Lives at
+    `latent_feedback_adapter.{norm.weight,proj.{weight,bias},alpha}`. ALL go to
+    AdamW: the `proj` matrix is zero-init with an identity residual + learnable
+    α (the FiLM-α opt-in-via-gradient curriculum), so Muon's Newton-Schulz
+    orthogonalisation is the wrong inductive bias (it would immediately push the
+    zero matrix toward an orthogonal one).
+    """
+    return name.startswith("latent_feedback_adapter.")
+
+
 def _is_refinement_head(name: str) -> bool:
     """Phase D RefinementHead params (2026-05-27). Lives at
     `refinement_head.{W_q,W_k,W_v,W_o,W_up,W_down,attn_norm,mlp_norm}.*`
@@ -185,6 +196,9 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
             adamw_regular.append(p)
             continue
         if _is_refinement_head(name):
+            adamw_regular.append(p)
+            continue
+        if _is_latent_feedback_adapter(name):
             adamw_regular.append(p)
             continue
         if _is_embedding_like(name) or p.ndim != 2:

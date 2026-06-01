@@ -90,6 +90,52 @@ class ThinkAdapter(nn.Module):
         return self.alpha * mask * adapter_out
 
 
+class LatentFeedbackAdapter(nn.Module):
+    """Input adapter for LATENT (Coconut-style) thinking feedback (2026-06-01).
+
+    The latent-thinking loop feeds the trunk's OWN `out_norm(h)` hidden state
+    back as the next think-step `inputs_embeds`. But the input layer was only
+    ever trained on embedding-TABLE vectors — a different manifold — so feeding
+    a raw out_norm hidden is OOD and produces near-garbage (the documented
+    Δlogp ≈ -4 to -6 "thinking HURTS" failure mode). This module learns the
+    mapping `out_norm-hidden → input-embedding space` applied BEFORE the fed-back
+    hidden is consumed as the next think input.
+
+        z_adapted = z + α · Linear(RMSNorm(z))
+
+    Init so behaviour is UNCHANGED at start: the `Linear` is zero-init AND a
+    learnable scalar α (init 0) wraps it, so a fresh / untrained adapter is the
+    identity `z_adapted == z` — i.e. byte-identical to the no-adapter latent
+    path, and an existing ckpt without the adapter loads identically (the module
+    is only built when the flag is on, and its zero-init makes its first forward
+    a no-op). The optimizer opts in only via gradient (the FiLM-α / ThinkAdapter
+    pattern). The Linear weights route to AdamW (matched by
+    `optim_utils._is_latent_feedback_adapter`).
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.norm = RMSNorm(d_model)
+        self.proj = nn.Linear(d_model, d_model, bias=True)
+        # Zero-init the projection so the residual `z + α·proj(norm(z))` is the
+        # identity at cold start regardless of α. α init 0 is belt-and-braces
+        # (and gives the same opt-in-via-gradient curriculum the rest of the
+        # stack uses); because proj.weight is also zero, the GRADIENT on α is
+        # zero until proj has moved — so we DON'T zero proj.bias-only; instead
+        # we keep proj fully zero and rely on α's gradient bootstrapping once
+        # proj.weight gets gradient from the LM loss flowing through z.
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+        self.alpha = nn.Parameter(torch.ones(1))
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Map a fed-back hidden `z` (…, d_model) into input-embedding space.
+
+        Identity at cold start (proj zero-init). `z` may be (N, 1, d) or (N, d).
+        """
+        return z + self.alpha * self.proj(self.norm(z))
+
+
 class Block(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_head: int, d_ff: int,
                  attention_cls: Callable[..., nn.Module],
@@ -1321,6 +1367,13 @@ class TinyLM(nn.Module):
         refinement_head_n_heads: int = 8,
         refinement_head_mlp_mult: int = 2,
         refinement_head_alpha_init: float = 0.3,
+        # Latent-thinking input adapter (2026-06-01). When True, build a
+        # `LatentFeedbackAdapter` that maps the fed-back out_norm hidden into
+        # the input-embedding manifold before it is consumed as the next
+        # latent think-step input. Zero-init → identity → a fresh ckpt is
+        # byte-identical to the no-adapter latent path. Default OFF (existing
+        # ckpts load identically; they simply lack the adapter keys).
+        use_latent_feedback_adapter: bool = False,
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1391,6 +1444,12 @@ class TinyLM(nn.Module):
                 mlp_mult=self.refinement_head_mlp_mult,
                 alpha_init=self.refinement_head_alpha_init,
             )
+        # Latent-thinking input adapter (2026-06-01). Built here so state-dict
+        # round-trip preserves weights; zero-init → identity → a freshly
+        # attached adapter is byte-identical to the no-adapter latent path.
+        self.use_latent_feedback_adapter = bool(use_latent_feedback_adapter)
+        if self.use_latent_feedback_adapter:
+            self.latent_feedback_adapter = LatentFeedbackAdapter(d_model)
         self.out_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         if tie_embeddings:
@@ -1740,6 +1799,21 @@ class TinyLM(nn.Module):
             return h_normed
         return self.memory(h_normed, input_ids, read_mask=read_mask,
                            doc_ids=doc_ids)
+
+    def apply_latent_feedback_adapter(self, z: torch.Tensor) -> torch.Tensor:
+        """Map a fed-back latent hidden `z` into the input-embedding manifold.
+
+        Called by the latent-thinking loop (`thinking._latent_think_logits`
+        and its grad twin) on the trunk's own `out_norm(h)` hidden BEFORE it is
+        used as the next think-step `inputs_embeds`. No-op (identity) when the
+        adapter is not built — so every existing latent callsite keeps its
+        current behaviour unless the model was constructed with
+        `use_latent_feedback_adapter=True`. With the adapter built but untrained
+        (zero-init proj) it is also the identity, so a fresh ckpt is unchanged.
+        """
+        if not getattr(self, "use_latent_feedback_adapter", False):
+            return z
+        return self.latent_feedback_adapter(z)
 
     def _apply_refinement_head(self, h: torch.Tensor) -> torch.Tensor:
         """Phase D soft-mixture: σ · h + (1-σ) · refinement_head(h).

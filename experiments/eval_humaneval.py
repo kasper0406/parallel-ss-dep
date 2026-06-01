@@ -504,6 +504,13 @@ def generate_latent_think(
             # embedding. The appended think token makes β=0 fire at this
             # position (state-readonly), so the recurrence is not written.
             latent = h[:, -1:, :].to(inputs_embeds.dtype)     # (B, 1, d)
+            # Learned input adapter: map the fed-back out_norm hidden into the
+            # input-embedding manifold (identity when the model has none /
+            # untrained — byte-identical to the prior path then). Mirrors the
+            # measurement/grad primitives in thinking.py so inference matches
+            # training.
+            latent = model.apply_latent_feedback_adapter(latent).to(
+                inputs_embeds.dtype)
             # Unified hybrid (auto-detected via model.mem_alpha): augment the
             # hidden-feedback thread with a learned-α WM retrieval so the model
             # pulls in new info as it thinks (THINKING_MEMORY_PLAN D8/D11).

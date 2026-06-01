@@ -487,7 +487,11 @@ def _latent_think_logits(model, prefixes: torch.Tensor, *, R: int,
     z = h0[:, -1:, :]                                            # (N, 1, d)
     last_logits = None
     for _ in range(max(1, int(R))):
-        ie = torch.cat([base_emb, z.to(base_emb.dtype)], dim=1)  # (N, Lmax+1, d)
+        # Map the fed-back out_norm hidden into the input-embedding manifold
+        # via the learned adapter (identity when the model has none / it is
+        # untrained — so this is byte-identical to the no-adapter path then).
+        zi = model.apply_latent_feedback_adapter(z)
+        ie = torch.cat([base_emb, zi.to(base_emb.dtype)], dim=1)  # (N, Lmax+1, d)
         logits, h = _logits_hidden(model(ids, inputs_embeds=ie,
                                          return_hidden=True,
                                          mem_read_mask=mem_read_mask))
@@ -556,7 +560,10 @@ def _latent_think_logits_grad(model, prefixes: torch.Tensor, *, R: int,
     z = h0[:, -1:, :]
     last_logits = None
     for _ in range(max(1, int(R))):
-        ie = torch.cat([base_emb, z.to(base_emb.dtype)], dim=1)
+        # Learned input adapter (identity when absent/untrained); gradient
+        # flows through it AND the R latent steps into the trunk + adapter.
+        zi = model.apply_latent_feedback_adapter(z)
+        ie = torch.cat([base_emb, zi.to(base_emb.dtype)], dim=1)
         logits, h = _logits_hidden(model(ids, inputs_embeds=ie,
                                          return_hidden=True))
         z = h[:, -1:, :]
@@ -574,11 +581,46 @@ def _latent_clean_mask(input_ids, targets, *, thinking_token_id, pad_id, eos_id)
     return valid
 
 
+def _selective_position_weights(model, input_ids, bsel, tsel):
+    """Per-(valid-position) sampling weight in [eps, ∞) biased toward where
+    thinking SHOULD help: high gate σ (P(think)=1-σ... see note) OR high
+    no-think predictive entropy. Computed under no_grad from ONE clean forward.
+
+    Note on the gate convention: `model._last_gate` is σ = P(EMIT). Thinking is
+    wanted where the model is UNCERTAIN, i.e. where σ is LOW (the gate would
+    route to think) OR the next-token entropy is HIGH. We weight by
+    `w = (1 - σ) + entropy_norm` so both "gate wants to think" and "model is
+    uncertain" pull the sample toward useful positions. Returns a (P,) tensor.
+    """
+    with torch.no_grad():
+        out = model(input_ids, return_hidden=False, return_gate=True)
+        logits = out[0] if isinstance(out, (tuple, list)) else out
+        logits = logits.float()
+        # Predictive entropy of the no-think next-token distribution.
+        logp = F.log_softmax(logits, dim=-1)
+        ent = -(logp.exp() * logp).sum(dim=-1)                  # (B, T)
+        # Normalise entropy to ~[0,1] by its own batch max (robust, scale-free).
+        ent = ent / ent.amax().clamp_min(1e-6)
+        gate = getattr(model, "_last_gate", None)               # σ=P(emit), (B,T)
+        if gate is not None:
+            gate = gate.float()
+            want_think = (1.0 - gate.clamp(0.0, 1.0))           # high where σ low
+        else:
+            want_think = torch.zeros_like(ent)
+        score = want_think + ent                                # (B, T)
+        w = score[bsel, tsel]                                   # (P,)
+        # Floor so every valid position keeps a non-zero probability (the
+        # selective bias is a tilt, not a hard filter — avoids starving the
+        # trunk of "thinking didn't help here" negatives entirely).
+        return w.clamp_min(1e-3)
+
+
 def latent_cotrain_loss(model, input_ids: torch.Tensor, targets: torch.Tensor,
                         *, R: int, thinking_token_id: int,
                         sample_frac: float = 0.05, max_positions: int = 32,
                         max_prefix_len: int = 256,
                         pad_id: int = 0, eos_id: int | None = None,
+                        selective: bool = False,
                         generator: torch.Generator | None = None):
     """Grad CE on the post-R-latent-think prediction at sampled positions.
 
@@ -587,6 +629,12 @@ def latent_cotrain_loss(model, input_ids: torch.Tensor, targets: torch.Tensor,
     logp_no_think(true): the v9 validation signal — it should climb from v8's
     ≈ -7 toward 0/positive as the trunk learns to use thinking. ``None`` if no
     positions sampled.
+
+    ``selective``: when True, sample the ``max_positions`` positions WEIGHTED
+    toward where thinking should help (high gate-think / high no-think entropy)
+    via `_selective_position_weights`, instead of uniform-random. The
+    fixed-shape contract (exactly ``max_positions`` rows, full ``max_prefix_len``
+    window) is preserved so the compile path still specializes once.
     """
     assert int(thinking_token_id) != int(pad_id), "think id must differ from pad"
     B, T = input_ids.shape
@@ -607,27 +655,13 @@ def latent_cotrain_loss(model, input_ids: torch.Tensor, targets: torch.Tensor,
     if P < max_positions:
         return None
     gdev = generator.device if generator is not None else bsel.device
-    perm = torch.randperm(P, generator=generator,
-                          device=gdev)[:max_positions].to(bsel.device)
-    bsel, tsel = bsel[perm], tsel[perm]
-    true_next = targets[bsel, tsel]                              # (max_positions,)
-    Lmax = int(max_prefix_len)
-    rows = []
-    for j in range(bsel.numel()):
-        b, t = int(bsel[j].item()), int(tsel[j].item())
-        pref = input_ids[b, : t + 1][-Lmax:]
-        if pref.numel() < Lmax:
-            pad = torch.full((Lmax - pref.numel(),), pad_id, dtype=pref.dtype,
-                             device=input_ids.device)
-            pref = torch.cat([pad, pref], dim=0)                 # LEFT pad
-        rows.append(pref)
-    prefixes = torch.stack(rows, dim=0)
 
-    # The extra forwards below clobber the model's per-step diagnostic stashes
-    # (_last_gate*, memory._last_*), which the main training loop indexes with
-    # the MAIN-batch shape. Save them and restore at the end so this loss is
-    # transparent to every downstream diagnostic (the documented 2026-05-27
-    # footgun, generalized).
+    # Snapshot the model's per-step diagnostic stashes (_last_gate*,
+    # memory._last_*) NOW — every extra forward below (the selective-weight
+    # forward AND the grad/no-think latent forwards) clobbers them with a
+    # wrong-shape (max_positions, …) tensor that the main training loop would
+    # otherwise index with the MAIN-batch shape. Restored in the `finally`
+    # (the documented 2026-05-27 footgun, generalized).
     mem = getattr(model, "memory", None)
     _saved = {a: getattr(model, a, None)
               for a in ("_last_gate", "_last_gate_logits")}
@@ -635,6 +669,29 @@ def latent_cotrain_loss(model, input_ids: torch.Tensor, targets: torch.Tensor,
                    for a in ("_last_injection", "_last_write_gate")}
                   if mem is not None else {})
     try:
+        if selective:
+            # Weighted sampling (without replacement) toward useful positions.
+            w = _selective_position_weights(model, input_ids, bsel, tsel)
+            perm = torch.multinomial(w.to(gdev), max_positions,
+                                     replacement=False,
+                                     generator=generator).to(bsel.device)
+        else:
+            perm = torch.randperm(P, generator=generator,
+                                  device=gdev)[:max_positions].to(bsel.device)
+        bsel, tsel = bsel[perm], tsel[perm]
+        true_next = targets[bsel, tsel]                          # (max_positions,)
+        Lmax = int(max_prefix_len)
+        rows = []
+        for j in range(bsel.numel()):
+            b, t = int(bsel[j].item()), int(tsel[j].item())
+            pref = input_ids[b, : t + 1][-Lmax:]
+            if pref.numel() < Lmax:
+                pad = torch.full((Lmax - pref.numel(),), pad_id,
+                                 dtype=pref.dtype, device=input_ids.device)
+                pref = torch.cat([pad, pref], dim=0)             # LEFT pad
+            rows.append(pref)
+        prefixes = torch.stack(rows, dim=0)
+
         logits = _latent_think_logits_grad(model, prefixes, R=R,
                                            thinking_token_id=thinking_token_id)
         loss = F.cross_entropy(logits.float(), true_next)

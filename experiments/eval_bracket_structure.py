@@ -46,7 +46,8 @@ def build_model_from_ckpt(ckpt_path: str,
                           force_refinement_head_n_heads: int | None = None,
                           force_refinement_head_mlp_mult: int | None = None,
                           force_refinement_head_alpha_init: float | None = None,
-                          force_state_readonly: bool | None = None):
+                          force_state_readonly: bool | None = None,
+                          force_use_latent_feedback_adapter: bool | None = None):
     """Construct a TinyLM from a saved ckpt.
 
     `force_use_think_adapter` (optional) overrides the auto-detect:
@@ -197,6 +198,16 @@ def build_model_from_ckpt(ckpt_path: str,
     refinement_head_alpha_init = float(cfg.get("refinement_head_alpha_init", 0.3))
     if force_use_refinement_head is not None:
         use_refinement_head = bool(force_use_refinement_head)
+    # Latent-thinking input adapter (2026-06-01). Weights live at
+    # `latent_feedback_adapter.{norm.weight,proj.weight,proj.bias,alpha}`, so
+    # auto-detect from the state-dict. force_* lets the co-train launcher ATTACH
+    # a fresh (identity-init) adapter to a ckpt that lacks one.
+    use_latent_feedback_adapter = bool(
+        cfg.get("use_latent_feedback_adapter", False))
+    if any(k.startswith("latent_feedback_adapter.") for k in sd_keys):
+        use_latent_feedback_adapter = True
+    if force_use_latent_feedback_adapter is not None:
+        use_latent_feedback_adapter = bool(force_use_latent_feedback_adapter)
     if force_refinement_head_window is not None:
         refinement_head_window = int(force_refinement_head_window)
     if force_refinement_head_n_heads is not None:
@@ -223,6 +234,7 @@ def build_model_from_ckpt(ckpt_path: str,
         refinement_head_n_heads=refinement_head_n_heads,
         refinement_head_mlp_mult=refinement_head_mlp_mult,
         refinement_head_alpha_init=refinement_head_alpha_init,
+        use_latent_feedback_adapter=use_latent_feedback_adapter,
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,

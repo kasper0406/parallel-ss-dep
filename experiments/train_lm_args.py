@@ -628,6 +628,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--latent_cotrain_max_positions", type=int, default=32,
                    help="Hard cap on latent-cotrain positions per step "
                         "(grad through R forwards — keep small for memory).")
+    p.add_argument("--use_latent_feedback_adapter", action="store_true",
+                   help="Build a LatentFeedbackAdapter (RMSNorm→zero-init "
+                        "Linear, identity-residual + learnable α) that maps the "
+                        "fed-back out_norm hidden into the input-embedding "
+                        "manifold before it is consumed as the next latent "
+                        "think-step input. Fixes the OOD-feedback failure mode "
+                        "(latent Δlogp ≈ -4..-6). Identity at cold start → a "
+                        "fresh ckpt is byte-identical to the no-adapter path. "
+                        "Use with --latent_cotrain_weight so the adapter gets "
+                        "gradient.")
+    p.add_argument("--latent_cotrain_selective", action="store_true",
+                   help="Sample latent-cotrain positions WEIGHTED toward where "
+                        "thinking should help (high gate σ / high no-think "
+                        "predictive entropy) instead of uniform-random. Keeps "
+                        "the fixed (max_positions, max_prefix_len) shape the "
+                        "compile path needs. The uniform path is preserved when "
+                        "this flag is off.")
     p.add_argument("--bf16_optim_state", action="store_true",
                    help="Store optimizer state (AdamW exp_avg/exp_avg_sq, "
                         "Muon momentum_buffer) in bf16 instead of fp32. "

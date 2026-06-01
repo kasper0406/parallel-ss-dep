@@ -146,6 +146,8 @@ def build_model_from_args(args, *, vocab_size: int,
             getattr(args, "refinement_head_mlp_mult", 2)),
         refinement_head_alpha_init=float(
             getattr(args, "refinement_head_alpha_init", 0.3)),
+        use_latent_feedback_adapter=bool(
+            getattr(args, "use_latent_feedback_adapter", False)),
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,

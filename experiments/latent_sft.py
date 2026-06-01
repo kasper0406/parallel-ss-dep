@@ -53,6 +53,11 @@ def latent_sft_loss(model, comment_ids, sol_ids, eos_id, R, thinking_id, device)
     for _ in range(R):
         _logits, h = model(cur_ids, inputs_embeds=cur_emb, return_hidden=True)
         z = h[:, -1:, :].to(cur_emb.dtype)          # hidden carries the thread
+        # Learned input adapter: map the fed-back out_norm hidden into the
+        # input-embedding manifold (identity when absent/untrained → matches the
+        # prior behaviour). Mirrors thinking.py + eval_humaneval (adapter
+        # precedes any WM augmentation).
+        z = model.apply_latent_feedback_adapter(z).to(cur_emb.dtype)
         if hybrid:
             # Unified mechanism: augment the hidden-feedback thread with a
             # learned-α WM retrieval (the model pulls in new info as it thinks).

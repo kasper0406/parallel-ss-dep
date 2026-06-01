@@ -1434,6 +1434,8 @@ def main():
                             sample_frac=args.latent_cotrain_sample_frac,
                             max_positions=args.latent_cotrain_max_positions,
                             max_prefix_len=128,
+                            selective=bool(getattr(
+                                args, "latent_cotrain_selective", False)),
                             pad_id=int(pad_token_id))
                         if _lc is not None:
                             _lc_loss, _lc_delta, _lc_n = _lc
@@ -1877,6 +1879,8 @@ def main():
                                       and args.think_decision == "gate")),
                 state_readonly_at_think=bool(
                     getattr(args, "state_readonly_at_think", False)),
+                use_latent_feedback_adapter=bool(
+                    getattr(args, "use_latent_feedback_adapter", False)),
                 retrieval_input_additive=False,
             )
             torch.save({"state_dict": model.state_dict(), "step": step,
@@ -2021,6 +2025,8 @@ def main():
                 "think_backpressure_explore": args.think_backpressure_explore,
                 "state_readonly_at_think": bool(
                     getattr(args, "state_readonly_at_think", False)),
+                "use_latent_feedback_adapter": bool(
+                    getattr(args, "use_latent_feedback_adapter", False)),
                 "retrieval_input_additive": False,
             },
         }

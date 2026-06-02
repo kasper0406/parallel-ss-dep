@@ -84,8 +84,14 @@ def train(args):
           f"params={model.num_params():,}", flush=True)
 
     band = [int(x) for x in args.rungs.split(",") if x.strip()]
-    reason_data = {n: _load_rung(args.reason_prefix, n, tok, args.max_len) for n in band}
-    for n in band:
+    reason_data = {}
+    for n in list(band):
+        path = pathlib.Path(f"{args.reason_prefix}_n{n}.jsonl")
+        if not path.exists():
+            print(f"  reason rung {n}: SKIP (missing {path})", flush=True)
+            band.remove(n)
+            continue
+        reason_data[n] = _load_rung(args.reason_prefix, n, tok, args.max_len)
         print(f"  reason rung {n}: {len(reason_data[n])} ex", flush=True)
     print(f"  loading code pairs from {args.code_jsonl} ...", flush=True)
     pairs = load_distilled_jsonl(args.code_jsonl, prefer_full_completion=True,
@@ -151,12 +157,14 @@ def train(args):
             if args.save:
                 cfg["state_readonly_at_think"] = True
                 cfg["use_latent_feedback_adapter"] = True
+                cfg["use_memory"] = bool(getattr(model, "use_memory", False))
                 torch.save({"state_dict": model.state_dict(), "config": cfg,
                             "step": step}, args.save)
 
     if args.save:
         cfg["state_readonly_at_think"] = True
         cfg["use_latent_feedback_adapter"] = True
+        cfg["use_memory"] = bool(getattr(model, "use_memory", False))
         torch.save({"state_dict": model.state_dict(), "config": cfg, "step": args.steps},
                    args.save)
         print(f"[saved] {args.save}", flush=True)

@@ -287,6 +287,15 @@ def train(args):
     train_data = {n: _load_rung(args.train_prefix, n, tok, args.max_len) for n in band}
     for n in band:
         print(f"  rung {n}: {len(train_data[n])} train examples", flush=True)
+    if args.per_hop:
+        # per-hop supervises the FIRST token of each intermediate; multi-token
+        # values (m>10) would silently train on first-digit-only. Enforce single-token.
+        for n in band:
+            if train_data[n] and len(tok.encode(str(train_data[n][0][2]),
+                                                 add_special_tokens=False)) > 1:
+                raise SystemExit(
+                    f"--per_hop needs single-token values (use the m<=10 corpus); "
+                    f"rung {n} answer {train_data[n][0][2]} is multi-token")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                             weight_decay=0.0)
@@ -363,12 +372,14 @@ def train(args):
             if args.save:
                 cfg["state_readonly_at_think"] = True
                 cfg["use_latent_feedback_adapter"] = True
+                cfg["use_memory"] = bool(getattr(model, "use_memory", False))
                 torch.save({"state_dict": model.state_dict(), "config": cfg,
                             "step": step}, args.save)
 
     if args.save:
         cfg["state_readonly_at_think"] = True
         cfg["use_latent_feedback_adapter"] = True
+        cfg["use_memory"] = bool(getattr(model, "use_memory", False))
         torch.save({"state_dict": model.state_dict(), "config": cfg,
                     "step": args.steps}, args.save)
         print(f"[saved] {args.save}", flush=True)

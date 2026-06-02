@@ -128,12 +128,24 @@ def train(args):
         ex = code_data[cperm[cptr]]; cptr += 1
         return ex
 
+    def pick_rung(step):
+        # Optional depth-ramp: grow the reasoning-depth frontier over the first
+        # reason_ramp_frac of steps (bootstraps the lookup skill easy->hard, the
+        # way the toy learned fastest), then sample the full band uniformly.
+        if args.reason_ramp_frac > 0 and step < args.reason_ramp_frac * args.steps:
+            frac = step / (args.reason_ramp_frac * args.steps)
+            frontier = max(1, int(round(1 + frac * (len(band) - 1))))
+            choices = band[:frontier]
+        else:
+            choices = band
+        return choices[int(torch.randint(0, len(choices), (1,), generator=g).item())]
+
     t0 = time.time()
     run_loss = run_code = run_reason = 0.0
     n_code = 0
     opt.zero_grad(set_to_none=True)
     for step in range(1, args.steps + 1):
-        n = band[int(torch.randint(0, len(band), (1,), generator=g).item())]
+        n = pick_rung(step)
         loss_accum = 0.0
         for _ in range(args.accum):
             is_code = (torch.rand(1, generator=g).item() < args.code_frac)
@@ -188,6 +200,9 @@ def main():
     ap.add_argument("--eval_rungs", default="")
     ap.add_argument("--code_jsonl", default="data/sft_phase_c_combined.jsonl")
     ap.add_argument("--code_frac", type=float, default=0.5)
+    ap.add_argument("--reason_ramp_frac", type=float, default=0.0,
+                    help="ramp reasoning depth easy->hard over this fraction of "
+                         "steps (bootstraps from-scratch lookup learning)")
     ap.add_argument("--code_pure", action="store_true",
                     help="train code stream on a clean ```python``` block (no CoT "
                          "prose); latent thinking does the reasoning silently")

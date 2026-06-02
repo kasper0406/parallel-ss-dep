@@ -30,7 +30,15 @@ import pathlib
 import random
 
 
-def _gen_one(rng: random.Random, n_steps: int, m: int, idx: int) -> dict:
+def _dict_repr(f: list[int]) -> str:
+    # Multi-line (one entry per line): valid Python AND gives the recurrence a
+    # clean per-entry anchor to store each mapping. A dense single-line dict is
+    # positionally hard to index and tanks lookup learnability (v4 finding).
+    return "{\n" + "".join(f"    {i}: {v},\n" for i, v in enumerate(f)) + "}"
+
+
+def _gen_one(rng: random.Random, n_steps: int, m: int, idx: int,
+             dict_format: bool = False) -> dict:
     f = [rng.randrange(m) for _ in range(m)]
     s = rng.randrange(m)
     x = s
@@ -39,15 +47,27 @@ def _gen_one(rng: random.Random, n_steps: int, m: int, idx: int) -> dict:
         x = f[x]
         intermediates.append(x)
     answer = x
-    table_lines = "\n".join(f"f({i}) = {f[i]}" for i in range(m))
-    prompt = (
-        f"You are given a function f defined on the integers 0 to {m-1}:\n"
-        f"{table_lines}\n\n"
-        f"Start with x = {s}. Apply f to x a total of {n_steps} times "
-        f"(compute f(f(...f(x)...)) with {n_steps} applications).\n\n"
-        f"Write a Python function `solve()` that takes no arguments and returns "
-        f"the final value of x.\n"
-    )
+    if dict_format:
+        # CODE-FORMAT: a Python dict + repeated indexing. Same depth-bound task,
+        # but Python syntax the code model has priors for (less interference).
+        prompt = (
+            f"You are given a Python dictionary d mapping integers to integers:\n"
+            f"d = {_dict_repr(f)}\n\n"
+            f"Start with x = {s}. Apply the update x = d[x] a total of {n_steps} "
+            f"times. Return the final value of x.\n\n"
+            f"Write a Python function `solve()` that takes no arguments and returns "
+            f"the final value of x.\n"
+        )
+    else:
+        table_lines = "\n".join(f"f({i}) = {f[i]}" for i in range(m))
+        prompt = (
+            f"You are given a function f defined on the integers 0 to {m-1}:\n"
+            f"{table_lines}\n\n"
+            f"Start with x = {s}. Apply f to x a total of {n_steps} times "
+            f"(compute f(f(...f(x)...)) with {n_steps} applications).\n\n"
+            f"Write a Python function `solve()` that takes no arguments and returns "
+            f"the final value of x.\n"
+        )
     return {
         "task_id": f"ptr/m{m}/n{n_steps}/{idx}",
         "prompt": prompt,
@@ -61,7 +81,8 @@ def _gen_one(rng: random.Random, n_steps: int, m: int, idx: int) -> dict:
     }
 
 
-def _gen_one_fixed_point(rng: random.Random, d: int, m: int, idx: int) -> dict:
+def _gen_one_fixed_point(rng: random.Random, d: int, m: int, idx: int,
+                         dict_format: bool = False) -> dict:
     """IMPLICIT-depth task: x = f(x) repeated until a fixed point f(t)=t, return t.
 
     The depth d (#hops to the fixed point) is NOT stated in the prompt — the model
@@ -78,16 +99,27 @@ def _gen_one_fixed_point(rng: random.Random, d: int, m: int, idx: int) -> dict:
     f[t] = t                             # the only fixed point the orbit reaches
     answer = t
     intermediates = orbit[1:]            # f^1(s)..f^d(s)
-    table_lines = "\n".join(f"f({i}) = {f[i]}" for i in range(m))
-    prompt = (
-        f"You are given a function f defined on the integers 0 to {m-1}:\n"
-        f"{table_lines}\n\n"
-        f"Start with x = {s}. Repeatedly replace x with f(x) until you reach a "
-        f"value that maps to itself (a value x with f(x) = x). Return that final "
-        f"value.\n\n"
-        f"Write a Python function `solve()` that takes no arguments and returns "
-        f"the final value of x.\n"
-    )
+    if dict_format:
+        prompt = (
+            f"You are given a Python dictionary d mapping integers to integers:\n"
+            f"d = {_dict_repr(f)}\n\n"
+            f"Start with x = {s}. Repeatedly apply the update x = d[x] until x "
+            f"stops changing (you reach a value with d[x] == x). Return that final "
+            f"value.\n\n"
+            f"Write a Python function `solve()` that takes no arguments and returns "
+            f"the final value of x.\n"
+        )
+    else:
+        table_lines = "\n".join(f"f({i}) = {f[i]}" for i in range(m))
+        prompt = (
+            f"You are given a function f defined on the integers 0 to {m-1}:\n"
+            f"{table_lines}\n\n"
+            f"Start with x = {s}. Repeatedly replace x with f(x) until you reach a "
+            f"value that maps to itself (a value x with f(x) = x). Return that final "
+            f"value.\n\n"
+            f"Write a Python function `solve()` that takes no arguments and returns "
+            f"the final value of x.\n"
+        )
     return {
         "task_id": f"ptrfp/m{m}/d{d}/{idx}",
         "prompt": prompt,
@@ -102,12 +134,13 @@ def _gen_one_fixed_point(rng: random.Random, d: int, m: int, idx: int) -> dict:
 
 
 def _gen_split(n_steps: int, n: int, m: int, seed: int,
-               fixed_point: bool = False) -> list[dict]:
+               fixed_point: bool = False, dict_format: bool = False) -> list[dict]:
     rng = random.Random(seed)
     seen, out, idx, attempts = set(), [], 0, 0
     while len(out) < n and attempts < n * 50:
-        rec = (_gen_one_fixed_point(rng, n_steps, m, idx) if fixed_point
-               else _gen_one(rng, n_steps, m, idx))
+        rec = (_gen_one_fixed_point(rng, n_steps, m, idx, dict_format=dict_format)
+               if fixed_point
+               else _gen_one(rng, n_steps, m, idx, dict_format=dict_format))
         attempts += 1
         if rec["prompt"] in seen:
             continue
@@ -127,6 +160,9 @@ def main() -> int:
     ap.add_argument("--fixed_point", action="store_true",
                     help="IMPLICIT-depth task: iterate f until a fixed point f(x)=x "
                          "(depth NOT stated; model must recognise the halt condition)")
+    ap.add_argument("--dict_format", action="store_true",
+                    help="render as a Python dict + repeated indexing (x=d[x]) so the "
+                         "reasoning is CODE-format, not alien f(i)= prose")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -134,9 +170,9 @@ def main() -> int:
     pathlib.Path(args.out_prefix).parent.mkdir(parents=True, exist_ok=True)
     for n in rungs:
         tr = _gen_split(n, args.n_train, args.m, seed=args.seed + n,
-                        fixed_point=args.fixed_point)
+                        fixed_point=args.fixed_point, dict_format=args.dict_format)
         he = _gen_split(n, args.n_heldout, args.m, seed=args.seed + 10000 + n,
-                        fixed_point=args.fixed_point)
+                        fixed_point=args.fixed_point, dict_format=args.dict_format)
         tr_keys = {r["prompt"] for r in tr}
         he = [r for r in he if r["prompt"] not in tr_keys]
         tp = f"{args.out_prefix}_train_n{n}.jsonl"

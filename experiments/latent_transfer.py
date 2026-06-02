@@ -94,8 +94,14 @@ def train(args):
         reason_data[n] = _load_rung(args.reason_prefix, n, tok, args.max_len)
         print(f"  reason rung {n}: {len(reason_data[n])} ex", flush=True)
     print(f"  loading code pairs from {args.code_jsonl} ...", flush=True)
-    pairs = load_distilled_jsonl(args.code_jsonl, prefer_full_completion=True,
+    pairs = load_distilled_jsonl(args.code_jsonl,
+                                 prefer_full_completion=not args.code_pure,
                                  require_extracted_code=True)
+    if args.code_pure:
+        # PURE code: target is a clean ```python``` block, NO discrete CoT prose.
+        # Latent thinking does the reasoning silently — this removes the v1
+        # rambling-CoT failure (model narrated forever, never reached the code).
+        pairs = [(p, f"```python\n{s.strip()}\n```") for p, s in pairs]
     if args.code_max_pairs:
         pairs = pairs[:args.code_max_pairs]
     code_data = _tokenize_code(pairs, tok, args.code_max_len)
@@ -182,6 +188,9 @@ def main():
     ap.add_argument("--eval_rungs", default="")
     ap.add_argument("--code_jsonl", default="data/sft_phase_c_combined.jsonl")
     ap.add_argument("--code_frac", type=float, default=0.5)
+    ap.add_argument("--code_pure", action="store_true",
+                    help="train code stream on a clean ```python``` block (no CoT "
+                         "prose); latent thinking does the reasoning silently")
     ap.add_argument("--code_max_pairs", type=int, default=30000)
     ap.add_argument("--code_max_len", type=int, default=768)
     ap.add_argument("--steps", type=int, default=4000)

@@ -85,7 +85,7 @@ def latent_perhop_loss(model, comment_ids, inter_ids, R, thinking_id, device):
 
 
 def autonomous_halt_loss(model, comment_ids, sol_ids, eos_id, R, thinking_id,
-                         device, gate_weight=1.0):
+                         device, gate_weight=1.0, route_emit_all=False):
     """Answer-span CE + gate halt-schedule BCE: teach the model to think R times
     then HALT on its own (handles multi-token answers).
 
@@ -125,6 +125,14 @@ def autonomous_halt_loss(model, comment_ids, sol_ids, eos_id, R, thinking_id,
     tgt = torch.zeros(len(dec), device=device, dtype=gl.dtype)
     tgt[-1] = 1.0                                     # EMIT at the last decision
     gate_loss = F.binary_cross_entropy_with_logits(gl, tgt)
+    if route_emit_all:
+        # AIRTIGHT ROUTING: on a code example, the gate must EMIT at EVERY position
+        # (never think during code generation). Without this, only the prompt-end
+        # decision is supervised and the gate fires thinking mid-code -> harmful
+        # collapse. Supervise all gate logits -> emit(1).
+        ge = gate_logits[0]
+        gate_loss = gate_loss + F.binary_cross_entropy_with_logits(
+            ge, torch.ones_like(ge))
     return ans_loss + gate_weight * gate_loss
 
 
@@ -256,6 +264,25 @@ def train(args):
         force_use_latent_feedback_adapter=True)
     model = model.to(device).train()
     model._film_bypass = True                      # single-forward FiLM (speed + WM bug)
+    if args.freeze_trunk:
+        # PARAMETER SEPARATION: freeze the code trunk (preserve code) and train the
+        # thinking params (adapter + gate_head) PLUS optionally the last N trunk
+        # blocks (lookup needs some trunk capacity — full freeze can't learn it).
+        n_layers = int(cfg.get("n_layers", 10))
+        unfreeze_blocks = set(range(max(0, n_layers - args.unfreeze_last_layers),
+                                    n_layers))
+        n_tr = 0
+        for name, p in model.named_parameters():
+            train_it = ("latent_feedback_adapter" in name or "gate_head" in name
+                        or "out_norm" in name)
+            mm = re.match(r"blocks\.(\d+)\.", name)
+            if mm and int(mm.group(1)) in unfreeze_blocks:
+                train_it = True
+            p.requires_grad = train_it
+            n_tr += p.numel() if train_it else 0
+        print(f"  [freeze_trunk] unfreeze last {args.unfreeze_last_layers} blocks "
+              f"+ adapter+gate: {n_tr:,} trainable params "
+              f"({100*n_tr/sum(p.numel() for p in model.parameters()):.1f}%)", flush=True)
     if args.no_memory and getattr(model, "use_memory", False):
         # CLEAN latent feedback: the model returns `out_norm(h)` AFTER
         # _apply_memory, so with use_memory=True the fed-back latent is
@@ -297,8 +324,8 @@ def train(args):
                     f"--per_hop needs single-token values (use the m<=10 corpus); "
                     f"rung {n} answer {train_data[n][0][2]} is multi-token")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
-                            weight_decay=0.0)
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                            lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
     g = torch.Generator().manual_seed(args.seed)
     ptr = {n: 0 for n in band}
     perm = {n: torch.randperm(len(train_data[n]), generator=g).tolist() for n in band}
@@ -425,6 +452,12 @@ def main():
                     help="skip the depth ramp; sample the full band uniformly "
                          "from step 1 (use when continuing from an already-"
                          "curriculum-trained ckpt — pure consolidation)")
+    ap.add_argument("--freeze_trunk", action="store_true",
+                    help="parameter separation: freeze the code trunk, train the "
+                         "thinking params (adapter+gate) + last N blocks.")
+    ap.add_argument("--unfreeze_last_layers", type=int, default=0,
+                    help="with --freeze_trunk, also train the last N trunk blocks "
+                         "(gives the latent lookup some trunk capacity)")
     ap.add_argument("--no_memory", action="store_true",
                     help="disable WorkingMemory so the latent feedback is the "
                          "clean out_norm(h) thread (matches the validated synthetic; "

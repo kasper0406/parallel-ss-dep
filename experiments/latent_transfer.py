@@ -51,6 +51,35 @@ from experiments.sft_code import load_distilled_jsonl
 
 CODE_COMMENT = "# Complete the following Python function.\n"
 
+import torch.nn.functional as F
+
+
+def do_no_harm_loss(model, comment_ids, R, thinking_id, device):
+    """DO-NO-HARM: on a non-reasoning (code/text) prefix, run R latent steps and
+    push the post-think next-token distribution TOWARD the no-think distribution.
+
+    The mechanistic probe found that forced thinking on untrained positions
+    collapses to a HARMFUL fixed point (dlogp ~ -4). This loss reshapes the thread
+    dynamics so that on these positions thinking is a NO-OP (benign) instead of
+    harmful — making thinking pure-upside (helps where trained, harmless elsewhere)
+    so the gate can route freely. KL(no_think.detach() || think)."""
+    base = torch.tensor([comment_ids], dtype=torch.long, device=device)
+    with torch.no_grad():
+        o0 = model(base, return_hidden=True)
+        nothink = (o0[0] if isinstance(o0, tuple) else o0)[0, -1].detach()
+    cur_ids, cur_emb = base, model.embed(base)
+    think_tok = torch.full((1, 1), int(thinking_id), dtype=torch.long, device=device)
+    for _ in range(R):
+        o = model(cur_ids, inputs_embeds=cur_emb, return_hidden=True)
+        z = model.apply_latent_feedback_adapter(o[1][:, -1:, :]).to(cur_emb.dtype)
+        cur_ids = torch.cat([cur_ids, think_tok], dim=1)
+        cur_emb = torch.cat([cur_emb, z], dim=1)
+    o = model(cur_ids, inputs_embeds=cur_emb, return_hidden=True)
+    think = (o[0] if isinstance(o, tuple) else o)[0, -1]
+    # push the post-think distribution to match the (detached) no-think one
+    return F.kl_div(F.log_softmax(think, -1),
+                    F.softmax(nothink, -1), reduction="sum")
+
 
 def _tokenize_code(pairs, tok, max_len):
     data = []
@@ -148,11 +177,17 @@ def train(args):
         n = pick_rung(step)
         loss_accum = 0.0
         for _ in range(args.accum):
-            is_code = (torch.rand(1, generator=g).item() < args.code_frac)
-            if is_code:
+            roll = torch.rand(1, generator=g).item()
+            if roll < args.dnh_frac:
+                # DO-NO-HARM step: make forced thinking benign on a code prefix.
+                c, _s = next_code()
+                loss = args.dnh_weight * do_no_harm_loss(
+                    model, c, args.dnh_R, thinking_id, device)
+            elif torch.rand(1, generator=g).item() < args.code_frac:
                 c, s = next_code()
                 loss = autonomous_halt_loss(model, c, s, eos_id, 0, thinking_id,
-                                            device, gate_weight=args.gate_weight)
+                                            device, gate_weight=args.gate_weight,
+                                            route_emit_all=True)
                 run_code += loss.item(); n_code += 1
             else:
                 c, s, _a, _i = next_reason(n)
@@ -203,6 +238,13 @@ def main():
     ap.add_argument("--reason_ramp_frac", type=float, default=0.0,
                     help="ramp reasoning depth easy->hard over this fraction of "
                          "steps (bootstraps from-scratch lookup learning)")
+    ap.add_argument("--dnh_frac", type=float, default=0.0,
+                    help="fraction of steps spent on the DO-NO-HARM objective "
+                         "(make forced thinking benign on code/text positions)")
+    ap.add_argument("--dnh_R", type=int, default=3,
+                    help="latent steps used in the do-no-harm objective")
+    ap.add_argument("--dnh_weight", type=float, default=1.0,
+                    help="weight on the do-no-harm KL loss")
     ap.add_argument("--code_pure", action="store_true",
                     help="train code stream on a clean ```python``` block (no CoT "
                          "prose); latent thinking does the reasoning silently")

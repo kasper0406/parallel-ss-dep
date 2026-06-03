@@ -81,6 +81,29 @@ def do_no_harm_loss(model, comment_ids, R, thinking_id, device):
                     F.softmax(nothink, -1), reduction="sum")
 
 
+def compute_fisher(model, code_data, eos_id, thinking_id, device, n_samples):
+    """Empirical Fisher (importance) of each trunk weight FOR CODE: E[grad(code)^2].
+    Excludes the new adapter (no v8 reference). Used by EWC to anchor code-important
+    weights while reasoning trains the code-unimportant directions."""
+    fisher = {n: torch.zeros_like(p) for n, p in model.named_parameters()
+              if p.requires_grad and "latent_feedback_adapter" not in n}
+    order = torch.randperm(len(code_data), generator=torch.Generator().manual_seed(0)).tolist()
+    used = 0
+    for i in order[:n_samples]:
+        c, s = code_data[i]
+        model.zero_grad(set_to_none=True)
+        autonomous_halt_loss(model, c, s, eos_id, 0, thinking_id, device).backward()
+        for n, p in model.named_parameters():
+            if p.grad is not None and n in fisher:
+                fisher[n] += p.grad.detach() ** 2
+        used += 1
+    for n in fisher:
+        fisher[n] /= max(1, used)
+    model.zero_grad(set_to_none=True)
+    print(f"  [EWC] Fisher over {used} code samples", flush=True)
+    return fisher
+
+
 def _tokenize_code(pairs, tok, max_len):
     data = []
     for prob, sol in pairs:
@@ -136,6 +159,13 @@ def train(args):
     code_data = _tokenize_code(pairs, tok, args.code_max_len)
     print(f"  code examples usable: {len(code_data)}", flush=True)
 
+    fisher, theta_star = None, None
+    if args.ewc_weight > 0:
+        fisher = compute_fisher(model, code_data, eos_id, thinking_id, device,
+                                args.ewc_fisher_samples)
+        theta_star = {n: p.detach().clone() for n, p in model.named_parameters()
+                      if n in fisher}
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                             weight_decay=0.0)
     g = torch.Generator().manual_seed(args.seed)
@@ -170,7 +200,7 @@ def train(args):
         return choices[int(torch.randint(0, len(choices), (1,), generator=g).item())]
 
     t0 = time.time()
-    run_loss = run_code = run_reason = 0.0
+    run_loss = run_code = run_reason = run_ewc = 0.0
     n_code = 0
     opt.zero_grad(set_to_none=True)
     for step in range(1, args.steps + 1):
@@ -196,11 +226,19 @@ def train(args):
                 run_reason += loss.item()
             (loss / args.accum).backward()
             loss_accum += loss.item() / args.accum
+        if fisher is not None:
+            # EWC: anchor code-important weights to the v8 reference.
+            ewc = sum((fisher[n] * (p - theta_star[n]).pow(2)).sum()
+                      for n, p in model.named_parameters() if n in fisher)
+            ewc_term = args.ewc_weight * ewc
+            ewc_term.backward()
+            run_ewc += float(ewc_term.detach())
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step(); opt.zero_grad(set_to_none=True)
         run_loss += loss_accum
         if step % args.log_every == 0 or step == 1:
             print(f"  step {step:>5}  loss {run_loss/min(step,args.log_every):.4f}  "
+                  f"ewc {run_ewc/min(step,args.log_every):.4f}  "
                   f"code% {n_code/(step*args.accum):.2f}  ({time.time()-t0:.0f}s)",
                   flush=True)
             run_loss = 0.0
@@ -245,6 +283,11 @@ def main():
                     help="latent steps used in the do-no-harm objective")
     ap.add_argument("--dnh_weight", type=float, default=1.0,
                     help="weight on the do-no-harm KL loss")
+    ap.add_argument("--ewc_weight", type=float, default=0.0,
+                    help="EWC: anchor code-important weights to the v8 base "
+                         "(weighted by Fisher) so reasoning can't perturb code")
+    ap.add_argument("--ewc_fisher_samples", type=int, default=400,
+                    help="number of code samples for the Fisher estimate")
     ap.add_argument("--code_pure", action="store_true",
                     help="train code stream on a clean ```python``` block (no CoT "
                          "prose); latent thinking does the reasoning silently")

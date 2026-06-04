@@ -101,7 +101,7 @@ CUDA_VISIBLE_DEVICES=${GPU:-1} nohup .venv/bin/python -u experiments/train_lm.py
     --alpha_wd 0.0 --wd 0.01 \
     --grad_clip 1.0 --z_loss 1e-4 \
     --mask_eos_in_targets \
-    --optimizer muon --lr 1.4e-3 --lr_muon 5e-3 \
+    --optimizer muon --lr 3e-4 --lr_muon 1e-3 \
     --lr_schedule wsd --warmup_steps 400 --lr_decay_frac 0.15 \
     --load_ckpt checkpoints/pretrain_phase_c.pt \
     --start_step 23000 \

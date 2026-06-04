@@ -110,6 +110,32 @@ def test_alpha_floor_default_off_is_noop():
     torch.testing.assert_close(out_train, out_eval)
 
 
+def test_decoupled_kv_default_off():
+    """decoupled_kv defaults off → no W_k / temperature params (legacy path)."""
+    mem = WorkingMemory(d_model=16, d_mem=16, mem_size=16, thinking_token_id=7)
+    assert mem.decoupled_kv is False
+    assert not hasattr(mem, "W_k")
+
+
+def test_decoupled_kv_builds_addresses_and_trains():
+    """decoupled_kv=True adds a separate match-key W_k, a learned clamped
+    temperature, and a β-scaled gate bias; the read is active and its
+    addressing params receive gradient."""
+    import math
+    mem = WorkingMemory(d_model=16, d_mem=16, mem_size=16, thinking_token_id=7,
+                        decoupled_kv=True)
+    assert hasattr(mem, "W_k")
+    # temperature inits to sqrt(d_mem)
+    assert abs(mem.logit_scale.exp().item() - math.sqrt(16)) < 1e-4
+    assert abs(mem.gate_bias_beta.item() - 0.1) < 1e-6
+    h, input_ids, read_mask = _make_inputs()
+    out = mem(h, input_ids, read_mask=read_mask)
+    assert not torch.allclose(out, h), "decoupled read should change read rows"
+    out.pow(2).sum().backward()
+    assert mem.W_k.weight.grad.abs().sum().item() > 0
+    assert mem.logit_scale.grad is not None
+
+
 def test_old_ckpt_loads_without_read_alpha():
     """A state_dict produced before the gate existed (no `read_alpha` key)
     loads with strict=False and the param keeps its construction default —

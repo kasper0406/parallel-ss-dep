@@ -1004,6 +1004,7 @@ class WorkingMemory(nn.Module):
         read_alpha_init: float = 1.0,
         read_alpha_floor_start: float = 0.0,
         read_alpha_floor_warmup_steps: int = 0,
+        decoupled_kv: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -1027,6 +1028,24 @@ class WorkingMemory(nn.Module):
             nn.init.normal_(lin.weight, std=0.02)
         nn.init.normal_(self.W_write.weight, std=0.02)
         nn.init.zeros_(self.W_write.bias)
+
+        # DKV-WM (decoupled key/value, 2026-06-04). The default WM addresses
+        # BY VALUE: scores = W_q(h)·W_v(h_src) — one projection does double duty
+        # (be-matchable AND carry-content) and the raw dot-product has a
+        # magnitude degeneracy (small-norm → flat softmax → the measured
+        # top_mass=0.156 diffuse attention / mis-ranking → unreliable
+        # addressing). With decoupled_kv: a dedicated match-KEY W_k is stored
+        # per slot (W_v becomes content-only), scoring is cosine with a learned
+        # CLAMPED temperature (sharpness no longer needs growing weight norms),
+        # and the write-gate log-bias is β-scaled so write-recency can't swamp
+        # query-match. This is the minimal structural requirement for semantic
+        # (non-token-identity) recall. Default off → byte-identical legacy path.
+        self.decoupled_kv = bool(decoupled_kv)
+        if self.decoupled_kv:
+            self.W_k = nn.Linear(d_model, d_mem, bias=False)
+            nn.init.normal_(self.W_k.weight, std=0.02)
+            self.logit_scale = nn.Parameter(torch.tensor(math.log(math.sqrt(d_mem))))
+            self.gate_bias_beta = nn.Parameter(torch.tensor(0.1))
 
         # Output α gate on the READ injection (added 2026-06-04). Every other
         # side-module in this repo (FiLM, PKM, RefinementHead, LineSelector)
@@ -1104,16 +1123,27 @@ class WorkingMemory(nn.Module):
         gather_idx_v = top_idx.unsqueeze(-1).expand(-1, -1, self.d_mem)  # (B, K, d_mem)
         buf_v = torch.gather(v, dim=1, index=gather_idx_v)        # (B, K, d_mem)
         buf_g = torch.gather(g, dim=1, index=top_idx)             # (B, K)
+        if self.decoupled_kv:
+            buf_k = torch.gather(self.W_k(h), dim=1, index=gather_idx_v)  # (B, K, d_mem)
 
         # ---- Read side: query for every position -----------------------------
         # We only USE the result at think positions (mask later); cheaper than
         # gather-only-think indices but keeps the implementation uniform.
         q = self.W_q(h)                                          # (B, T, d_mem)
-        scale = 1.0 / math.sqrt(self.d_mem)
         # scores: (B, T, K)
-        scores = torch.einsum("btd,bkd->btk", q, buf_v) * scale
-        # Log-gate bias: tiny ε to keep log finite when a row's K-th slot has g=0.
-        scores = scores + torch.log(buf_g.clamp_min(1e-6)).unsqueeze(1)
+        if self.decoupled_kv:
+            # Cosine addressing: match query to the slot KEY (not the value),
+            # sharpness via a learned clamped temperature; β-scaled gate-bias.
+            qn = F.normalize(q, dim=-1)
+            kn = F.normalize(buf_k, dim=-1)
+            tau = self.logit_scale.exp().clamp(2.0, 100.0)
+            scores = torch.einsum("btd,bkd->btk", qn, kn) * tau
+            scores = scores + self.gate_bias_beta * torch.log(buf_g.clamp_min(1e-6)).unsqueeze(1)
+        else:
+            scale = 1.0 / math.sqrt(self.d_mem)
+            scores = torch.einsum("btd,bkd->btk", q, buf_v) * scale
+            # Log-gate bias: tiny ε to keep log finite when a row's K-th slot has g=0.
+            scores = scores + torch.log(buf_g.clamp_min(1e-6)).unsqueeze(1)
 
         # Causal mask: position t can attend to buffer-slot k iff top_idx[k] < t.
         # top_idx: (B, K) → (B, 1, K). pos: (1, T, 1).
@@ -1469,6 +1499,9 @@ class TinyLM(nn.Module):
                                               # 0.0 = zero-init-residual boot.
         mem_read_alpha_floor_start: float = 0.0,   # PKM-style α-floor for WM
         mem_read_alpha_floor_warmup_steps: int = 0,  # addressing bootstrap.
+        mem_decoupled_kv: bool = False,       # DKV-WM: decoupled key/value +
+                                              # cosine addressing (reliable
+                                              # semantic addressing).
         thinking_token_id: int | None = None,  # Required when use_memory=True.
         pad_token_id: int | None = None,      # Optional; used to keep padding
                                               # rows out of the memory.
@@ -1831,6 +1864,7 @@ class TinyLM(nn.Module):
                 read_alpha_init=float(mem_read_alpha_init),
                 read_alpha_floor_start=float(mem_read_alpha_floor_start),
                 read_alpha_floor_warmup_steps=int(mem_read_alpha_floor_warmup_steps),
+                decoupled_kv=bool(mem_decoupled_kv),
             )
             # Re-init the thinking-token embedding row to the mean of the
             # other rows. PyTorch's default init makes it random noise, which

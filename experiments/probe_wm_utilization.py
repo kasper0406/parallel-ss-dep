@@ -39,7 +39,7 @@ from experiments.tasks.mqar import make_batch as mqar_batch
 
 def build_and_train(seed, T, K, vocab, d_model, n_layers, n_heads, d_head,
                     steps, lr, mem_size, device="cuda",
-                    floor_start=0.0, floor_warmup=0):
+                    floor_start=0.0, floor_warmup=0, decoupled_kv=False):
     torch.manual_seed(seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -52,6 +52,7 @@ def build_and_train(seed, T, K, vocab, d_model, n_layers, n_heads, d_head,
         mem_read_alpha_init=1.0, thinking_token_id=thinking_id,
         mem_read_alpha_floor_start=floor_start,
         mem_read_alpha_floor_warmup_steps=floor_warmup,
+        mem_decoupled_kv=decoupled_kv,
         activation_checkpointing=False,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95),
@@ -154,13 +155,16 @@ def main():
     p.add_argument("--mem_size", type=int, default=256)
     p.add_argument("--floor_start", type=float, default=0.0)
     p.add_argument("--floor_warmup", type=int, default=0)
+    p.add_argument("--decoupled_kv", action="store_true",
+                   help="DKV-WM: decoupled key/value + cosine addressing.")
     args = p.parse_args()
 
     model = build_and_train(args.seed, args.T, args.K, args.vocab,
                             args.d_model, args.n_layers, args.n_heads,
                             args.d_head, args.steps, args.lr, args.mem_size,
                             floor_start=args.floor_start,
-                            floor_warmup=args.floor_warmup)
+                            floor_warmup=args.floor_warmup,
+                            decoupled_kv=args.decoupled_kv)
     m = probe(model, args.T, args.K, args.vocab)
     print(f"\n=== WM utilization (seed={args.seed}, K={args.K}, "
           f"mem_size={args.mem_size}) ===")

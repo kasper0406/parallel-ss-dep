@@ -1001,6 +1001,7 @@ class WorkingMemory(nn.Module):
         mem_size: int,
         thinking_token_id: int,
         pad_token_id: int | None = None,
+        read_alpha_init: float = 1.0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -1024,6 +1025,22 @@ class WorkingMemory(nn.Module):
             nn.init.normal_(lin.weight, std=0.02)
         nn.init.normal_(self.W_write.weight, std=0.02)
         nn.init.zeros_(self.W_write.bias)
+
+        # Output α gate on the READ injection (added 2026-06-04). Every other
+        # side-module in this repo (FiLM, PKM, RefinementHead, LineSelector)
+        # has a learned scalar α that lets the model dial its contribution to
+        # zero and fall back to the baseline trunk. WM was the lone exception:
+        # it injected W_proj(read) UNCONDITIONALLY at read positions, so when
+        # the injection hurt there was no escape hatch — at the saturating
+        # MQAR regime (K=256/T=1024/lr=3e-3) this drove training to collapse
+        # (recall 0.014, near-uniform loss) while plain DeltaNet hit 0.999.
+        # read_alpha_init=0.0 → zero-init-residual (FiLM-α pattern): cold start
+        # is byte-identical to no-WM, α moves first under loss gradient (∂L/∂α
+        # is non-zero because W_proj is non-zero), the W_* weights follow once
+        # α drifts off zero, and α→0 always recovers the baseline if WM hurts.
+        # Default 1.0 preserves the pre-gate behaviour AND keeps old ckpts
+        # (which lack this param) byte-identical when loaded with strict=False.
+        self.read_alpha = nn.Parameter(torch.tensor(float(read_alpha_init)))
 
     def forward(self, h: torch.Tensor, input_ids: torch.Tensor,
                 read_mask: torch.Tensor | None = None,
@@ -1114,7 +1131,7 @@ class WorkingMemory(nn.Module):
             inj = (input_ids == self.thinking_token_id).unsqueeze(-1).to(h.dtype)
         else:
             inj = read_mask.to(h.dtype).unsqueeze(-1)
-        return h + injection * inj
+        return h + self.read_alpha * injection * inj
 
 
 class RefinementHead(nn.Module):
@@ -1405,6 +1422,8 @@ class TinyLM(nn.Module):
                                               # positions only.
         mem_size: int = 1024,
         mem_dim: int | None = None,
+        mem_read_alpha_init: float = 1.0,     # α gate on WM read injection;
+                                              # 0.0 = zero-init-residual boot.
         thinking_token_id: int | None = None,  # Required when use_memory=True.
         pad_token_id: int | None = None,      # Optional; used to keep padding
                                               # rows out of the memory.
@@ -1764,6 +1783,7 @@ class TinyLM(nn.Module):
                 mem_size=int(mem_size),
                 thinking_token_id=int(thinking_token_id),
                 pad_token_id=pad_token_id,
+                read_alpha_init=float(mem_read_alpha_init),
             )
             # Re-init the thinking-token embedding row to the mean of the
             # other rows. PyTorch's default init makes it random noise, which
@@ -2900,7 +2920,9 @@ class TinyLM(nn.Module):
         injection = mem.W_proj(read)                                   # (B, 1, d_model)
         mem._last_injection = injection.detach()
 
-        return h_normed_new + injection * inj_mask.unsqueeze(-1)
+        # Apply the read-injection α gate (matches WorkingMemory.forward) so
+        # incremental decode reproduces the full-forward magnitude exactly.
+        return h_normed_new + mem.read_alpha * injection * inj_mask.unsqueeze(-1)
 
     @torch.no_grad()
     def forward_step(self, input_id: torch.Tensor, cache: dict, *,

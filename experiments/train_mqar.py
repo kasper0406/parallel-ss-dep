@@ -116,6 +116,7 @@ def train_one(arch, T, n_pairs, vocab, steps, batch_size,
               d_model, n_layers, n_heads, d_head, lr, log_every,
               device="cuda", seed=0, feedback="none",
               use_memory=False, mem_size=1024, mem_dim=0,
+              mem_read_alpha_init=1.0,
               feedback_pairs="", feedback_self_k=0,
               feedback_xattn="", feedback_xattn_form="attn",
               feedback_xattn_heads=4, label=None):
@@ -144,6 +145,7 @@ def train_one(arch, T, n_pairs, vocab, steps, batch_size,
         use_memory=use_memory,
         mem_size=mem_size,
         mem_dim=mem_dim if mem_dim > 0 else d_model,
+        mem_read_alpha_init=mem_read_alpha_init,
         thinking_token_id=thinking_id,
         activation_checkpointing=False,
     ).to(device)
@@ -208,8 +210,11 @@ def train_one(arch, T, n_pairs, vocab, steps, batch_size,
             # tuned for the 128d MQAR experiments).
             v_loss, recall = _val(model, T, n_pairs, vocab, batch_size,
                                    device, use_memory=use_memory)
+            extra = ""
+            if use_memory:
+                extra = f"  memα={model.memory.read_alpha.item():+.4f}"
             print(f"{step:>6d}  {last_train_loss:>11.4f}  "
-                  f"{v_loss:>9.4f}  {recall:>8.3f}")
+                  f"{v_loss:>9.4f}  {recall:>8.3f}{extra}")
 
     v_loss, recall = _val(model, T, n_pairs, vocab,
                            min(2 * batch_size, 256), device,
@@ -247,6 +252,10 @@ def main():
                    help="Max entries in the write-gated memory buffer.")
     p.add_argument("--mem_dim", type=int, default=0,
                    help="0 = use d_model.")
+    p.add_argument("--mem_read_alpha_init", type=float, default=1.0,
+                   help="Init for the WM read-injection α gate. 0.0 = "
+                        "zero-init-residual bootstrap (FiLM-α pattern); "
+                        "1.0 = legacy un-gated injection.")
     args = p.parse_args()
 
     arches = args.arches.split(",")
@@ -266,6 +275,7 @@ def main():
                 use_memory=args.use_memory,
                 mem_size=args.mem_size,
                 mem_dim=args.mem_dim,
+                mem_read_alpha_init=args.mem_read_alpha_init,
             )
             results.append(r)
 

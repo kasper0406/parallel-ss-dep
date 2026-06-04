@@ -92,6 +92,15 @@ def build_model_from_args(args, *, vocab_size: int,
             mem_size=int(args.mem_size),
             mem_dim=int(args.mem_dim) if args.mem_dim > 0 else int(args.d_model),
             thinking_token_id=int(thinking_token_id),
+            # WM decoupled-key/value (DKV) addressing + α-floor curriculum.
+            # getattr defaults preserve the legacy WM for callers that build
+            # an args namespace without these (newer) flags.
+            mem_decoupled_kv=bool(getattr(args, "mem_decoupled_kv", False)),
+            mem_read_alpha_init=float(getattr(args, "mem_read_alpha_init", 1.0)),
+            mem_read_alpha_floor_start=float(
+                getattr(args, "mem_read_alpha_floor_start", 0.0)),
+            mem_read_alpha_floor_warmup_steps=int(
+                getattr(args, "mem_read_alpha_floor_warmup_steps", 0)),
         )
 
     pkm_kwargs: dict = {}

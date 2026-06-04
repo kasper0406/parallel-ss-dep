@@ -483,20 +483,32 @@ def _latent_think_logits(model, prefixes: torch.Tensor, *, R: int,
     mem_read_mask = (torch.zeros(ids.shape, dtype=torch.float32,
                                  device=prefixes.device)
                      if wm_off else None)
-    _logits0, h0 = _logits_hidden(model(prefixes, return_hidden=True))
-    z = h0[:, -1:, :]                                            # (N, 1, d)
-    last_logits = None
+    # Memory-frugal (2026-06-04): the old path called model(..., return_hidden=
+    # True) which materialises the FULL (N, Lmax+1, V) logits EVERY iteration,
+    # but only the think slot (last position) is ever used. V≈49k ≫ d, so that
+    # tensor dominates — it is what made gate_calibration OOM at T=2048.
+    # skip_lm_head returns the post-out_norm+memory hidden WITHOUT the lm_head
+    # matmul; we apply lm_head to the LAST position only, at the end. Result is
+    # identical (lm_head(h)[:, -1] == lm_head(h[:, -1])). _last_premem_hidden
+    # preserves the premem-feedback semantics of the old return_hidden path.
+    premem = bool(getattr(model, "_latent_feedback_premem", False))
+    h0 = model(prefixes, skip_lm_head=True)                      # (N, Lmax, d)
+    z = (model._last_premem_hidden if premem else h0)[:, -1:, :]  # (N, 1, d)
+    h_last = None
     for _ in range(max(1, int(R))):
         # Map the fed-back out_norm hidden into the input-embedding manifold
         # via the learned adapter (identity when the model has none / it is
         # untrained — so this is byte-identical to the no-adapter path then).
         zi = model.apply_latent_feedback_adapter(z)
         ie = torch.cat([base_emb, zi.to(base_emb.dtype)], dim=1)  # (N, Lmax+1, d)
-        logits, h = _logits_hidden(model(ids, inputs_embeds=ie,
-                                         return_hidden=True,
-                                         mem_read_mask=mem_read_mask))
-        z = h[:, -1:, :]
-        last_logits = logits[:, -1, :]                           # think slot
+        h_last = model(ids, inputs_embeds=ie, skip_lm_head=True,
+                       mem_read_mask=mem_read_mask)              # (N, Lmax+1, d)
+        z = (model._last_premem_hidden if premem else h_last)[:, -1:, :]
+    # lm_head at the think slot ONLY → (N, V), not (N, Lmax+1, V).
+    _dev = h_last.device.type
+    with torch.autocast(device_type=_dev, dtype=torch.bfloat16,
+                        enabled=(_dev == "cuda")):
+        last_logits = model.lm_head(h_last[:, -1, :])           # (N, V)
     return last_logits
 
 

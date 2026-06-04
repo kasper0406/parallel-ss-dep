@@ -81,6 +81,157 @@ def gold_answer(record: dict) -> str:
     return m.group(0) if m else ""
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _wm_mean_ablation(model):
+    """Temporarily force WorkingMemory's read injection off (read_alpha→0).
+
+    The 'mean'-ablation framing from feature_probe._wm_mean_ablation: with
+    read_alpha=0 the residual `alpha * injection * inj` vanishes, so think
+    tokens still drive a normal forward (the think pathway is present) but the
+    RETRIEVED content contributes nothing. A recall-accuracy DROP under this
+    ablation therefore means "the retrieved content was load-bearing", not
+    "the think mechanism is broken" (which the older `--wm_ablate zero` that
+    zeroes W_proj cannot disentangle for retrieval-as-input ckpts).
+    """
+    mem = getattr(model, "memory", None)
+    if mem is None or not hasattr(mem, "read_alpha"):
+        yield
+        return
+    orig = mem.read_alpha.data.clone()
+    try:
+        mem.read_alpha.data.zero_()
+        yield
+    finally:
+        mem.read_alpha.data.copy_(orig)
+
+
+def eval_longctx_recall(
+    model,
+    tok,
+    path: str = "data/longctx_recall_heldout.jsonl",
+    n: int | None = None,
+    *,
+    generator: str = "retrieval_as_input",
+    wm_ablate: str = "none",
+    max_gen: int = 96,
+    total_think_budget: int = 200,
+    emit_threshold: float = 0.5,
+    gate_floor: float = 0.0,
+    additive: bool | None = None,
+    device: str = "cuda",
+) -> dict:
+    """Importable long-context recall eval — the WM-load-bearing probe.
+
+    Runs the same greedy generation loop as the CLI ``main`` but as a callable
+    so the train_lm feature-probe can invoke it periodically WITHOUT shelling
+    out. Returns recall accuracy (optionally with the WM read mean-ablated).
+
+    Args:
+      model: a loaded TinyLM (eval mode handled internally; train mode restored
+        on exit). Must have ``thinking_token_id``.
+      tok: tokenizer.
+      path: held-out recall JSONL (``problem_prompt`` + ``answer``/``print(N)``).
+      n: cap on number of tasks (None = all). Small (e.g. 64) for an in-train
+        probe.
+      generator: 'retrieval_as_input' (v5+/v10 WM ckpts), 'standard', or
+        'latent_think'.
+      wm_ablate: 'none' or 'mean' (zero read_alpha — see ``_wm_mean_ablation``).
+      additive: retrieval-as-input additive mode; None → read ckpt cfg via
+        ``model.retrieval_input_additive`` if present else False.
+
+    Returns a flat dict of finite floats: ``recall`` (accuracy in [0,1]),
+    ``n_correct``, ``n_total``, ``think_rate``, ``think_frac`` (= think_rate;
+    a >0 guard that the probe actually exercised the think path), and
+    ``wm_ablate`` echoed as 0/1 in ``wm_ablated``.
+
+    Never raises on a missing WM (just runs without ablation effect). Runs
+    under ``torch.no_grad``.
+    """
+    from experiments.eval_humaneval import (
+        generate, generate_with_retrieval_as_input, generate_latent_think)
+    from experiments.sft_code import _flatten_to_oneline
+
+    was_training = getattr(model, "training", False)
+    thinking_token_id = (getattr(model, "thinking_token_id", None))
+    if thinking_token_id is None:
+        raise ValueError("model has no thinking_token_id — needs a "
+                         "thinking-gate model for the recall probe.")
+    if additive is None:
+        additive = bool(getattr(model, "retrieval_input_additive", False))
+    eff_max_T = int(getattr(model, "max_T", 0) or 2048)
+
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    if n is not None:
+        records = records[:n]
+
+    n_correct = n_total = 0
+    agg_think = agg_emit = 0
+    abl_cm = (_wm_mean_ablation(model) if wm_ablate == "mean"
+              else contextlib.nullcontext())
+    try:
+        model.eval()
+        with torch.no_grad(), abl_cm:
+            for rec in records:
+                prompt = f"# {_flatten_to_oneline(rec['problem_prompt'])}\n"
+                prompt_ids = tok.encode(prompt, add_special_tokens=False)
+                if len(prompt_ids) + max_gen + total_think_budget > eff_max_T:
+                    continue
+                prompt_t = torch.tensor(
+                    prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+                if generator == "latent_think":
+                    gen, diag = generate_latent_think(
+                        model, prompt_t, max_gen=max_gen, temperature=0.0,
+                        eos_token_id=tok.eos_token_id,
+                        thinking_token_id=thinking_token_id,
+                        total_think_budget=total_think_budget,
+                        emit_threshold=emit_threshold, gate_floor=gate_floor)
+                elif generator == "retrieval_as_input":
+                    gen, diag = generate_with_retrieval_as_input(
+                        model, prompt_t, max_gen=max_gen, temperature=0.0,
+                        eos_token_id=tok.eos_token_id,
+                        thinking_token_id=thinking_token_id,
+                        total_think_budget=total_think_budget,
+                        emit_threshold=emit_threshold, gate_floor=gate_floor,
+                        additive=additive)
+                else:
+                    gen, diag = generate(
+                        model, prompt_t, max_gen=max_gen, temperature=0.0,
+                        eos_token_id=tok.eos_token_id, use_thinking=True,
+                        thinking_token_id=thinking_token_id,
+                        total_think_budget=total_think_budget,
+                        emit_threshold=emit_threshold, gate_floor=gate_floor)
+                gen_only = [t for t in gen[0, len(prompt_ids):].tolist()
+                            if t != int(thinking_token_id)]
+                text = tok.decode(gen_only, skip_special_tokens=True)
+                pred = extract_predicted_answer(text)
+                gold = gold_answer(rec)
+                n_total += 1
+                n_correct += int(pred is not None and pred == gold)
+                agg_think += diag.get("think_total", 0)
+                agg_emit += diag.get("emit_count", 0)
+    finally:
+        if was_training:
+            model.train()
+
+    think_rate = agg_think / max(1, agg_think + agg_emit)
+    return {
+        "recall": n_correct / max(1, n_total),
+        "n_correct": float(n_correct),
+        "n_total": float(n_total),
+        "think_rate": float(think_rate),
+        "think_frac": float(think_rate),
+        "wm_ablated": 1.0 if wm_ablate == "mean" else 0.0,
+    }
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", type=str, required=True)
@@ -94,9 +245,12 @@ def main() -> int:
                    help="latent_think: force N think steps before the answer "
                         "(matches latent_sft think-before-answer training).")
     p.add_argument("--wm_ablate", type=str, default="none",
-                   choices=["none", "zero"],
-                   help="'zero' zeroes memory.W_proj.weight. CONFOUNDED "
-                        "for retrieval-as-input ckpts — see module doc.")
+                   choices=["none", "zero", "mean"],
+                   help="'zero' zeroes memory.W_proj.weight (CONFOUNDED for "
+                        "retrieval-as-input ckpts — see module doc). 'mean' "
+                        "zeroes read_alpha so think tokens still drive a "
+                        "forward but the retrieved content contributes nothing "
+                        "(the unconfounded WM-content ablation).")
     p.add_argument("--max_gen", type=int, default=120)
     p.add_argument("--total_think_budget", type=int, default=200)
     p.add_argument("--emit_threshold", type=float, default=0.5)
@@ -172,7 +326,12 @@ def main() -> int:
     n_correct = n_total = n_truncated = 0
     agg_think = agg_emit = 0
 
-    for rec in records:
+    # 'mean' ablation: zero read_alpha for the whole loop (the unconfounded
+    # WM-content ablation; 'zero' is handled above by a rewritten ckpt).
+    _abl = (_wm_mean_ablation(model) if args.wm_ablate == "mean"
+            else __import__("contextlib").nullcontext())
+    with _abl:
+     for rec in records:
         prompt = f"# {_flatten_to_oneline(rec['problem_prompt'])}\n"
         prompt_ids = tok.encode(prompt, add_special_tokens=False)
         room = args.max_gen + args.total_think_budget

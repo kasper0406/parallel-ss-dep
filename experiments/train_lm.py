@@ -49,6 +49,7 @@ from experiments.thinking import (
 )
 
 
+from experiments.gate_calibration import compute_gate_calibration_loss
 from experiments.build_arch import build_arch, parse_layers_arg, _NAME_TO_CLS  # noqa: F401
 
 
@@ -611,6 +612,13 @@ def main():
     tokens_seen = 0
     next_eval_at = 0
     tokens_at_last_probe = 0
+    next_feature_probe_at = (int(args.feature_probe_every_tokens)
+                             if getattr(args, "feature_probe_every_tokens", 0) > 0
+                             else 0)
+    if next_feature_probe_at:
+        print(f"\nPer-feature usefulness probe enabled every "
+              f"{args.feature_probe_every_tokens:,} tokens "
+              f"(ablation-delta CE for WM/PKM, FiLM α, gate fire-rate).")
     if args.probe_humaneval_every_tokens > 0:
         if not pathlib.Path(args.probe_humaneval_path).exists():
             print(f"  [probe] {args.probe_humaneval_path} not found; "
@@ -1381,6 +1389,7 @@ def main():
             # The gate/plain-loss branches live in _nonthink_forward_loss.
             n_micro = max(1, args.grad_accum)
             _latent_cotrain_diag = None
+            _gate_calib_diag = None
             for micro in range(n_micro):
                 if micro > 0:
                     try:
@@ -1404,9 +1413,20 @@ def main():
                             doc_ids=doc_ids, gist_horizons=gist_horizons,
                             fwd_model=ddp_model)
                     # Snapshot the MAIN-forward gate NOW, before any aux loss
-                    # (latent_cotrain) runs an extra forward that clobbers
-                    # model._last_gate — the documented 2026-05-27 footgun.
+                    # (latent_cotrain / gate_calibration) runs an extra forward
+                    # that clobbers model._last_gate(_logits) — the documented
+                    # 2026-05-27 footgun. _last_gate is detached for diag;
+                    # _last_gate_logits is the GRAD-CARRYING tensor the
+                    # gate-calibration BCE flows into, so keep it un-detached.
                     main_gate = getattr(model, "_last_gate", None)
+                    main_gate_logits = getattr(model, "_last_gate_logits", None)
+                    # Snapshot the WM injection from the MAIN forward too: the
+                    # aux extra-forwards (latent_cotrain / gate_calibration) call
+                    # model() and clobber memory._last_injection with their own
+                    # (N, Lmax, d) shape, which then mismatches x at the
+                    # wm(inj=) diagnostic below (IndexError).
+                    main_wm_inj = getattr(getattr(model, "memory", None),
+                                          "_last_injection", None)
                     loss = lm_loss + args.aux_weight * aux_loss
                     loss = loss + _z_loss_term(logits, args.z_loss)
                     if args.output_gate and args.gate_entropy_aux_weight > 0.0:
@@ -1442,6 +1462,38 @@ def main():
                             loss = loss + (n_micro * args.latent_cotrain_weight) \
                                 * _lc_loss
                             _latent_cotrain_diag = (_lc_delta, _lc_n)
+                    # Gate-calibration: train the OUTPUT GATE (not the trunk) to
+                    # fire think exactly where a latent think raises
+                    # logp(true_next). The BCE flows ONLY into the grad-carrying
+                    # gate-logit snapshot taken BEFORE the latent extra forward
+                    # clobbered model._last_gate_logits. Fire once/step (last
+                    # microbatch) and scale by n_micro to keep the per-step
+                    # gradient equal to --gate_calibration_weight after the
+                    # (loss / n_micro).backward(). Default weight 0 = OFF.
+                    if (getattr(args, "gate_calibration_weight", 0.0) > 0.0
+                            and args.output_gate
+                            and _is_last_micro
+                            and main_gate_logits is not None
+                            and thinking_token_id is not None
+                            and int(thinking_token_id) != int(pad_token_id)):
+                        _gc = compute_gate_calibration_loss(
+                            model, x, y, main_gate_logits,
+                            thinking_token_id=int(thinking_token_id),
+                            latent_R=int(args.gate_calibration_R),
+                            sample_frac=float(args.gate_calibration_sample_frac),
+                            max_positions=int(args.gate_calibration_max_positions),
+                            sigma_low=float(args.gate_calibration_sigma_low),
+                            sigma_high=float(args.gate_calibration_sigma_high),
+                            # EOS targets are already -100 under
+                            # --mask_eos_in_targets and filtered by the
+                            # helper's targets!=-100 check, so eos_id=None.
+                            eos_id=None)
+                        if _gc is not None:
+                            loss = loss + (n_micro * args.gate_calibration_weight) \
+                                * _gc.loss
+                            _gate_calib_diag = (_gc.target_frac_pos,
+                                                _gc.mean_sigma, _gc.mean_delta,
+                                                _gc.n_positions)
                     # PKM diversity-bonus: -H(slot-selection distribution) per
                     # head, averaged across batch and heads. We MAXIMISE entropy
                     # so the auxiliary loss is NEGATIVE entropy. This is the
@@ -1500,6 +1552,14 @@ def main():
                     _latent_cotrain_diag is not None:
                 _d, _n = _latent_cotrain_diag
                 line += f"  latent(Δlogp={_d:+.3f},n={_n})"
+            if getattr(args, "gate_calibration_weight", 0.0) > 0.0 and \
+                    _gate_calib_diag is not None:
+                _t1, _sg, _gd, _gn = _gate_calib_diag
+                # tgt1 = fraction where latent think helped (BCE target=1);
+                # σ = mean gate sigmoid at scored positions; Δlogp = mean
+                # latent-think benefit. tgt1>σ ⇒ gate UNDER-fires (miscal).
+                line += (f"  gc(tgt1={_t1:.2f},σ={_sg:.2f},"
+                         f"Δlogp={_gd:+.2f},n={_gn})")
             if args.feedback != "none" or fb_xattn_pairs:
                 alphas = model.feedback_alphas()
                 if not alphas:
@@ -1656,10 +1716,11 @@ def main():
                     and hasattr(model, "memory")
                     and getattr(model.memory, "_last_injection", None) is not None):
                 with torch.no_grad():
-                    inj = model.memory._last_injection                   # (B,T,d)
+                    inj = main_wm_inj                                    # (B,T,d) main fwd
                     tmask = (x == int(thinking_token_id))                # (B,T)
                     n_think = int(tmask.sum())
-                    if n_think > 0:
+                    if (inj is not None and inj.shape[:2] == tmask.shape
+                            and n_think > 0):
                         inj_norm = float(
                             inj[tmask].float().norm(dim=-1).mean())
                     else:
@@ -1734,6 +1795,16 @@ def main():
                         else:
                             gate_floor = args.gate_floor_min
                         tb.add_scalar("gate/floor", gate_floor, step)
+                if (getattr(args, "gate_calibration_weight", 0.0) > 0.0
+                        and _gate_calib_diag is not None):
+                    _t1, _sg, _gd, _gn = _gate_calib_diag
+                    tb.add_scalar("gate_calib/target_frac_pos", _t1, step)
+                    tb.add_scalar("gate_calib/mean_sigma", _sg, step)
+                    tb.add_scalar("gate_calib/mean_delta_logp", _gd, step)
+                if (getattr(args, "latent_cotrain_weight", 0.0) > 0.0
+                        and _latent_cotrain_diag is not None):
+                    _d, _n = _latent_cotrain_diag
+                    tb.add_scalar("latent_cotrain/delta_logp", _d, step)
                 if args.enable_thinking_token and think_stats_window:
                     tb.add_scalar("think/rate", think_rate, step)
                     tb.add_scalar("think/explore_rate", explore_rate, step)
@@ -1800,6 +1871,66 @@ def main():
                 tb.add_scalar("val/ppl", ppl, step)
             model.train()
             torch.cuda.empty_cache()
+
+        # Per-feature usefulness probe: ablate each mechanism on a held-out
+        # batch and log the CE rise (load-bearing iff Δce > 0). Runs no_grad
+        # and restores every poked attribute, so it can't perturb training.
+        if (next_feature_probe_at and is_main
+                and tokens_seen >= next_feature_probe_at):
+            from experiments.feature_probe import (
+                run_feature_probe, format_feature_probe)
+            try:
+                _fp_batch = next(iter(val_loader))
+                _fpx, _fpy, *_fprest = _fp_batch
+                _fpx, _fpy = _fpx.to("cuda"), _fpy.to("cuda")
+                _fpdoc = _fprest[0].to("cuda") if _fprest else None
+                _fp_metrics = run_feature_probe(
+                    model, _fpx, _fpy, doc_ids=_fpdoc,
+                    thinking_token_id=thinking_token_id)
+                print("        " + format_feature_probe(_fp_metrics))
+                if tb is not None:
+                    for _k, _v in _fp_metrics.items():
+                        tb.add_scalar(f"probe/{_k}", float(_v), step)
+            except Exception as _e:  # never let the probe kill a 20h run
+                print(f"        [feature-probe] skipped ({_e})")
+
+            # WM load-bearing signal — the natural-text probe batch above has
+            # zero think tokens, so WM's ablation-delta there is ≈0 BY DESIGN
+            # (WM reads only at think positions). The real WM signal comes from
+            # held-out long-context recall WITH think tokens: recall_full vs
+            # recall with the WM read mean-ablated. delta > 0 ⇒ WM load-bearing.
+            _wm_recall_path = getattr(
+                args, "feature_probe_wm_recall_path", "") or ""
+            if (_wm_recall_path and getattr(model, "memory", None) is not None
+                    and thinking_token_id is not None):
+                try:
+                    from experiments.eval_longctx_recall import (
+                        eval_longctx_recall)
+                    _wm_n = int(getattr(args, "feature_probe_wm_recall_n", 64))
+                    _full = eval_longctx_recall(
+                        model, tok, _wm_recall_path, n=_wm_n,
+                        wm_ablate="none")
+                    _abl = eval_longctx_recall(
+                        model, tok, _wm_recall_path, n=_wm_n,
+                        wm_ablate="mean")
+                    _wm_recall = _full["recall"]
+                    _wm_recall_delta = _wm_recall - _abl["recall"]
+                    print(f"        [wm-recall] recall={_wm_recall:.3f} "
+                          f"Δ(full-ablated)={_wm_recall_delta:+.3f} "
+                          f"think_frac={_full['think_frac']:.3f} "
+                          f"(n={int(_full['n_total'])})")
+                    if tb is not None:
+                        tb.add_scalar("probe/wm_recall", _wm_recall, step)
+                        tb.add_scalar("probe/wm_recall_delta",
+                                      _wm_recall_delta, step)
+                        tb.add_scalar("probe/wm_recall_think_frac",
+                                      _full["think_frac"], step)
+                except Exception as _e:  # never let the probe kill a 20h run
+                    print(f"        [wm-recall] skipped ({_e})")
+                model.train()
+            torch.cuda.empty_cache()
+            while next_feature_probe_at <= tokens_seen:
+                next_feature_probe_at += int(args.feature_probe_every_tokens)
 
         if (args.probe_humaneval_every_tokens > 0 and is_main
                 and tokens_seen - tokens_at_last_probe

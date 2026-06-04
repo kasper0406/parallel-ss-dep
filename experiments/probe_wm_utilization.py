@@ -37,15 +37,31 @@ from experiments.model import TinyLM
 from experiments.tasks.mqar import make_batch as mqar_batch
 
 
+def _mqar(B, T, vocab, K, device, semantic):
+    """MQAR batch. semantic=True applies a fixed global ALIAS to the query
+    tokens (query = key + vocab, a disjoint vocab region) so the query is NEVER
+    token-identical to its key — token-identity / address-by-value scores 0 and
+    only LEARNED addressing can solve it. Targets (values) stay in [0, vocab)."""
+    x, y, mask = mqar_batch(B, T, vocab_size=vocab, n_pairs=K, device=device)
+    if semantic:
+        twoK = 2 * K
+        x = x.clone()
+        x[:, twoK:] = x[:, twoK:] + vocab
+    return x, y, mask
+
+
 def build_and_train(seed, T, K, vocab, d_model, n_layers, n_heads, d_head,
                     steps, lr, mem_size, device="cuda",
-                    floor_start=0.0, floor_warmup=0, decoupled_kv=False):
+                    floor_start=0.0, floor_warmup=0, decoupled_kv=False,
+                    semantic=False):
     torch.manual_seed(seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    thinking_id = vocab  # extra slot; never appears in MQAR inputs
+    # semantic queries live in [vocab, 2*vocab); model must embed them too.
+    in_vocab = 2 * vocab if semantic else vocab
+    thinking_id = in_vocab  # extra slot; never appears in MQAR inputs
     model = TinyLM(
-        vocab_size=vocab + 1, d_model=d_model, n_layers=n_layers,
+        vocab_size=in_vocab + 1, d_model=d_model, n_layers=n_layers,
         n_heads=n_heads, d_head=d_head, attention_cls=DeltaNetAttention,
         max_T=T, feedback_mode="none",
         use_memory=True, mem_size=mem_size, mem_dim=d_model,
@@ -61,8 +77,7 @@ def build_and_train(seed, T, K, vocab, d_model, n_layers, n_heads, d_head,
                                                        eta_min=lr * 0.1)
     model.train()
     for step in range(1, steps + 1):
-        x, y, mask = mqar_batch(256, T, vocab_size=vocab, n_pairs=K,
-                                device=device)
+        x, y, mask = _mqar(256, T, vocab, K, device, semantic)
         rmask = mask.bool()
         logits = model(x, mem_read_mask=rmask)
         logits = logits[..., :vocab]
@@ -77,10 +92,10 @@ def build_and_train(seed, T, K, vocab, d_model, n_layers, n_heads, d_head,
 
 
 @torch.no_grad()
-def probe(model, T, K, vocab, device="cuda"):
+def probe(model, T, K, vocab, device="cuda", semantic=False):
     model.eval()
     model.memory._capture_read = True
-    x, y, mask = mqar_batch(256, T, vocab_size=vocab, n_pairs=K, device=device)
+    x, y, mask = _mqar(256, T, vocab, K, device, semantic)
     rmask = mask.bool()
     logits = model(x, mem_read_mask=rmask)[..., :vocab]
     preds = logits.argmax(-1)
@@ -106,6 +121,8 @@ def probe(model, T, K, vocab, device="cuda"):
     # For each query position p, which pair i does its key belong to?
     keys_seq = x[:, 0:twoK:2]                                  # (B, K)
     q_tok = x[:, twoK:]                                        # (B, Q)
+    if semantic:
+        q_tok = q_tok - vocab     # undo the fixed alias to recover the key id
     # pair index i for each query: match q_tok against keys_seq
     match = (q_tok.unsqueeze(-1) == keys_seq.unsqueeze(1))     # (B, Q, K)
     pair_i = match.float().argmax(-1)                          # (B, Q)
@@ -157,6 +174,10 @@ def main():
     p.add_argument("--floor_warmup", type=int, default=0)
     p.add_argument("--decoupled_kv", action="store_true",
                    help="DKV-WM: decoupled key/value + cosine addressing.")
+    p.add_argument("--semantic", action="store_true",
+                   help="Semantic-MQAR: query = key + vocab (fixed alias, "
+                        "disjoint vocab) so addressing must be LEARNED, not "
+                        "token-identity. The generalization test.")
     args = p.parse_args()
 
     model = build_and_train(args.seed, args.T, args.K, args.vocab,
@@ -164,8 +185,9 @@ def main():
                             args.d_head, args.steps, args.lr, args.mem_size,
                             floor_start=args.floor_start,
                             floor_warmup=args.floor_warmup,
-                            decoupled_kv=args.decoupled_kv)
-    m = probe(model, args.T, args.K, args.vocab)
+                            decoupled_kv=args.decoupled_kv,
+                            semantic=args.semantic)
+    m = probe(model, args.T, args.K, args.vocab, semantic=args.semantic)
     print(f"\n=== WM utilization (seed={args.seed}, K={args.K}, "
           f"mem_size={args.mem_size}) ===")
     print(f"  recall              {m['recall']:.3f}")

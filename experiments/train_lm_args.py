@@ -426,6 +426,37 @@ def build_parser() -> argparse.ArgumentParser:
                         "behaves byte-identically without the flag).")
     p.add_argument("--mem_dim", type=int, default=0,
                    help="Memory projection dim. 0 = match d_model.")
+    # ---- WorkingMemory decoupled-key/value (DKV) addressing (2026-06-04) ----
+    # These constructor kwargs already exist on TinyLM/WorkingMemory; the
+    # flags below thread them through model_builder. All default to the
+    # legacy (pre-DKV) behaviour so the existing pretrain path is unchanged.
+    p.add_argument("--mem_decoupled_kv", action="store_true",
+                   help="DKV-WM: give WorkingMemory a dedicated match-KEY "
+                        "projection (W_v becomes content-only), cosine "
+                        "addressing with a learned clamped temperature, and a "
+                        "β-scaled write-gate log-bias. The validated reliable "
+                        "config for semantic (non-token-identity) recall — the "
+                        "default dot-product addressing has a magnitude "
+                        "degeneracy (diffuse softmax, top_mass≈0.16). Default "
+                        "OFF → byte-identical legacy WM.")
+    p.add_argument("--mem_read_alpha_init", type=float, default=1.0,
+                   help="Init value of the learned scalar α gate on the WM "
+                        "read injection. 1.0 (default) preserves the "
+                        "pre-α-gate behaviour; 0.0 = zero-init-residual boot "
+                        "(FiLM-α pattern, cold start byte-identical to no-WM).")
+    p.add_argument("--mem_read_alpha_floor_start", type=float, default=0.0,
+                   help="Sign-preserving additive α-FLOOR on the WM read "
+                        "injection (mirrors PKM FIX 1B). Holds the effective "
+                        "read contribution ≥ floor during the warmup window so "
+                        "W_q/W_v/W_proj keep strong gradient and the sharp "
+                        "addressing locks in before α takes over. Validated "
+                        "reliable value ~0.5. Anneals to 0 over "
+                        "--mem_read_alpha_floor_warmup_steps. 0 disables "
+                        "(default, byte-identical legacy path).")
+    p.add_argument("--mem_read_alpha_floor_warmup_steps", type=int, default=0,
+                   help="Anneal --mem_read_alpha_floor_start to 0 over this "
+                        "many WM forwards. A few thousand is the validated "
+                        "range. 0 disables the floor curriculum (default).")
     # ----- Persistent learned-RAG (Product-Key Memory) -----
     p.add_argument("--use_pkm", action="store_true",
                    help="Add a Product-Key Memory layer (Lample 2019 / "
@@ -645,6 +676,52 @@ def build_parser() -> argparse.ArgumentParser:
                         "the fixed (max_positions, max_prefix_len) shape the "
                         "compile path needs. The uniform path is preserved when "
                         "this flag is off.")
+    # --- Gate-calibration aux loss (latent "think only where helpful") ---
+    # Trains the OUTPUT GATE (not the trunk) toward firing think exactly where
+    # a latent think actually raises logp(true_next). Uses the shared latent
+    # primitive (thinking.latent_think_logp) under no_grad to derive a
+    # per-position BCE target, so it is the gate-side complement of
+    # --latent_cotrain_weight (which gives the TRUNK gradient through thinking).
+    # Default 0.0 = OFF (byte-identical). The latent extra forward is
+    # dynamo.disable'd; pass --no-compile if a compiled run still crashes.
+    p.add_argument("--gate_calibration_weight", type=float, default=0.0,
+                   help="Weight on the gate-calibration BCE loss "
+                        "(experiments/gate_calibration.compute_gate_calibration_"
+                        "loss). 0 disables (default). Requires --output_gate. "
+                        "Recommended 0.05.")
+    p.add_argument("--gate_calibration_R", type=int, default=4,
+                   help="Number of state-readonly LATENT think steps used to "
+                        "measure 'does thinking help' for the gate target.")
+    p.add_argument("--gate_calibration_sample_frac", type=float, default=0.05,
+                   help="Fraction of clean positions scored per step.")
+    p.add_argument("--gate_calibration_max_positions", type=int, default=32,
+                   help="Hard cap on gate-calibration positions per step "
+                        "(each runs R extra forwards — keep small).")
+    p.add_argument("--gate_calibration_sigma_low", type=float, default=0.0,
+                   help="Lower σ(gate) band for scored positions (focus on "
+                        "undecided positions). 0 keeps all.")
+    p.add_argument("--gate_calibration_sigma_high", type=float, default=1.0,
+                   help="Upper σ(gate) band for scored positions. 1 keeps all.")
+    # --- Per-feature usefulness probe (is each mechanism load-bearing yet?) ---
+    p.add_argument("--feature_probe_every_tokens", type=int, default=0,
+                   help="Run the per-feature usefulness probe every N tokens "
+                        "of training. 0 disables (default). On a held-out "
+                        "val batch, logs an ablation-delta CE for WM and PKM "
+                        "(CE rises iff the feature is load-bearing), the WM "
+                        "read_alpha, FiLM α per pair, and the current gate "
+                        "fire-rate. Console + TensorBoard (probe/*). Cheap: a "
+                        "handful of forwards on one batch.")
+    p.add_argument("--feature_probe_wm_recall_path", type=str,
+                   default="data/longctx_recall_heldout.jsonl",
+                   help="Held-out long-context recall JSONL for the WM "
+                        "load-bearing signal. The natural-text val batch has "
+                        "zero think tokens, so WM (which reads only at think "
+                        "positions) shows ablation-delta≈0 there; this recall "
+                        "set drives think tokens and is where WM can actually "
+                        "be measured. Set empty to skip the recall probe.")
+    p.add_argument("--feature_probe_wm_recall_n", type=int, default=64,
+                   help="Cap the number of recall tasks for the WM probe "
+                        "(generation is CUDA-heavy; keep small).")
     p.add_argument("--bf16_optim_state", action="store_true",
                    help="Store optimizer state (AdamW exp_avg/exp_avg_sq, "
                         "Muon momentum_buffer) in bf16 instead of fp32. "

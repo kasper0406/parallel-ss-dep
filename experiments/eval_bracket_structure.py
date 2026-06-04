@@ -85,6 +85,11 @@ def build_model_from_ckpt(ckpt_path: str,
     # with the right kwargs and avoid strict-load mismatches.
     has_gate = any(k.startswith("gate_head.") for k in sd_keys)
     has_memory = any(k.startswith("memory.") for k in sd_keys)
+    # DKV-WM (decoupled key/value addressing): the trained ckpt has memory.W_k
+    # (+ logit_scale, gate_bias_beta). Detect it so the reconstructed WM creates
+    # those params and the trained addressing actually loads — else strict load
+    # drops them and the model silently reverts to legacy address-by-value.
+    has_dkv = any(k.startswith("memory.W_k") for k in sd_keys)
     has_pkm = any(k.startswith("pkm_layer.") for k in sd_keys)
     mem_kwargs = {}
     if has_memory:
@@ -97,6 +102,7 @@ def build_model_from_ckpt(ckpt_path: str,
             mem_size=int(cfg.get("mem_size", 1024)),
             thinking_token_id=int(cfg.get("thinking_token_id",
                                           cfg["vocab_size"] - 1)),
+            mem_decoupled_kv=bool(has_dkv),
         )
     pkm_kwargs = {}
     if has_pkm:

@@ -73,6 +73,43 @@ def test_alpha_grad_nonzero_at_zero():
     assert mem.read_alpha.grad.abs().item() > 0.0
 
 
+def test_alpha_floor_boosts_in_training_then_decays():
+    """The α-floor adds a sign-preserving magnitude to the read injection
+    during a warmup window (training only), then decays to 0. Default off."""
+    mem = WorkingMemory(d_model=16, d_mem=16, mem_size=16, thinking_token_id=7,
+                        read_alpha_init=1.0, read_alpha_floor_start=0.5,
+                        read_alpha_floor_warmup_steps=4)
+    h, input_ids, read_mask = _make_inputs()
+    # eval: floor inactive -> effective α == read_alpha (1.0)
+    mem.eval()
+    with torch.no_grad():
+        d_eval = (mem(h, input_ids, read_mask=read_mask) - h)
+    # train step 0: floor = 0.5 * (1 - 0/4) = 0.5 -> effective α = 1.5
+    mem.train()
+    d0 = (mem(h, input_ids, read_mask=read_mask) - h).detach()
+    rp = read_mask  # rows with injection
+    ratio = (d0[rp].norm() / d_eval[rp].norm()).item()
+    assert abs(ratio - 1.5) < 0.05, f"expected ~1.5x boost, got {ratio:.3f}"
+    # advance past warmup; floor -> 0 so train delta == eval delta
+    for _ in range(6):
+        mem(h, input_ids, read_mask=read_mask)
+    d_late = (mem(h, input_ids, read_mask=read_mask) - h).detach()
+    torch.testing.assert_close(d_late[rp], d_eval[rp], rtol=1e-4, atol=1e-5)
+
+
+def test_alpha_floor_default_off_is_noop():
+    """floor_start=0 (default) -> train and eval injections are identical."""
+    mem = WorkingMemory(d_model=16, d_mem=16, mem_size=16, thinking_token_id=7,
+                        read_alpha_init=1.0)
+    h, input_ids, read_mask = _make_inputs()
+    mem.eval()
+    with torch.no_grad():
+        out_eval = mem(h, input_ids, read_mask=read_mask)
+    mem.train()
+    out_train = mem(h, input_ids, read_mask=read_mask).detach()
+    torch.testing.assert_close(out_train, out_eval)
+
+
 def test_old_ckpt_loads_without_read_alpha():
     """A state_dict produced before the gate existed (no `read_alpha` key)
     loads with strict=False and the param keeps its construction default —

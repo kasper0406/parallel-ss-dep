@@ -1002,6 +1002,8 @@ class WorkingMemory(nn.Module):
         thinking_token_id: int,
         pad_token_id: int | None = None,
         read_alpha_init: float = 1.0,
+        read_alpha_floor_start: float = 0.0,
+        read_alpha_floor_warmup_steps: int = 0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -1041,6 +1043,31 @@ class WorkingMemory(nn.Module):
         # Default 1.0 preserves the pre-gate behaviour AND keeps old ckpts
         # (which lack this param) byte-identical when loaded with strict=False.
         self.read_alpha = nn.Parameter(torch.tensor(float(read_alpha_init)))
+
+        # Sign-preserving additive α-FLOOR curriculum (mirrors PKM FIX 1B).
+        # The utilization probe (2026-06-04) showed WM's seed-variance is an
+        # ADDRESSING-learning failure, NOT a capacity one: failing seeds have
+        # full value-coverage in the buffer but diffuse read attention (top
+        # mass 0.16 vs 0.99) and a read_alpha that drifted DOWN (0.35 vs 0.55)
+        # — the starvation loop "weak read → looks useless → α shrinks → read
+        # gets less gradient → addressing never locks in". Holding the
+        # EFFECTIVE contribution magnitude ≥ floor during a warmup window keeps
+        # strong gradient on W_q/W_v/W_proj so the sharp addressing locks in,
+        # then the floor decays to 0 and the learned α takes over. Default 0.0
+        # = off (backwards-compat, compile-safe — no counter math runs).
+        self.read_alpha_floor_start = float(read_alpha_floor_start)
+        self.read_alpha_floor_warmup_steps = int(read_alpha_floor_warmup_steps)
+        self.register_buffer("_fwd_count", torch.zeros((), dtype=torch.long),
+                             persistent=False)
+
+        # Diagnostics: when _capture_read is set True (probe-only, default off
+        # to avoid the B·T·K activation cost during training), forward stashes
+        # the per-position read-attention and the buffer's source positions so
+        # a utilization probe can measure write concentration + read-addressing
+        # accuracy. See experiments/probe_wm_utilization.py.
+        self._capture_read = False
+        self._last_read_attn = None
+        self._last_top_idx = None
 
     def forward(self, h: torch.Tensor, input_ids: torch.Tensor,
                 read_mask: torch.Tensor | None = None,
@@ -1112,6 +1139,10 @@ class WorkingMemory(nn.Module):
         attn = torch.softmax(scores, dim=-1)
         attn = torch.where(all_masked, torch.zeros_like(attn), attn)
 
+        if self._capture_read:
+            self._last_read_attn = attn.detach()                  # (B, T, K)
+            self._last_top_idx = top_idx.detach()                 # (B, K)
+
         read = torch.einsum("btk,bkd->btd", attn, buf_v)          # (B, T, d_mem)
         injection = self.W_proj(read)                             # (B, T, d_model)
         # Stash per-position pre-mask injection. Two versions:
@@ -1131,7 +1162,19 @@ class WorkingMemory(nn.Module):
             inj = (input_ids == self.thinking_token_id).unsqueeze(-1).to(h.dtype)
         else:
             inj = read_mask.to(h.dtype).unsqueeze(-1)
-        return h + self.read_alpha * injection * inj
+
+        # Effective α = learned α (+ decaying sign-preserving floor in training).
+        alpha = self.read_alpha
+        if (self.training and self.read_alpha_floor_start > 0.0
+                and self.read_alpha_floor_warmup_steps > 0):
+            frac = (1.0 - self._fwd_count.float()
+                    / self.read_alpha_floor_warmup_steps).clamp_min(0.0)
+            floor = self.read_alpha_floor_start * frac
+            self._fwd_count += 1
+            sign = torch.sign(alpha.detach())
+            sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+            alpha = alpha + sign * floor
+        return h + alpha * injection * inj
 
 
 class RefinementHead(nn.Module):
@@ -1424,6 +1467,8 @@ class TinyLM(nn.Module):
         mem_dim: int | None = None,
         mem_read_alpha_init: float = 1.0,     # α gate on WM read injection;
                                               # 0.0 = zero-init-residual boot.
+        mem_read_alpha_floor_start: float = 0.0,   # PKM-style α-floor for WM
+        mem_read_alpha_floor_warmup_steps: int = 0,  # addressing bootstrap.
         thinking_token_id: int | None = None,  # Required when use_memory=True.
         pad_token_id: int | None = None,      # Optional; used to keep padding
                                               # rows out of the memory.
@@ -1784,6 +1829,8 @@ class TinyLM(nn.Module):
                 thinking_token_id=int(thinking_token_id),
                 pad_token_id=pad_token_id,
                 read_alpha_init=float(mem_read_alpha_init),
+                read_alpha_floor_start=float(mem_read_alpha_floor_start),
+                read_alpha_floor_warmup_steps=int(mem_read_alpha_floor_warmup_steps),
             )
             # Re-init the thinking-token embedding row to the mean of the
             # other rows. PyTorch's default init makes it random noise, which

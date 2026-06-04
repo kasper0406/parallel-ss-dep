@@ -117,6 +117,7 @@ def train_one(arch, T, n_pairs, vocab, steps, batch_size,
               device="cuda", seed=0, feedback="none",
               use_memory=False, mem_size=1024, mem_dim=0,
               mem_read_alpha_init=1.0,
+              mem_read_alpha_floor_start=0.0, mem_read_alpha_floor_warmup_steps=0,
               feedback_pairs="", feedback_self_k=0,
               feedback_xattn="", feedback_xattn_form="attn",
               feedback_xattn_heads=4, label=None):
@@ -146,6 +147,8 @@ def train_one(arch, T, n_pairs, vocab, steps, batch_size,
         mem_size=mem_size,
         mem_dim=mem_dim if mem_dim > 0 else d_model,
         mem_read_alpha_init=mem_read_alpha_init,
+        mem_read_alpha_floor_start=mem_read_alpha_floor_start,
+        mem_read_alpha_floor_warmup_steps=mem_read_alpha_floor_warmup_steps,
         thinking_token_id=thinking_id,
         activation_checkpointing=False,
     ).to(device)
@@ -256,6 +259,11 @@ def main():
                    help="Init for the WM read-injection α gate. 0.0 = "
                         "zero-init-residual bootstrap (FiLM-α pattern); "
                         "1.0 = legacy un-gated injection.")
+    p.add_argument("--mem_read_alpha_floor_start", type=float, default=0.0,
+                   help="Sign-preserving additive α-floor (PKM-style) to "
+                        "bootstrap WM read-addressing; decays to 0 over "
+                        "--mem_read_alpha_floor_warmup_steps. 0 = off.")
+    p.add_argument("--mem_read_alpha_floor_warmup_steps", type=int, default=0)
     args = p.parse_args()
 
     arches = args.arches.split(",")
@@ -276,6 +284,8 @@ def main():
                 mem_size=args.mem_size,
                 mem_dim=args.mem_dim,
                 mem_read_alpha_init=args.mem_read_alpha_init,
+                mem_read_alpha_floor_start=args.mem_read_alpha_floor_start,
+                mem_read_alpha_floor_warmup_steps=args.mem_read_alpha_floor_warmup_steps,
             )
             results.append(r)
 

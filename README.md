@@ -18,13 +18,20 @@ work log live in [`AGENTS.md`](AGENTS.md); project framing in
   self-feed. Iso-param swap of the 30L × 576d trunk; ~18 % faster wall-clock,
   matches/beats it on VAL ppl.
 - **Sparse FiLM feedback** — the headline architectural finding (below).
-- **Working Memory** — write-gated bounded buffer, read at think positions.
-  +11 pp on saturated MQAR recall; 98 % long-context recall.
+- **Working Memory** — write-gated bounded buffer with **decoupled-KV (DKV)
+  cosine addressing**, read at think positions. Useful exactly when the
+  recurrent state *saturates* (more items than fit in it): converged
+  saturated-MQAR recall **0.855 → 0.962** across seeds once made reliable. See
+  "Making each feature load-bearing".
 - **Product-Key Memory** — 262 k learned KV slots after one block. Load-bearing
   on HumanEval (−5 in ablation) once the v7.1 bootstrap-fix package is used.
-- **Thinking gate** — per-position emit/think head. *Status below.*
+- **Thinking** — per-position emit/think gate taught *where* thinking helps by
+  an execution-grounded gate-calibration loss, paired with **latent
+  (Coconut-style, high-bandwidth) thinking** for the computation. *Status below.*
 - **Mixed-corpus pretrain** with cross-document state isolation (`cu_seqlens`
-  from per-position `doc_ids`).
+  from per-position `doc_ids`), and a **co-trained "v10" stack** that trains
+  every mechanism above together from day 1 with per-feature usefulness
+  tracking (see below).
 - **Execution-grounded RL** ([`train_rl_grader.py`](experiments/train_rl_grader.py))
   — GRPO with a dense `code_grader` reward. The post-pretrain capability lever.
 
@@ -34,20 +41,50 @@ work log live in [`AGENTS.md`](AGENTS.md); project framing in
   GRPO on the Chinchilla-completed 287 M base).
 - **Validated primitives**: FiLM (−3–5 % PPL), PKM (−5 HumanEval ablation),
   WM (98 % recall). These earn their place on their own metrics.
-- **The open question — does *thinking* improve task correctness?** Currently
-  **no** at this scale, and on a weak base it actively *hurts*: a held-out
-  probe shows discrete-token thinking gives negative next-token Δlogp, and a
-  thinking-on vs thinking-off HumanEval split is 3 vs 8 — the model thinks
-  where it's *uncertain*, but uncertainty ≠ "thinking helps". Latent
-  (high-bandwidth, Coconut-style) thinking works on synthetic reasoning tasks
-  but, bolted onto a converged trunk, costs base quality without a measured
-  win. The standing conclusion: a thinking mechanism has to be **co-trained
-  into a strong base**, not added post-hoc — and we **require a measured
-  thinking contribution before scaling on it**. Full trail in `AGENTS.md`.
+- **Thinking — latent and co-trained.** Discrete-token thinking does not
+  amplify on this trunk; **latent (high-bandwidth, Coconut-style) thinking** is
+  the working primitive, validated on synthetic reasoning and real
+  arithmetic-chain transfer. Because a mechanism bolted onto a converged trunk
+  stays inert, thinking is now **co-trained from day 1** (the v10 stack) with an
+  execution-grounded gate teacher. We **require a measured thinking
+  contribution before scaling on it**. Full trail in `AGENTS.md`.
 - Dead ends documented so they aren't repeated: discrete-token thinking
   (never amplifies on this trunk), gate aux loss targeting the wrong
   mechanism, latent thinking as a post-hoc bolt-on (regresses VAL),
   continuation SFT/DPO on off-distribution data (regresses).
+
+## Making each feature load-bearing
+
+Adding a module is never enough — it has to be *conditioned* so the optimizer
+actually uses it, and *probed* so we can prove it contributes. The working
+designs:
+
+- **Working Memory — decoupled-KV cosine addressing.** A dedicated match-key
+  `W_k`, separate from the content value `W_v`, so a slot is retrieved by *what
+  it means* rather than by its payload; scores are L2-normalized cosine with a
+  learnable temperature and a β-scaled write-gate bias. A learnable output
+  **α-gate** (zero-init residual) lets the model fall back to the bare trunk,
+  and an **α-floor** curriculum holds the read strong during warmup so the
+  addressing locks in. This gives reliable, converged saturated-MQAR recall
+  (0.962 ± 0.03 across seeds). A utilization probe (read-hit-rate, attention
+  concentration, buffer coverage) confirms the lever is *addressing*, not buffer
+  size. Reliable on identity/symbol recall (the bulk of code recall); fully
+  disjoint *semantic* recall is the next step (a contrastive addressing teacher).
+- **PKM — the v7.1 bootstrap package.** Output-gate α + sign-preserving
+  α-floor, ε-greedy slot exploration, residual-magnitude value init, LayerNorm
+  score-norm, a diversity penalty, and a 100× value-table LR — together turning
+  a near-dead table into an always-positive per-source contribution.
+- **Thinking gate — an execution-grounded teacher.** A gate-calibration loss
+  supervises *where* to think by comparing post-latent-think vs no-think
+  `logp(true)` and training the gate toward "think iff it helps". The latent
+  rollouts apply `lm_head` at only the think slot (`skip_lm_head`), keeping the
+  teacher cheap enough to co-train.
+- **Co-train from day 1, and measure it.** Every mechanism is trained together
+  from the first step (not bolted on post-hoc, which leaves it inert), on a
+  recall-heavy data mix so WM's state actually saturates, with a periodic
+  **ablation-delta probe** (zero each feature, watch CE rise) that makes each
+  mechanism's load-bearing-ness visible *during* training rather than guessed
+  from VAL ppl.
 
 ## Headline architecture finding
 

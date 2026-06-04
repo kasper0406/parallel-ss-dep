@@ -1216,6 +1216,120 @@ class RefinementHead(nn.Module):
         return h + self.alpha * refined
 
 
+class LineSelectorAttn(nn.Module):
+    """Think-time op-selector — position-addressable VERBATIM line content (2026-06-03).
+
+    At latent-thinking step `j`, softly select program line `j` (by a learned
+    per-burst-step query) from the non-think prompt prefix and return its
+    VERBATIM mean-pooled INPUT EMBEDDING. The selected content is injected as a
+    zero-init-α additive side-channel into the trunk input at the think
+    position only. This gives latent thinking position-addressable verbatim
+    content access WITHOUT overwriting the carried latent thread (additive, not
+    replacement; and never touches non-think positions).
+
+    Cold start: `out_proj.weight` is zero-init AND a learnable scalar `alpha`
+    (init 0) wraps the output, so a fresh / untrained selector returns EXACTLY
+    zero at every position — the additive term is a no-op and the trunk is
+    byte-identical to "no selector". The model opts in only via gradient (the
+    FiLM-α / ThinkAdapter / LatentFeedbackAdapter pattern).
+
+    The prompt is segmented into "lines" by a running cumsum of the newline
+    token over the non-think prefix; each line's value is the mean of its
+    constituent token INPUT embeddings (verbatim content, not trunk hidden).
+    Keys add a per-line index embedding so the query can address by position
+    (line 0, line 1, ...). Queries are a per-think-step embedding indexed by the
+    token's position within its consecutive-think burst. The whole prompt
+    precedes the think tokens, so strict causality is unnecessary.
+    """
+
+    def __init__(self, d_model: int, max_lines: int = 64, max_burst: int = 32):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.max_lines = int(max_lines)
+        self.max_burst = int(max_burst)
+        # Per-line index key (addressable by absolute line position) and the
+        # per-think-step query table.
+        self.line_key_emb = nn.Embedding(self.max_lines, d_model)
+        self.burst_q_emb = nn.Embedding(self.max_burst, d_model)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        # Zero-init the OUTPUT projection -> cold-start no-op (output = 0, byte-
+        # identical load). alpha is a FIXED scale of 1.0, NOT a zero gate. With
+        # out_proj zero-init, d_loss/d_out_proj ∝ alpha = 1 (nonzero) so out_proj
+        # learns the right direction from zero — the standard zero-init-residual
+        # trick. (Two earlier inits FAILED: zero-init BOTH alpha & out_proj = dead
+        # gradient on both; alpha=0 + nonzero out_proj = a scalar can only scale a
+        # RANDOM out_proj direction -> sign-oscillating grad -> alpha stuck at 0,
+        # selector never activated through step 5k. 2026-06-04.)
+        nn.init.zeros_(self.out_proj.weight)
+        self.alpha = nn.Parameter(torch.ones(1))
+
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor,
+                embeds: torch.Tensor, thinking_token_id: int,
+                newline_token_id: int, burst_idx: torch.Tensor) -> torch.Tensor:
+        """Returns an additive (B, T, d) term, ZERO everywhere except think
+        positions (and exactly zero at cold start).
+
+        x:        (B, T, d) current trunk input (unused for content; kept for
+                  signature symmetry with the other think-time modules).
+        input_ids:(B, T) long token ids.
+        embeds:   (B, T, d) raw token INPUT embeddings = model.embed(input_ids).
+        burst_idx:(B, T) long index of each token within its consecutive-think
+                  burst (0 elsewhere); the per-think-step query index.
+        """
+        B, T, d = embeds.shape
+        device = embeds.device
+        think_mask = (input_ids == thinking_token_id)             # (B, T) bool
+        # No-think (all-prompt) batch: nothing to inject -> return zeros. The
+        # final output is gated by think_mask anyway, so a plain zeros tensor is
+        # the correct early-out.
+        if not bool(think_mask.any()):
+            return embeds.new_zeros(B, T, d)
+        prompt_mask = ~think_mask                                 # (B, T) bool
+
+        # Per-token line id: cumsum of newline occurrences within the prompt.
+        # Counting BEFORE a newline keeps the newline token itself on the line
+        # it terminates; we just need a stable per-line bucket. Clamp to the
+        # last bucket so over-long programs don't index OOB.
+        is_nl = (input_ids == newline_token_id) & prompt_mask     # (B, T) bool
+        line_id = is_nl.to(torch.int64).cumsum(dim=1)             # (B, T)
+        line_id = line_id.clamp(max=self.max_lines - 1)           # (B, T)
+
+        # Vectorized scatter-mean of `embeds` over line_id (prompt tokens only).
+        # line_sum[b, l] = sum of embeds[b, t] for prompt tokens t on line l.
+        # line_cnt[b, l] = number of such tokens.
+        pm = prompt_mask.unsqueeze(-1).to(embeds.dtype)           # (B, T, 1)
+        masked_emb = embeds * pm                                  # (B, T, d)
+        line_sum = embeds.new_zeros(B, self.max_lines, d)
+        idx_d = line_id.unsqueeze(-1).expand(B, T, d)             # (B, T, d)
+        line_sum.scatter_add_(1, idx_d, masked_emb)              # (B, max_lines, d)
+        line_cnt = embeds.new_zeros(B, self.max_lines)
+        line_cnt.scatter_add_(1, line_id, prompt_mask.to(embeds.dtype))
+        line_valid = line_cnt > 0                                 # (B, max_lines) bool
+        denom = line_cnt.clamp(min=1.0).unsqueeze(-1)             # (B, max_lines, 1)
+        line_val = line_sum / denom                              # (B, max_lines, d)
+
+        # Keys: projected line content + a per-line absolute-index embedding.
+        line_ids = torch.arange(self.max_lines, device=device)
+        keys = self.k_proj(line_val) + self.line_key_emb(line_ids).unsqueeze(0)
+        vals = self.v_proj(line_val)                             # (B, max_lines, d)
+
+        # Query per think position from the burst-step table.
+        q_idx = burst_idx.clamp(max=self.max_burst - 1)          # (B, T)
+        query = self.burst_q_emb(q_idx)                          # (B, T, d)
+
+        scores = torch.matmul(query, keys.transpose(1, 2)) / math.sqrt(d)
+        # Mask invalid (empty) lines so softmax never attends to padding rows.
+        invalid = (~line_valid).unsqueeze(1)                     # (B, 1, max_lines)
+        scores = scores.masked_fill(invalid, float("-inf"))      # (B, T, max_lines)
+        attn = torch.softmax(scores, dim=-1)                     # (B, T, max_lines)
+        sel = torch.matmul(attn, vals)                          # (B, T, d)
+        out = self.out_proj(sel) * self.alpha                    # zero at cold start
+        # Additive term: ZERO at non-think positions.
+        return out * think_mask.unsqueeze(-1).to(out.dtype)
+
+
 class TinyLM(nn.Module):
     def __init__(
         self,
@@ -1374,6 +1488,17 @@ class TinyLM(nn.Module):
         # byte-identical to the no-adapter latent path. Default OFF (existing
         # ckpts load identically; they simply lack the adapter keys).
         use_latent_feedback_adapter: bool = False,
+        # Think-time op-selector (2026-06-03). When True, build a
+        # `LineSelectorAttn` that softly selects a program LINE from the prompt
+        # by a learned per-think-step query and injects that line's verbatim
+        # mean-pooled input embedding as a zero-init-α additive side-channel at
+        # think positions only. Zero-init out_proj + α(0) → byte-identical to
+        # OFF at cold start, so an existing ckpt loads identically (it simply
+        # lacks the `line_selector.*` keys). `newline_token_id` is required for
+        # line segmentation.
+        use_line_selector: bool = False,
+        line_selector_max_lines: int = 64,
+        newline_token_id: int | None = None,
     ):
         super().__init__()
         # Per-layer attention class list (for hybrid architectures) takes
@@ -1450,6 +1575,15 @@ class TinyLM(nn.Module):
         self.use_latent_feedback_adapter = bool(use_latent_feedback_adapter)
         if self.use_latent_feedback_adapter:
             self.latent_feedback_adapter = LatentFeedbackAdapter(d_model)
+        # Think-time op-selector (2026-06-03). Built here so state-dict
+        # round-trip preserves weights; zero-init out_proj + α(0) → byte-identical
+        # to OFF at cold start. `newline_token_id` drives line segmentation.
+        self.use_line_selector = bool(use_line_selector)
+        self.line_selector_max_lines = int(line_selector_max_lines)
+        self.newline_token_id = newline_token_id
+        if self.use_line_selector:
+            self.line_selector = LineSelectorAttn(
+                d_model, max_lines=self.line_selector_max_lines)
         self.out_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         if tie_embeddings:
@@ -1693,14 +1827,29 @@ class TinyLM(nn.Module):
         per-position 0-indexed burst-position is `(c - reset - 1).clamp(0)`.
         """
         think_mask = (input_ids == int(self.thinking_token_id))
-        m_int = think_mask.to(torch.int64)
-        c = m_int.cumsum(dim=1)
-        reset = (c * (1 - m_int)).cummax(dim=1).values
-        burst_idx = (c - reset - 1).clamp(min=0)
+        burst_idx = self._compute_burst_index(input_ids)
         burst_idx = burst_idx.clamp(max=self.think_index_emb_size - 1)
         idx_emb = self.think_index_emb(burst_idx)
         # Mask to think positions only (non-think positions contribute 0).
         return idx_emb * think_mask.unsqueeze(-1).to(idx_emb.dtype)
+
+    def _compute_burst_index(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Per-token 0-indexed position within its consecutive-think burst.
+
+        Returns a (B, T) long tensor: at think positions, the token's index
+        within the run of consecutive think tokens it belongs to (0 for the
+        first think in a burst, 1 for the second, ...); 0 at non-think
+        positions. Vectorized via the cumsum-reset trick: let
+        `c = cumsum(think_mask)` and `reset = cummax(c * (1-mask))` (the cumsum
+        value just before the current burst began), then the burst-position is
+        `(c - reset - 1).clamp(0)`. Shared by `_compute_think_index_emb` (Phase
+        3 index embedding) and `LineSelectorAttn` (per-think-step query index).
+        """
+        think_mask = (input_ids == int(self.thinking_token_id))
+        m_int = think_mask.to(torch.int64)
+        c = m_int.cumsum(dim=1)
+        reset = (c * (1 - m_int)).cummax(dim=1).values
+        return (c - reset - 1).clamp(min=0)
 
     def _maybe_pkm(self, h: torch.Tensor, L: int) -> torch.Tensor:
         """Apply the PKM residual side-table after layer L iff configured.
@@ -1876,6 +2025,15 @@ class TinyLM(nn.Module):
         # identity for any σ → byte-identical to no-head training.
         h_raw = self._apply_refinement_head(h_raw)
         h = self.out_norm(h_raw)
+        # Pre-memory hidden = the CLEAN latent-thread source. With WM on, the
+        # post-memory `h` (below) carries a WM retrieval injected at think
+        # positions; feeding THAT back as the latent thread overwrites the
+        # precise value the thread must carry (audit 2026-06-03). When
+        # `_latent_feedback_premem` is set, return_hidden hands back this
+        # pre-memory hidden so the thread stays clean while WM still shapes the
+        # emitted logits below. Default off -> byte-identical to old behaviour.
+        h_premem = h
+        self._last_premem_hidden = h_premem
         h = self._apply_memory(h, input_ids, read_mask=mem_read_mask,
                                doc_ids=doc_ids)
         if skip_lm_head:
@@ -1893,7 +2051,9 @@ class TinyLM(nn.Module):
         if return_aux and self.aux_dim > 0:
             outs = outs + (self.aux_head(h),)
         if return_hidden:
-            outs = outs + (h,)
+            hid = (h_premem if getattr(self, "_latent_feedback_premem", False)
+                   else h)
+            outs = outs + (hid,)
         if return_gate:
             outs = outs + (maybe_gate(h),)
         else:
@@ -1956,6 +2116,21 @@ class TinyLM(nn.Module):
                 and self.thinking_token_id is not None
                 and input_ids is not None):
             x = x + self._compute_think_index_emb(input_ids)
+
+        # Think-time op-selector (2026-06-03). Inject a position-addressable
+        # verbatim program-line embedding as a zero-init-α additive side-channel
+        # at think positions only. Uses the raw token embeddings (NOT x) for the
+        # KV content so retrieval-as-input mode (x != embeds) still selects from
+        # verbatim prompt content. Zero at non-think positions / cold start.
+        if (getattr(self, "use_line_selector", False)
+                and self.thinking_token_id is not None
+                and input_ids is not None
+                and self.newline_token_id is not None):
+            embeds = self.embed(input_ids)
+            burst_idx = self._compute_burst_index(input_ids)
+            x = x + self.line_selector(
+                x, input_ids, embeds, int(self.thinking_token_id),
+                int(self.newline_token_id), burst_idx)
 
         # Cross-document isolation: when `doc_ids` marks multiple documents
         # packed into one T-length row, `cu_seqlens` makes the DeltaNet

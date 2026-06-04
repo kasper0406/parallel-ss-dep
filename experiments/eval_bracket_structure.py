@@ -47,7 +47,9 @@ def build_model_from_ckpt(ckpt_path: str,
                           force_refinement_head_mlp_mult: int | None = None,
                           force_refinement_head_alpha_init: float | None = None,
                           force_state_readonly: bool | None = None,
-                          force_use_latent_feedback_adapter: bool | None = None):
+                          force_use_latent_feedback_adapter: bool | None = None,
+                          force_use_line_selector: bool | None = None,
+                          force_think_index_emb_size: int | None = None):
     """Construct a TinyLM from a saved ckpt.
 
     `force_use_think_adapter` (optional) overrides the auto-detect:
@@ -156,6 +158,12 @@ def build_model_from_ckpt(ckpt_path: str,
     # ckpts that predate the cfg key but were trained with it on).
     if think_idx_emb == 0 and "think_index_emb.weight" in sd_keys:
         think_idx_emb = int(ckpt["state_dict"]["think_index_emb.weight"].shape[0])
+    # Explicit caller override (2026-06-03): ATTACH a program-counter index
+    # embedding (zero-init -> byte-identical at load) to a ckpt that lacks one,
+    # so the latent step can know its position within the think burst. Tests
+    # whether the model can USE WorkingMemory once it can address "which step".
+    if force_think_index_emb_size is not None:
+        think_idx_emb = int(force_think_index_emb_size)
     # Phase-B (use_think_adapter / think_adapter_hidden_mult). Adapter
     # weights ARE in the state-dict (blocks.{L}.think_adapter.{fc1,fc2,alpha}),
     # so auto-detect from any block's fc1.weight shape and override the cfg
@@ -208,6 +216,22 @@ def build_model_from_ckpt(ckpt_path: str,
         use_latent_feedback_adapter = True
     if force_use_latent_feedback_adapter is not None:
         use_latent_feedback_adapter = bool(force_use_latent_feedback_adapter)
+    # Think-time op-selector (2026-06-03). Weights live at `line_selector.*`,
+    # so auto-detect from the state-dict. force_* lets the trainer ATTACH a
+    # fresh (zero-init -> byte-identical at load) selector to a ckpt that lacks
+    # one. `newline_token_id` has no state-dict footprint; read from cfg (the
+    # trainer sets it from the tokenizer's "\n" id).
+    use_line_selector = bool(cfg.get("use_line_selector", False))
+    line_selector_max_lines = int(cfg.get("line_selector_max_lines", 64))
+    if any(k.startswith("line_selector.") for k in sd_keys):
+        use_line_selector = True
+        # Infer max_lines from the saved line-key embedding table.
+        if "line_selector.line_key_emb.weight" in sd_keys:
+            line_selector_max_lines = int(
+                ckpt["state_dict"]["line_selector.line_key_emb.weight"].shape[0])
+    if force_use_line_selector is not None:
+        use_line_selector = bool(force_use_line_selector)
+    newline_token_id = cfg.get("newline_token_id")
     if force_refinement_head_window is not None:
         refinement_head_window = int(force_refinement_head_window)
     if force_refinement_head_n_heads is not None:
@@ -235,6 +259,9 @@ def build_model_from_ckpt(ckpt_path: str,
         refinement_head_mlp_mult=refinement_head_mlp_mult,
         refinement_head_alpha_init=refinement_head_alpha_init,
         use_latent_feedback_adapter=use_latent_feedback_adapter,
+        use_line_selector=use_line_selector,
+        line_selector_max_lines=line_selector_max_lines,
+        newline_token_id=newline_token_id,
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,

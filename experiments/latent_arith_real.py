@@ -152,6 +152,28 @@ def _load_rung(prefix: str, n: int, tok, max_len: int) -> list[tuple]:
     return out
 
 
+def _parse_pred(new_tokens, tok):
+    """Parse the model's predicted answer from the FIRST emitted token (= the
+    last think-slot argmax = f^R(s), exactly what per-hop training supervises).
+
+    BUGFIX (2026-06-04): the old parse was
+        re.search(r"-?\\d+", tok.decode(ALL emitted tokens))
+    which grabbed the FIRST CONTIGUOUS DIGIT RUN across every emitted token.
+    After emitting the (correct, single-token) answer the model keeps emitting
+    digits — it was never trained to STOP after the answer — so the run became
+    e.g. "5"+"19999..." and a CORRECT answer (5) was parsed as 519999... and
+    scored wrong. This silently turned correct heterogeneous traces into a
+    spurious "deep-rung collapse": verified last-slot accuracy was 0.93-1.00 at
+    n=5-8 while this parse reported ~0.05. Answers here are single-token (m<=10),
+    so read from the first digit-bearing emitted token ONLY, never concatenating
+    across tokens (which is what produced the artifact)."""
+    for t in new_tokens[:4]:
+        m = re.search(r"-?\d+", tok.decode([t], skip_special_tokens=True))
+        if m:
+            return int(m.group())
+    return None
+
+
 @torch.no_grad()
 def _eval_rung(model, recs, R_eval, thinking_id, eos_id, device,
                max_gen=12, max_problems=150):
@@ -172,9 +194,7 @@ def _eval_rung(model, recs, R_eval, thinking_id, eos_id, device,
                 eos_token_id=eos_id, thinking_token_id=thinking_id,
                 force_prefix_think=R, emit_threshold=(0.0 if is_none else 0.5))
             new = [t for t in out[0, plen:].tolist() if t != thinking_id]
-            text = model_tok.decode(new, skip_special_tokens=True)
-            m = re.search(r"-?\d+", text)
-            pred = int(m.group()) if m else None
+            pred = _parse_pred(new, model_tok)
             ok = (pred is not None and pred == gold)
             if is_none and ok:
                 n_none += 1
@@ -203,9 +223,7 @@ def _eval_autonomous(model, recs, thinking_id, eos_id, device,
             force_prefix_think=0, emit_threshold=emit_threshold,
             max_think_per_step=max_think, total_think_budget=max_think + max_gen)
         new = [t for t in out[0, plen:].tolist() if t != thinking_id]
-        text = model_tok.decode(new, skip_special_tokens=True)
-        m = re.search(r"-?\d+", text)
-        pred = int(m.group()) if m else None
+        pred = _parse_pred(new, model_tok)
         n_correct += int(pred is not None and pred == gold)
         steps_sum += diag.get("think_total", 0)
         total += 1
@@ -260,10 +278,19 @@ def train(args):
     torch.backends.cudnn.allow_tf32 = True
 
     model, cfg = build_model_from_ckpt(
-        args.base, force_state_readonly=True,
-        force_use_latent_feedback_adapter=True)
+        args.base, force_state_readonly=(False if args.state_writable else True),
+        force_use_latent_feedback_adapter=True,
+        force_use_think_adapter=(args.use_think_adapter or None),
+        force_think_adapter_hidden_mult=(args.think_adapter_hidden_mult
+                                         if args.use_think_adapter else None),
+        force_use_line_selector=(args.use_line_selector or None),
+        force_think_index_emb_size=(args.think_index_emb_size or None))
     model = model.to(device).train()
     model._film_bypass = True                      # single-forward FiLM (speed + WM bug)
+    model._latent_feedback_premem = bool(args.feedback_premem)
+    if args.feedback_premem:
+        print("  [feedback_premem] latent thread = PRE-memory hidden "
+              "(WM shapes logits only, can't corrupt the carried value)", flush=True)
     if args.freeze_trunk:
         # PARAMETER SEPARATION: freeze the code trunk (preserve code) and train the
         # thinking params (adapter + gate_head) PLUS optionally the last N trunk
@@ -273,8 +300,11 @@ def train(args):
                                     n_layers))
         n_tr = 0
         for name, p in model.named_parameters():
+            # MoE-of-one expert: think_adapter is dedicated reasoning capacity
+            # (fires only at think positions, zero at code positions) -> training
+            # it can't perturb code. out_norm kept FROZEN (code-critical).
             train_it = ("latent_feedback_adapter" in name or "gate_head" in name
-                        or "out_norm" in name)
+                        or "think_adapter" in name or "line_selector" in name)
             mm = re.match(r"blocks\.(\d+)\.", name)
             if mm and int(mm.group(1)) in unfreeze_blocks:
                 train_it = True
@@ -298,6 +328,18 @@ def train(args):
         cfg.get("tokenizer", "HuggingFaceTB/SmolLM2-135M"))
     model_tok = tok
     eos_id = tok.eos_token_id
+    # Think-time op-selector (2026-06-03): set the newline id from the live
+    # tokenizer (the builder can't load one) and round-trip the config so the
+    # ckpt re-builds the selector consistently on reload.
+    if args.use_line_selector:
+        nl_id = tok.encode("\n", add_special_tokens=False)[-1]
+        model.newline_token_id = int(nl_id)
+        model.line_selector_max_lines = int(args.line_selector_max_lines)
+        cfg["use_line_selector"] = True
+        cfg["line_selector_max_lines"] = int(args.line_selector_max_lines)
+        cfg["newline_token_id"] = int(nl_id)
+        print(f"  [line_selector] newline_token_id={nl_id} "
+              f"max_lines={args.line_selector_max_lines}", flush=True)
     has_ad = bool(getattr(model, "use_latent_feedback_adapter", False))
     print(f"[latent-arith-real] base={args.base} thinking_id={thinking_id} "
           f"adapter={has_ad} film={cfg.get('feedback_mode')} "
@@ -385,9 +427,14 @@ def train(args):
             ad = model.latent_feedback_adapter
             an = float(ad.alpha.detach().item()) if hasattr(ad, "alpha") else float("nan")
             pn = float(ad.proj.weight.detach().norm().item()) if hasattr(ad, "proj") else float("nan")
+            sel = ""
+            if getattr(model, "use_line_selector", False):
+                sa = float(model.line_selector.alpha.detach().item())
+                so = float(model.line_selector.out_proj.weight.detach().norm().item())
+                sel = f"  selα {sa:+.3f} sel_out {so:.2f}"
             print(f"  step {step:>5}  loss {running/min(step,args.log_every):.4f}  "
                   f"n {n}  R {R}  α {an:+.3f}  proj.norm {pn:.2f}  "
-                  f"nt {n_no_think/step:.2f}  ({time.time()-t0:.0f}s)",
+                  f"nt {n_no_think/step:.2f}{sel}  ({time.time()-t0:.0f}s)",
                   flush=True)
             running = 0.0
         if args.eval_every and step % args.eval_every == 0:
@@ -455,9 +502,42 @@ def main():
     ap.add_argument("--freeze_trunk", action="store_true",
                     help="parameter separation: freeze the code trunk, train the "
                          "thinking params (adapter+gate) + last N blocks.")
+    ap.add_argument("--think_index_emb_size", type=int, default=0,
+                    help="PROGRAM COUNTER primitive: attach a zero-init per-step index "
+                         "embedding (size N) so each latent step knows its position in "
+                         "the think burst. Lets the model address 'which step am I' — "
+                         "needed to query WorkingMemory for the right line. 0=off.")
+    ap.add_argument("--state_writable", action="store_true",
+                    help="DISABLE state-readonly-at-think (default ON). Lets latent "
+                         "think steps WRITE to the DeltaNet recurrent state S so the "
+                         "computation can ACCUMULATE across steps (CoT-like context "
+                         "growth), instead of being crammed into the single fed-back "
+                         "vector. Use WITH --use_line_selector: the selector reads the "
+                         "program from embeddings (S-independent), so S is free to "
+                         "accumulate without losing the program it would otherwise "
+                         "hold. Untested CoT-analog variable (2026-06-04).")
+    ap.add_argument("--use_line_selector", action="store_true",
+                    help="OP-SELECTOR primitive: attach a zero-init LineSelectorAttn that "
+                         "softly selects a program LINE from the prompt by a per-step "
+                         "query and injects its verbatim mean-pooled input embedding as an "
+                         "additive side-channel at think positions. Gives latent thinking "
+                         "position-addressable verbatim content access. Cold-start no-op.")
+    ap.add_argument("--line_selector_max_lines", type=int, default=64,
+                    help="max addressable program lines for --use_line_selector")
+    ap.add_argument("--use_think_adapter", action="store_true",
+                    help="attach a per-block think-routed expert (ThinkAdapter, fires "
+                         "only at think positions) as DEDICATED reasoning capacity")
+    ap.add_argument("--think_adapter_hidden_mult", type=int, default=4,
+                    help="hidden multiplier for the ThinkAdapter expert")
     ap.add_argument("--unfreeze_last_layers", type=int, default=0,
                     help="with --freeze_trunk, also train the last N trunk blocks "
                          "(gives the latent lookup some trunk capacity)")
+    ap.add_argument("--feedback_premem", action="store_true",
+                    help="feed back the PRE-memory hidden as the latent thread so a "
+                         "WM retrieval can't overwrite the carried value (audit fix "
+                         "#1). WM still shapes the emitted logits. Use WITH memory on "
+                         "(no --no_memory) to test if WM helps once it stops "
+                         "contaminating the thread.")
     ap.add_argument("--no_memory", action="store_true",
                     help="disable WorkingMemory so the latent feedback is the "
                          "clean out_norm(h) thread (matches the validated synthetic; "

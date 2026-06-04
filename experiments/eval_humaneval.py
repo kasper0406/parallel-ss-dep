@@ -467,10 +467,14 @@ def generate_latent_think(
         total_think_budget = 2 * max_gen
     if thinking_token_id is None:
         raise ValueError("generate_latent_think requires thinking_token_id")
+    # state_readonly_at_think is the validated default, but this is a FULL-forward
+    # path (the whole sequence is re-read every step), so it is equally correct for
+    # a STATE-WRITABLE model (think tokens write to S) — the eval forward then
+    # matches a state-writable training forward exactly. Only warn, don't block
+    # (2026-06-04: the CoT-analog state-writable experiment needs this eval).
     if not getattr(model, "state_readonly_at_think", False):
-        raise ValueError("generate_latent_think requires a model with "
-                         "state_readonly_at_think=True (load with "
-                         "force_state_readonly=True).")
+        print("  [generate_latent_think] note: state_readonly_at_think=False "
+              "(state-writable) — full-forward eval matches state-writable training.")
     device = prompt_ids.device
     out = prompt_ids.clone()
     inputs_embeds = model.embed(out).clone()      # (B, prompt_len, d)

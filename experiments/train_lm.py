@@ -50,6 +50,8 @@ from experiments.thinking import (
 
 
 from experiments.gate_calibration import compute_gate_calibration_loss
+# LatentReasoningCotrain is imported lazily inside main() — its dependency chain
+# (latent_sft → eval_bracket_structure → train_lm) would otherwise be circular.
 from experiments.build_arch import build_arch, parse_layers_arg, _NAME_TO_CLS  # noqa: F401
 
 
@@ -161,7 +163,16 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
         else:
             gate_floor = args.gate_floor_min
         g_eff = g.clamp(min=gate_floor) if gate_floor > 0.0 else g
-        gate_terms = g_eff * ce_per_token + (1.0 - g_eff) * args.gate_lambda
+        # Ponder cost. The CE term uses the floor-clamped g_eff (so real-token
+        # loss keeps weight >= floor — the gate_floor_min anti-collapse fix).
+        # The THINK-cost term, however, must penalise the RAW gate g, not g_eff:
+        # clamp() zeros the gradient to g whenever g < floor, so with the cost
+        # on g_eff the *raw* gate (the one generation uses, with no clamp) is
+        # never penalised for thinking -> it over-thinks at deploy (think_frac
+        # ~0.6 observed). Costing the raw g restores that gradient so the gate
+        # learns to emit unless CE > gate_lambda. Default off (backwards-compat).
+        ponder_gate = g if getattr(args, "gate_ponder_raw", False) else g_eff
+        gate_terms = g_eff * ce_per_token + (1.0 - ponder_gate) * args.gate_lambda
         valid = (y != -100).float()
         denom = valid.sum().clamp(min=1.0)
         lm_loss = (gate_terms * valid).sum() / denom
@@ -657,6 +668,32 @@ def main():
     pad_token_id = tok.eos_token_id
     if pad_token_id is None:
         pad_token_id = tok.bos_token_id if tok.bos_token_id is not None else 0
+
+    # Depth-matched latent-reasoning co-train (2026-06-05 fix). Loads the
+    # depth-bound pointer-chase corpus once; emits one answer-span latent loss
+    # per optimizer step (last microbatch) at R=depth with a curriculum.
+    _latent_reasoner = None
+    if getattr(args, "latent_reasoning_weight", 0.0) > 0.0:
+        from experiments.latent_reasoning_cotrain import LatentReasoningCotrain
+        if thinking_token_id is None:
+            raise SystemExit("--latent_reasoning_weight needs a thinking token "
+                             "(set --thinking_token or use --data_mix).")
+        _rr_rungs = [int(x) for x in args.latent_reasoning_rungs.split(",")
+                     if x.strip()]
+        _latent_reasoner = LatentReasoningCotrain(
+            train_prefix=args.latent_reasoning_train_prefix,
+            rungs=_rr_rungs, tok=tok, thinking_id=int(thinking_token_id),
+            eos_id=int(tok.eos_token_id if tok.eos_token_id is not None
+                       else pad_token_id),
+            device="cuda", max_len=int(args.latent_reasoning_max_len),
+            no_ramp=bool(args.latent_reasoning_no_ramp),
+            gate_weight=float(getattr(args, "latent_reasoning_gate_weight", 0.0)),
+            seed=int(args.seed))
+        print(f"Latent-reasoning co-train ON: weight={args.latent_reasoning_weight} "
+              f"rungs={_latent_reasoner.rungs} "
+              f"n/step={args.latent_reasoning_n} "
+              f"(examples/rung: "
+              f"{ {n: len(_latent_reasoner.data[n]) for n in _latent_reasoner.rungs} })")
 
     # TensorBoard writer — no-op context when --tb_dir is not set. Under DDP
     # only rank 0 writes (multiple ranks → the same event file would corrupt).
@@ -1389,6 +1426,7 @@ def main():
             # The gate/plain-loss branches live in _nonthink_forward_loss.
             n_micro = max(1, args.grad_accum)
             _latent_cotrain_diag = None
+            _latent_reasoning_diag = None
             _gate_calib_diag = None
             for micro in range(n_micro):
                 if micro > 0:
@@ -1462,6 +1500,20 @@ def main():
                             loss = loss + (n_micro * args.latent_cotrain_weight) \
                                 * _lc_loss
                             _latent_cotrain_diag = (_lc_delta, _lc_n)
+                    # Depth-matched latent-REASONING co-train (the 2026-06-05 fix):
+                    # answer-span CE on pointer-chase at R=depth, clean latent
+                    # thread (WM off + film bypass inside the helper). Fires once
+                    # per optimizer step; scaled by n_micro so the per-step
+                    # gradient matches --latent_reasoning_weight after /n_micro.
+                    if (_latent_reasoner is not None
+                            and _is_last_micro):
+                        _lr_loss, _lr_rung = _latent_reasoner.step(
+                            model, step, args.steps,
+                            int(args.latent_reasoning_n))
+                        loss = loss + (n_micro * args.latent_reasoning_weight) \
+                            * _lr_loss
+                        _latent_reasoning_diag = (float(_lr_loss.detach()),
+                                                  int(_lr_rung))
                     # Gate-calibration: train the OUTPUT GATE (not the trunk) to
                     # fire think exactly where a latent think raises
                     # logp(true_next). The BCE flows ONLY into the grad-carrying
@@ -1552,6 +1604,10 @@ def main():
                     _latent_cotrain_diag is not None:
                 _d, _n = _latent_cotrain_diag
                 line += f"  latent(Δlogp={_d:+.3f},n={_n})"
+            if _latent_reasoner is not None and \
+                    _latent_reasoning_diag is not None:
+                _rl, _rr = _latent_reasoning_diag
+                line += f"  reason(loss={_rl:.3f},R={_rr})"
             if getattr(args, "gate_calibration_weight", 0.0) > 0.0 and \
                     _gate_calib_diag is not None:
                 _t1, _sg, _gd, _gn = _gate_calib_diag
@@ -1805,6 +1861,11 @@ def main():
                         and _latent_cotrain_diag is not None):
                     _d, _n = _latent_cotrain_diag
                     tb.add_scalar("latent_cotrain/delta_logp", _d, step)
+                if (_latent_reasoner is not None
+                        and _latent_reasoning_diag is not None):
+                    _rl, _rr = _latent_reasoning_diag
+                    tb.add_scalar("latent_reasoning/loss", _rl, step)
+                    tb.add_scalar("latent_reasoning/rung", _rr, step)
                 if args.enable_thinking_token and think_stats_window:
                     tb.add_scalar("think/rate", think_rate, step)
                     tb.add_scalar("think/explore_rate", explore_rate, step)

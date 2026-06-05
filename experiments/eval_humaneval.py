@@ -955,17 +955,29 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
             elif generator == "latent_think":
                 # Latent-ponder thinking: state-readonly, hidden fed back as
                 # the think-slot input embedding (THINKING_LATENT_2026_05_28).
-                gen, diag = generate_latent_think(
-                    model, prompt_t, max_gen=max_gen,
-                    temperature=temperature, eos_token_id=tok.eos_token_id,
-                    thinking_token_id=thinking_token_id,
-                    max_think_per_step=max_think_per_step,
-                    total_think_budget=total_think_budget,
-                    emit_threshold=emit_threshold,
-                    min_emit_before_eos=min_emit_before_eos,
-                    gate_floor=gate_floor,
-                    force_prefix_think=force_prefix_think,
-                )
+                # BUG FIX (2026-06-05): the latent thread MUST run WorkingMemory
+                # OFF here — every training path (latent_reasoning_cotrain,
+                # latent_sft, the thinking.py measurement twins via wm_off) feeds
+                # back the CLEAN out_norm(h); leaving WM on at eval feeds back
+                # out_norm(h)+α·W_proj(WM_read), an OOD signal the latent adapter
+                # was built to avoid → corrupted feedback → run-on output. Toggle
+                # WM off for the duration, restore after.
+                _saved_um = getattr(model, "use_memory", False)
+                model.use_memory = False
+                try:
+                    gen, diag = generate_latent_think(
+                        model, prompt_t, max_gen=max_gen,
+                        temperature=temperature, eos_token_id=tok.eos_token_id,
+                        thinking_token_id=thinking_token_id,
+                        max_think_per_step=max_think_per_step,
+                        total_think_budget=total_think_budget,
+                        emit_threshold=emit_threshold,
+                        min_emit_before_eos=min_emit_before_eos,
+                        gate_floor=gate_floor,
+                        force_prefix_think=force_prefix_think,
+                    )
+                finally:
+                    model.use_memory = _saved_um
             elif generator == "retrieval_as_input":
                 # v5+ models trained with --retrieval_as_input_thinking
                 # must be evaluated with the matching generator (the
@@ -1126,14 +1138,42 @@ def main():
                         "latent_sft think-before-solution training).")
     p.add_argument("--generator", type=str, default="standard",
                    choices=["standard", "retrieval_as_input", "latent_think"],
-                   help="'standard' (default): append [THINKING] tokens. "
-                        "'retrieval_as_input': at think positions inject "
-                        "the WM retrieval as the next input embedding. "
-                        "REQUIRED for ckpts SFT'd with "
-                        "--retrieval_as_input_thinking (v5+) — evaluating "
-                        "those with the standard generator is a "
-                        "train/inference mismatch.")
+                   help="'standard' (default): NO thinking — plain greedy code "
+                        "(the no-think baseline; works for any ckpt). "
+                        "'latent_think': the VALIDATED thinking mechanism "
+                        "(Coconut-style hidden feedback, state-readonly). Use "
+                        "this for any thinking eval. "
+                        "'retrieval_as_input': DEPRECATED legacy WM-injection "
+                        "thinking (v5-v7 ckpts) — gated behind "
+                        "--allow_legacy_thinking. Mixing it with latent-trained "
+                        "ckpts caused a toy-vs-HumanEval mechanism mismatch.")
+    p.add_argument("--allow_legacy_thinking", action="store_true",
+                   help="Opt-in to the DEPRECATED thinking mechanisms "
+                        "(--generator retrieval_as_input, or --generator "
+                        "standard together with --use_thinking = discrete-token "
+                        "thinking). Off by default so they can't be selected by "
+                        "accident — the validated mechanism is "
+                        "--generator latent_think. Only set this to reproduce a "
+                        "historical v5-v7 ckpt eval.")
     args = p.parse_args()
+
+    # Guard the deprecated thinking mechanisms behind an explicit opt-in. The
+    # toy ('thinking helps') used latent_think; a HumanEval run accidentally used
+    # retrieval_as_input ('thinking hurts') — apples-to-oranges. Don't expose the
+    # old modes silently.
+    _legacy_think = (
+        args.generator == "retrieval_as_input"
+        or (args.generator == "standard" and args.use_thinking)
+    )
+    if _legacy_think and not args.allow_legacy_thinking:
+        p.error(
+            "Refusing a DEPRECATED thinking mechanism: "
+            f"--generator {args.generator}"
+            + (" with --use_thinking (discrete-token thinking)"
+               if args.generator == "standard" else "")
+            + ". The validated mechanism is `--generator latent_think`. "
+            "If you really need the legacy mode (e.g. a v5-v7 ckpt SFT'd with "
+            "--retrieval_as_input_thinking), pass --allow_legacy_thinking.")
 
     all_results = {}
     for ckpt in args.ckpt:

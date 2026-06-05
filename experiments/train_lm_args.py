@@ -102,6 +102,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "λ > avg_CE → rarely pauses (degenerates to standard LM). "
                         "Recommended sweep: {1.0, 2.0, 3.0, 4.0} for a "
                         "codeparrot model with CE ≈ 3-4 nats.")
+    p.add_argument("--gate_ponder_raw", action="store_true",
+                   help="Apply the (1-g)*gate_lambda THINK cost to the RAW gate "
+                        "g instead of the floor-clamped g_eff. clamp(g,floor) "
+                        "zeros the ponder gradient to the raw gate below the "
+                        "floor, so the deploy-time gate (raw σ) is never "
+                        "penalised for thinking and over-thinks at generation. "
+                        "This restores that gradient so the gate learns to emit "
+                        "unless CE > gate_lambda. CE term still uses g_eff.")
     p.add_argument("--gate_warmup_steps", type=int, default=2000,
                    help="Number of warmup steps over which the gate floor "
                         "linearly decays from 1.0 (always emit) toward "
@@ -676,6 +684,41 @@ def build_parser() -> argparse.ArgumentParser:
                         "the fixed (max_positions, max_prefix_len) shape the "
                         "compile path needs. The uniform path is preserved when "
                         "this flag is off.")
+    # --- Depth-matched latent-REASONING co-train (the 2026-06-05 fix) ---
+    # Instead of latent_cotrain_loss (R latent steps -> predict a random natural
+    # next token, which learns "thinking not needed", Δlogp<0), draw from a
+    # depth-bound NON-parallelizable reasoning corpus (pointer-chase) and
+    # supervise the ANSWER with R = problem depth + a curriculum. Co-trained at
+    # low weight alongside the general mix so the trunk keeps general ability.
+    # Validated standalone (latent_arith_real.py): fair lift +0.40-0.65, the
+    # autonomous gate allocates exactly n hops. Default 0.0 = OFF.
+    p.add_argument("--latent_reasoning_weight", type=float, default=0.0,
+                   help="Weight on the depth-matched latent-reasoning co-train "
+                        "(answer-span CE on pointer-chase, R=depth). 0 disables. "
+                        "Requires --state_readonly_at_think; pair with "
+                        "--use_latent_feedback_adapter. Needs --no-compile.")
+    p.add_argument("--latent_reasoning_train_prefix", type=str,
+                   default="data/ptr10dict_train",
+                   help="Prefix for the depth-bound reasoning corpus "
+                        "(<prefix>_n{rung}.jsonl, each record has prompt+answer).")
+    p.add_argument("--latent_reasoning_rungs", type=str, default="2,3,4,5,6,7,8",
+                   help="Comma-separated depth rungs to co-train on.")
+    p.add_argument("--latent_reasoning_n", type=int, default=4,
+                   help="Reasoning examples per optimizer step (each is R extra "
+                        "sequential forwards — keep small).")
+    p.add_argument("--latent_reasoning_max_len", type=int, default=256,
+                   help="Drop reasoning examples whose tokenised length exceeds "
+                        "this (keeps the latent loop cheap).")
+    p.add_argument("--latent_reasoning_no_ramp", action="store_true",
+                   help="Skip the depth curriculum (sample rungs uniformly from "
+                        "step 0). Default off = ramp 1->max over 60%% of steps.")
+    p.add_argument("--latent_reasoning_gate_weight", type=float, default=0.0,
+                   help="If >0, ALSO train the output gate to invoke+halt "
+                        "thinking on reasoning examples (autonomous_halt BCE: "
+                        "P(emit)→THINK for the first R decision positions, EMIT "
+                        "at the last). Fixes 'capability baked but gate never "
+                        "fires it' (avg_steps≈0.77 vs target n). 0 = capability "
+                        "only.")
     # --- Gate-calibration aux loss (latent "think only where helpful") ---
     # Trains the OUTPUT GATE (not the trunk) toward firing think exactly where
     # a latent think actually raises logp(true_next). Uses the shared latent

@@ -613,7 +613,14 @@ def main() -> int:
     p.add_argument("--mem_size", type=int, default=1024)
     p.add_argument("--mem_dim", type=int, default=0)
     p.add_argument("--retrieval_as_input_thinking", action="store_true",
-                   help="Replace the discrete [THINKING] token's input "
+                   help="DEPRECATED (2026-06-05): legacy WM-injection thinking. "
+                        "This trains a DIFFERENT thinking mechanism than the "
+                        "validated latent thinking (latent_sft.py / "
+                        "latent_reasoning_cotrain), and evaluating such ckpts "
+                        "with --generator latent_think vs retrieval_as_input "
+                        "gives apples-to-oranges results. Prefer the latent "
+                        "pipeline for new runs. "
+                        "Replace the discrete [THINKING] token's input "
                         "embedding with the WorkingMemory retrieval at the "
                         "previous position. Solves the think-position "
                         "homogeneity that caused FIX A to fail (the "
@@ -745,6 +752,20 @@ def main() -> int:
                    help="Restrict calibration to positions with σ<high "
                         "(default 1 = no upper bound).")
     args = p.parse_args()
+
+    if args.retrieval_as_input_thinking:
+        print("=" * 72)
+        print("WARNING: --retrieval_as_input_thinking is DEPRECATED (legacy "
+              "WM-injection thinking).")
+        print("  It trains a DIFFERENT mechanism than the validated LATENT "
+              "thinking. Ckpts SFT'd")
+        print("  this way must be eval'd with `--generator retrieval_as_input "
+              "--allow_legacy_thinking`,")
+        print("  NOT `--generator latent_think` — mixing them is an "
+              "apples-to-oranges mismatch.")
+        print("  For new runs use the latent pipeline (latent_sft.py / latent "
+              "reasoning co-train).")
+        print("=" * 72)
 
     torch.manual_seed(args.seed)
     device = "cuda"

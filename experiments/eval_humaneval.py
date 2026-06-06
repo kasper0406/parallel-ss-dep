@@ -908,6 +908,7 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
     n_passed = 0
     n_total = 0
     failures: list[dict] = []
+    per_problem: list[dict] = []     # diagnostics: per-problem pass + think + output
     agg_think_total = 0
     agg_emit_total = 0
     agg_gate_values: list[float] = []
@@ -1042,6 +1043,12 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
                 "task_id": problem["task_id"],
                 "gen_preview": gen_text[:120],
             })
+        per_problem.append({
+            "task_id": problem["task_id"],
+            "passed": bool(any_passed),
+            "think_total": int(last_diag["think_total"]) if (use_thinking and last_diag) else 0,
+            "gen": gen_text[:2000],
+        })
         if use_thinking and last_diag:
             agg_think_total += last_diag["think_total"]
             agg_emit_total += last_diag["emit_count"]
@@ -1061,7 +1068,7 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
     print(f"\npass@{n_samples} = {rate:.3f}  ({n_passed}/{n_total})")
     result = {"pass_rate": rate, "n_passed": n_passed, "n_total": n_total,
               "n_samples_per_problem": n_samples, "temperature": temperature,
-              "failures_first_5": failures[:5]}
+              "failures_first_5": failures[:5], "per_problem": per_problem}
     if use_thinking:
         import statistics as _stats
         mean_gate = (_stats.fmean(agg_gate_values) if agg_gate_values else 0.0)
@@ -1082,6 +1089,8 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", type=str, required=True, action="append")
+    p.add_argument("--diagnose_json", type=str, default=None,
+                   help="dump per-problem {task_id,passed,think_total,gen} to this JSON path")
     p.add_argument("--n_samples", type=int, default=1)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max_gen", type=int, default=256)
@@ -1193,6 +1202,12 @@ def main():
             gate_mode=args.gate_mode,
             force_prefix_think=args.force_prefix_think,
         )
+
+    if args.diagnose_json:
+        import json as _json
+        with open(args.diagnose_json, "w") as _f:
+            _json.dump(all_results, _f)
+        print(f"[diagnose] per-problem records dumped to {args.diagnose_json}")
 
     print("\n" + "=" * 70)
     print("SUMMARY")

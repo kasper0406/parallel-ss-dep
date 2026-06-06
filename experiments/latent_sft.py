@@ -126,7 +126,25 @@ def train(args):
                   flush=True)
     print(f"  usable examples: {len(data)}", flush=True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
+    if getattr(args, "freeze_trunk", False):
+        # CLEAN INVARIANT TEST: freeze everything except the latent thinking
+        # params (adapter + gate + retrieval-α). Then the R=0/no-think path is
+        # BIT-IDENTICAL to the base ckpt (adapter unused at emit positions), so
+        # no-think competence + output style are preserved by construction, and
+        # thinking-ON isolates whether the code-trained latent op helps.
+        keep = ("latent_feedback_adapter", "gate_head", "retrieval_input_alpha")
+        n_tr = 0
+        for name, p in model.named_parameters():
+            train_it = any(k in name for k in keep)
+            p.requires_grad = train_it
+            n_tr += p.numel() if train_it else 0
+        print(f"  [freeze_trunk] training ONLY latent params: {n_tr:,} "
+              f"({100*n_tr/sum(p.numel() for p in model.parameters()):.2f}%)",
+              flush=True)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+    else:
+        trainable = list(model.parameters())
+    opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95),
                             weight_decay=0.0)
     g = torch.Generator().manual_seed(args.seed)
     perm = torch.randperm(len(data), generator=g).tolist()
@@ -190,6 +208,10 @@ def main():
                     help="train on extracted_code (no CoT/fence) instead of "
                          "the full completion; changes output format")
     ap.add_argument("--max_pairs", type=int, default=20000)
+    ap.add_argument("--freeze_trunk", action="store_true",
+                    help="train ONLY the latent params (adapter+gate+α); freeze "
+                         "the trunk so no-think == base by construction (clean "
+                         "invariant test, no competence/format degradation)")
     ap.add_argument("--keep_only_passing", action="store_true")
     ap.add_argument("--log_every", type=int, default=50)
     ap.add_argument("--seed", type=int, default=0)

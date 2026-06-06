@@ -124,6 +124,7 @@ Tests: `experiments/test_latent_think.py` (5 pass). Ckpts:
 ## Documentation index
 
 - `THINKING_LATENT_2026_05_28.md` — **latent-space thinking works** (the result above): mechanism, ablations, real-arithmetic transfer, port plan.
+- `THINKING_HUMANEVAL_2026_06_06.md` — **making latent thinking help HumanEval** (selective gating): the collapse (gate compulsively firing an OOD op mid-gen → degenerate loops, 0/164) was a gating bug; fix = route gate→emit-on-code (`route_emit_finetune.py`) + low inference emit_threshold → think only ~2% selectively → thinking-ON 11/164 vs matched no-think control 7/164. Modest lift, magnitude needs temp-sampled confirmation; collapse fix solid.
 - `MILESTONE_ARCH.md` — north-star milestone: PKM, WM, thinking gate (+ long chains), and selective memory writes must each be measurably load-bearing. Current status, ablation table, and workstreams (A–D) to get there.
 - `README.md` — headline results (FiLM lift, MQAR recall, deployment-fair scoring) and the small-super-coder framing.
 - `THESIS.md` — project framing: small-model performance is under-served by training-methodology research; what we claim and what we explicitly don't.

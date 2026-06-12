@@ -14,9 +14,7 @@ import argparse, json, random, sys
 import torch
 import torch.nn.functional as F
 sys.path.insert(0, ".")
-from experiments.eval_bracket_structure import build_model_from_ckpt
-from experiments.thinking import latent_cotrain_loss
-from transformers import AutoTokenizer
+from experiments.thinking import latent_cotrain_loss, load_latent_model
 
 
 def _logits(out):
@@ -78,7 +76,11 @@ def main():
                     help="train ONLY the latent_feedback_adapter -> no-think path "
                          "byte-identical to original (zero forgetting)")
     ap.add_argument("--train_gate", action="store_true",
-                    help="with --freeze_trunk, also train gate_head")
+                    help="RESERVED (currently rejected): no gate-gradient-bearing "
+                         "loss is wired here — latent_cotrain_loss's CE never "
+                         "touches gate_head, so the gate would silently stay at "
+                         "its base values. Use gate_calibration / latent_rl to "
+                         "train the gate.")
     ap.add_argument("--save_every", type=int, default=200)
     ap.add_argument("--log_every", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
@@ -86,45 +88,43 @@ def main():
     args = ap.parse_args()
     if args.smoke:
         args.steps = 5
+    if args.train_gate:
+        raise SystemExit(
+            "--train_gate is rejected: under this trainer the only gradient-"
+            "bearing loss (latent_cotrain_loss CE) never touches gate_head, so "
+            "the gate would receive zero gradient and silently stay at its base "
+            "values while looking 'co-calibrated'. Train the gate with "
+            "gate_calibration (SFT) or latent_rl (RL) instead.")
     device = "cuda"
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    model, cfg = build_model_from_ckpt(args.base, force_state_readonly=True,
-                                       force_use_latent_feedback_adapter=True)
-    model = model.to(device).train()
-    model._gist_loss_enabled = False
-    if getattr(model, "use_memory", False):
-        model.use_memory = False
-    # FREEZE-TRUNK: train ONLY the latent_feedback_adapter (+ optionally gate).
-    # The no-think forward NEVER uses the adapter (it fires only at think
-    # positions), so freezing the trunk leaves the no-think path BYTE-IDENTICAL
-    # to the original -> base code ability preserved EXACTLY (no forgetting),
-    # while the adapter learns to make latent thinking on code non-harmful.
+    model, cfg, tid, tok, eos = load_latent_model(args.base, device, train=True)
+    # FREEZE-TRUNK: train ONLY the latent_feedback_adapter. The no-think forward
+    # NEVER uses the adapter (it fires only at think positions), so freezing the
+    # trunk leaves the no-think path BYTE-IDENTICAL to the original -> base code
+    # ability preserved EXACTLY (no forgetting), while the adapter learns to
+    # make latent thinking on code non-harmful.
     if args.freeze_trunk:
         ntrain = 0
         for n, p in model.named_parameters():
-            keep = ("latent_feedback_adapter" in n
-                    or (args.train_gate and "gate_head" in n))
+            keep = "latent_feedback_adapter" in n
             p.requires_grad = keep
             ntrain += p.numel() if keep else 0
-        print(f"[freeze_trunk] training only adapter"
-              f"{'+gate' if args.train_gate else ''}: {ntrain:,} params", flush=True)
+        print(f"[freeze_trunk] training only adapter: {ntrain:,} params", flush=True)
     # Frozen reference = the ORIGINAL base, used to KL-anchor the no-think logits
     # so co-training the latent-think aux loss does NOT degrade base code ability
     # (the cw=1.0 narrow-data run forgot ~18% of MBPP). KL pins no-think behaviour
-    # while the cotrain loss is free to fix the latent-think path.
+    # while the cotrain loss is free to fix the latent-think path. Pointless (and
+    # structurally zero) under --freeze_trunk, hence rejected there.
     ref = None
     if args.kl_anchor > 0:
-        ref, _ = build_model_from_ckpt(args.base, force_state_readonly=True,
-                                       force_use_latent_feedback_adapter=True)
-        ref = ref.to(device).eval()
+        if args.freeze_trunk:
+            raise SystemExit("--kl_anchor with --freeze_trunk is a no-op that "
+                             "costs a full ref model: the no-think path is "
+                             "frozen byte-identical, so the KL is exactly 0.")
+        ref, _, _, _, _ = load_latent_model(args.base, device, train=False)
         for p in ref.parameters():
             p.requires_grad = False
-        if getattr(ref, "use_memory", False):
-            ref.use_memory = False
-    tid = int(cfg.get("thinking_token_id", cfg["vocab_size"] - 1))
-    tok = AutoTokenizer.from_pretrained(cfg.get("tokenizer", "HuggingFaceTB/SmolLM2-135M"))
-    eos = tok.eos_token_id
     comment = "# Complete the following Python function.\n"
     rows = load_code(args.jsonl, tok, comment, args.max_len, args.min_score, args.limit)
     print(f"[code-cotrain] base={args.base} code_examples={len(rows)} R={args.R} "
@@ -138,22 +138,36 @@ def main():
         idxs = [rng.randrange(len(rows)) for _ in range(args.batch)]
         inp, tgt = make_batch(rows, idxs, pad_id=0, device=device)
         opt.zero_grad()
-        # 1) no-think LM loss (preserve code ability)
-        logits = _logits(model(inp))
-        lm = F.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]),
-                             tgt[:, :-1].reshape(-1), ignore_index=-100)
-        # 1b) KL anchor: keep no-think logits close to the frozen original so the
-        # aux loss can't erode base code ability (anti-forgetting).
+        is_log_step = (step % args.log_every == 0 or step == 1)
+        lm = torch.zeros((), device=device)
         kl = torch.zeros((), device=device)
-        if ref is not None:
-            with torch.no_grad():
-                rlog = _logits(ref(inp))[:, :-1].float()
-            cur = logits[:, :-1].float()
-            mask = (tgt[:, :-1] != -100).reshape(-1)
-            kl_tok = F.kl_div(F.log_softmax(cur, -1).reshape(-1, cur.shape[-1]),
-                              F.log_softmax(rlog, -1).reshape(-1, rlog.shape[-1]),
-                              reduction="none", log_target=True).sum(-1)
-            kl = (kl_tok * mask).sum() / mask.sum().clamp(min=1)
+        if args.freeze_trunk:
+            # The no-think path is frozen byte-identical: the LM loss carries no
+            # gradient and would roughly DOUBLE step wall-clock if computed every
+            # step. Compute it under no_grad on log steps only (sanity readout —
+            # it should never move).
+            if is_log_step:
+                with torch.no_grad():
+                    logits = _logits(model(inp))
+                    lm = F.cross_entropy(
+                        logits[:, :-1].reshape(-1, logits.shape[-1]),
+                        tgt[:, :-1].reshape(-1), ignore_index=-100)
+        else:
+            # 1) no-think LM loss (preserve code ability)
+            logits = _logits(model(inp))
+            lm = F.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]),
+                                 tgt[:, :-1].reshape(-1), ignore_index=-100)
+            # 1b) KL anchor: keep no-think logits close to the frozen original so
+            # the aux loss can't erode base code ability (anti-forgetting).
+            if ref is not None:
+                with torch.no_grad():
+                    rlog = _logits(ref(inp))[:, :-1].float()
+                cur = logits[:, :-1].float()
+                mask = (tgt[:, :-1] != -100).reshape(-1)
+                kl_tok = F.kl_div(F.log_softmax(cur, -1).reshape(-1, cur.shape[-1]),
+                                  F.log_softmax(rlog, -1).reshape(-1, rlog.shape[-1]),
+                                  reduction="none", log_target=True).sum(-1)
+                kl = (kl_tok * mask).sum() / mask.sum().clamp(min=1)
         # 2) latent co-train loss (make thinking useful/harmless on code)
         res = latent_cotrain_loss(model, inp, tgt, R=args.R, thinking_token_id=tid,
                                   max_positions=args.max_positions,
@@ -163,22 +177,18 @@ def main():
             ct, dlp, npos = torch.zeros((), device=device), float("nan"), 0
         else:
             ct, dlp, npos = res
-        # With freeze_trunk the no-think LM loss has no trainable params -> exclude
-        # it (the adapter-only path is what carries gradient). Otherwise keep it to
-        # preserve base code ability.
-        loss = args.cotrain_weight * (ct if isinstance(ct, torch.Tensor) else 0.0)
+        loss = args.cotrain_weight * ct
         if not args.freeze_trunk:
             loss = loss + lm + args.kl_anchor * kl
-        if isinstance(loss, torch.Tensor) and loss.requires_grad:
+        if loss.requires_grad:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], 1.0)
             opt.step()
-        if step % args.log_every == 0 or step == 1:
-            ctv = float(ct.detach()) if isinstance(ct, torch.Tensor) else float(ct)
+        if is_log_step:
             dlpv = float(dlp) if not isinstance(dlp, torch.Tensor) else float(dlp.detach())
             print(f"step {step:>4}/{args.steps}  lm={float(lm.detach()):.3f}  "
-                  f"cotrain={ctv:.3f}  kl={float(kl.detach()):.4f}  "
+                  f"cotrain={float(ct.detach()):.3f}  kl={float(kl.detach()):.4f}  "
                   f"Δlogp={dlpv:+.3f}  npos={npos}", flush=True)
         if not args.smoke and step % args.save_every == 0:
             torch.save({"state_dict": model.state_dict(), "step": step, "config": cfg}, args.save)

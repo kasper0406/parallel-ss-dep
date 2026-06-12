@@ -23,7 +23,11 @@ def tier_of(rec):
     code = _extract_code_block(gen)
     full = code if code is not None else gen
     p = probs[rec["task_id"]]
-    gp = CG.Problem(task_id=p.task_id, prompt="", tests=p.tests, entry_point=p.entry_point)
+    # prompt_is_code=False: dumped gens are complete standalone programs; the
+    # dataclass default (True) makes grade() truncate at the first top-level
+    # stop, over-reporting syntax/exec tiers in the failure histogram.
+    gp = CG.Problem(task_id=p.task_id, prompt="", tests=p.tests,
+                    entry_point=p.entry_point, prompt_is_code=False)
     try:
         return CG.grade(gp, full)
     except Exception as e:

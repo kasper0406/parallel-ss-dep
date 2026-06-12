@@ -28,6 +28,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from experiments.eval_bracket_structure import build_model_from_ckpt
+from experiments.thinking import clean_latent_thread
 
 
 # Stop sequences typical of function-end at column 0.
@@ -883,6 +884,17 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
     thinking_token_id = getattr(model, "thinking_token_id", None)
     if thinking_token_id is None:
         thinking_token_id = cfg.get("thinking_token_id")
+    # The non-standard generators (and soft gate mode) think regardless of the
+    # legacy use_thinking flag — use this for everything that must account for
+    # thinking (context-budget reserve, per-problem think stats), otherwise a
+    # `--generator latent_think` run records think_total=0 everywhere and the
+    # think-vs-pass diagnosis concludes "the model never thought".
+    thinking_active = (use_thinking or gate_mode == "soft"
+                       or generator in ("latent_think", "retrieval_as_input"))
+    if generator == "latent_think" and thinking_token_id is None:
+        raise RuntimeError("--generator latent_think but ckpt has no "
+                           "thinking_token_id in cfg and "
+                           "model.thinking_token_id is None.")
     if use_thinking:
         if not has_gate:
             raise RuntimeError(
@@ -931,7 +943,7 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
         # Generation may produce up to max_gen emits + total_think_budget
         # think tokens, so reserve room for both when budget-truncating.
         thinks_reserve = (total_think_budget if total_think_budget is not None
-                          else 2 * max_gen) if use_thinking else 0
+                          else 2 * max_gen) if thinking_active else 0
         room_needed = max_gen + thinks_reserve
         if len(prompt_ids) + room_needed > eff_max_T:
             prompt_ids = prompt_ids[-(eff_max_T - room_needed):]
@@ -956,16 +968,9 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
             elif generator == "latent_think":
                 # Latent-ponder thinking: state-readonly, hidden fed back as
                 # the think-slot input embedding (THINKING_LATENT_2026_05_28).
-                # BUG FIX (2026-06-05): the latent thread MUST run WorkingMemory
-                # OFF here — every training path (latent_reasoning_cotrain,
-                # latent_sft, the thinking.py measurement twins via wm_off) feeds
-                # back the CLEAN out_norm(h); leaving WM on at eval feeds back
-                # out_norm(h)+α·W_proj(WM_read), an OOD signal the latent adapter
-                # was built to avoid → corrupted feedback → run-on output. Toggle
-                # WM off for the duration, restore after.
-                _saved_um = getattr(model, "use_memory", False)
-                model.use_memory = False
-                try:
+                # clean_latent_thread = the canonical WM-off toggle (the
+                # 2026-06-05 WM-contamination fix; rationale in its docstring).
+                with clean_latent_thread(model):
                     gen, diag = generate_latent_think(
                         model, prompt_t, max_gen=max_gen,
                         temperature=temperature, eos_token_id=tok.eos_token_id,
@@ -977,8 +982,6 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
                         gate_floor=gate_floor,
                         force_prefix_think=force_prefix_think,
                     )
-                finally:
-                    model.use_memory = _saved_um
             elif generator == "retrieval_as_input":
                 # v5+ models trained with --retrieval_as_input_thinking
                 # must be evaluated with the matching generator (the
@@ -1046,19 +1049,19 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
         per_problem.append({
             "task_id": problem["task_id"],
             "passed": bool(any_passed),
-            "think_total": int(last_diag["think_total"]) if (use_thinking and last_diag) else 0,
+            "think_total": int(last_diag.get("think_total", 0)) if (thinking_active and last_diag) else 0,
             "gen": gen_text[:2000],
         })
-        if use_thinking and last_diag:
-            agg_think_total += last_diag["think_total"]
-            agg_emit_total += last_diag["emit_count"]
-            agg_gate_values.extend(last_diag["gate_emit_values"])
-            if last_diag["think_total"] > 0:
+        if thinking_active and last_diag:
+            agg_think_total += last_diag.get("think_total", 0)
+            agg_emit_total += last_diag.get("emit_count", 0)
+            agg_gate_values.extend(last_diag.get("gate_emit_values", []))
+            if last_diag.get("think_total", 0) > 0:
                 n_problems_with_any_think += 1
 
         if (i + 1) % 20 == 0:
             msg = f"  {i + 1} problems: pass@{n_samples}={n_passed/n_total:.3f}"
-            if use_thinking:
+            if thinking_active:
                 tr = agg_think_total / max(1, agg_think_total + agg_emit_total)
                 msg += (f"  think_rate={tr:.3f}  "
                         f"problems_using_think={n_problems_with_any_think}/{n_total}")
@@ -1069,7 +1072,7 @@ def evaluate(ckpt_path: str, n_samples: int = 1, temperature: float = 0.0,
     result = {"pass_rate": rate, "n_passed": n_passed, "n_total": n_total,
               "n_samples_per_problem": n_samples, "temperature": temperature,
               "failures_first_5": failures[:5], "per_problem": per_problem}
-    if use_thinking:
+    if thinking_active:
         import statistics as _stats
         mean_gate = (_stats.fmean(agg_gate_values) if agg_gate_values else 0.0)
         result.update({

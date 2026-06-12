@@ -72,8 +72,14 @@ def run_humaneval(ckpt_path: str, n_problems: int = 50,
         "--max_gen", str(max_gen),
     ]
     if use_thinking:
+        # Discrete-token thinking is the DEPRECATED mechanism (the validated one
+        # is --generator latent_think), but mid-eval tracking keys on it for
+        # continuity with older runs; without --allow_legacy_thinking the
+        # eval_humaneval CLI guard exits with argparse error 2 and every
+        # mid-eval pass rate silently becomes NaN.
         cmd += [
             "--use_thinking",
+            "--allow_legacy_thinking",
             "--emit_threshold", str(emit_threshold),
             "--max_think_per_step", str(max_think_per_step),
         ]

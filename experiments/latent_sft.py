@@ -51,7 +51,11 @@ def latent_sft_loss(model, comment_ids, sol_ids, eos_id, R, thinking_id, device)
     P = len(comment_ids)
     hybrid = getattr(model, "_hybrid_mem", False) and hasattr(model, "memory")
     for _ in range(R):
-        _logits, h = model(cur_ids, inputs_embeds=cur_emb, return_hidden=True)
+        # Index, don't 2-tuple-unpack: in training mode with the trunk-gist
+        # loss enabled the forward returns (logits, hidden, gist) — hidden is
+        # index 1 in both arities (same fix as latent_reasoning_cotrain).
+        out = model(cur_ids, inputs_embeds=cur_emb, return_hidden=True)
+        h = out[1]
         z = h[:, -1:, :].to(cur_emb.dtype)          # hidden carries the thread
         # Learned input adapter: map the fed-back out_norm hidden into the
         # input-embedding manifold (identity when absent/untrained → matches the

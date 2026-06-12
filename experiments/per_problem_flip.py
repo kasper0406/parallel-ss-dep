@@ -15,6 +15,7 @@ from transformers import AutoTokenizer
 from experiments.eval_bracket_structure import build_model_from_ckpt
 from experiments.eval_humaneval import (generate, generate_latent_think,
                                         _extract_code_block, _run_test_in_subprocess)
+from experiments.thinking import clean_latent_thread
 
 
 def main():
@@ -30,7 +31,6 @@ def main():
     tok = AutoTokenizer.from_pretrained(cfg.get("tokenizer", "HuggingFaceTB/SmolLM2-135M"))
     tid = int(cfg.get("thinking_token_id", cfg["vocab_size"] - 1))
     eos = tok.eos_token_id
-    saved_um = getattr(model, "use_memory", False)
     ds = load_dataset("openai_humaneval", split="test")
 
     def code_of(out, plen):
@@ -51,15 +51,12 @@ def main():
         o1, _ = generate(model, ids, max_gen=args.max_gen, temperature=0.0, eos_token_id=eos,
                          min_emit_before_eos=10)
         nt_ok = _run_test_in_subprocess(code_of(o1, plen), p["test"], p["entry_point"])
-        # thinking-ON (WM off)
-        model.use_memory = False
-        try:
+        # thinking-ON (clean latent thread = WM off, restore after)
+        with clean_latent_thread(model):
             o2, d = generate_latent_think(model, ids, max_gen=args.max_gen, temperature=0.0,
                                           eos_token_id=eos, thinking_token_id=tid,
                                           emit_threshold=args.emit_threshold,
                                           min_emit_before_eos=10)
-        finally:
-            model.use_memory = saved_um
         th_ok = _run_test_in_subprocess(code_of(o2, plen), p["test"], p["entry_point"])
         nt_pass += int(nt_ok); th_pass += int(th_ok)
         if th_ok and not nt_ok: gained.append(p["task_id"])

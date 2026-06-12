@@ -1,11 +1,79 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterable
 
 import torch
 import torch.nn.functional as F
+
+
+@contextmanager
+def clean_latent_thread(model, *, film_bypass: bool | None = None,
+                        no_activation_ckpt: bool | None = None):
+    """Run the latent-thinking thread on a CLEAN model config, restore after.
+
+    Canonical home of the WM-contamination fix (2026-06-05): every latent
+    training path feeds back the clean ``out_norm(h)``; leaving WorkingMemory
+    on at a latent callsite feeds back ``out_norm(h) + α·W_proj(WM_read)`` — an
+    OOD signal the latent adapter was built to avoid → corrupted feedback →
+    run-on output. Every ``generate_latent_think`` / latent-loss callsite must
+    run inside this context (or set the toggles permanently, as whole-process
+    trainers like latent_rl.py do).
+
+    Optional toggles (default: leave untouched, preserving caller semantics):
+      film_bypass=True        — single-forward FiLM for short latent seqs
+                                (validated speed win, parity with training).
+      no_activation_ckpt=True — checkpointing's backward RECOMPUTES the FLA
+                                kernel at the latent path's short/odd lengths,
+                                intermittently hitting a Blackwell
+                                "unspecified launch failure"; latent seqs are
+                                tiny so retaining activations costs ~nothing.
+    """
+    saved_mem = getattr(model, "use_memory", False)
+    saved_bypass = getattr(model, "_film_bypass", False)
+    saved_ckpt = getattr(model, "activation_checkpointing", False)
+    model.use_memory = False
+    if film_bypass is not None:
+        model._film_bypass = bool(film_bypass)
+    if no_activation_ckpt is not None:
+        model.activation_checkpointing = not bool(no_activation_ckpt)
+    try:
+        yield model
+    finally:
+        model.use_memory = saved_mem
+        if film_bypass is not None:
+            model._film_bypass = saved_bypass
+        if no_activation_ckpt is not None:
+            model.activation_checkpointing = saved_ckpt
+
+
+def load_latent_model(ckpt_path: str, device: str = "cuda", *,
+                      train: bool = False, fresh_adapter: bool = True):
+    """Canonical model-bootstrap for latent-thinking scripts.
+
+    One place for the boilerplate that had drifted across ~8 scripts (missing
+    force flags, hardcoded tokenizers): build with the latent force flags, move
+    to device, disable WM + gist for the latent thread, resolve the
+    thinking-token id and tokenizer from cfg.
+
+    Returns ``(model, cfg, thinking_id, tok, eos_id)``.
+    """
+    from experiments.eval_bracket_structure import build_model_from_ckpt
+    from transformers import AutoTokenizer
+    model, cfg = build_model_from_ckpt(
+        ckpt_path, force_state_readonly=True,
+        force_use_latent_feedback_adapter=True if fresh_adapter else None)
+    model = model.to(device)
+    model.train() if train else model.eval()
+    model._gist_loss_enabled = False
+    if getattr(model, "use_memory", False):
+        model.use_memory = False        # latent thread runs WM-off (parity)
+    thinking_id = int(cfg.get("thinking_token_id", cfg["vocab_size"] - 1))
+    tok = AutoTokenizer.from_pretrained(
+        cfg.get("tokenizer", "HuggingFaceTB/SmolLM2-135M"))
+    return model, cfg, thinking_id, tok, tok.eos_token_id
 
 
 @dataclass

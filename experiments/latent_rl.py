@@ -22,21 +22,24 @@ PPO replay is a SINGLE grad forward over the recorded (ids, inputs_embeds)
 sequence: DeltaNet is causal and think positions are state-readonly (β=0), so
 the full-sequence forward reproduces every per-position hidden the sequential
 rollout produced — hence exact gate + token log-probs (ratio == 1 at step 0)
-with O(T) memory. The latent feedback embeddings are taken from the rollout
-(detached) in the replay, so grad flows into the TRUNK (which produces the
-thought hidden), the GATE (when/how-much to think), and the lm_head — i.e. RL
-optimizes WHEN to think and WHAT the trunk thinks; the linear feedback adapter
-map is held fixed-from-rollout (it was trained in latent SFT).
+with O(T) memory. SCOPE OF THE GRADIENT (be precise — fair-claims): the latent
+feedback embeddings are recorded DETACHED, and think positions are
+state-readonly, so the reward gradient reaches the GATE (when/how-much to
+think), the trunk/lm_head at EMIT positions, and think-position trunk compute
+only via the gate term + FiLM-lag leakage. It does NOT optimize the thought
+CONTENT — the adapter and the hidden→latent production get no task-reward
+gradient (that would need re-chaining the latent forwards with grad, the old
+O(T²)-memory path). Thought content must come pre-trained (latent SFT /
+latent_code_cotrain); this trainer optimizes the POLICY around it.
 
 Contrast with train_rl_grader.py, which appends the discrete [THINKING] token id
 (no hidden feedback) — that trains discrete-token thinking, which never helps.
 """
-import argparse, math, random, re, sys
+import argparse, random, re, sys
 import torch
 import torch.nn.functional as F
 sys.path.insert(0, ".")
-from experiments.eval_bracket_structure import build_model_from_ckpt
-from transformers import AutoTokenizer
+from experiments.thinking import load_latent_model
 import experiments.code_grader as CG
 
 
@@ -48,8 +51,13 @@ def grade_clean(prob, raw_text):
     """Dense reward that doesn't undercount a name-inventing, prose-leading model
     (the two bugs the audit found): strip any leading prose to the first
     def/import, and alias the model's first top-level def to the expected
-    entry_point so the mbpp/HumanEval test can resolve it. Then code_grader.grade
-    for the dense tier score."""
+    entry_point so the mbpp test can resolve it. Then code_grader.grade for the
+    dense tier score. NL-prompt problems only: for prompt_is_code problems
+    (HumanEval/LeetCode-style) grade() prepends prob.prompt AND truncates at the
+    first top-level stop token, so the strip/alias surgery below would corrupt
+    the submission — pass those through untouched."""
+    if getattr(prob, "prompt_is_code", False):
+        return CG.grade(prob, raw_text)
     lines = raw_text.split("\n")
     start = 0
     for i, l in enumerate(lines):
@@ -82,6 +90,20 @@ def _gate_logp(gate_logit, emit: bool, temp: float, floor: float, ceil: float):
     return torch.log(p) if emit else torch.log1p(-p)
 
 
+def _masked_emit_logits(row, emit_idx: int, thinking_id, eos_id, temp: float,
+                        min_emit_before_eos: int):
+    """Think/eos masking + temperature on one position's logits. The SINGLE
+    source of truth shared by rollout sampling and PPO replay — the ratio==1
+    invariant depends on the two normalized distributions matching exactly, so
+    never fork this logic."""
+    lg = row.float() / max(temp, 1e-6)
+    lg = lg.clone()
+    lg[int(thinking_id)] = -float("inf")
+    if eos_id is not None and emit_idx < min_emit_before_eos:
+        lg[int(eos_id)] = -float("inf")
+    return lg
+
+
 @torch.no_grad()
 def rollout(model, comment_ids, thinking_id, eos_id, device, max_gen, temp,
             max_think_per_step, total_think_budget, gate_floor,
@@ -93,11 +115,13 @@ def rollout(model, comment_ids, thinking_id, eos_id, device, max_gen, temp,
       ids       : (1, L) full token-id sequence (prompt + think_id/emit tokens)
       embeds    : (1, L, d) inputs_embeds used (latents at think positions) DETACHED
       steps     : list of per-action records, each:
-          {"emit": bool, "forced": bool, "gate_old_lp": float,
-           "tok": int|None, "tok_old_lp": float|None, "pos": int}
+          {"emit": bool, "forced": bool, "tok": int|None, "pos": int}
         where pos = index (in ids) of the position whose hidden produced the
         decision (i.e. the last position BEFORE the appended action token).
-      code      : decoded emit-only string (for grading)
+        (No rollout log-probs are recorded: the PPO "old" is the detached
+        replay — see main() — so the incremental rollout's chunked-kernel
+        numerics never enter the ratio.)
+      emit_toks : emit-only token list (for grading)
     """
     gate_ceil = 1.0 - gate_floor               # symmetric: think-prob floor too
     cur_ids = torch.tensor([comment_ids], dtype=torch.long, device=device)
@@ -124,30 +148,22 @@ def rollout(model, comment_ids, thinking_id, eos_id, device, max_gen, temp,
             emit = True
         else:
             emit = (torch.rand(1, device=device).item() < g_eff)
-        # gate log-prob recorded against the SAME clamped distribution the replay
-        # recomputes (sigmoid(raw_logit) == g, clamped identically) -> ratio 1.0.
-        gate_old_lp = math.log(g_eff) if emit else math.log(1.0 - g_eff)
 
         if not emit:
             # THINK: latent feedback (state-readonly via appended think token).
             latent = model.apply_latent_feedback_adapter(h).to(cur_emb.dtype)
             cur_ids = torch.cat([cur_ids, think_tok], dim=1)
             cur_emb = torch.cat([cur_emb, latent], dim=1)
-            steps.append({"emit": False, "forced": forced, "gate_old_lp": gate_old_lp,
-                          "tok": None, "tok_old_lp": None, "pos": pos})
+            steps.append({"emit": False, "forced": forced, "tok": None, "pos": pos})
             thinks_this_step += 1
             think_total += 1
             continue
         # EMIT: sample a code token from THIS forward's logits.
-        lg = logits.clone()
-        lg[int(thinking_id)] = -float("inf")
-        if eos_id is not None and emit_count < min_emit_before_eos:
-            lg[int(eos_id)] = -float("inf")
-        probs = F.softmax(lg / max(temp, 1e-6), dim=-1)
+        lg = _masked_emit_logits(logits, emit_count, thinking_id, eos_id,
+                                 temp, min_emit_before_eos)
+        probs = F.softmax(lg, dim=-1)
         tok = int(torch.multinomial(probs, 1))
-        tok_lp = float(torch.log(probs[tok] + 1e-12))
-        steps.append({"emit": True, "forced": forced, "gate_old_lp": gate_old_lp,
-                      "tok": tok, "tok_old_lp": tok_lp, "pos": pos})
+        steps.append({"emit": True, "forced": forced, "tok": tok, "pos": pos})
         emit_toks.append(tok)
         emit_count += 1
         thinks_this_step = 0
@@ -165,42 +181,33 @@ def replay_logps(model, traj, thinking_id, eos_id, temp, min_emit_before_eos,
                  gate_floor, gate_temp=1.0):
     """Single grad forward over the recorded (ids, embeds) sequence. DeltaNet is
     causal + think positions state-readonly, so per-position hiddens match the
-    rollout exactly. Returns (gate_new_lp, gate_old_lp, tok_new_lp, tok_old_lp)
-    as 1-D tensors (gate terms exclude FORCED positions)."""
+    rollout exactly. Returns (gate_lp, tok_lp) as 1-D tensors under the CURRENT
+    model (gate terms exclude FORCED positions — the policy had no choice
+    there). The shared _masked_emit_logits keeps the emit distribution
+    identical to the rollout's."""
     gate_ceil = 1.0 - gate_floor
     ids = traj["ids"]
     emb = traj["embeds"]
     out = model(ids, inputs_embeds=emb, return_hidden=True)
     logits = _logits(out)                                       # (1, L, V)
     gate_logits = model._last_gate_logits[0]                    # (L,) grad-aware
-    gate_new, gate_old = [], []
-    tok_new, tok_old = [], []
+    gate_lp, tok_lp = [], []
     emit_idx = 0
     for st in traj["steps"]:
         p = st["pos"]
         if not st["forced"]:
             gl = gate_logits[p]
-            gate_new.append(
+            gate_lp.append(
                 _gate_logp(gl, st["emit"], gate_temp, gate_floor, gate_ceil).unsqueeze(0))
-            gate_old.append(st["gate_old_lp"])
         if st["emit"]:
-            lg = logits[0, p].float() / max(temp, 1e-6)
-            lg = lg.clone()
-            lg[int(thinking_id)] = -float("inf")
-            # Replicate the rollout's per-emit-index eos mask EXACTLY so the
-            # normalized distribution (and hence the PPO ratio) matches at step 0.
-            if eos_id is not None and emit_idx < min_emit_before_eos:
-                lg[int(eos_id)] = -float("inf")
-            lp_full = F.log_softmax(lg, dim=-1)
-            tok_new.append(lp_full[st["tok"]].unsqueeze(0))
-            tok_old.append(st["tok_old_lp"])
+            lg = _masked_emit_logits(logits[0, p], emit_idx, thinking_id,
+                                     eos_id, temp, min_emit_before_eos)
+            tok_lp.append(F.log_softmax(lg, dim=-1)[st["tok"]].unsqueeze(0))
             emit_idx += 1
     dev = logits.device
-    g_new = torch.cat(gate_new) if gate_new else torch.zeros(0, device=dev)
-    t_new = torch.cat(tok_new) if tok_new else torch.zeros(0, device=dev)
-    g_old = torch.tensor(gate_old, device=dev) if gate_old else torch.zeros(0, device=dev)
-    t_old = torch.tensor(tok_old, device=dev) if tok_old else torch.zeros(0, device=dev)
-    return g_new, g_old, t_new, t_old
+    g = torch.cat(gate_lp) if gate_lp else torch.zeros(0, device=dev)
+    t = torch.cat(tok_lp) if tok_lp else torch.zeros(0, device=dev)
+    return g, t
 
 
 def main():
@@ -229,9 +236,14 @@ def main():
     ap.add_argument("--min_emit_before_eos", type=int, default=10)
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--ponder_cost", type=float, default=0.004,
-                    help="per-latent-think penalty subtracted from the reward before "
-                         "the GRPO advantage. Makes the gate suppress thinking that "
-                         "doesn't flip correctness; selective thinking survives. 0=off.")
+                    help="per-latent-think penalty subtracted (ABSOLUTE, after the "
+                         "group z-score of the task score — separate-ponder-norm) "
+                         "from the GRPO advantage. Makes the gate suppress thinking "
+                         "that doesn't flip correctness; selective thinking "
+                         "survives. 0=off.")
+    ap.add_argument("--ponder_warmup_steps", type=int, default=50,
+                    help="ramp the ponder cost 0→full over N steps (cold-start "
+                         "ponder bite was the grader-RL v1 collapse trigger)")
     ap.add_argument("--clip_eps", type=float, default=0.2)
     ap.add_argument("--kl_coef", type=float, default=0.05)
     ap.add_argument("--gate_entropy_bonus", type=float, default=0.01,
@@ -247,22 +259,16 @@ def main():
     device = "cuda"
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    model, cfg = build_model_from_ckpt(args.base, force_state_readonly=True,
-                                       force_use_latent_feedback_adapter=True)
-    model = model.to(device).train()
-    model._gist_loss_enabled = False        # no aux gist loss during RL
-    if getattr(model, "use_memory", False):
-        model.use_memory = False           # latent thread runs WM-off (training parity)
-    ref, _ = build_model_from_ckpt(args.base, force_state_readonly=True,
-                                   force_use_latent_feedback_adapter=True)
-    ref = ref.to(device).eval()
+    model, cfg, thinking_id, tok, eos = load_latent_model(
+        args.base, device, train=True)
+    if not hasattr(model, "_last_gate_logits") and not any(
+            "gate_head" in n for n, _ in model.named_parameters()):
+        raise SystemExit(f"--base {args.base} has no output gate (gate_head): "
+                         "gate-driven RL needs one. Train/SFT with the gate on, "
+                         "or use a ckpt that has it.")
+    ref, _, _, _, _ = load_latent_model(args.base, device, train=False)
     for p in ref.parameters():
         p.requires_grad = False
-    if getattr(ref, "use_memory", False):
-        ref.use_memory = False
-    thinking_id = int(cfg.get("thinking_token_id", cfg["vocab_size"] - 1))
-    tok = AutoTokenizer.from_pretrained(cfg.get("tokenizer", "HuggingFaceTB/SmolLM2-135M"))
-    eos = tok.eos_token_id
     probs_all = CG.LOADERS[args.dataset]()
     print(f"[gate-latent-rl] base={args.base} dataset={args.dataset} "
           f"({len(probs_all)} problems) params={model.num_params():,}", flush=True)
@@ -303,37 +309,43 @@ def main():
                 res = grade_clean(prob, code)
                 n_think = sum(1 for s in traj["steps"] if not s["emit"])
                 n_emit = sum(1 for s in traj["steps"] if s["emit"])
-                # Ponder-cost-shaped reward: a small per-think penalty gives the
-                # gate a CLEAN gradient to suppress thinking that doesn't pay for
-                # itself. Selective thinking survives only where it flips
-                # correctness enough to beat the cost (the correctness-only
-                # advantage was too noisy to teach this). Raw score is logged.
-                shaped = res.score - args.ponder_cost * n_think
-                rolls.append((traj, shaped, res.passed))
+                rolls.append((traj, res.score, n_think))
                 step_reward += res.score; step_pass += int(res.passed)
                 think_steps_tot += n_think
                 think_rate_acc += n_think / max(1, n_think + n_emit)
-            rewards = torch.tensor([r[1] for r in rolls], dtype=torch.float32)
-            adv = rewards - rewards.mean()
-            if rewards.std() > 1e-6:
-                adv = adv / (rewards.std() + 1e-6)
+            # Separate ponder norm (the validated --grpo_separate_ponder_norm
+            # semantics from thinking.compute_grpo_advantages): z-score the TASK
+            # score only, then subtract the ABSOLUTE ponder cost. Folding the
+            # cost into the reward before the group norm has two documented
+            # pathologies: (a) high task variance washes the small ponder term
+            # into noise; (b) tied task scores make ponder the ONLY variance, so
+            # the norm amplifies it to a full-magnitude anti-think gradient.
+            # The cost is also warmed up over --ponder_warmup_steps (the
+            # grader-RL v1 collapse trigger was a cold-start ponder bite).
+            scores = torch.tensor([r[1] for r in rolls], dtype=torch.float32)
+            adv = scores - scores.mean()
+            if scores.std() > 1e-6:
+                adv = adv / (scores.std() + 1e-6)
+            pcost = args.ponder_cost * min(1.0, step / max(1, args.ponder_warmup_steps))
+            adv = adv - pcost * torch.tensor([float(r[2]) for r in rolls])
             for (traj, _, _), a in zip(rolls, adv.tolist()):
                 if not traj["steps"] or abs(a) < 1e-8:
                     continue
-                # OLD log-probs via the SAME full-forward path (no_grad) the grad
-                # replay uses -> ratio == 1.0 at step 0 exactly (the incremental
-                # rollout's chunked-kernel numerics differ from the full forward;
-                # evaluating old & new identically removes that discrepancy).
-                with torch.no_grad():
-                    g_old, _, t_old, _ = replay_logps(
-                        model, traj, thinking_id, eos, args.temperature,
-                        args.min_emit_before_eos, args.gate_floor, args.gate_temperature)
-                g_new, _, t_new, _ = replay_logps(
+                # Grad replay over the recorded sequence. The PPO "old" is the
+                # detached replay output: there is exactly ONE update per
+                # trajectory (no multi-epoch PPO) and no optimizer step between
+                # "old" and "new", so a separate no-grad replay would return the
+                # bit-identical values at the cost of one extra full forward.
+                # Ratio == 1 by construction; clip_eps only matters if multi-
+                # epoch replay is ever added (then restore a real old-policy
+                # replay — do NOT use rollout-time log-probs, whose incremental
+                # chunked-kernel numerics differ from the full forward).
+                g_new, t_new = replay_logps(
                     model, traj, thinking_id, eos, args.temperature,
                     args.min_emit_before_eos, args.gate_floor, args.gate_temperature)
                 # PPO surrogate over the union of gate + token actions.
                 new_lp = torch.cat([g_new, t_new])
-                old_lp = torch.cat([g_old, t_old])
+                old_lp = new_lp.detach()
                 if new_lp.numel() == 0:
                     continue
                 ratio = torch.exp(new_lp - old_lp)
@@ -350,11 +362,21 @@ def main():
                     ent = -(p_act * p_act.log() + (1 - p_act) * (1 - p_act).log()).mean()
                 # KL to frozen ref on the EMIT-token distribution (the deployed
                 # output); gate-KL omitted (the gate is the thing we WANT to move).
+                # k3 estimator (exp(δ)-δ-1, δ = t_ref - t_new): the naive
+                # (t_new - t_ref).mean() is the k1 estimator, whose pathwise
+                # gradient on on-policy samples is ZERO-MEAN (E[∇log π] = 0) —
+                # i.e. no restoring force at all, the exact failure that let
+                # grader-RL v1 collapse. k3's gradient (1 - exp(δ))·∇t_new pulls
+                # t_new toward t_ref from both sides and is non-negative.
                 with torch.no_grad():
-                    _, _, t_ref, _ = replay_logps(
+                    _, t_ref = replay_logps(
                         ref, traj, thinking_id, eos, args.temperature,
                         args.min_emit_before_eos, args.gate_floor, args.gate_temperature)
-                kl = (t_new - t_ref).mean() if t_new.numel() > 0 else torch.zeros((), device=device)
+                if t_new.numel() > 0:
+                    delta = t_ref - t_new
+                    kl = (delta.exp() - delta - 1.0).mean()
+                else:
+                    kl = torch.zeros((), device=device)
                 loss = (-surr.mean() + args.kl_coef * kl
                         - args.gate_entropy_bonus * ent) / (args.batch * args.n_group)
                 loss.backward()

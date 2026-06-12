@@ -61,7 +61,12 @@ def main():
         txt = tok.decode(toks, skip_special_tokens=True)
         code = _extract_code_block(txt)
         full = code if code is not None else txt
-        gp = CG.Problem(task_id=prob.task_id, prompt="", tests=prob.tests, entry_point=prob.entry_point)
+        # prompt_is_code=False: the model output here is a complete standalone
+        # program; the dataclass default (True) makes grade() truncate it at the
+        # first '\ndef '/'\n#'/'\nclass ' — cutting helper functions and
+        # over-reporting syntax/exec tiers.
+        gp = CG.Problem(task_id=prob.task_id, prompt="", tests=prob.tests,
+                        entry_point=prob.entry_point, prompt_is_code=False)
         res = CG.grade(gp, full)
         tiers[res.tier] = tiers.get(res.tier, 0) + 1
         thinks.append(nthink)

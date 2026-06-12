@@ -24,6 +24,8 @@ import json
 import torch
 import torch.nn.functional as F
 
+from experiments.thinking import clean_latent_thread
+
 
 def _answer_span_latent_loss(model, comment_ids, sol_ids, eos_id, R,
                              thinking_id, device, gate_weight=0.0):
@@ -151,19 +153,12 @@ class LatentReasoningCotrain:
         """Return (loss, rung): mean answer-span CE over n_examples at depth=rung
         (R=rung latent steps). Toggles a clean latent thread for the duration."""
         rung = self._pick_rung(step, total_steps)
-        saved_mem = getattr(model, "use_memory", False)
-        saved_bypass = getattr(model, "_film_bypass", False)
-        saved_ckpt = getattr(model, "activation_checkpointing", False)
-        model.use_memory = False        # clean latent thread (no WM contamination)
-        model._film_bypass = True       # single-forward FiLM (validated + faster)
-        # Activation checkpointing OFF for the tiny latent sequences: the
-        # checkpoint backward RECOMPUTES the FLA chunk_delta_rule kernel at the
-        # latent path's short/odd lengths, which intermittently triggers a
-        # Blackwell "unspecified launch failure". These seqs are ~70 tokens at
-        # batch 1, so retaining their activations costs ~nothing. (The validated
-        # latent_arith_real.py built its model with checkpointing off too.)
-        model.activation_checkpointing = False
-        try:
+        # clean_latent_thread: WM off (no contamination), FiLM bypass (validated
+        # + faster at these tiny seqs), activation checkpointing off (the
+        # checkpoint backward RECOMPUTES the FLA kernel at the latent path's
+        # short/odd lengths → intermittent Blackwell "unspecified launch
+        # failure"; full rationale in the contextmanager's docstring).
+        with clean_latent_thread(model, film_bypass=True, no_activation_ckpt=True):
             total = None
             for _ in range(max(1, int(n_examples))):
                 c, s = self._next(rung)
@@ -172,8 +167,4 @@ class LatentReasoningCotrain:
                                              gate_weight=self.gate_weight)
                 total = l if total is None else total + l
             loss = total / max(1, int(n_examples))
-        finally:
-            model.use_memory = saved_mem
-            model._film_bypass = saved_bypass
-            model.activation_checkpointing = saved_ckpt
         return loss, rung

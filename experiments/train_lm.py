@@ -495,6 +495,18 @@ def main():
     aux_dim = _build_info.aux_dim
     # ---- Speed knobs (must run AFTER model is built but BEFORE the train
     # loop touches it). See experiments/speed_knobs.py.
+    # The latent co-train aux losses run extra eager forwards at short/odd
+    # shapes; under torch.compile (strict mode, no silent fallback) that
+    # reproduces the documented Inductor symbolic-shape assertion (2026-05-27
+    # gate-calibration smoke, bug #1) as a hard crash mid-run. Auto-disable
+    # compile rather than relying on every launcher remembering --no-compile.
+    if bool(args.compile) and (getattr(args, "latent_cotrain_weight", 0.0) > 0.0
+                               or getattr(args, "latent_reasoning_weight", 0.0) > 0.0):
+        print("[compile] AUTO-DISABLED: --latent_cotrain_weight/"
+              "--latent_reasoning_weight run variable-shape extra forwards "
+              "that crash Inductor under strict compile. Pass --no-compile "
+              "to silence this message.")
+        args.compile = False
     from experiments.speed_knobs import apply_speed_knobs
     apply_speed_knobs(model, bf16=bool(args.bf16), tf32=bool(args.tf32),
                       compile_model=bool(args.compile),

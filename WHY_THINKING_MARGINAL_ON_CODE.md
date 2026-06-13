@@ -132,3 +132,42 @@ Dense scale also works but is the expensive path; the under-exposure levers are
 much cheaper and are the honest first move.
 
 Probe: `probe_pkm_capacity.py`.
+
+## ADDENDUM 2 — the deepest layer: stability–plasticity, and why PKM doesn't escape it
+
+Validating the exposure lever ON THE REAL MODEL (`probe_exposure_lever.py`):
+continue-train `sft_baked_pure` on CLEAN gold solutions of 40 failing problems
+(~80 exposures each), eval the trained problems, a disjoint failing CONTROL set,
+and a previously-SOLVED set (forgetting check):
+
+| training mode | TRAIN (fixed) | failing-CONTROL | SOLVED-control (forgetting) |
+|---|---|---|---|
+| full fine-tune (all params)        | 0→18 | 0→0 | 30→**8** |
+| PKM only (addressing + values)     | 0→15 | 0→0 | 30→**6** |
+| PKM values only, addressing FROZEN | 0→**0** | 0→0 | 30→**30** |
+
+Findings:
+1. **Learnable, but zero generalization.** Clean repeated exposure DOES fix the
+   specific trained problems (0→18, train-loss→0.001) — so it's not raw capacity
+   — but failing-CONTROL stays 0→0: pure memorization, no transfer to unseen
+   problems.
+2. **Catastrophic forgetting is the real wall.** Cramming 40 facts destroyed
+   ~22/30 previously-solved problems (full AND PKM). The binding limit is not
+   storage (ample) but **plasticity-without-interference**.
+3. **PKM does NOT escape the dilemma.** PKM-only forgets as badly as full FT,
+   because PKM is read at EVERY token through SHARED learned addressing — storing
+   a new fact shifts the query/sub-keys and re-routes all other facts. Freeze the
+   addressing (values-only) and forgetting vanishes (30→30) but so does learning
+   (0→0). Learning a fact REQUIRES the addressing plasticity that CAUSES the
+   forgetting. Same stability-plasticity dilemma as dense weights.
+
+**This is the mechanistic answer to "it should be a huge benefit to have PKM/WM,
+why isn't it":** the current PKM is not an interference-free, growable memory —
+it's a densely-read, shared-addressing layer with the same forgetting limit as
+dense weights. The "huge benefit" requires a memory where adding a fact
+ALLOCATES A FRESH/DEDICATED slot without shifting existing routes — i.e. a
+growable sparse store with per-fact slot allocation, or a NON-PARAMETRIC kNN
+retrieval (append the fact, no gradient, no interference). That is the concrete
+architectural direction the evidence points to for a small super-coder.
+
+Probe: `probe_exposure_lever.py` (modes: full | pkm | pkmval).

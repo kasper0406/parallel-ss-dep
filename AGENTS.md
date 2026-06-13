@@ -24,8 +24,19 @@ bullet below conflicts with this list, THIS LIST WINS:
   that does NOT help (0.09 vs 1.00) — calibrating against it taught the gate to
   suppress thinking. Don't reintroduce discrete-token thinking measurement.
 - **`gate_calibration.compute_gate_calibration_loss` now uses the latent
-  primitive** (param `K`→`latent_R`). It is wired into `sft_code.py` ONLY (flag
-  `--gate_calibration_latent_R`), NOT into `train_lm.py`.
+  primitive** (param `K`→`latent_R`). It is wired into BOTH `sft_code.py` AND
+  `train_lm.py` pretrain (`--gate_calibration_weight`; see "Pretrain wiring"
+  below) — an earlier version of this bullet wrongly said train_lm was excluded.
+  **POLARITY FIX (2026-06-13):** the gate convention is
+  `σ=sigmoid(gate_logit)=P(EMIT)` (the gate-terms LM loss, eval `emit iff
+  g≥threshold`, and the entropy-aux all agree). The calibration loss was training
+  `σ→1{Δlogp>0}` — i.e. EMIT where a latent think *helps* — which is backwards.
+  Fixed to train `P(think)=σ(−gate_logit)→1{Δlogp>0}` (negate the logit in the
+  BCE) so the gate THINKS where thinking helps; also fixed the baseline lp0 to be
+  computed on the SAME left-padded prefix as lpR (was clean full-context → Δ
+  biased by pad contamination). Regression guard:
+  `test_gate_calibration.py::test_gate_calibration_polarity_thinks_where_helpful`.
+  This bug was live in the v10 all-features pretrain.
 - **Process-reward aux loss is REMOVED** — `experiments/process_reward.py` no
   longer exists; its "Process-reward auxiliary loss" bullet below is historical
   only.

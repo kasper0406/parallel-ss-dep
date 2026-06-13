@@ -235,3 +235,47 @@ def test_bce_drives_gate_toward_target():
         assert loss1 < loss0 - 0.05
     finally:
         gc_mod.latent_think_logp = orig
+
+
+def test_gate_calibration_polarity_thinks_where_helpful():
+    """POLARITY GUARD (regression for the 2026-06-13 inverted-target bug).
+
+    Convention: σ = sigmoid(gate_logit) = P(EMIT) (gate-terms LM loss, eval, and
+    entropy-aux all use this). gate-calibration must make the gate THINK (σ↓)
+    where a latent think HELPS the truth. Here we force "thinking ALWAYS helps"
+    (y=1 everywhere) and assert mean σ (=P(emit)) DECREASES after training. The
+    pre-fix code (BCE(+logit, y)) would push σ UP (emit) and fail this."""
+    import experiments.gate_calibration as gc_mod
+    m = _tiny_model()
+    input_ids, targets = _clean_batch(B=2, T=16, seed=5)
+    for p in m.parameters():
+        p.requires_grad_(False)
+    for p in m.gate_head.parameters():
+        p.requires_grad_(True)
+    orig = gc_mod.latent_think_logp
+
+    def always_helps(model, prefixes, true_next, *, R, thinking_token_id, pad_id=0):
+        # high logp on every row -> Δ = lpR - lp0 > 0 -> y=1 (thinking helps)
+        return torch.zeros(prefixes.shape[0])
+
+    gc_mod.latent_think_logp = always_helps
+    try:
+        def mean_sigma():
+            with torch.no_grad():
+                _ = m(input_ids)
+                return float(torch.sigmoid(m._last_gate_logits).mean())
+        s0 = mean_sigma()
+        opt = torch.optim.Adam(m.gate_head.parameters(), lr=0.05)
+        for _ in range(80):
+            _ = m(input_ids)
+            snap = m._last_gate_logits
+            res = compute_gate_calibration_loss(
+                m, input_ids, targets, snap, thinking_token_id=THINK_ID,
+                sample_frac=1.0, max_positions=64, eos_id=EOS_ID,
+                generator=torch.Generator().manual_seed(0))
+            opt.zero_grad(); res.loss.backward(); opt.step()
+        s1 = mean_sigma()
+        # thinking helps everywhere -> gate should move toward THINK -> σ↓
+        assert s1 < s0 - 0.02, f"gate σ should drop (think) where helpful: {s0:.3f}->{s1:.3f}"
+    finally:
+        gc_mod.latent_think_logp = orig

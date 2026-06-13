@@ -185,16 +185,15 @@ def compute_gate_calibration_loss(
 
     true_next = targets[bsel, tsel]                           # (P,)
 
-    # Baseline lp0 from a no_grad forward (the TARGET side never needs grad).
-    with torch.no_grad():
-        base_logits = _unwrap_logits(model(input_ids)).float()
-        lp0 = F.log_softmax(base_logits[bsel, tsel, :], dim=-1).gather(
-            1, true_next.view(-1, 1)).squeeze(1)              # (P,)
-
-    # Post-latent-think lpR in chunks (left-padded prefixes). Each chunk runs
-    # R state-readonly latent think steps via the shared primitive.
+    # Baseline lp0 AND post-think lpR are both computed on the SAME left-padded
+    # prefix (fixed 2026-06-13): previously lp0 used the clean full sequence while
+    # lpR used a left-padded prefix, so Δ=lpR-lp0 conflated "thinking helped" with
+    # "left-pad corrupted lpR's recurrent state". Computing the no-think baseline
+    # on the identical padded prefix (last real position = index -1) makes Δ
+    # isolate the latent-think effect.
     Lmax = int(tsel.max().item()) + 1
     lpR = torch.empty(P, device=device)
+    lp0 = torch.empty(P, device=device)
     for s in range(0, P, think_batch):
         e = min(s + think_batch, P)
         rows = []
@@ -209,24 +208,32 @@ def compute_gate_calibration_loss(
                 pref = torch.cat([pad, pref], dim=0)          # LEFT pad
             rows.append(pref)
         chunk_pref = torch.stack(rows, dim=0)
+        # no-think baseline on the SAME padded prefix: logp(true_next) at the
+        # last (real) position.
+        with torch.no_grad():
+            cl = _unwrap_logits(model(chunk_pref)).float()[:, -1, :]
+            lp0[s:e] = F.log_softmax(cl, dim=-1).gather(
+                1, true_next[s:e].view(-1, 1)).squeeze(1)
         lpR[s:e] = latent_think_logp(
             model, chunk_pref, true_next[s:e], R=latent_R,
             thinking_token_id=thinking_token_id, pad_id=PAD_ID)
 
     delta = (lpR - lp0).detach()
-    y = (delta > margin).float()
+    y = (delta > margin).float()       # 1 where a latent think HELPS the truth
 
-    # The BCE target is detached; the gradient flows ONLY through the
-    # snapshotted (grad-carrying) gate logits at the sampled positions.
-    # pos_weight up-weights the "think helps here" class: on code only ~10% of
-    # positions have Delta_logp>0, so unweighted BCE collapses to "never think"
-    # (predicting all-emit is ~90% accurate). pos_weight≈neg/pos rebalances so
-    # the gate actually learns to fire on the helpful minority. None = legacy
-    # unweighted behaviour.
+    # POLARITY (fixed 2026-06-13): the gate convention everywhere — the
+    # gate-terms LM loss (`g·CE + (1-g)·λ`), eval (`g=P(emit), emit iff
+    # g≥threshold`), and the entropy-aux (confident→σ→1→emit) — is
+    # σ = sigmoid(gate_logit) = P(EMIT). We want the gate to THINK where
+    # thinking helps, i.e. σ→0 (P(think)=1-σ→1) at y=1 positions. So train
+    # P(think) = σ(-gate_logit) toward y by negating the logit in the BCE.
+    # (The previous code trained σ(+logit)→y, which drove EMIT exactly where
+    # thinking helps — backwards.) pos_weight up-weights the helpful "think"
+    # minority (~10% of code positions) so BCE doesn't collapse to all-emit.
     gate_logit_sel = gate_logits_snapshot[bsel, tsel]
     pw = (torch.tensor(float(pos_weight), device=device)
           if pos_weight is not None else None)
-    loss = F.binary_cross_entropy_with_logits(gate_logit_sel, y, pos_weight=pw)
+    loss = F.binary_cross_entropy_with_logits(-gate_logit_sel, y, pos_weight=pw)
 
     with torch.no_grad():
         sigma_sel = torch.sigmoid(gate_logit_sel.detach())

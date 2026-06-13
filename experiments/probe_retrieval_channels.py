@@ -69,18 +69,23 @@ def main():
                 break
     print(f"[channels] problems={len(rows)} pos/problem={pos_per_problem}", flush=True)
 
-    # Channel configs: (label, use_pkm, use_memory, wm_off)
-    configs = [("T", False, False, True),
-               ("T+P", True, False, True),
-               ("T+P+WM", True, True, False)]
+    # Channel configs: (label, use_pkm, use_memory, wm_off, cosine)
+    # T+P+WMc = WM with NO-TRAIN cosine addressing (DKV-spirit: does L2-norm
+    # alone fix the legacy dot-product's diffuse-softmax failure on code?).
+    configs = [("T", False, False, True, False),
+               ("T+P", True, False, True, False),
+               ("T+P+WM", True, True, False, False),
+               ("T+P+WMc", True, True, False, True)]
     dlogp = {c[0]: [] for c in configs}
 
     base_use_pkm = getattr(model, "use_pkm", False)
     base_use_mem = getattr(model, "use_memory", False)
 
-    def latent_logp(prefix, true_next, use_pkm, use_mem, wm_off):
+    def latent_logp(prefix, true_next, use_pkm, use_mem, wm_off, cosine):
         model.use_pkm = use_pkm if has_pkm else False
         model.use_memory = use_mem if has_wm else False
+        if has_wm:
+            model.memory.cosine_address = cosine
         try:
             return latent_think_logp(model, prefix, true_next, R=R,
                                      thinking_token_id=tid, pad_id=0,
@@ -88,6 +93,8 @@ def main():
         finally:
             model.use_pkm = base_use_pkm
             model.use_memory = base_use_mem
+            if has_wm:
+                model.memory.cosine_address = False
 
     import time as _time
     for pi, (ids, plen) in enumerate(rows):
@@ -108,8 +115,8 @@ def main():
                 out = model(prefix)
                 logits = (out[0] if isinstance(out, tuple) else out)[0, -1].float()
                 nothink_lp = F.log_softmax(logits, -1)[ids[t + 1]].item()
-                for label, up, um, wo in configs:
-                    tl = latent_logp(prefix, true_next, up, um, wo)
+                for label, up, um, wo, cos in configs:
+                    tl = latent_logp(prefix, true_next, up, um, wo, cos)
                     dlogp[label].append(tl - nothink_lp)
         if pi % 5 == 0:
             print(f"  [{pi}/{len(rows)}] L={L} {_time.time()-_t:.2f}s", flush=True)
@@ -133,6 +140,10 @@ def main():
     print(f"  native WM (T+P+WM)-(T+P)            = "
           f"{ceil['T+P+WM'][0]-ceil['T+P'][0]:+.3f} frac, "
           f"{ceil['T+P+WM'][1]-ceil['T+P'][1]:+.3f} mag")
+    if "T+P+WMc" in ceil:
+        print(f"  cosine WM (T+P+WMc)-(T+P)  [no-train DKV]= "
+              f"{ceil['T+P+WMc'][0]-ceil['T+P'][0]:+.3f} frac, "
+              f"{ceil['T+P+WMc'][1]-ceil['T+P'][1]:+.3f} mag")
     print(f"\nVERDICT: if T+P+WM clears the T+P wall → WM has headroom (train "
           f"RALT-WM). If T+P>>T → PKM is the channel. If all flat → no "
           f"retrieval headroom, rethink.")

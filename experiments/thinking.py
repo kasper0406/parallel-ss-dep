@@ -50,9 +50,12 @@ def clean_latent_thread(model, *, film_bypass: bool | None = None,
 
 
 def latent_think_step_input(model, z_premem, wm_inj=None):
-    """THE single think-step input builder, shared by the co-train grad twin,
-    the no-grad measurement primitive, and the inference generator — so the
-    train/eval latent formula can never silently diverge (the recurring killer).
+    """THE single think-step input builder, shared by the co-train grad twin
+    (`_latent_think_logits_grad`) and the inference generator
+    (`generate_latent_think`) — so the train/eval latent formula can never
+    silently diverge (the recurring killer). NOTE: the no-grad MEASUREMENT
+    primitive `_latent_think_logits` deliberately does NOT use this — it stays
+    the adapter-only / no-WM control for the Δlogp probes (pass wm_off there).
 
     next-input = adapter(z_premem) [+ mem_alpha · wm_inj]
 
@@ -795,8 +798,16 @@ def latent_cotrain_loss(model, input_ids: torch.Tensor, targets: torch.Tensor,
     mem = getattr(model, "memory", None)
     _saved = {a: getattr(model, a, None)
               for a in ("_last_gate", "_last_gate_logits")}
+    # `_last_injection_grad` MUST be in this set: the grad twin's WM-cooperation
+    # path (latent_wm_injection(grad=True)) reads it, and each extra forward
+    # overwrites it with a (max_positions, …)-shaped grad tensor carrying THIS
+    # aux loss's autograd graph. If the main training step has its own WM-aux
+    # loss (Option-A future-emb-pred through WM) it would otherwise consume that
+    # stale wrong-shape/wrong-graph tensor. Restore it (and the detached twin +
+    # write gate) in the `finally`.
     _saved_mem = ({a: getattr(mem, a, None)
-                   for a in ("_last_injection", "_last_write_gate")}
+                   for a in ("_last_injection", "_last_injection_grad",
+                             "_last_write_gate")}
                   if mem is not None else {})
     try:
         if selective:

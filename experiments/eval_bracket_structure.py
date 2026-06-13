@@ -302,8 +302,13 @@ def build_model_from_ckpt(ckpt_path: str,
     model.load_state_dict(sd, strict=False)
     # WM×latent cooperation: the latent thread must carry the PRE-memory hidden
     # so the WM injection shapes emit logits without contaminating the adapter's
-    # input. Persisted as a cfg flag; default off → unchanged for all prior ckpts.
-    if bool(cfg.get("latent_feedback_premem", False)):
+    # input. COOPERATION IMPLIES PREMEM — a cooperation ckpt (has mem_alpha) must
+    # always reconstruct with premem on, else it trains with premem (via
+    # load_latent_model(wm_on=True)) but evals via build_model_from_ckpt with
+    # premem off → the adapter runs on the contaminated post-memory hidden (a
+    # silent train/eval divergence; the 2026-06-05 corruption footgun). Also
+    # honour an explicit cfg flag for non-cooperation premem ckpts.
+    if bool(cfg.get("latent_feedback_premem", False)) or coop_latent_wm:
         model._latent_feedback_premem = True
     model = model.to("cuda").eval()
     return model, cfg

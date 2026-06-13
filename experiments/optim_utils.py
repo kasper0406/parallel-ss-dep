@@ -112,8 +112,13 @@ def _make_scheduler(opt, *, base_lr: float, schedule: str, steps: int,
 
 
 def is_film_alpha(name: str) -> bool:
-    """Match the learnable α inside any feedback container
-    (sparse_feedback, xattn_feedback, feedback)."""
+    """Match learnable α scalars that must get NO weight decay (CLAUDE.md
+    mandate): FiLM α inside any feedback container, plus the top-level
+    cooperation/retrieval scalars `mem_alpha` and `retrieval_input_alpha`
+    (init 0.1; WD on these fights the FiLM-α curriculum that grows them only
+    if useful)."""
+    if name.endswith("mem_alpha") or name.endswith("retrieval_input_alpha"):
+        return True
     if not name.endswith(".alpha"):
         return False
     return any(name.startswith(prefix) or f".{prefix}" in name

@@ -194,6 +194,26 @@ MBPP problems (sft_baked_pure, baseline 0/40):
   continuation — it is retrieval-as-memorization-at-scale, NOT
   compose-a-novel-solution-from-similar-ones.
 
+## ADDENDUM 4 — coverage-datastore test: the apparent win was LEAKAGE (fair-baseline catch)
+
+Tested the "small model + LARGE datastore" lever (`probe_knn_oracle.py` mode
+`corpus` / `corpus_clean`), datastore from distill_corpus (147k magicoder+
+codefeedback solutions), eval = the same 40 failing MBPP, d_min coverage logged:
+
+| datastore (20k solutions) | pass | near-exact step coverage (d_min<0.1) |
+|---|---|---|
+| `corpus` (raw distill_corpus) | 11/40 | 0.50 |
+| `corpus_clean` (exact eval problems REMOVED) | **1/40** | 0.10 |
+
+The raw 11/40 was **pure leakage**: distill_corpus (magicoder/codefeedback)
+*contains the exact MBPP problems* — every checked flipped problem had its exact
+prompt + gold in the store (verified). De-leaking (drop entries whose normalized
+prompt matches an eval prompt or whose gold contains the eval gold prefix)
+collapses it to 1/40 — identical to the disjoint-MBPP realistic test, and
+near-exact coverage drops 0.50→0.10. So "scale the datastore" helps ONLY by
+containing the exact problem (memorization/leakage), NOT by generalizing from
+similar solutions. The coverage lever is refuted as a path to NOVEL-problem gains.
+
 ## FINAL SYNTHESIS — the one root cause under everything
 
 At 287M the model is **composition-bound**: it can reproduce knowledge that is

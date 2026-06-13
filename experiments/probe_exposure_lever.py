@@ -47,10 +47,23 @@ def main():
     ckpt = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/sft_baked_pure.pt"
     exposures = int(sys.argv[2]) if len(sys.argv) > 2 else 80
     lr = float(sys.argv[3]) if len(sys.argv) > 3 else 1e-5
-    mode = sys.argv[4] if len(sys.argv) > 4 else "full"   # full | pkm
+    mode = sys.argv[4] if len(sys.argv) > 4 else "full"   # full | pkm | pkmval
+    replay_ratio = float(sys.argv[5]) if len(sys.argv) > 5 else 0.0  # B1: frac of
+    #   each step that is a REPLAY batch from the original SFT mix (anti-forgetting)
+    kl_coef = float(sys.argv[6]) if len(sys.argv) > 6 else 0.0       # B1: KL to a
+    #   frozen base on the replay batch (anchor old behaviour)
     torch.backends.cuda.matmul.allow_tf32 = True
     m, cfg = build_model_from_ckpt(ckpt, force_state_readonly=True)
     m = m.to(DEVICE)
+    # B1 frozen reference for the KL anchor (anti-forgetting). Loaded only when
+    # needed; its no-think logits on replay data pin the model to old behaviour
+    # while the new facts are injected.
+    ref = None
+    if kl_coef > 0.0:
+        ref, _ = build_model_from_ckpt(ckpt, force_state_readonly=True)
+        ref = ref.to(DEVICE).eval()
+        for p in ref.parameters():
+            p.requires_grad = False
     tid = int(cfg.get("thinking_token_id", cfg["vocab_size"] - 1))
     tok = AutoTokenizer.from_pretrained(cfg.get("tokenizer", "HuggingFaceTB/SmolLM2-135M"))
     eos = tok.eos_token_id
@@ -104,6 +117,26 @@ def main():
             tgt[r, :plen - 1] = -100
         return inp.to(DEVICE), tgt.to(DEVICE)
 
+    # B1: REPLAY pool from the original SFT mix (passing solutions), to interleave
+    # so the trunk keeps seeing the old distribution while new facts are injected.
+    replay_rows = []
+    if replay_ratio > 0.0 or kl_coef > 0.0:
+        import json as _json
+        with open("data/sft_phase_c_combined.jsonl") as f:
+            for line in f:
+                d = _json.loads(line)
+                if float(d.get("score", 0)) < 0.99 or not d.get("extracted_code"):
+                    continue
+                pre = tok.encode(comment + d["problem_prompt"], add_special_tokens=False)
+                code = tok.encode(d["extracted_code"], add_special_tokens=False)
+                ids = (pre + code)[:320]
+                if len(ids) > len(pre) + 2:
+                    replay_rows.append((ids, len(pre)))
+                if len(replay_rows) >= 4000:
+                    break
+        print(f"  [B1] replay_ratio={replay_ratio} kl_coef={kl_coef} "
+              f"replay_pool={len(replay_rows)}", flush=True)
+
     def evalset(ps):
         return sum(int(solved(p)) for p in ps)
 
@@ -145,13 +178,34 @@ def main():
     rng = random.Random(0)
     bs = 8
     steps = max(1, exposures * len(rows) // bs)
+    def _ce(logits, tgt):
+        return F.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]),
+                              tgt[:, :-1].reshape(-1), ignore_index=-100)
     for s in range(steps):
         bb = [rows[rng.randrange(len(rows))] for _ in range(bs)]
         inp, tgt = make_batch(bb)
         out = m(inp)
         logits = out[0] if isinstance(out, tuple) else out
-        loss = F.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]),
-                               tgt[:, :-1].reshape(-1), ignore_index=-100)
+        loss = _ce(logits, tgt)
+        # B1 anti-forgetting: interleave a REPLAY batch (old-distribution CE) +
+        # a KL-to-frozen-base term on the replay batch, so injecting the new
+        # facts doesn't re-route/wipe old skills.
+        if replay_rows and (replay_ratio > 0.0 or kl_coef > 0.0):
+            rb = [replay_rows[rng.randrange(len(replay_rows))] for _ in range(bs)]
+            rinp, rtgt = make_batch(rb)
+            rout = m(rinp)
+            rlogits = rout[0] if isinstance(rout, tuple) else rout
+            if replay_ratio > 0.0:
+                loss = loss + replay_ratio * _ce(rlogits, rtgt)
+            if kl_coef > 0.0 and ref is not None:
+                with torch.no_grad():
+                    reflog = (lambda o: o[0] if isinstance(o, tuple) else o)(ref(rinp)).float()
+                mask = (rtgt != -100)
+                lp = F.log_softmax(rlogits.float(), -1)
+                rp = F.log_softmax(reflog, -1)
+                kl_tok = (rp.exp() * (rp - lp)).sum(-1)        # KL(ref || cur), per token
+                kl = (kl_tok * mask).sum() / mask.sum().clamp(min=1)
+                loss = loss + kl_coef * kl
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
         opt.step()

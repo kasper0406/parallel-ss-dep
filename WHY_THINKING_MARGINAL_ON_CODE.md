@@ -214,6 +214,42 @@ near-exact coverage drops 0.50→0.10. So "scale the datastore" helps ONLY by
 containing the exact problem (memorization/leakage), NOT by generalizing from
 similar solutions. The coverage lever is refuted as a path to NOVEL-problem gains.
 
+## VALIDATION & CORRECTIONS (2026-06-13, adversarial agent + B1 run) — read this before trusting the strong-form claims below
+
+A background validation agent + a gentle-update experiment (`probe_exposure_lever`
+with replay+KL) found the strong-form synthesis OVER-CLAIMS. Corrections:
+
+1. **"0/93 search-bound, model rates wrong answer 4.6× over gold" is a
+   GREEDY-ARGMAX ARTIFACT.** `probe_knowledge_vs_search` computes `logp_own` on
+   the model's OWN argmax decode (near per-token max by construction) vs
+   `logp_gold` on an arbitrary alternative → `logp_gold < logp_own` is nearly
+   tautological. Proper rank test: gold tokens are **62% top-1 / 82% top-5 /
+   88% top-10** reachable; pass@8 recovers **~9%** of greedy failures. So failures
+   are **predominantly — NOT exclusively (not 100%)** — knowledge-bound; there is
+   a ~10–15% search-recoverable tail. [Re-measure with a pass@k≥50 sweep.]
+2. **"Can't add knowledge without catastrophic forgetting" is RECIPE-bound, not
+   fundamental.** Naive continue-train forgot 30→8. Gentle update (full FT +
+   replay 1.0 + KL 0.5, `probe_exposure_lever ... full 1.0 0.5`) → 30→**16**
+   (forgetting HALVED, −22→−14) while TRAIN still 0→18. So anti-forgetting works
+   partially already; LoRA / EWC / lower-lr / higher-replay are untried and
+   likely improve it further. The forgetting wall is softer than ADDENDUM 2
+   stated.
+3. **"Fundamentally composition-bound at 287M" conflates scale-vs-data and
+   over-reaches.** ADDENDUM 2's own "clean exposure flips 0→18" shows these
+   failures are LEARNABLE (under-exposed / mis-learned from the ~6%-broken,
+   ~70%-unverified SFT), not a hard synthesis ceiling. The honest framing:
+   **under-exposed + dirty-SFT + decoding-fragile, predominantly knowledge-bound,
+   ON THIS BASE/EVAL** — distinguish from a true 287M wall by re-running the
+   bottleneck probes on a cleaner-SFT and on the 708M base.
+
+**DEFENSIBLE CORE (survives scrutiny):** on short, knowledge-bound MBPP code-gen
+with this SFT base, inference-time depth/recall/retrieval have little addressable
+surface; non-parametric retrieval helps only near-exact (the de-leaked kNN
+11→1/40 is the best-controlled result and stands); each mechanism is load-bearing
+on its matched bottleneck. Good for routing effort. The BINARY/strong rhetoric
+below (0/93, 4.6×, "every feature bounded by the same wall, none can manufacture
+composition") outruns the data — read it as the weaker, base/recipe-scoped claim.
+
 ## FINAL SYNTHESIS — the one root cause under everything
 
 At 287M the model is **composition-bound**: it can reproduce knowledge that is

@@ -336,3 +336,24 @@ recall jumps well above +2.7pp.
 Probes: `eval_stage_a_killgate.py` (WM-on vs full_off, forced think),
 `probe_wm_recall_addressing.py` (write/read/readout localization),
 `gen_multibind_recall.py` (the headroom-bearing probe).
+
+### Fix-test (2026-06-13): fine-tuning addressing does NOT install content recall
+
+Ran Stage A (train WM addressing + mem_alpha on multibind, trunk frozen) on the
+CO-TRAINED v10 base (DKV baked in over 7B tokens) to test "does a co-trained
+trunk make the hiddens addressable":
+- Addressing probe: top-1-on-binding 0.0% (unchanged), peakiness 0.70 → 0.90 —
+  the fine-tune made the read MORE confidently wrong (sharper onto the recency/
+  positional slot), not redirected to the queried binding.
+- Kill-gate: recall ~0.8% — CONFOUNDED (v10 is a raw pretrain ckpt, can't follow
+  the "# instr\n program → answer" format; recall floor ~0). The kill-gate on v10
+  is uninformative; the addressing probe is the clean, format-independent signal.
+
+Conclusion: neither (frozen non-co-trained trunk + addressing FT) nor (co-trained
+trunk + addressing FT) yields content-addressable retrieval of the queried
+binding. A short addressing fine-tune reinforces the query-independent prior; it
+cannot install an objective the representations were never shaped for. The fix is
+NOT post-hoc addressing training — it is making content-recall (multibind/MQAR)
+a PRETRAIN objective so the trunk co-adapts its hiddens to be content-addressable
+AND the read query is shaped by a loss that rewards finding the queried key.
+That is a fresh multi-hour pretrain (resource decision), not a quick fine-tune.

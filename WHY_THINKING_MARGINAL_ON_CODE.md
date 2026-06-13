@@ -440,3 +440,30 @@ correctly marginal, not a bug.
 
 Probes/ckpts: `latent_code_cotrain.py --wm_on [--unfreeze_trunk]`,
 `probe_wm_recall_addressing.py`, `eval_stage_a_killgate.py` (full_off arm).
+
+### ROOT CAUSE AT THE SOURCE (2026-06-13): v10's pretrain recall stream was SINGLE-binding
+
+The decisive discovery: v10 (the co-trained pretrain) ALREADY mixed a recall
+stream into the loss at 13% (`configs/pretrain_mix_v10.yaml`: longctx_recall_train
+0.09 + synthetic_memory 0.04) specifically "so the co-trained WorkingMemory has a
+saturating-recall gradient." But that stream is `data/longctx_recall_train.jsonl`
+— SINGLE-binding recall, which a DeltaNet solves at 100% no-think (the binding
+fits in the recurrent state). So v10's recall task was NOT capacity-exceeding →
+the trunk routed around WM during pretrain → v10's read learned recency (0% on
+the queried binding). The "make WM load-bearing" data-side fix was in place but
+used the WRONG task.
+
+THE FIX (`configs/pretrain_mix_v11.yaml`): swap the single-binding recall stream
+for CAPACITY-EXCEEDING multi-binding recall (`data/multibind_recall_pretrain.jsonl`,
+N∈{8..32}, 50k fresh instances; `experiments/gen_multibind_recall.py`). At N=24/32
+the recurrent state saturates → predicting the queried value FORCES the trunk to
+make its hiddens WM-addressable (WM is the only low-loss path). This is the one
+genuinely-untested lever; every retrofit/fine-tune onto an already-trained trunk
+failed (a 600-step fine-tune can't re-shape committed recency representations).
+
+Status: v11 config + 50k-example stream are BUILT and committed. Launching the
+fresh v11 pretrain is ~20 GPU-h (v10 was 7B tok / ~20 h) — a deliberate resource
+decision. Open caveat: WM going load-bearing in v11 would prove the MECHANISM is
+fixable at the source, but transfer to HumanEval is separate (real code is
+knowledge-bound; PKM already covers that). v11 tests the mechanism, not
+necessarily the coding headline.

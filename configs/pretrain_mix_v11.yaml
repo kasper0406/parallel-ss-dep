@@ -1,0 +1,160 @@
+# Mixed-corpus pretrain v11 — v10 mix, but the WM recall gradient is swapped
+# from SINGLE-binding to CAPACITY-EXCEEDING MULTI-binding recall.
+#
+# WHY v11 EXISTS (the 2026-06-13 root-cause finding — read before changing):
+#   v10 added a recall stream (longctx_recall_train @ 0.09 + synthetic_memory @
+#   0.04) so the co-trained WorkingMemory would have a "saturating-recall
+#   gradient." But that stream is SINGLE-binding recall (bind one value →
+#   distractors → recall it). Measured 2026-06-13: a DeltaNet linear-RNN solves
+#   single-binding recall at 100% with NO thinking out to 512+ tokens — the one
+#   binding fits trivially in the recurrent state. So the v10 recall task was
+#   NOT capacity-exceeding: the trunk solved it via the recurrence and ROUTED
+#   AROUND WM, leaving WM's read non-content-addressable (recency; 0% mass on
+#   the queried binding — probe_wm_recall_addressing.py on v10).
+#
+#   The capstone principle (WHY_THINKING_MARGINAL_ON_CODE.md): an auxiliary
+#   mechanism stays idle whenever the primary path (trunk/recurrence) can do the
+#   task. WM becomes load-bearing ONLY when the task is BOTH (1) capacity-
+#   exceeding (more simultaneous bindings than the recurrent state holds) AND
+#   (2) non-memorizable (fresh random content). v10's single-binding stream was
+#   neither. That is why every post-hoc/fine-tune attempt to make WM load-bearing
+#   failed (+2.7pp at best), and why MQAR K=128 (random keys, K>state capacity)
+#   is the ONE place WM ever earned +11.1pp.
+#
+# THE v11 FIX (data-side): replace single-binding recall with MULTI-binding
+# recall — `multibind_recall_pretrain.jsonl` (assign N∈{8..32} variables,
+# interleaved distractors, print ONE queried variable; 50k fresh random
+# instances). At N=24/32 the recurrent state saturates, so predicting the
+# queried value FORCES the trunk to make its hiddens WM-addressable — WM becomes
+# the only low-loss path. `synthetic_memory` is KEPT (multi-step families add
+# variety). All other weights unchanged from v10.
+#   - longctx_recall_train (single-binding) 0.09 -> REMOVED
+#   + multibind_recall_pretrain (N 8..32)   0.00 -> 0.09
+#
+# CAVEAT / what to verify after this run: WM load-bearing here does NOT
+# guarantee a HumanEval lift — real code rarely has the capacity-exceeding,
+# non-memorizable recall sub-task this stream creates (the deployment workload is
+# knowledge-bound, PKM's job). v11 tests whether the MECHANISM can be made
+# load-bearing at the source; transfer to code is a separate, open question.
+
+sources:
+
+  # ---- Long-context RECALL (13 % — the WM gradient, now CAPACITY-EXCEEDING) ----
+
+  - name: multibind_recall_pretrain
+    jsonl_path: data/multibind_recall_pretrain.jsonl
+    text_field: problem_prompt
+    split: train
+    weight: 0.09
+    filter: always
+
+  - name: synthetic_memory
+    jsonl_path: data/synthetic_memory.jsonl
+    text_field: problem_prompt
+    split: train
+    weight: 0.04
+    filter: always
+
+  # ---- Raw code (down-weighted to make room for recall) ----
+
+  - name: codeparrot
+    dataset_id: codeparrot/codeparrot-clean
+    text_field: content
+    split: train
+    weight: 0.23
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 200 }
+
+  - name: python_codes_25k
+    dataset_id: flytech/python-codes-25k
+    text_field: text
+    split: train
+    weight: 0.08
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  # ---- Problem-solving instruction code ----
+
+  - name: magicoder_oss
+    dataset_id: ise-uiuc/Magicoder-OSS-Instruct-75K
+    text_field: [problem, solution]
+    split: train
+    weight: 0.09
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  - name: code_exercises_jinaai
+    dataset_id: jinaai/code_exercises
+    text_field: [problem, solution]
+    split: train
+    weight: 0.02
+    fim_rate: 0.5
+    filter: always
+
+  - name: python_instr_18k_alpaca
+    dataset_id: iamtarun/python_code_instructions_18k_alpaca
+    text_field: [prompt, output]
+    split: train
+    weight: 0.06
+    filter: always
+
+  - name: codealpaca_20k
+    dataset_id: HuggingFaceH4/CodeAlpaca_20K
+    text_field: [prompt, completion]
+    split: train
+    weight: 0.05
+    filter: always
+
+  # ---- CVE / vulnerability + fix (KEPT at v4 weights) ----
+
+  - name: bigvul
+    dataset_id: bstee615/bigvul
+    text_builder: bigvul
+    split: train
+    weight: 0.10
+    filter: bigvul_vulnerable
+
+  - name: cybernative_vuln_dpo
+    dataset_id: CyberNative/Code_Vulnerability_Security_DPO
+    text_builder: cybernative_dpo
+    split: train
+    weight: 0.05
+    filter: always
+
+  # ---- Synthetic CS textbooks (unchanged) ----
+
+  - name: textbooks_lite_sciphi
+    dataset_id: SciPhi/textbooks-are-all-you-need-lite
+    text_field: completion
+    split: train
+    weight: 0.06
+    filter:
+      name: min_content_len
+      args: { min_chars: 400 }
+
+  - name: textbook_quality_programming
+    dataset_id: vikp/textbook_quality_programming
+    text_field: markdown
+    split: train
+    weight: 0.05
+    filter:
+      name: min_content_len
+      args: { min_chars: 400 }
+
+  # ---- Wikipedia (unchanged) ----
+
+  - name: wikipedia_en
+    dataset_id: wikimedia/wikipedia
+    hf_extra: { name: "20231101.en" }
+    text_field: text
+    split: train
+    weight: 0.10
+    filter:
+      name: min_content_len
+      args: { min_chars: 500 }

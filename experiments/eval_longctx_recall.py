@@ -85,6 +85,29 @@ import contextlib
 
 
 @contextlib.contextmanager
+def _full_off_ablation(model):
+    """Temporarily turn WorkingMemory FULLY off (use_memory=False).
+
+    The CORRECT WM-off arm for the Stage A kill-gate (M0 review B1). There are
+    TWO WM channels at a think step: (1) the DIRECT channel — the WM injection is
+    added to the post-out_norm hidden at the think slot (scaled by read_alpha)
+    and that hidden produces the emit logits; (2) the COOPERATION channel —
+    mem_alpha·WM_inj becomes the next think input. `_coop_off_ablation`
+    (mem_alpha→0) disables ONLY channel 2; `_wm_mean_ablation` (read_alpha→0)
+    disables only channel 1's residual scale. Neither alone is a true WM-off, so
+    a kill-gate built on either UNDER-counts WM's contribution. Setting
+    use_memory=False disables BOTH (latent_wm_injection also returns None when
+    use_memory is off), so recall(WM-on) − recall(full_off) is the honest 'is WM
+    load-bearing for this recall' measure."""
+    orig = getattr(model, "use_memory", False)
+    try:
+        model.use_memory = False
+        yield
+    finally:
+        model.use_memory = orig
+
+
+@contextlib.contextmanager
 def _coop_off_ablation(model):
     """Temporarily zero `mem_alpha` — the WM×latent COOPERATION channel.
 
@@ -146,6 +169,7 @@ def eval_longctx_recall(
     emit_threshold: float = 0.5,
     gate_floor: float = 0.0,
     additive: bool | None = None,
+    force_prefix_think: int = 0,
     device: str = "cuda",
 ) -> dict:
     """Importable long-context recall eval — the WM-load-bearing probe.
@@ -203,6 +227,7 @@ def eval_longctx_recall(
     agg_think = agg_emit = 0
     abl_cm = (_wm_mean_ablation(model) if wm_ablate == "mean"
               else _coop_off_ablation(model) if wm_ablate == "coop_off"
+              else _full_off_ablation(model) if wm_ablate == "full_off"
               else contextlib.nullcontext())
     try:
         model.eval()
@@ -220,7 +245,8 @@ def eval_longctx_recall(
                         eos_token_id=tok.eos_token_id,
                         thinking_token_id=thinking_token_id,
                         total_think_budget=total_think_budget,
-                        emit_threshold=emit_threshold, gate_floor=gate_floor)
+                        emit_threshold=emit_threshold, gate_floor=gate_floor,
+                        force_prefix_think=force_prefix_think)
                 elif generator == "retrieval_as_input":
                     gen, diag = generate_with_retrieval_as_input(
                         model, prompt_t, max_gen=max_gen, temperature=0.0,
@@ -256,7 +282,7 @@ def eval_longctx_recall(
         "n_total": float(n_total),
         "think_rate": float(think_rate),
         "think_frac": float(think_rate),
-        "wm_ablated": 1.0 if wm_ablate in ("mean", "coop_off", "zero") else 0.0,
+        "wm_ablated": 1.0 if wm_ablate in ("mean", "coop_off", "zero", "full_off") else 0.0,
     }
 
 
@@ -273,7 +299,7 @@ def main() -> int:
                    help="latent_think: force N think steps before the answer "
                         "(matches latent_sft think-before-answer training).")
     p.add_argument("--wm_ablate", type=str, default="none",
-                   choices=["none", "zero", "mean", "coop_off"],
+                   choices=["none", "zero", "mean", "coop_off", "full_off"],
                    help="'zero' zeroes memory.W_proj.weight (CONFOUNDED for "
                         "retrieval-as-input ckpts — see module doc). 'mean' "
                         "zeroes read_alpha so think tokens still drive a "
@@ -363,6 +389,7 @@ def main() -> int:
     # kill-gate WM-off arm — the only ablation that disables cooperation).
     _abl = (_wm_mean_ablation(model) if args.wm_ablate == "mean"
             else _coop_off_ablation(model) if args.wm_ablate == "coop_off"
+            else _full_off_ablation(model) if args.wm_ablate == "full_off"
             else __import__("contextlib").nullcontext())
     with _abl:
      for rec in records:

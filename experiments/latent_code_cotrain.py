@@ -59,6 +59,7 @@ def load_recall(jsonl, tok, max_len, limit):
     AND in the WM buffer the grad-forward builds from that same window. Distances
     above ~max_len are simply not trained (and the kill-gate is at ≥384, well
     inside a 768 window)."""
+    from experiments.sft_code import _flatten_to_oneline
     rows = []
     n_skip_long = 0
     with open(jsonl) as f:
@@ -67,7 +68,13 @@ def load_recall(jsonl, tok, max_len, limit):
             ans = d.get("answer")
             if ans is None or not d.get("problem_prompt"):
                 continue
-            pre = tok.encode(d["problem_prompt"], add_special_tokens=False)
+            # MUST match the eval prompt EXACTLY (eval_longctx_recall builds
+            # `"# " + _flatten_to_oneline(problem_prompt) + "\n"`). Training on the
+            # raw multi-line prompt while the eval flattens to one line shifts the
+            # token stream the WM addressing (W_q/W_k) sees — a silent train/eval
+            # distribution mismatch (M0 review A2). Build the prefix identically.
+            prompt = "# " + _flatten_to_oneline(d["problem_prompt"]) + "\n"
+            pre = tok.encode(prompt, add_special_tokens=False)
             ans_ids = tok.encode(str(ans), add_special_tokens=False)
             if not ans_ids:
                 continue

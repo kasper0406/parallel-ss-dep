@@ -67,10 +67,15 @@ def main() -> int:
                    help="cap tasks per arm (full + band each capped).")
     p.add_argument("--min_distance", type=int, default=384,
                    help="kill-gate band: distance >= this (M1 is on this band).")
-    p.add_argument("--max_gen", type=int, default=24)
+    p.add_argument("--max_gen", type=int, default=12)
     p.add_argument("--total_think_budget", type=int, default=64)
     p.add_argument("--emit_threshold", type=float, default=0.5)
     p.add_argument("--gate_floor", type=float, default=0.0)
+    p.add_argument("--force_prefix_think", type=int, default=2,
+                   help="force N latent think steps before the answer (B2: the "
+                        "frozen gate emits at the answer position → without this "
+                        "neither WM channel fires and the kill-gate is trivially "
+                        "0). Set =R used in training.")
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
 
@@ -97,41 +102,46 @@ def main() -> int:
               f"(mem_alpha={float(ma.detach()):.3f})")
     model.eval()
 
-    def _run(path, n):
-        on = eval_longctx_recall(
+    def _eval(path, n, ablate):
+        return eval_longctx_recall(
             model, tok, path=path, n=n, generator="latent_think",
-            wm_ablate="none", max_gen=args.max_gen,
+            wm_ablate=ablate, max_gen=args.max_gen,
             total_think_budget=args.total_think_budget,
             emit_threshold=args.emit_threshold, gate_floor=args.gate_floor,
-            device=args.device)
-        off = eval_longctx_recall(
-            model, tok, path=path, n=n, generator="latent_think",
-            wm_ablate="coop_off", max_gen=args.max_gen,
-            total_think_budget=args.total_think_budget,
-            emit_threshold=args.emit_threshold, gate_floor=args.gate_floor,
-            device=args.device)
-        return on, off
+            force_prefix_think=args.force_prefix_think, device=args.device)
 
-    print("\n=== FULL held-out set ===")
-    full_on, full_off = _run(args.tasks, args.n)
-    print(f"  WM-on  recall={full_on['recall']:.3f} "
-          f"(n={int(full_on['n_total'])}, think_rate={full_on['think_rate']:.3f})")
-    print(f"  WM-off recall={full_off['recall']:.3f} "
-          f"(n={int(full_off['n_total'])}, think_rate={full_off['think_rate']:.3f})")
-    print(f"  Δ(on-off) = {100*(full_on['recall']-full_off['recall']):+.1f} pp")
+    def _report(label, path, n):
+        # WM-on (cooperation active) vs WM-full-off (use_memory=False → BOTH the
+        # direct read_alpha channel AND the mem_alpha cooperation channel off:
+        # the only honest WM-off arm — M0 review B1). coop_off is the secondary
+        # cooperation-channel-only probe.
+        on = _eval(path, n, "none")
+        full = _eval(path, n, "full_off")
+        coop = _eval(path, n, "coop_off")
+        d_full = 100 * (on["recall"] - full["recall"])
+        d_coop = 100 * (on["recall"] - coop["recall"])
+        print(f"\n=== {label} (n={int(on['n_total'])}, "
+              f"think_rate={on['think_rate']:.2f}) ===")
+        print(f"  WM-on      recall={on['recall']:.3f}")
+        print(f"  WM-full-off recall={full['recall']:.3f}   "
+              f"Δ(on − full_off) = {d_full:+.1f} pp   <- M1 metric")
+        print(f"  coop-off   recall={coop['recall']:.3f}   "
+              f"Δ(on − coop_off) = {d_coop:+.1f} pp   (cooperation-channel only)")
+        if on["think_rate"] <= 0.0:
+            print("  WARNING: think_rate=0 — thinking never fired; kill-gate "
+                  "is uninformative (raise --force_prefix_think).")
+        return d_full
+
+    print(f"[killgate] force_prefix_think={args.force_prefix_think}")
+    _report("FULL held-out set", args.tasks, args.n)
 
     band_path, n_band = _write_filtered(args.tasks, args.min_distance, args.n)
-    print(f"\n=== KILL-GATE band (distance ≥ {args.min_distance}, {n_band} tasks) ===")
-    band_on, band_off = _run(band_path, args.n)
-    d_band = 100 * (band_on["recall"] - band_off["recall"])
-    print(f"  WM-on  recall={band_on['recall']:.3f} "
-          f"(n={int(band_on['n_total'])}, think_rate={band_on['think_rate']:.3f})")
-    print(f"  WM-off recall={band_off['recall']:.3f} "
-          f"(n={int(band_off['n_total'])}, think_rate={band_off['think_rate']:.3f})")
-    print(f"  Δ(on-off) = {d_band:+.1f} pp")
+    d_band = _report(f"KILL-GATE band (distance ≥ {args.min_distance}, "
+                     f"{n_band} tasks)", band_path, args.n)
 
     verdict = "PASS" if d_band > 15.0 else "FAIL"
-    print(f"\nKILL-GATE M1 (band Δ > +15pp): {verdict}  ({d_band:+.1f} pp)")
+    print(f"\nKILL-GATE M1 (band Δ(on − full_off) > +15pp): {verdict}  "
+          f"({d_band:+.1f} pp)")
     return 0
 
 

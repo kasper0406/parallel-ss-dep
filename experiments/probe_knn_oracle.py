@@ -55,9 +55,17 @@ def main():
     ckpt = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/sft_baked_pure.pt"
     n_target = int(sys.argv[2]) if len(sys.argv) > 2 else 40
     lam_max = float(sys.argv[3]) if len(sys.argv) > 3 else 0.7
+    # datastore: "oracle" = gold of the eval problems (upper bound, leaky);
+    # "realistic" = gold of a DISJOINT set of problems (near-neighbor retrieval).
+    ds_mode = sys.argv[4] if len(sys.argv) > 4 else "oracle"
+    n_ds = int(sys.argv[5]) if len(sys.argv) > 5 else 1000
+    conf_scale = float(sys.argv[6]) if len(sys.argv) > 6 else 0.15
     topk = 8
     temp_knn = 10.0          # softmax temp on -distance (cosine in [0,2])
-    conf_scale = 0.15        # retrieval-confidence gate: lam_eff = lam_max*exp(-d_min/scale)
+    # conf_scale: retrieval-confidence gate lam_eff = lam_max*exp(-d_min/scale).
+    # Small (0.15) = only near-exact matches contribute (right for oracle);
+    # large (>=1.0) = let distant near-neighbors contribute too (tests whether
+    # cross-problem similar solutions are usable at all).
     torch.backends.cuda.matmul.allow_tf32 = True
     m, cfg = build_model_from_ckpt(ckpt, force_state_readonly=True)
     m = m.to(DEVICE).eval()
@@ -103,21 +111,31 @@ def main():
         out = [t for t in ids[0, len(cids):].tolist() if t != tid]
         return tok.decode(out, skip_special_tokens=True)
 
-    # 1) find failing problems
+    # 1) find failing problems in an eval window (first 200); reserve the rest
+    #    as a disjoint datastore pool for the realistic test.
+    eval_window = probs_all[:200]
+    pool = probs_all[200:]
     fails = []
-    for prob in probs_all:
+    for prob in eval_window:
         if not prob.gold_solution:
             continue
         if not clean_grade(prob, greedy(prob)):
             fails.append(prob)
         if len(fails) >= n_target:
             break
-    print(f"[knn-oracle] ckpt={ckpt} failing={len(fails)} lam_max={lam_max} "
-          f"topk={topk} conf_scale={conf_scale}", flush=True)
+    fail_ids = {p.task_id for p in fails}
+    print(f"[knn-oracle] ckpt={ckpt} mode={ds_mode} failing={len(fails)} "
+          f"lam_max={lam_max} topk={topk} conf_scale={conf_scale}", flush=True)
 
-    # 2) build ORACLE datastore: gold solutions of the failing problems
+    # 2) build datastore. oracle: the failing problems' own gold (leaky upper
+    #    bound). realistic: gold of n_ds DISJOINT problems (no eval answer in it).
+    if ds_mode == "realistic":
+        ds_probs = [p for p in pool if p.gold_solution
+                    and p.task_id not in fail_ids][:n_ds]
+    else:
+        ds_probs = fails
     keys, values = [], []
-    for prob in fails:
+    for prob in ds_probs:
         pre = tok.encode(comment + prob.prompt, add_special_tokens=False)
         gold = tok.encode("\n" + prob.gold_solution.replace("\r\n", "\n"),
                           add_special_tokens=False)

@@ -171,3 +171,54 @@ retrieval (append the fact, no gradient, no interference). That is the concrete
 architectural direction the evidence points to for a small super-coder.
 
 Probe: `probe_exposure_lever.py` (modes: full | pkm | pkmval).
+
+## ADDENDUM 3 — non-parametric retrieval: clears forgetting + consumption, but only for near-EXACT matches
+
+`probe_knn_oracle.py` (kNN-LM: key = last pre-lm_head hidden, value = next token;
+interp p = λ·p_kNN + (1-λ)·p_LM with retrieval-CONFIDENCE-gated λ). On 40 failing
+MBPP problems (sft_baked_pure, baseline 0/40):
+
+| datastore | gate | pass |
+|---|---|---|
+| ORACLE (gold of the eval problems IN store, 2.5k keys) | conf_scale 0.15 | **23/40** |
+| REALISTIC (1000 DISJOINT problems' gold, 62k keys) | conf_scale 0.15 | 1/40 |
+| REALISTIC (disjoint) | conf_scale 1.0, λ_max 0.5 (loose) | 0/40 |
+
+- **The consumption barrier is NOT fatal** (oracle 0→23): a confidently-wrong
+  model CAN be overridden by retrieval when the answer is retrievable and λ is
+  gated on retrieval confidence. Non-parametric retrieval also structurally
+  escapes the forgetting wall. Both of the agent's risks cleared.
+- **BUT cross-problem near-neighbor retrieval does NOT transfer** (realistic
+  0-1/40, both gates). Loosening the gate to force distant neighbors in only
+  added noise. So kNN-LM helps ONLY when the datastore holds the (near-)exact
+  continuation — it is retrieval-as-memorization-at-scale, NOT
+  compose-a-novel-solution-from-similar-ones.
+
+## FINAL SYNTHESIS — the one root cause under everything
+
+At 287M the model is **composition-bound**: it can reproduce knowledge that is
+DIRECTLY PRESENT (in weights via enough clean exposure, or in a datastore via
+near-exact retrieval) but cannot SYNTHESIZE a novel algorithm it doesn't already
+know and can't retrieve verbatim. Every mechanism is bounded by this same wall:
+- latent thinking → helps only the iterated-computation slice (arithmetic), flat
+  on code composition;
+- PKM/WM (parametric) → can't add knowledge without catastrophic forgetting;
+- kNN-LM (non-parametric) → adds knowledge without forgetting, but only the
+  near-exact kind; doesn't compose.
+
+So "it should be a huge benefit to have PKM/WM/latent thinking" is true only on
+the bottlenecks those mechanisms match (recall, exact retrieval, iterated depth),
+which the composition-bound coding benchmarks don't primarily stress. The levers
+for REAL coding gains, in honest order:
+1. **Base capability** (more params / more+cleaner training) — the only thing
+   that buys composition. Expensive but it's the real bottleneck.
+2. **Datastore that COVERS the task distribution** — a 287M model + a LARGE code
+   datastore can match a bigger model on problems whose solutions resemble seen
+   ones (the oracle 23/40 shows consumption works at coverage). Viable real-world
+   strategy where most tasks are variations of solved ones; won't solve genuinely
+   novel problems. (This is where to take the non-parametric memory next, if
+   pursued: scale the datastore, measure coverage vs pass.)
+3. **Reserve latent thinking / WM for their matched bottlenecks** (multi-step
+   computation, long-context recall) — real but narrow on general coding.
+
+Probe: `probe_knn_oracle.py` (modes: oracle | realistic).

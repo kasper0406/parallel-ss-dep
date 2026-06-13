@@ -144,11 +144,23 @@ def main():
                          "Implies the recall dataset + freeze.")
     ap.add_argument("--recall_jsonl", default="data/longctx_recall_train.jsonl",
                     help="recall dataset for --wm_on (program + bound `answer`)")
+    ap.add_argument("--unfreeze_trunk", action="store_true",
+                    help="FIX-TEST (--wm_on only): also train the TRUNK (not just "
+                         "WM+mem_alpha), so the hiddens can become content-"
+                         "addressable. The no-think LM loss is added back (no "
+                         "longer byte-identical). Trunk gets lr*--trunk_lr_mult; "
+                         "WM/mem_alpha get full lr. Tests whether co-adapting the "
+                         "trunk sharpens the read onto the binding (the root-cause "
+                         "fix), at the cost of base-ability drift.")
+    ap.add_argument("--trunk_lr_mult", type=float, default=0.2,
+                    help="trunk lr multiplier under --unfreeze_trunk (WM stays 1x)")
     ap.add_argument("--save_every", type=int, default=200)
     ap.add_argument("--log_every", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
+    if args.unfreeze_trunk and not args.wm_on:
+        raise SystemExit("--unfreeze_trunk is only meaningful with --wm_on")
     if args.smoke:
         args.steps = 5
     if args.wm_on and args.max_len == 256:
@@ -191,7 +203,17 @@ def main():
     # ability is preserved EXACTLY, while the WM addressing (W_q/W_k/W_proj +
     # logit_scale/gate_bias_beta) and mem_alpha learn to retrieve the bound value
     # through the cooperation channel.
-    if args.wm_on:
+    if args.wm_on and args.unfreeze_trunk:
+        # FIX-TEST: train EVERYTHING (trunk + WM + mem_alpha). The no-think path
+        # is no longer byte-identical → frozen_base=False adds the LM loss back.
+        ntrain = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        has_dkv = any(n.startswith("memory.W_k") for n, _ in model.named_parameters())
+        model.activation_checkpointing = True
+        print(f"[wm_on+unfreeze] FIX-TEST: training trunk+WM+mem_alpha: "
+              f"{ntrain:,} params (DKV={'on' if has_dkv else 'OFF!'}, "
+              f"mem_alpha={float(model.mem_alpha.detach()):.3f}, "
+              f"trunk_lr_mult={args.trunk_lr_mult}, act_ckpt=on)", flush=True)
+    elif args.wm_on:
         ntrain = 0
         for n, p in model.named_parameters():
             keep = n.startswith("memory.") or n == "mem_alpha"
@@ -220,10 +242,11 @@ def main():
     # (the cw=1.0 narrow-data run forgot ~18% of MBPP). KL pins no-think behaviour
     # while the cotrain loss is free to fix the latent-think path. Pointless (and
     # structurally zero) under --freeze_trunk, hence rejected there.
-    # The no-think path is frozen byte-identical under BOTH --freeze_trunk (only
-    # the think-only adapter trains) and --wm_on (only WM, which is inert on
-    # think-free data, + mem_alpha train). Either way the LM/KL terms are no-ops.
-    frozen_base = args.freeze_trunk or args.wm_on
+    # The no-think path is frozen byte-identical under --freeze_trunk (only the
+    # think-only adapter trains) and plain --wm_on (only WM, inert on think-free
+    # data, + mem_alpha). Either way the LM/KL terms are no-ops. NOT frozen under
+    # --unfreeze_trunk (the whole point) → the LM loss is added back.
+    frozen_base = args.freeze_trunk or (args.wm_on and not args.unfreeze_trunk)
     ref = None
     if args.kl_anchor > 0:
         if frozen_base:
@@ -249,13 +272,26 @@ def main():
 
     # mem_alpha (and any FiLM-α-style scalar) gets NO weight decay — the FiLM-α
     # curriculum mandate (WD fights the gradient that grows it only if useful).
-    no_wd = [p for n, p in model.named_parameters()
-             if p.requires_grad and is_film_alpha(n)]
-    decay = [p for n, p in model.named_parameters()
-             if p.requires_grad and not is_film_alpha(n)]
-    opt = torch.optim.AdamW(
-        [{"params": decay, "weight_decay": 0.01},
-         {"params": no_wd, "weight_decay": 0.0}], lr=args.lr)
+    # Under --unfreeze_trunk the TRUNK (non-WM, non-α) gets lr*trunk_lr_mult so
+    # the big trunk adapts gently while the small WM addressing learns at full lr.
+    def _is_wm(n):
+        return n.startswith("memory.") or n == "mem_alpha"
+    no_wd, wm_decay, trunk_decay = [], [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if is_film_alpha(n):
+            no_wd.append(p)
+        elif _is_wm(n) or not args.unfreeze_trunk:
+            wm_decay.append(p)            # WM (and, when frozen, the only group)
+        else:
+            trunk_decay.append(p)         # trunk, only populated under unfreeze
+    groups = [{"params": wm_decay, "weight_decay": 0.01, "lr": args.lr},
+              {"params": no_wd, "weight_decay": 0.0, "lr": args.lr}]
+    if trunk_decay:
+        groups.append({"params": trunk_decay, "weight_decay": 0.01,
+                       "lr": args.lr * args.trunk_lr_mult})
+    opt = torch.optim.AdamW(groups, lr=args.lr)
     gen = torch.Generator(device=device).manual_seed(args.seed)
     rng = random.Random(args.seed)
     for step in range(1, args.steps + 1):

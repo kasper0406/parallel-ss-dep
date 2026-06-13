@@ -49,8 +49,43 @@ def clean_latent_thread(model, *, film_bypass: bool | None = None,
             model.activation_checkpointing = saved_ckpt
 
 
+def latent_think_step_input(model, z_premem, wm_inj=None):
+    """THE single think-step input builder, shared by the co-train grad twin,
+    the no-grad measurement primitive, and the inference generator — so the
+    train/eval latent formula can never silently diverge (the recurring killer).
+
+    next-input = adapter(z_premem) [+ mem_alpha · wm_inj]
+
+    `z_premem` is the CLEAN pre-memory hidden the adapter was trained on. The WM
+    term is added AFTER the adapter and α-gated from ~0 (mem_alpha), so it shapes
+    the next think input without contaminating the adapter's input manifold (the
+    2026-06-05 corruption fix). When the model has no `mem_alpha` (cooperation
+    off) or `wm_inj is None`, this is exactly the legacy `adapter(z)` path —
+    byte-identical to pre-cooperation behaviour.
+    """
+    zi = model.apply_latent_feedback_adapter(z_premem)
+    ma = getattr(model, "mem_alpha", None)
+    if ma is not None and wm_inj is not None:
+        zi = zi + ma.to(zi.dtype) * wm_inj.to(zi.dtype)
+    return zi
+
+
+def latent_wm_injection(model, *, grad: bool):
+    """The WM retrieval to feed into the next think step, or None when WM/
+    cooperation is off. Reads the pre-read-mask injection stash from the most
+    recent forward (grad-carrying for training, detached for inference)."""
+    if getattr(model, "mem_alpha", None) is None or not getattr(model, "use_memory", False):
+        return None
+    mem = getattr(model, "memory", None)
+    if mem is None:
+        return None
+    inj = getattr(mem, "_last_injection_grad" if grad else "_last_injection", None)
+    return inj[:, -1:, :] if inj is not None else None
+
+
 def load_latent_model(ckpt_path: str, device: str = "cuda", *,
-                      train: bool = False, fresh_adapter: bool = True):
+                      train: bool = False, fresh_adapter: bool = True,
+                      wm_on: bool = False):
     """Canonical model-bootstrap for latent-thinking scripts.
 
     One place for the boilerplate that had drifted across ~8 scripts (missing
@@ -58,17 +93,27 @@ def load_latent_model(ckpt_path: str, device: str = "cuda", *,
     to device, disable WM + gist for the latent thread, resolve the
     thinking-token id and tokenizer from cfg.
 
+    `wm_on=True` keeps WorkingMemory enabled (for the WM×latent COOPERATION path,
+    where the latent step feeds back `adapter(h_premem)+mem_alpha·WM_inj`); also
+    sets the pre-memory thread so the WM injection can't contaminate the adapter
+    input. Default False = the clean WM-off latent thread (parity with the
+    standard latent generator).
+
     Returns ``(model, cfg, thinking_id, tok, eos_id)``.
     """
     from experiments.eval_bracket_structure import build_model_from_ckpt
     from transformers import AutoTokenizer
     model, cfg = build_model_from_ckpt(
         ckpt_path, force_state_readonly=True,
-        force_use_latent_feedback_adapter=True if fresh_adapter else None)
+        force_use_latent_feedback_adapter=True if fresh_adapter else None,
+        force_cooperative_latent_wm=True if wm_on else None)
     model = model.to(device)
     model.train() if train else model.eval()
     model._gist_loss_enabled = False
-    if getattr(model, "use_memory", False):
+    if wm_on:
+        model._latent_feedback_premem = True   # carry clean pre-mem hidden
+        # leave use_memory as-is (on) so WM injects at think slots
+    elif getattr(model, "use_memory", False):
         model.use_memory = False        # latent thread runs WM-off (parity)
     thinking_id = int(cfg.get("thinking_token_id", cfg["vocab_size"] - 1))
     tok = AutoTokenizer.from_pretrained(
@@ -640,9 +685,14 @@ def _latent_think_logits_grad(model, prefixes: torch.Tensor, *, R: int,
     z = h0[:, -1:, :]
     last_logits = None
     for _ in range(max(1, int(R))):
-        # Learned input adapter (identity when absent/untrained); gradient
-        # flows through it AND the R latent steps into the trunk + adapter.
-        zi = model.apply_latent_feedback_adapter(z)
+        # Shared think-step builder: adapter(z) [+ mem_alpha·WM_inj] — gradient
+        # flows through the adapter, the R latent steps into the trunk, AND (in
+        # WM×latent cooperation) the WM read path + mem_alpha. wm_inj is None
+        # unless cooperation is on (use_memory + mem_alpha) → byte-identical to
+        # the legacy adapter-only path otherwise. Uses the SAME helper as the
+        # inference generator so train/eval can't diverge.
+        wm_inj = latent_wm_injection(model, grad=True)
+        zi = latent_think_step_input(model, z, wm_inj)
         ie = torch.cat([base_emb, zi.to(base_emb.dtype)], dim=1)
         logits, h = _logits_hidden(model(ids, inputs_embeds=ie,
                                          return_hidden=True))

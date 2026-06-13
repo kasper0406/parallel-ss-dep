@@ -49,7 +49,9 @@ def build_model_from_ckpt(ckpt_path: str,
                           force_state_readonly: bool | None = None,
                           force_use_latent_feedback_adapter: bool | None = None,
                           force_use_line_selector: bool | None = None,
-                          force_think_index_emb_size: int | None = None):
+                          force_think_index_emb_size: int | None = None,
+                          force_cooperative_latent_wm: bool | None = None,
+                          force_mem_decoupled_kv: bool | None = None):
     """Construct a TinyLM from a saved ckpt.
 
     `force_use_think_adapter` (optional) overrides the auto-detect:
@@ -90,6 +92,16 @@ def build_model_from_ckpt(ckpt_path: str,
     # those params and the trained addressing actually loads — else strict load
     # drops them and the model silently reverts to legacy address-by-value.
     has_dkv = any(k.startswith("memory.W_k") for k in sd_keys)
+    # WM×latent cooperation: `mem_alpha` is a top-level param when present. Detect
+    # it so the reconstructed model creates the param and the trained value loads
+    # (else strict=False drops it → coupling silently disabled at eval).
+    has_mem_alpha = "mem_alpha" in sd_keys
+    coop_latent_wm = (has_mem_alpha if force_cooperative_latent_wm is None
+                      else bool(force_cooperative_latent_wm))
+    # Allow forcing fresh DKV onto a legacy ckpt (Stage A attaches W_k/temp/bias);
+    # auto-detect only fires when the key already exists.
+    if force_mem_decoupled_kv is not None:
+        has_dkv = has_dkv or bool(force_mem_decoupled_kv)
     has_pkm = any(k.startswith("pkm_layer.") for k in sd_keys)
     mem_kwargs = {}
     if has_memory:
@@ -103,6 +115,7 @@ def build_model_from_ckpt(ckpt_path: str,
             thinking_token_id=int(cfg.get("thinking_token_id",
                                           cfg["vocab_size"] - 1)),
             mem_decoupled_kv=bool(has_dkv),
+            cooperative_latent_wm=bool(coop_latent_wm),
         )
     pkm_kwargs = {}
     if has_pkm:
@@ -287,6 +300,11 @@ def build_model_from_ckpt(ckpt_path: str,
                 new_sd[k] = v
         sd = new_sd
     model.load_state_dict(sd, strict=False)
+    # WM×latent cooperation: the latent thread must carry the PRE-memory hidden
+    # so the WM injection shapes emit logits without contaminating the adapter's
+    # input. Persisted as a cfg flag; default off → unchanged for all prior ckpts.
+    if bool(cfg.get("latent_feedback_premem", False)):
+        model._latent_feedback_premem = True
     model = model.to("cuda").eval()
     return model, cfg
 

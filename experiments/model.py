@@ -1514,6 +1514,13 @@ class TinyLM(nn.Module):
         mem_decoupled_kv: bool = False,       # DKV-WM: decoupled key/value +
                                               # cosine addressing (reliable
                                               # semantic addressing).
+        cooperative_latent_wm: bool = False,  # WM×latent cooperation: register a
+                                              # learned `mem_alpha` so a latent
+                                              # think step can add an α-gated WM
+                                              # retrieval (adapter(h_premem)+α·inj).
+                                              # Must be a real ctor param (not a
+                                              # runtime attr) so it round-trips
+                                              # through save/load.
         thinking_token_id: int | None = None,  # Required when use_memory=True.
         pad_token_id: int | None = None,      # Optional; used to keep padding
                                               # rows out of the memory.
@@ -1903,6 +1910,19 @@ class TinyLM(nn.Module):
             # the model.forward path itself is unchanged (the caller
             # builds inputs_embeds). Keep WD off this parameter.
             self.retrieval_input_alpha = nn.Parameter(torch.tensor(0.1))
+
+            # WM×latent cooperation scalar (M0). Registered as a real parameter
+            # (init 0.1, no-WD) ONLY when cooperative_latent_wm=True, so it
+            # round-trips through state_dict/build_model_from_ckpt — fixing the
+            # audit bug where trainers set `model.mem_alpha` as a runtime attr
+            # that load_state_dict(strict=False) silently dropped, disabling the
+            # coupling at eval. At a latent think step the next input embedding is
+            #   adapter(h_premem) + mem_alpha · WM_injection
+            # so a useless retrieval contributes ≈0 and the clean adapter
+            # baseline always survives (FiLM-α curriculum). Default OFF →
+            # byte-identical to pre-cooperation ckpts.
+            if cooperative_latent_wm:
+                self.mem_alpha = nn.Parameter(torch.tensor(0.1))
 
         # Persistent learned-RAG (Product-Key Memory). Drop-in residual
         # at one mid-depth block. See PKM_PLAN.md.

@@ -161,6 +161,34 @@ channel that hurts). Two valid directions remain:
    specialized for PKM retrieval), or gate thinking toward PKM-hit positions.
    Smaller headroom but cheap and targets the proven channel.
 
+## UPDATE 2026-06-13 (2) — DKV-WM-for-code RULED OUT by cheap validation
+
+Per the "validate fast/efficient before GPU-hours" mandate, two no-train probes
+settled DKV-WM-for-code:
+
+1. **No-train cosine addressing** (`probe_retrieval_channels.py` T+P+WMc, using
+   existing W_q/W_v): +0.025 mag / −0.001 frac — does NOT fix WM on code.
+2. **Oracle retrieval vs random control** (`probe_oracle_retrieval.py`, 181
+   positions): oracle (best-of-16 buffer slots, peeking) frac 0.249, but
+   **matched-norm RANDOM injection scored 0.298** — higher. Oracle − random =
+   −0.05 frac ≈ 0. The apparent "oracle lift" was entirely max-of-K selection
+   noise. **The WM buffer carries no addressable code-thinking signal**; no
+   addressing scheme (trained DKV included) can manufacture it.
+
+**Decision: do NOT build DKV-WM for code.** WM is effective for RECALL (MQAR
++11pp, long-context 98.2%) — short MBPP/HumanEval code generation simply doesn't
+exercise long-range recall, so WM has nothing to fetch. PKM (+0.052 frac, the
+one real retrieval channel) is modest and already exploited by the base.
+
+**Pivot: execution-grounded objective** (option 4's second half) — the
+higher-ceiling code lever that sidesteps per-token retrieval entirely:
+supervise/gate thinking only at decision points that flip pass@1, not per-token
+Δlogp. Validate cheaply first: does oracle-placed thinking (try a burst at each
+position, keep what flips a no-think FAILURE to a pass) flip materially more
+problems than the gate's current ~2? If yes, execution-grounded targeting has
+headroom; if no, latent thinking's code ceiling is genuinely ~neutral and the
+honest move is to stop polishing it.
+
 ## Open risks for the validation agents to scrutinize
 
 1. Does turning WM on in the latent thread re-trigger contamination despite

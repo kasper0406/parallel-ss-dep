@@ -1139,6 +1139,18 @@ class WorkingMemory(nn.Module):
             tau = self.logit_scale.exp().clamp(2.0, 100.0)
             scores = torch.einsum("btd,bkd->btk", qn, kn) * tau
             scores = scores + self.gate_bias_beta * torch.log(buf_g.clamp_min(1e-6)).unsqueeze(1)
+        elif getattr(self, "cosine_address", False):
+            # No-train DKV-spirit probe: cosine(query, VALUE) with a fixed
+            # temperature, using the EXISTING W_q/W_v (no W_k, no training).
+            # Tests whether L2-normalization alone fixes the legacy
+            # dot-product's magnitude-degeneracy / diffuse-softmax failure
+            # before committing to a full DKV continuation. Default OFF
+            # (getattr) so production paths are byte-identical.
+            qn = F.normalize(q, dim=-1)
+            vn = F.normalize(buf_v, dim=-1)
+            tau = float(getattr(self, "cosine_address_tau", 20.0))
+            scores = torch.einsum("btd,bkd->btk", qn, vn) * tau
+            scores = scores + torch.log(buf_g.clamp_min(1e-6)).unsqueeze(1)
         else:
             scale = 1.0 / math.sqrt(self.d_mem)
             scores = torch.einsum("btd,bkd->btk", q, buf_v) * scale

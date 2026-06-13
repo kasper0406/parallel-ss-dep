@@ -149,9 +149,14 @@ def load_distilled_jsonl(path: str, *,
                 n_dropped_failed += 1
                 continue
             problem = r["problem_prompt"]
-            solution = (r["qwen_completion"] if prefer_full_completion
-                        else r["extracted_code"])
+            # robust to rows missing one field (e.g. harvested rollouts carry
+            # only extracted_code): prefer the requested field, fall back.
+            if prefer_full_completion:
+                solution = r.get("qwen_completion") or r.get("extracted_code") or ""
+            else:
+                solution = r.get("extracted_code") or r.get("qwen_completion") or ""
             if not solution:
+                n_dropped_no_code += 1
                 continue
             pairs.append((problem, solution))
     print(f"  loaded {len(pairs)} pairs from {path} "
@@ -202,8 +207,10 @@ def load_distilled_jsonl_with_cot(
                 solution = r.get("extracted_code") or ""
                 cot_text = r["cot_text"]
             else:
-                solution = (r["qwen_completion"] if prefer_full_completion
-                            else r.get("extracted_code") or "")
+                if prefer_full_completion:
+                    solution = r.get("qwen_completion") or r.get("extracted_code") or ""
+                else:
+                    solution = r.get("extracted_code") or r.get("qwen_completion") or ""
                 cot_text = None
             if not solution:
                 continue

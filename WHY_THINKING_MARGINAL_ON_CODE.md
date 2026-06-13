@@ -233,7 +233,13 @@ with replay+KL) found the strong-form synthesis OVER-CLAIMS. Corrections:
    (forgetting HALVED, −22→−14) while TRAIN still 0→18. So anti-forgetting works
    partially already; LoRA / EWC / lower-lr / higher-replay are untried and
    likely improve it further. The forgetting wall is softer than ADDENDUM 2
-   stated.
+   stated. SWEEP (added after): replay3.0+KL1.0+lr5e-6 → 30→19 but TRAIN only
+   0→5 (plasticity tax) — so full-param continue-train has a stability-plasticity
+   TRADE-OFF; no recipe cleanly adds facts AND keeps all old. **The clean fix is
+   NOT a better continue-train recipe — it's a FULL RETRAIN on the combined
+   (cleaned-old + new-verified) corpus** (old data present → nothing forgotten),
+   i.e. E1 rejection-sampling self-distillation as a full SFT pass. Continue-
+   training was the wrong frame for knowledge addition.
 3. **"Fundamentally composition-bound at 287M" conflates scale-vs-data and
    over-reaches.** ADDENDUM 2's own "clean exposure flips 0→18" shows these
    failures are LEARNABLE (under-exposed / mis-learned from the ~6%-broken,

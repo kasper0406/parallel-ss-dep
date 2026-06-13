@@ -288,3 +288,19 @@ def test_loader_registry_has_new_keys():
     for k in ("mbpp", "mbpp_all", "mbpp_plus", "mbpp_combined",
               "leetcode", "super_combined"):
         assert k in LOADERS, f"LOADERS missing key {k!r}"
+
+
+def test_infinite_loop_does_not_hang():
+    """Regression: model-generated code with an infinite loop must be reaped
+    within ~timeout_s, never hang the grader. This bug hung an eval for 6.8h —
+    the unbounded p.join() after terminate() blocked on a child that ignored
+    SIGTERM (a fork-from-CUDA zombie). grade() now uses a bounded q.get +
+    SIGKILL fallback."""
+    import time
+    p = Problem(task_id="t", prompt="", tests="assert f(1) == 1",
+                entry_point="f", prompt_is_code=False)
+    t0 = time.perf_counter()
+    r = grade(p, "def f(x):\n    while True:\n        pass\n", timeout_s=3)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 12.0, f"grader hung {elapsed:.1f}s on an infinite loop"
+    assert not r.passed and r.tier in ("timeout", "grader_error")

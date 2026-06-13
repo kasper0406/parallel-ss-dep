@@ -300,29 +300,43 @@ def grade(problem: Problem, completion: str, timeout_s: int = 7) -> GradingResul
         # top-level defs/classes). Don't truncate — exec the whole thing.
         full_code = completion
 
+    import queue as _queue
+
     q = mp.Queue()
     p = mp.Process(target=_exec_target, args=(full_code, problem.tests,
                                               problem.entry_point, q))
     t0 = time.perf_counter()
     p.start()
-    p.join(timeout=timeout_s)
-    if p.is_alive():
-        # Outer wall-clock guard (the inner _time_limit alarm should fire
-        # first, but a hung subprocess that ignores SIGALRM lands here).
-        p.terminate()
-        p.join()
+    # Read the result with a BOUNDED wait, then guarantee the child is reaped
+    # without ever blocking on an unbounded join. A subprocess that ignores
+    # SIGALRM *and* SIGTERM (e.g. a child forked from a CUDA-initialised parent,
+    # or one stuck in a C extension) previously hung the unbounded p.join()
+    # here for hours — the wall-clock guard alone is not enough. q.get(timeout)
+    # caps the wait; SIGKILL (p.kill) cannot be ignored, so cleanup is bounded.
+    result = None
+    try:
+        result = q.get(timeout=timeout_s)
+    except _queue.Empty:
+        result = None
+    finally:
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=2)
+        if p.is_alive():
+            try:
+                p.kill()            # SIGKILL — cannot be caught/ignored
+            except Exception:
+                pass
+            p.join(timeout=2)
+        q.cancel_join_thread()      # don't block on the queue feeder thread
+    if result is None:
         return GradingResult(passed=False, tier="timeout", score=0.05,
                              error="timeout",
                              error_text="execution exceeded the wall-clock "
-                                        "limit (possible infinite loop)",
+                                        "limit (possible infinite loop) or "
+                                        "produced no result",
                              elapsed_s=time.perf_counter() - t0)
-    try:
-        tier, err, n_tests, n_passed, error_text = q.get_nowait()
-    except Exception:
-        return GradingResult(passed=False, tier="grader_error", score=0.0,
-                             error="no-result",
-                             error_text="grader subprocess produced no result",
-                             elapsed_s=time.perf_counter() - t0)
+    tier, err, n_tests, n_passed, error_text = result
     return GradingResult(
         passed=(tier == "pass"), tier=tier,
         score=_compute_score(tier, n_tests, n_passed),

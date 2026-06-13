@@ -85,6 +85,31 @@ import contextlib
 
 
 @contextlib.contextmanager
+def _coop_off_ablation(model):
+    """Temporarily zero `mem_alpha` — the WM×latent COOPERATION channel.
+
+    Stage A kill-gate ablation. In the cooperation latent step the next think
+    input is `adapter(h) + mem_alpha·WM_inj`; setting mem_alpha→0 collapses it to
+    the adapter-only path (WM retrieval contributes nothing) WITHOUT touching the
+    adapter, the trunk, or the gate. So WM-on (trained mem_alpha) minus WM-off
+    (this ablation) isolates exactly 'did the trained WM addressing help recall
+    through the cooperation channel'. NOTE: `_wm_mean_ablation` (read_alpha→0)
+    does NOT ablate this channel — the cooperation read uses `_last_injection`,
+    which is stashed BEFORE read_alpha scaling. This is the correct ablation for
+    a cooperation ckpt."""
+    ma = getattr(model, "mem_alpha", None)
+    if ma is None:
+        yield
+        return
+    orig = ma.data.clone()
+    try:
+        ma.data.zero_()
+        yield
+    finally:
+        ma.data.copy_(orig)
+
+
+@contextlib.contextmanager
 def _wm_mean_ablation(model):
     """Temporarily force WorkingMemory's read injection off (read_alpha→0).
 
@@ -138,7 +163,9 @@ def eval_longctx_recall(
         probe.
       generator: 'retrieval_as_input' (v5+/v10 WM ckpts), 'standard', or
         'latent_think'.
-      wm_ablate: 'none' or 'mean' (zero read_alpha — see ``_wm_mean_ablation``).
+      wm_ablate: 'none', 'mean' (zero read_alpha — see ``_wm_mean_ablation``),
+        or 'coop_off' (zero mem_alpha — the WM×latent cooperation channel, the
+        Stage A kill-gate WM-off arm).
       additive: retrieval-as-input additive mode; None → read ckpt cfg via
         ``model.retrieval_input_additive`` if present else False.
 
@@ -175,6 +202,7 @@ def eval_longctx_recall(
     n_correct = n_total = 0
     agg_think = agg_emit = 0
     abl_cm = (_wm_mean_ablation(model) if wm_ablate == "mean"
+              else _coop_off_ablation(model) if wm_ablate == "coop_off"
               else contextlib.nullcontext())
     try:
         model.eval()
@@ -228,7 +256,7 @@ def eval_longctx_recall(
         "n_total": float(n_total),
         "think_rate": float(think_rate),
         "think_frac": float(think_rate),
-        "wm_ablated": 1.0 if wm_ablate == "mean" else 0.0,
+        "wm_ablated": 1.0 if wm_ablate in ("mean", "coop_off", "zero") else 0.0,
     }
 
 
@@ -245,12 +273,15 @@ def main() -> int:
                    help="latent_think: force N think steps before the answer "
                         "(matches latent_sft think-before-answer training).")
     p.add_argument("--wm_ablate", type=str, default="none",
-                   choices=["none", "zero", "mean"],
+                   choices=["none", "zero", "mean", "coop_off"],
                    help="'zero' zeroes memory.W_proj.weight (CONFOUNDED for "
                         "retrieval-as-input ckpts — see module doc). 'mean' "
                         "zeroes read_alpha so think tokens still drive a "
                         "forward but the retrieved content contributes nothing "
-                        "(the unconfounded WM-content ablation).")
+                        "(the unconfounded WM-content ablation). 'coop_off' "
+                        "zeroes mem_alpha — the WM×latent cooperation channel "
+                        "(Stage A kill-gate WM-off arm; the read_alpha 'mean' "
+                        "ablation does NOT disable cooperation).")
     p.add_argument("--max_gen", type=int, default=120)
     p.add_argument("--total_think_budget", type=int, default=200)
     p.add_argument("--emit_threshold", type=float, default=0.5)
@@ -328,7 +359,10 @@ def main() -> int:
 
     # 'mean' ablation: zero read_alpha for the whole loop (the unconfounded
     # WM-content ablation; 'zero' is handled above by a rewritten ckpt).
+    # 'coop_off': zero mem_alpha (the WM×latent cooperation channel; Stage A
+    # kill-gate WM-off arm — the only ablation that disables cooperation).
     _abl = (_wm_mean_ablation(model) if args.wm_ablate == "mean"
+            else _coop_off_ablation(model) if args.wm_ablate == "coop_off"
             else __import__("contextlib").nullcontext())
     with _abl:
      for rec in records:

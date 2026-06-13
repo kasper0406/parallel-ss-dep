@@ -126,6 +126,41 @@ from `WM_ADDRESSING_PROPOSAL_*`; defer until v1 proves retrieval helps at all.
 - WM must be ON (not `clean_latent_thread` / `wm_off`) for RALT — opt out of the
   blunt WM-off toggle, rely on the α-gate + premem safeguards instead.
 
+## UPDATE 2026-06-13 — channel decomposition result (REDIRECTS the plan)
+
+`probe_retrieval_channels.py` on `latent_code_adapteronly.pt` (100 problems,
+959 positions, no training), latent-think Δlogp ceiling by channel vs the
+deployed no-think baseline:
+
+| config | frac help | mean Δlogp\|helps | mean(all) | median |
+|---|---|---|---|---|
+| T (trunk only)        | 7.6%  | +0.327 | −1.226 | −0.348 |
+| T+P (trunk+PKM)       | 12.8% | +0.293 | −0.848 | −0.121 |
+| T+P+WM (native legacy)| 12.5% | +0.324 | −1.126 | −0.222 |
+
+- **PKM is the working thinking-retrieval channel**: +0.052 frac-helpful
+  (+68% rel), median −0.35 → −0.12 (near-harmless). It is already trained,
+  load-bearing, fires at the think slot, and the co-trained base already
+  exploits it (so the current +1/+3 win includes it).
+- **Legacy WM HURTS thinking**: −0.003 frac, mean(all) −0.85 → −1.13. The
+  address-by-value variant's diffuse-softmax addressing (flagged in
+  model.py:1032-1042) is net-negative as a latent-step retrieval channel.
+
+**Consequence: RALT-via-legacy-WM is the wrong build** (it would train the
+channel that hurts). Two valid directions remain:
+
+1. **DKV-WM for thinking (the principled "make WM effective" path).** Legacy
+   addressing is broken by design; DKV cosine addressing (decoupled W_k +
+   learned temperature) is the fix, but NO ckpt has trained it. Build =
+   continuation-train DKV addressing (+ the contrastive address pretext from
+   WM_ADDRESSING_PROPOSAL_*) on `sft_baked_pure.pt` / `pretrain_phase_c.pt`,
+   fix the `forward_step` decode-parity gap (model.py:2980), then re-run this
+   decomposition with DKV-WM — does it clear the wall legacy couldn't?
+2. **PKM-exploitation for thinking (cheaper).** PKM already works passively;
+   the lever is to train the latent step to query/iterate PKM better (adapter
+   specialized for PKM retrieval), or gate thinking toward PKM-hit positions.
+   Smaller headroom but cheap and targets the proven channel.
+
 ## Open risks for the validation agents to scrutinize
 
 1. Does turning WM on in the latent thread re-trigger contamination despite

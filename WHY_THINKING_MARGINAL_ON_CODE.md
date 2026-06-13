@@ -403,3 +403,40 @@ CONSTRUCTIVE CHECK (in flight): a small DeltaNet+WM trained FROM SCRATCH on MQAR
 content-addressable (val_hit/either_hit high)? If yes, it proves the mechanism is
 sound and the only missing ingredient is the objective. (The project already has
 the recall-side result: +11.1pp WM recall on saturated MQAR.)
+
+### CAPSTONE (2026-06-13): the model routes AROUND WM unless WM is the ONLY way
+
+The unfreeze fix-test (train trunk+WM+mem_alpha together on multibind) was meant
+to prove "co-adapt the trunk → WM becomes addressable." It did the OPPOSITE, and
+the failure is the deepest finding of the whole investigation:
+
+- Train loss → 0.000 (the trunk MEMORIZED the training set).
+- Heldout recall 5% (WORSE than frozen Stage A's 10.7% — overfit), read still
+  diffuse (2.5% on-binding), Δ(WM-on − full_off) = +0.0pp, mem_alpha pushed DOWN
+  0.10→0.088.
+
+**Why:** the whole multibind program (≤626 tokens, ≤12 bindings) fits in the
+local context window, so the TRUNK can solve recall directly (memorize / attend
+within the recurrent state). Given any path that works, gradient descent took the
+trunk path and left WM idle. **The model routes around an auxiliary mechanism
+whenever the primary path (trunk/recurrence) can do the task — even under
+co-training.**
+
+**This unifies the entire project history.** Every post-hoc feature was inert
+because the trunk could already fit the data. The ONE place WM was load-bearing
+(MQAR K=128, +11.1pp) is the ONE place the trunk provably COULD NOT: (a) keys are
+random every batch → NOT memorizable, and (b) K=128 > the recurrent state's
+capacity → the recurrence CANNOT hold them. Both conditions are necessary.
+
+**Sharpened fix (supersedes "bake content-recall into pretrain"):** for WM to
+become load-bearing, training must contain a sub-task that is BOTH
+(1) capacity-exceeding (more simultaneous bindings than the linear-RNN state
+holds) AND (2) non-memorizable (fresh random content per instance), so WM is the
+ONLY path to low loss. Plain "mix recall in" is insufficient if the trunk can
+memorize or fit it. And on the DEPLOYMENT side: WM helps real code only where the
+task has a sub-problem the recurrent state genuinely can't hold AND that varies
+per instance — rare in general code at 287M, which is why WM's benefit there is
+correctly marginal, not a bug.
+
+Probes/ckpts: `latent_code_cotrain.py --wm_on [--unfreeze_trunk]`,
+`probe_wm_recall_addressing.py`, `eval_stage_a_killgate.py` (full_off arm).

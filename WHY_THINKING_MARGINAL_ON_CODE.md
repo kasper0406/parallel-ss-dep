@@ -84,3 +84,51 @@ not (MBPP general code).
 Probes (reusable): `probe_gate_placement`, `probe_retrieval_channels`,
 `probe_oracle_retrieval`, `probe_failure_bottleneck`, `probe_knowledge_vs_search`,
 `probe_thinking_passk`.
+
+## ADDENDUM — "why didn't it learn it in training?" (capacity vs exposure)
+
+The model SAW the failing facts (degrees_to_radians 22× with the correct
+`math.pi/180` in-target; longest_chain is training row 1) and still fails. Two
+controlled experiments (`probe_pkm_capacity.py`, param-matched dense vs PKM
+fact-memorization) decompose why:
+
+**Part 1 — raw capacity is NOT the bottleneck.** A 76k-param model memorizes
+~10k random facts at 100%; the cliff is 10k–20k facts. Scaled to 287M that's
+~tens of millions of facts — MBPP needs a few thousand. So the model has orders
+of magnitude more storage than required. At matched params PKM ≈ dense for
+storage (no magic capacity advantage).
+
+**Part 2 — EXPOSURE/data-efficiency IS the bottleneck.** Holding facts well under
+capacity (N=4000) and varying exposures-per-fact:
+
+| exposures/fact | DENSE acc | PKM acc |
+|---|---|---|
+| 2  | 0.05 | 0.07 |
+| 10 | 0.05 | 0.07 |
+| 22 | 0.07 | **0.12** |
+| 50 | 0.13 | **0.29** |
+| 150| 0.95 | 0.93 |
+
+A precise fact needs **~100+ gradient exposures** to lock in. At the 22 the model
+actually got, retention is ~7–12%. Rare coding algorithms appear far fewer times
+than that in the training mix → the long tail is structurally under-exposed.
+**This is the root cause: not capacity, not thinking — under-exposure of
+long-tail facts** (compounded by the ~6% broken / 70% unverified SFT targets).
+
+**PKM's real role:** at low exposure PKM is 1.7–2.2× more sample-efficient than
+dense (22 exp: 0.12 vs 0.07; 50 exp: 0.29 vs 0.13) — it acquires rare facts
+faster. So "it should be a huge benefit to have PKM" is partly right: PKM helps
+the long tail acquire, but the benefit is bounded because EVERYTHING still needs
+many exposures and PKM doesn't change that.
+
+**The real, cheap levers (boost real coding, use the insight):**
+1. **Targeted repetition / tail up-sampling** — over-sample the rare/failing
+   problem families so their facts cross the ~100-exposure threshold. Cheap,
+   directly attacks the root cause.
+2. **Data cleaning** — drop the ~6% verified-broken targets, verify the ~70%
+   no-test ones (the model learned degrees_to_radians from malformed examples).
+3. **Route tail facts through PKM** (2× sample-efficient) + give them exposure.
+Dense scale also works but is the expensive path; the under-exposure levers are
+much cheaper and are the honest first move.
+
+Probe: `probe_pkm_capacity.py`.

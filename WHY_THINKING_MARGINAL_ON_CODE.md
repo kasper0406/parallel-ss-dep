@@ -284,3 +284,55 @@ for REAL coding gains, in honest order:
    computation, long-context recall) — real but narrow on general coding.
 
 Probe: `probe_knn_oracle.py` (modes: oracle | realistic).
+
+---
+
+## ADDENDUM (2026-06-13): WM on its IDEAL niche — addressing is the wall
+
+The WM×latent "cooperation" build (M0 plumbing + Stage A: attach fresh DKV +
+mem_alpha, freeze trunk, train ONLY WM addressing + mem_alpha) was tested on the
+regime WM is SUPPOSED to own: long-context recall. Findings:
+
+1. **Single-binding recall has ZERO headroom.** Base `sft_baked_pure` = 100%
+   no-think recall at every in-context distance (64→512); think_rate 0. A delta-
+   rule state trivially holds ONE never-overwritten binding. WM literally can't
+   improve 100%. (The "thinking corrupts recall" v1 finding was a different,
+   over-thinking ckpt.)
+
+2. **Multi-binding recall (the realistic MQAR analog) HAS headroom.** "Assign N
+   vars, print the queried one" — base no-think recall N=8 → 15%, N=24 → 5% vs
+   100% single-binding. The delta-rule state saturates holding many simultaneous
+   bindings. This is where WM should win. (`gen_multibind_recall.py`.)
+
+3. **Trained WM addressing barely helps, and the cooperation channel is inert.**
+   Stage A (600 steps, fresh DKV + mem_alpha, trunk frozen) on N∈{8,12}:
+   recall 8% → 10.7% (**+2.7pp**, vs the +15pp kill-gate → FAIL). coop-off
+   (mem_alpha→0) == WM-on (Δ +0.0pp): ALL of the lift is the direct WM→logits
+   injection; the latent-feedback cooperation (mem_alpha·wm_inj) adds NOTHING
+   (mem_alpha grew only 0.10→0.13).
+
+4. **Localized to the READ/addressing side (`probe_wm_recall_addressing.py`).**
+   At a forced think at the recall position: the binding's value is in the buffer
+   (WRITE 100%), but the read query lands on the correct slot only **1.7%** of
+   the time, with **1.6%** of attention mass on it and a diffuse read overall
+   (top-1 mass 5%). The trained W_q/W_k cosine addressing on a FROZEN trunk
+   cannot find the right slot.
+
+**WHY (the deep one):** the frozen trunk's hidden states do NOT encode
+content-addressable `(which-variable, its-value)` structure. A thin post-hoc
+addressing layer (2 matrices, 600 steps) can't conjure addressability the
+underlying representations don't have. This is the project-wide "post-hoc
+features are inert because the trunk fit the data WITHOUT them" pattern —
+now MEASURED on WM's ideal niche, not inferred. It also explains why PKM/WM/
+latent modules added after pretrain stay decorative: the trunk never learned to
+emit the representations they need.
+
+**Implied fix (next test):** WM must be load-bearing DURING pretrain so the trunk
+learns to write addressable keys/values — i.e. co-train the trunk (the #55–58
+pretrain-wiring direction), not bolt WM on after. The constructive test: unfreeze
+the trunk in Stage A and check whether the read sharpens (mass-on-binding ↑) and
+recall jumps well above +2.7pp.
+
+Probes: `eval_stage_a_killgate.py` (WM-on vs full_off, forced think),
+`probe_wm_recall_addressing.py` (write/read/readout localization),
+`gen_multibind_recall.py` (the headroom-bearing probe).

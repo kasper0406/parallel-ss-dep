@@ -88,7 +88,7 @@ def latent_wm_injection(model, *, grad: bool):
 
 def load_latent_model(ckpt_path: str, device: str = "cuda", *,
                       train: bool = False, fresh_adapter: bool = True,
-                      wm_on: bool = False):
+                      wm_on: bool = False, dkv: bool = False):
     """Canonical model-bootstrap for latent-thinking scripts.
 
     One place for the boilerplate that had drifted across ~8 scripts (missing
@@ -98,9 +98,15 @@ def load_latent_model(ckpt_path: str, device: str = "cuda", *,
 
     `wm_on=True` keeps WorkingMemory enabled (for the WM×latent COOPERATION path,
     where the latent step feeds back `adapter(h_premem)+mem_alpha·WM_inj`); also
-    sets the pre-memory thread so the WM injection can't contaminate the adapter
-    input. Default False = the clean WM-off latent thread (parity with the
-    standard latent generator).
+    attaches a fresh `mem_alpha` (force_cooperative_latent_wm) and sets the
+    pre-memory thread so the WM injection can't contaminate the adapter input.
+    Default False = the clean WM-off latent thread (parity with the standard
+    latent generator).
+
+    `dkv=True` (Stage A): ATTACH a fresh decoupled key/value addressing head
+    (`memory.W_k` + logit_scale + gate_bias_beta) to a legacy address-by-value
+    WM ckpt, so the cosine query→key addressing can be TRAINED. Only meaningful
+    with `wm_on=True`.
 
     Returns ``(model, cfg, thinking_id, tok, eos_id)``.
     """
@@ -109,7 +115,8 @@ def load_latent_model(ckpt_path: str, device: str = "cuda", *,
     model, cfg = build_model_from_ckpt(
         ckpt_path, force_state_readonly=True,
         force_use_latent_feedback_adapter=True if fresh_adapter else None,
-        force_cooperative_latent_wm=True if wm_on else None)
+        force_cooperative_latent_wm=True if wm_on else None,
+        force_mem_decoupled_kv=True if dkv else None)
     model = model.to(device)
     model.train() if train else model.eval()
     model._gist_loss_enabled = False

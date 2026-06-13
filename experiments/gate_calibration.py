@@ -112,6 +112,7 @@ def compute_gate_calibration_loss(
     sigma_high: float = 1.0,
     eos_id: int | None = None,
     think_batch: int = 64,
+    pos_weight: float | None = None,
     generator: torch.Generator | None = None,
 ) -> GateCalibrationResult | None:
     """Differentiable gate-calibration BCE loss for one (B, T) batch.
@@ -217,8 +218,15 @@ def compute_gate_calibration_loss(
 
     # The BCE target is detached; the gradient flows ONLY through the
     # snapshotted (grad-carrying) gate logits at the sampled positions.
+    # pos_weight up-weights the "think helps here" class: on code only ~10% of
+    # positions have Delta_logp>0, so unweighted BCE collapses to "never think"
+    # (predicting all-emit is ~90% accurate). pos_weight≈neg/pos rebalances so
+    # the gate actually learns to fire on the helpful minority. None = legacy
+    # unweighted behaviour.
     gate_logit_sel = gate_logits_snapshot[bsel, tsel]
-    loss = F.binary_cross_entropy_with_logits(gate_logit_sel, y)
+    pw = (torch.tensor(float(pos_weight), device=device)
+          if pos_weight is not None else None)
+    loss = F.binary_cross_entropy_with_logits(gate_logit_sel, y, pos_weight=pw)
 
     with torch.no_grad():
         sigma_sel = torch.sigmoid(gate_logit_sel.detach())

@@ -357,3 +357,49 @@ NOT post-hoc addressing training — it is making content-recall (multibind/MQAR
 a PRETRAIN objective so the trunk co-adapts its hiddens to be content-addressable
 AND the read query is shaped by a loss that rewards finding the queried key.
 That is a fresh multi-hour pretrain (resource decision), not a quick fine-tune.
+
+---
+
+## UNIFYING SYNTHESIS (2026-06-13): a mechanism helps iff training demanded its function
+
+Pulling PKM + WM + latent thinking together, one principle explains all three:
+
+> **Each mechanism helps exactly to the degree its TRAINING OBJECTIVE demanded
+> its FUNCTION — and the deployment workload actually has that bottleneck.**
+
+| mechanism | its function | was that the training objective? | is it the deployment bottleneck? | result |
+|---|---|---|---|---|
+| **PKM** (product-key parametric store) | store/recall facts | YES — facts reduce next-token CE directly, everywhere in text | YES — the 287M model is knowledge-bound | **load-bearing** (pkm_off −5/−50% on HumanEval) ✓ |
+| **WM** (content-addressable recall) | retrieve a specific bound value | NO — general text only needs RECENCY, which the delta-rule recurrence already gives | rarely (real code seldom holds many live bindings to recall) | **inert** — read collapses to recency, redundant with the recurrence ✗ |
+| **latent thinking** (sequential computation) | multi-hop iterated reasoning | PARTIALLY — only on the arith/reasoning co-train, OOD for code | rarely (per-token code is recall, not iteration; ~10% of positions, flat in R) | **marginal** ~ |
+
+**The mechanisms are not broken.** Gradient flows, the plumbing is correct
+(M0 review confirmed it). They are inert because the *training never created the
+bottleneck each one relieves* — except PKM, whose bottleneck (knowledge) the LM
+loss creates automatically because facts are everywhere. WM's bottleneck
+(many-simultaneous-binding recall) and latent thinking's bottleneck (multi-hop
+iteration) are rare in general text AND rare in the deployment task, so the loss
+never pressured the trunk to build the representations those mechanisms need
+(measured: WM's read is recency/positional, never content-addressable — see the
+addressing addendum above).
+
+**Why the user's intuition ("should be a HUGE benefit") and the result both
+hold:** WM/latent thinking WOULD be huge on a workload bottlenecked on
+memory/iteration. The actual workload (general code at 287M) is bottlenecked on
+KNOWLEDGE, which PKM already covers. So their marginal benefit is *correct given
+this workload*, not a failure of the idea.
+
+**Actionable corollary (the real fix):** to make WM or latent thinking
+load-bearing, the bottleneck must exist in TRAINING — bake tasks whose function
+IS the mechanism (multibind/MQAR content-recall for WM; multi-hop chains for
+latent thinking) into PRETRAIN, so the loss demands the representations. This is
+*why* PKM works out-of-the-box and the others don't, and it is a stronger claim
+than "co-train the modules": co-training is necessary but not sufficient — the
+co-training LOSS must contain the bottleneck (v10 co-trained WM still went
+recency because the pretrain loss never required content recall).
+
+CONSTRUCTIVE CHECK (in flight): a small DeltaNet+WM trained FROM SCRATCH on MQAR
+(where retrieving the queried key IS the objective) — does its read become
+content-addressable (val_hit/either_hit high)? If yes, it proves the mechanism is
+sound and the only missing ingredient is the objective. (The project already has
+the recall-side result: +11.1pp WM recall on saturated MQAR.)

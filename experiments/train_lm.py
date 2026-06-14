@@ -1495,6 +1495,7 @@ def main():
                     # n_micro so the per-step gradient still matches
                     # --latent_cotrain_weight after the (loss / n_micro).backward().
                     if (getattr(args, "latent_cotrain_weight", 0.0) > 0.0
+                            and step >= getattr(args, "latent_cotrain_start_step", 0)
                             and _is_last_micro
                             and thinking_token_id is not None
                             and int(thinking_token_id) != int(pad_token_id)):
@@ -1535,6 +1536,7 @@ def main():
                     # gradient equal to --gate_calibration_weight after the
                     # (loss / n_micro).backward(). Default weight 0 = OFF.
                     if (getattr(args, "gate_calibration_weight", 0.0) > 0.0
+                            and step >= getattr(args, "gate_calibration_start_step", 0)
                             and args.output_gate
                             and _is_last_micro
                             and main_gate_logits is not None

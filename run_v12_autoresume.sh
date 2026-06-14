@@ -1,0 +1,75 @@
+#!/bin/bash
+# v12 — v11 (capacity-exceeding multibind recall = the WM fix) PLUS the PKM
+# bootstrap fix (the 2026-06-14 investigation finding). DO NOT LAUNCH until v11's
+# WM verdict is in; if v11 shows the multibind stream makes WM load-bearing, v12
+# keeps it and adds the PKM fix; if not, revise the WM half first.
+#
+# WHY v12 (see memory project_v11_pkm_bootstrap_fail):
+#   v11's PKM failed to bootstrap (v7.0 α-decay: αL never committed in the floor
+#   window, vs v7.1's +0.27). Cause: v11's new aux losses (latent_cotrain +
+#   gate_calibration) — extra forwards + competing gradient — destabilized the
+#   PKM α-bootstrap that v7.1 had clean (v7.1 had NONE of these). FIX: DELAY the
+#   thinking aux losses past the PKM α-floor window (--*_start_step 3500, floor is
+#   3000) so PKM bootstraps clean like v7.1, THEN thinking engages at full weight.
+#   Also probe on MODERATE-N recall (N=8/12) where the first breakthrough shows
+#   billions of tokens before the N=24/32 bigN probe moves.
+#
+# Changes vs v11: + --latent_cotrain_start_step 3500 --gate_calibration_start_step
+#   3500 ; feature_probe_wm_recall_path → multibind_recall_heldout.jsonl (mod-N).
+# Same auto-resume + 250M-ckpt + HF timeout robustness as run_v11_autoresume.sh.
+set -u
+cd /home/knielsen/ml/parallel-ss-dep
+export PYTHONPATH="${PYTHONPATH:-}:."
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HF_HUB_DOWNLOAD_TIMEOUT=60
+GPU=${GPU:-1}
+LOG=runs/pretrain_v12.log
+mkdir -p runs checkpoints
+
+common_args() {
+  cat <<'ARGS'
+--arch deltanet --d_model 896 --n_layers 10 --d_head 64 --n_heads 14
+--feedback film --feedback_pairs 0,5;1,6;2,7;3,8;4,9 --feedback_self_k 3 --feedback_self_k_warmup_steps 1300
+--output_gate --gate_entropy_aux_weight 0.1 --gate_entropy_aux_temperature 2.0
+--gate_floor_min 0.5 --gate_warmup_steps 20000 --state_readonly_at_think
+--use_memory --mem_size 1024 --mem_decoupled_kv --mem_read_alpha_init 1.0
+--mem_read_alpha_floor_start 0.5 --mem_read_alpha_floor_warmup_steps 3000
+--use_pkm --pkm_after_layer 5 --pkm_n_heads 4 --pkm_n_keys 256 --pkm_k_dim 128 --pkm_top_k 32
+--pkm_use_output_gate --pkm_epsilon_start 0.5 --pkm_epsilon_warmup_steps 3000 --pkm_value_init_std 1.0
+--pkm_score_norm layer --pkm_diversity_weight 0.01 --pkm_alpha_floor_start 0.3 --pkm_alpha_floor_warmup_steps 3000
+--pkm_value_lr_mult 100.0 --gist_loss_weight 0.1 --gist_horizons 16,64,256
+--latent_cotrain_weight 0.025 --latent_cotrain_R 4 --latent_cotrain_sample_frac 0.05 --latent_cotrain_max_positions 4
+--latent_cotrain_start_step 3500
+--gate_calibration_weight 0.05 --gate_calibration_R 4 --gate_calibration_sample_frac 0.05 --gate_calibration_max_positions 4
+--gate_calibration_sigma_low 0.1 --gate_calibration_sigma_high 0.9 --gate_calibration_start_step 3500
+--feature_probe_every_tokens 500000000 --feature_probe_wm_recall_path data/multibind_recall_heldout.jsonl --feature_probe_wm_recall_n 64
+--data_mix configs/pretrain_mix_v11.yaml --tokenizer HuggingFaceTB/SmolLM2-135M
+--think_burst_prob 0.5 --think_max_bursts 2 --think_max_burst_depth 6
+--T 2048 --batch 4 --grad_accum 32 --activation_checkpointing --bf16 --tf32 --no-compile
+--alpha_wd 0.0 --wd 0.01 --grad_clip 1.0 --z_loss 1e-4 --mask_eos_in_targets
+--optimizer muon --lr 1.4e-3 --lr_muon 5e-3 --lr_schedule wsd --warmup_steps 400 --lr_decay_frac 0.15
+--steps 19000 --val_every 200 --log_every 20
+--mid_eval_every_tokens 250000000 --mid_eval_save_only --mid_eval_n_problems 50 --mid_eval_max_gen 192
+--save_ckpt checkpoints/pretrain_v12.pt --tb_dir runs/tb/pretrain_v12
+ARGS
+}
+
+for attempt in $(seq 1 40); do
+  latest=$(ls -t checkpoints/pretrain_v12_step*.pt 2>/dev/null | head -1)
+  if [ -n "$latest" ]; then
+    rstep=$(echo "$latest" | sed -E 's/.*_step([0-9]+)_.*/\1/')
+    resume="--load_ckpt $latest --start_step $rstep"
+    echo "=== [autoresume $attempt] resuming from $latest (step $rstep) ===" >> "$LOG"
+  else
+    resume="--start_step 0"
+    echo "=== [autoresume $attempt] fresh start ===" >> "$LOG"
+  fi
+  CUDA_VISIBLE_DEVICES=$GPU .venv/bin/python -u experiments/train_lm.py $(common_args) $resume >> "$LOG" 2>&1
+  rc=$?
+  if grep -q "saved.*checkpoints/pretrain_v12.pt" "$LOG" && [ "$(ls -t checkpoints/pretrain_v12_step*.pt 2>/dev/null | head -1 | sed -E 's/.*_step([0-9]+)_.*/\1/')" -ge 18900 ] 2>/dev/null; then
+    echo "=== [autoresume] COMPLETE (rc=$rc) ===" >> "$LOG"; exit 0
+  fi
+  echo "=== [autoresume $attempt] exited rc=$rc — will resume from latest ckpt ===" >> "$LOG"
+  sleep 20
+done
+echo "=== [autoresume] GAVE UP after 40 attempts ===" >> "$LOG"; exit 1

@@ -659,6 +659,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "0 disables (default). Gives the trunk gradient to do "
                         "useful sequential computation during thinking. "
                         "Requires --state_readonly_at_think + --output_gate.")
+    p.add_argument("--latent_cotrain_start_step", type=int, default=0,
+                   help="Delay the latent-cotrain loss until this step (default 0 "
+                        "= from step 1). v12 fix: co-training/gate aux losses + "
+                        "their extra forwards destabilized the PKM α-bootstrap in "
+                        "v11 (αL never committed during the floor window → v7.0 "
+                        "α-decay failure). Start these AFTER the PKM α-floor window "
+                        "(~pkm_alpha_floor_warmup_steps) so PKM bootstraps clean "
+                        "like v7.1, then thinking engages at full weight.")
     p.add_argument("--latent_cotrain_R", type=int, default=4,
                    help="Number of state-readonly latent think steps in the "
                         "co-training loss.")
@@ -732,6 +740,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "(experiments/gate_calibration.compute_gate_calibration_"
                         "loss). 0 disables (default). Requires --output_gate. "
                         "Recommended 0.05.")
+    p.add_argument("--gate_calibration_start_step", type=int, default=0,
+                   help="Delay the gate-calibration loss until this step (default "
+                        "0). Same v12 rationale as --latent_cotrain_start_step: "
+                        "let PKM bootstrap clean before the gate aux loss + its "
+                        "extra forwards engage.")
     p.add_argument("--gate_calibration_R", type=int, default=4,
                    help="Number of state-readonly LATENT think steps used to "
                         "measure 'does thinking help' for the gate target.")

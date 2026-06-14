@@ -41,16 +41,24 @@ sources:
 
   # ---- Long-context RECALL (13 % — the WM gradient, now CAPACITY-EXCEEDING) ----
 
+  # ROOT-CAUSE FIX (2026-06-14, agent-validated): feed BOTH the program AND the
+  # answer-bearing completion. With problem_prompt ONLY, the bound value appears
+  # once (at its binding) and is NEVER a recall-requiring target — so the recall
+  # probe was structurally 0 and WM got no content-recall gradient (collapsed to
+  # recency) in BOTH v10 and v11. qwen_completion ("...outputs N. Answer: N")
+  # adds positions that FORCE recall of the fresh-random value (and match the
+  # probe's `Answer: N` format). This is what makes the capacity-exceeding design
+  # meaningful — difficulty without a recall target trains nothing.
   - name: multibind_recall_pretrain
     jsonl_path: data/multibind_recall_pretrain.jsonl
-    text_field: problem_prompt
+    text_field: [problem_prompt, qwen_completion]
     split: train
     weight: 0.09
     filter: always
 
   - name: synthetic_memory
     jsonl_path: data/synthetic_memory.jsonl
-    text_field: problem_prompt
+    text_field: [problem_prompt, qwen_completion]
     split: train
     weight: 0.04
     filter: always

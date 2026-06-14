@@ -66,7 +66,14 @@ for attempt in $(seq 1 40); do
   fi
   CUDA_VISIBLE_DEVICES=$GPU .venv/bin/python -u experiments/train_lm.py $(common_args) $resume >> "$LOG" 2>&1
   rc=$?
-  if grep -q "saved.*checkpoints/pretrain_v12.pt" "$LOG" && [ "$(ls -t checkpoints/pretrain_v12_step*.pt 2>/dev/null | head -1 | sed -E 's/.*_step([0-9]+)_.*/\1/')" -ge 18900 ] 2>/dev/null; then
+  # Completion gate: the FINAL-save line ("Checkpoint saved to .../pretrain_v12.pt")
+  # is printed ONLY when the loop reaches --steps, so it is the true done-signal.
+  # The mid-eval cadence (250M tok ≈ 953.7 steps) lands the LAST numbered ckpt at
+  # step ~18120 in a clean 19000-step run, NEVER ≥18900 — so an 18900 threshold
+  # made completion unreachable (clean run → spurious resumes → "GAVE UP" rc=1,
+  # ~60 GPU-h wasted). 18000 is satisfied by the final mid-eval ckpt yet never by
+  # the second-to-last (~17167), and the grep already gates on true completion.
+  if grep -q "saved.*checkpoints/pretrain_v12.pt" "$LOG" && [ "$(ls -t checkpoints/pretrain_v12_step*.pt 2>/dev/null | head -1 | sed -E 's/.*_step([0-9]+)_.*/\1/')" -ge 18000 ] 2>/dev/null; then
     echo "=== [autoresume] COMPLETE (rc=$rc) ===" >> "$LOG"; exit 0
   fi
   echo "=== [autoresume $attempt] exited rc=$rc — will resume from latest ckpt ===" >> "$LOG"

@@ -9,7 +9,7 @@
 # crash loses < ~1.8h. feature-probe stays at 500M (the WM-load-bearing signal).
 set -u
 cd /home/knielsen/ml/parallel-ss-dep
-export PYTHONPATH=$PYTHONPATH:.
+export PYTHONPATH="${PYTHONPATH:-}:."
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HUB_DOWNLOAD_TIMEOUT=60
 GPU=${GPU:-1}
@@ -56,7 +56,11 @@ for attempt in $(seq 1 40); do
   fi
   CUDA_VISIBLE_DEVICES=$GPU .venv/bin/python -u experiments/train_lm.py $(common_args) $resume >> "$LOG" 2>&1
   rc=$?
-  if grep -q "saved.*checkpoints/pretrain_v11.pt" "$LOG" && [ "$(ls -t checkpoints/pretrain_v11_step*.pt 2>/dev/null | head -1 | sed -E 's/.*_step([0-9]+)_.*/\1/')" -ge 18900 ] 2>/dev/null; then
+  # NOTE: the live v11 wrapper parsed the OLD -ge 18900 into memory at launch, so
+  # this edit only fixes future re-launches — the running instance will spurious-
+  # resume at completion and must be killed manually (confirm pretrain_v11.pt
+  # exists first). 18900 was unreachable: last mid-eval ckpt lands at ~step 18120.
+  if grep -q "saved.*checkpoints/pretrain_v11.pt" "$LOG" && [ "$(ls -t checkpoints/pretrain_v11_step*.pt 2>/dev/null | head -1 | sed -E 's/.*_step([0-9]+)_.*/\1/')" -ge 18000 ] 2>/dev/null; then
     echo "=== [autoresume] COMPLETE (rc=$rc) ===" >> "$LOG"; exit 0
   fi
   echo "=== [autoresume $attempt] exited rc=$rc — will resume from latest ckpt ===" >> "$LOG"

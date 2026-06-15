@@ -1,0 +1,197 @@
+# Mixed-corpus pretrain v14 — make the VALIDATED WM recall mechanism load-bearing
+# on the PROJECT'S REAL workload (coding + agentic), without forgetting code.
+#
+# WHY v14 EXISTS (read project_recall_discrete_key_direction +
+#   project_wm_recall_probe_broken_and_routed_around before changing).
+#   The WM recall mechanism is now VALIDATED end-to-end on a SATURATING probe:
+#   name-keyed addressing (key = the identifier's INPUT-EMBEDDING window) +
+#   copy/pointer readout gives 100% exact recall where the bare DeltaNet
+#   recurrence scores ~0 (wm_namekey_probe.py / wm_multitok_readout.py). But that
+#   was on the SYNTHETIC `vN = MMMM` multibind set. v14 trains + measures whether
+#   the mechanism is USEFUL on recall built from REAL code / agentic structure.
+#
+#   The headroom principle (project_recall_no_headroom): single-binding recall at
+#   distance is TRIVIAL for the recurrence (~100% at 512+). WM only earns its keep
+#   when the task is BOTH (1) capacity-exceeding — MANY simultaneous competing
+#   bindings of the same kind — AND (2) non-memorizable (fresh random content).
+#   The new realistic streams below are built to that spec (gen_code_recall_tasks.py
+#   / gen_agentic_recall_tasks.py: N competing constants / signatures / imports /
+#   tool-outputs, query ONE, real-code distractors padding the distance).
+#
+# PREREQUISITE PLUMBING (code change, NOT in this file — the v14 "addressing" +
+#   "readout" + "mem_read_mask" plumbing specified in
+#   project_recall_discrete_key_direction). The recall streams below carry
+#   `answer_char_span` (+ binding/query spans) PRECISELY so data_mix can emit a
+#   per-position mem_read_mask over the answer span (so answer-token CE flows into
+#   the WM read W_proj — the gradient that was structurally MISSING in v10-v13 and
+#   the documented root cause of "WM inert for recall"). Without that threading,
+#   v14 trains the RECURRENCE on these streams (still useful: realistic recall
+#   data) but does NOT make WM load-bearing. The minimal change:
+#     (a) data_mix: opt-in `emit_read_mask` for recall sources → aligned mask like
+#         doc_ids, 1 over the qwen_completion answer span;
+#     (b) train_lm: thread mem_read_mask into TinyLM.forward; raise read_alpha floor;
+#     (c) (optional) name-key addressing channel + copy head (model.py) — the
+#         validated win. Default off = byte-identical; old ckpts load strict=False.
+#
+# ANTI-FORGETTING (the narrow-data catastrophic-forgetting trap). Keep the recall
+#   streams a MINORITY (~16% total, in line with v11's 0.13) and keep the FULL
+#   code/instruction/wiki mix so the trunk does not over-fit the recall template.
+#   This is a v12-CONTINUATION recipe (load_ckpt the latest v12, do NOT cold-start)
+#   so general code competence is inherited; the recall streams add the missing
+#   WM gradient on top.
+
+sources:
+
+  # ==== RECALL streams (16% total — the WM gradient) =========================
+
+  # (A) SYNTHETIC capacity-exceeding multibind (kept from v11): the cleanest,
+  #     hardest addressing signal — N near-identical `vN = MMMM` bindings. This is
+  #     where name-keyed addressing was VALIDATED; keep it to bootstrap the read.
+  - name: multibind_recall_pretrain
+    jsonl_path: data/multibind_recall_pretrain.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.05
+    filter: always
+    # v14 WM-recall: emit a per-position read mask over the answer span. The
+    # multibind set has no answer_char_span, so the loader falls back to the
+    # first occurrence of the `answer` string inside qwen_completion.
+    emit_read_mask: true
+
+  # (B) REALISTIC CODE recall (NEW, gen_code_recall_tasks.py): config-constant /
+  #     function-signature / import-alias / function-name recall, N competing
+  #     bindings, REAL magicoder Python as distractor interference. The primary
+  #     test of "does WM recall help on actual coding structure".
+  - name: code_recall_train
+    jsonl_path: data/code_recall_train.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.05
+    filter: always
+    # v14 WM-recall: read mask over the annotated answer_char_span.
+    emit_read_mask: true
+
+  # (C) REALISTIC AGENTIC recall (NEW, gen_agentic_recall_tasks.py): recall an
+  #     early tool-output value / user instruction / set variable from thousands of
+  #     tokens back in a ReAct-style trajectory. Semi-synthetic (templated trace) —
+  #     transfer to real agent logs is the open next step.
+  - name: agentic_recall_train
+    jsonl_path: data/agentic_recall_train.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.03
+    filter: always
+    # v14 WM-recall: read mask over the annotated answer_char_span.
+    emit_read_mask: true
+
+  # (D) multi-step synthetic memory families (variety; kept from v10/v11)
+  - name: synthetic_memory
+    jsonl_path: data/synthetic_memory.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.03
+    filter: always
+
+  # ==== Raw code (the anti-forgetting bulk) =================================
+
+  - name: codeparrot
+    dataset_id: codeparrot/codeparrot-clean
+    text_field: content
+    split: train
+    weight: 0.22
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 200 }
+
+  - name: python_codes_25k
+    dataset_id: flytech/python-codes-25k
+    text_field: text
+    split: train
+    weight: 0.08
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  # ==== Problem-solving instruction code ===================================
+
+  - name: magicoder_oss
+    dataset_id: ise-uiuc/Magicoder-OSS-Instruct-75K
+    text_field: [problem, solution]
+    split: train
+    weight: 0.09
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  - name: code_exercises_jinaai
+    dataset_id: jinaai/code_exercises
+    text_field: [problem, solution]
+    split: train
+    weight: 0.02
+    fim_rate: 0.5
+    filter: always
+
+  - name: python_instr_18k_alpaca
+    dataset_id: iamtarun/python_code_instructions_18k_alpaca
+    text_field: [prompt, output]
+    split: train
+    weight: 0.06
+    filter: always
+
+  - name: codealpaca_20k
+    dataset_id: HuggingFaceH4/CodeAlpaca_20K
+    text_field: [prompt, completion]
+    split: train
+    weight: 0.05
+    filter: always
+
+  # ==== CVE / vulnerability + fix ==========================================
+
+  - name: bigvul
+    dataset_id: bstee615/bigvul
+    text_builder: bigvul
+    split: train
+    weight: 0.08
+    filter: bigvul_vulnerable
+
+  - name: cybernative_vuln_dpo
+    dataset_id: CyberNative/Code_Vulnerability_Security_DPO
+    text_builder: cybernative_dpo
+    split: train
+    weight: 0.04
+    filter: always
+
+  # ==== Synthetic CS textbooks =============================================
+
+  - name: textbooks_lite_sciphi
+    dataset_id: SciPhi/textbooks-are-all-you-need-lite
+    text_field: completion
+    split: train
+    weight: 0.05
+    filter:
+      name: min_content_len
+      args: { min_chars: 400 }
+
+  - name: textbook_quality_programming
+    dataset_id: vikp/textbook_quality_programming
+    text_field: markdown
+    split: train
+    weight: 0.05
+    filter:
+      name: min_content_len
+      args: { min_chars: 400 }
+
+  # ==== Wikipedia ==========================================================
+
+  - name: wikipedia_en
+    dataset_id: wikimedia/wikipedia
+    hf_extra: { name: "20231101.en" }
+    text_field: text
+    split: train
+    weight: 0.10
+    filter:
+      name: min_content_len
+      args: { min_chars: 500 }

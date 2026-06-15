@@ -143,6 +143,19 @@ class SourceConfig:
     jsonl_path: str | None = None    # if set, stream rows from a local JSONL
                                       # file instead of HF. `text_field`
                                       # selects which field to extract.
+    # v14 WM-recall: when True, this source emits a per-position read mask = 1
+    # over the ANSWER span (the recalled value the WM read must supply), aligned
+    # like doc_ids. The span is `answer_span_field` (char offsets into the
+    # `answer_field`, which must be the LAST element of a list `text_field` —
+    # e.g. qwen_completion — so the join offset is recoverable). Requires the
+    # stream-level emit_read_mask=True. Default False → no mask emitted for this
+    # source (it contributes an all-zero mask in a mask-emitting stream).
+    emit_read_mask: bool = False
+    answer_field: str = "qwen_completion"
+    answer_span_field: str = "answer_char_span"
+    answer_value_field: str = "answer"   # fallback when the char span is absent:
+                                          # locate this answer STRING inside the
+                                          # answer_field (first occurrence).
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +281,67 @@ def _extract_text(example: dict, text_field, text_builder: str | None = None
     return "\n\n".join(parts)
 
 
+def _answer_tok_span(tok, text: str, c0: int, c1: int):
+    """Map a char span [c0, c1) in `text` to (ids, t0, t1) using the fast
+    tokenizer's offset mapping (a token whose char range overlaps [c0,c1) is in
+    the span). Returns None on failure. Mirrors eval_code_recall.tokenize_with_
+    span so the training mem_read_mask marks exactly the answer tokens the
+    teacher-forced eval scores."""
+    try:
+        enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
+        ids = enc["input_ids"]
+        offs = enc["offset_mapping"]
+        idxs = [i for i, (a, b) in enumerate(offs) if a < c1 and b > c0]
+        if idxs:
+            return ids, idxs[0], idxs[-1] + 1
+        return ids, None, None
+    except Exception:
+        return None
+
+
+def _build_read_mask(ex: dict, text: str, src: "SourceConfig", tok):
+    """Return (ids, mask) for a recall-source document: `mask` is a 0/1 list the
+    length of `ids`, 1 over the answer-token span. The answer span is given by
+    `src.answer_span_field` (char offsets into `src.answer_field`); since the
+    answer field is the LAST joined part of `text`, its char base in `text` is
+    `len(text) - len(answer_text)`. Falls back to ids-only (all-zero mask) when
+    spans are missing/unparseable. Returns None if tokenization fails (caller
+    falls back to the plain encode path)."""
+    ans_text = ex.get(src.answer_field)
+    if not (isinstance(ans_text, str) and ans_text and len(text) >= len(ans_text)):
+        ids = tok.encode(text, add_special_tokens=False)
+        return ids, [0] * len(ids)
+    base = len(text) - len(ans_text)   # answer_field is the LAST joined part
+    span = ex.get(src.answer_span_field)
+    if span:
+        c0 = base + int(span[0])
+        c1 = base + int(span[1])
+    else:
+        # Fallback: no annotated char span (e.g. the synthetic multibind set).
+        # Mark the first occurrence of the answer STRING inside answer_field.
+        val = ex.get(src.answer_value_field)
+        pos = ans_text.find(val) if isinstance(val, str) and val else -1
+        if pos < 0:
+            ids = tok.encode(text, add_special_tokens=False)
+            return ids, [0] * len(ids)
+        c0 = base + pos
+        c1 = base + pos + len(val)
+    res = _answer_tok_span(tok, text, c0, c1)
+    if res is None:
+        return None
+    ids, t0, t1 = res
+    mask = [0] * len(ids)
+    if t0 is not None:
+        # Mark the PREDICTING positions [t0-1, t1-1): logits[p] predicts token
+        # p+1, so to supply the answer token at position q the WM read / copy
+        # must fire at q-1. The contiguous-run offset then indexes the value
+        # span (offset 0 at t0-1 → value token 0 predicted at t0, etc.) — this
+        # is the alignment validated in wm_multitok_readout.py (ans_h=h[ap-1+j]).
+        for ti in range(max(0, t0 - 1), min(t1 - 1, len(ids))):
+            mask[ti] = 1
+    return ids, mask
+
+
 def _jsonl_stream(path: str, seed: int = 0, skip_first: int = 0):
     """Stream a local JSONL file as an HF-like iterable. Yields dict
     rows. Cycles forever so the source doesn't exhaust mid-training;
@@ -367,6 +441,7 @@ class MixedSourceStream(IterableDataset):
                  base_seed: int = 0,
                  mask_eos_in_targets: bool = False,
                  emit_doc_ids: bool = False,
+                 emit_read_mask: bool = False,
                  ):
         if not sources:
             raise ValueError("sources must be non-empty")
@@ -384,6 +459,14 @@ class MixedSourceStream(IterableDataset):
         self.think_max_burst_depth = int(think_max_burst_depth)
         self.base_seed = int(base_seed)
         self.mask_eos_in_targets = bool(mask_eos_in_targets)
+        # v14 WM-recall: emit a per-position read mask (1 over recall-source
+        # answer spans) as a 4th tuple element. Implies doc-id machinery so the
+        # mask stays aligned through think-burst insertion (we pack doc_id*2+mask
+        # through the existing `aligned=` channel, then unpack). Default off →
+        # yields stay (x, y[, doc_ids]) exactly as before.
+        self.emit_read_mask = bool(emit_read_mask)
+        if self.emit_read_mask:
+            emit_doc_ids = True
         self.emit_doc_ids = bool(emit_doc_ids)
         self._filters = [_build_filter(s.filter_spec) for s in sources]
 
@@ -415,6 +498,9 @@ class MixedSourceStream(IterableDataset):
         # the *closing* document; the next document's first token increments.
         buffer_docids: list[list[int]] = [[] for _ in self.sources]
         doc_counters = [0] * len(self.sources)
+        # Parallel per-position read mask (only filled when emit_read_mask): 1
+        # over recall-source answer spans, 0 elsewhere.
+        buffer_readmask: list[list[int]] = [[] for _ in self.sources]
         source_counts = [0] * len(self.sources)  # for smoke diagnostics
 
         def fill_buffer(idx: int) -> bool:
@@ -439,13 +525,29 @@ class MixedSourceStream(IterableDataset):
                     continue
                 if fim_rate > 0.0:
                     text = maybe_apply_fim(text, rng=rng, fim_rate=fim_rate)
-                ids = tok.encode(text, add_special_tokens=False)
+                # v14: build ids + answer read-mask together for recall sources
+                # (offset mapping needs the same encode call). Non-mask streams
+                # and non-recall sources take the plain encode path.
+                rmask = None
+                if self.emit_read_mask and src.emit_read_mask:
+                    built = _build_read_mask(ex, text, src, tok)
+                    if built is not None:
+                        ids, rmask = built
+                    else:
+                        ids = tok.encode(text, add_special_tokens=False)
+                else:
+                    ids = tok.encode(text, add_special_tokens=False)
                 buffers[idx].extend(ids)
                 buffers[idx].append(eos)
                 if self.emit_doc_ids:
                     c = doc_counters[idx]
                     buffer_docids[idx].extend([c] * (len(ids) + 1))  # +1 = EOS
                     doc_counters[idx] = c + 1
+                if self.emit_read_mask:
+                    if rmask is None:
+                        rmask = [0] * len(ids)
+                    # EOS position is never a read position.
+                    buffer_readmask[idx].extend(rmask + [0])
             return True
 
         while True:
@@ -465,6 +567,11 @@ class MixedSourceStream(IterableDataset):
                 buffer_docids[idx] = buffer_docids[idx][self.block_size:]
             else:
                 chunk_docids = None
+            if self.emit_read_mask:
+                chunk_readmask = buffer_readmask[idx][: self.block_size + 1]
+                buffer_readmask[idx] = buffer_readmask[idx][self.block_size:]
+            else:
+                chunk_readmask = None
             # Random think-burst insertion at chunk boundary.
             if (self.thinking_token_id is not None
                     and self.think_burst_prob > 0.0
@@ -476,14 +583,24 @@ class MixedSourceStream(IterableDataset):
                 ids_only = chunk[:]
                 fake_labels = chunk[:]  # placeholder; rebuilt below
                 if chunk_docids is not None:
-                    ids_with_thinks, _, docids_with_thinks = insert_think_bursts(
+                    # When also emitting a read mask, pack doc_id*2 + read_mask
+                    # through the SINGLE `aligned` channel so both survive the
+                    # insertion (then unpack); think positions are forced to
+                    # read_mask=0 afterwards. emit_read_mask off → aligned is
+                    # just chunk_docids (byte-identical to the old path).
+                    if self.emit_read_mask:
+                        aligned_in = [d * 2 + m for d, m
+                                      in zip(chunk_docids, chunk_readmask)]
+                    else:
+                        aligned_in = chunk_docids[:]
+                    ids_with_thinks, _, aligned_out = insert_think_bursts(
                         ids_only, fake_labels,
                         thinking_token_id=int(self.thinking_token_id),
                         max_len=self.block_size + 1,
                         max_bursts=self.think_max_bursts,
                         max_burst_depth=self.think_max_burst_depth,
                         rng=torch_rng,
-                        aligned=chunk_docids[:],
+                        aligned=aligned_in,
                     )
                 else:
                     ids_with_thinks, _ = insert_think_bursts(
@@ -494,19 +611,27 @@ class MixedSourceStream(IterableDataset):
                         max_burst_depth=self.think_max_burst_depth,
                         rng=torch_rng,
                     )
-                    docids_with_thinks = None
+                    aligned_out = None
                 # Re-pad if shortened (insert_think_bursts caps at max_len; can
                 # be shorter if the bursts pushed the tail off and we already
                 # had < max_len real tokens). Pad with eos.
                 while len(ids_with_thinks) < self.block_size + 1:
                     ids_with_thinks.append(eos)
-                    if docids_with_thinks is not None:
+                    if aligned_out is not None:
                         # Padding belongs to the last document seen.
-                        docids_with_thinks.append(
-                            docids_with_thinks[-1] if docids_with_thinks else 0)
+                        aligned_out.append(
+                            aligned_out[-1] if aligned_out else 0)
                 chunk = ids_with_thinks[: self.block_size + 1]
-                if docids_with_thinks is not None:
-                    chunk_docids = docids_with_thinks[: self.block_size + 1]
+                if aligned_out is not None:
+                    aligned_out = aligned_out[: self.block_size + 1]
+                    if self.emit_read_mask:
+                        chunk_docids = [p // 2 for p in aligned_out]
+                        chunk_readmask = [p % 2 for p in aligned_out]
+                        _tid = int(self.thinking_token_id)
+                        chunk_readmask = [0 if t == _tid else m for t, m
+                                          in zip(chunk, chunk_readmask)]
+                    else:
+                        chunk_docids = aligned_out
             # Shift to (inputs, targets); mask targets at think positions.
             inputs = torch.tensor(chunk[:-1], dtype=torch.long)
             targets = torch.tensor(chunk[1:], dtype=torch.long)
@@ -530,7 +655,12 @@ class MixedSourceStream(IterableDataset):
                 row = chunk_docids[:-1]
                 mn = min(row) if row else 0
                 doc_ids = torch.tensor([d - mn for d in row], dtype=torch.long)
-                yield inputs, targets, doc_ids
+                if self.emit_read_mask:
+                    read_mask = torch.tensor(chunk_readmask[:-1],
+                                             dtype=torch.long)
+                    yield inputs, targets, doc_ids, read_mask
+                else:
+                    yield inputs, targets, doc_ids
             else:
                 yield inputs, targets
 
@@ -566,6 +696,11 @@ def load_sources_from_yaml(path: str) -> list[SourceConfig]:
             skip_first=int(src.get("skip_first", 0)),
             fim_rate=float(src.get("fim_rate", 0.0)),
             jsonl_path=jsonl_path,
+            emit_read_mask=bool(src.get("emit_read_mask", False)),
+            answer_field=str(src.get("answer_field", "qwen_completion")),
+            answer_span_field=str(src.get("answer_span_field",
+                                          "answer_char_span")),
+            answer_value_field=str(src.get("answer_value_field", "answer")),
         ))
     if not out:
         raise ValueError(f"YAML at {path} has no enabled sources")

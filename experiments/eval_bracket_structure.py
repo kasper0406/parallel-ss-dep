@@ -102,6 +102,15 @@ def build_model_from_ckpt(ckpt_path: str,
     # auto-detect only fires when the key already exists.
     if force_mem_decoupled_kv is not None:
         has_dkv = has_dkv or bool(force_mem_decoupled_kv)
+    # v14 WM-recall plumbing. EMBEDDING-KEY addressing has NO state-dict
+    # footprint (it pools raw input embeddings; no new params), so it can only
+    # be read from cfg. The COPY readout DOES add params (copy_head.gate.*), so
+    # auto-detect from the state-dict (cfg as fallback). Both default off →
+    # back-compat with every pre-v14 ckpt.
+    mem_key_from_embedding = bool(cfg.get("mem_key_from_embedding", False))
+    mem_key_window = int(cfg.get("mem_key_window", 4))
+    has_copy_head = any(k.startswith("copy_head.") for k in sd_keys)
+    use_copy_head = has_copy_head or bool(cfg.get("use_copy_head", False))
     has_pkm = any(k.startswith("pkm_layer.") for k in sd_keys)
     mem_kwargs = {}
     if has_memory:
@@ -116,6 +125,9 @@ def build_model_from_ckpt(ckpt_path: str,
                                           cfg["vocab_size"] - 1)),
             mem_decoupled_kv=bool(has_dkv),
             cooperative_latent_wm=bool(coop_latent_wm),
+            mem_key_from_embedding=bool(mem_key_from_embedding),
+            mem_key_window=int(mem_key_window),
+            use_copy_head=bool(use_copy_head),
         )
     pkm_kwargs = {}
     if has_pkm:

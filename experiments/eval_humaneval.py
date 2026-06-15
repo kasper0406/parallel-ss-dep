@@ -253,8 +253,17 @@ def generate_with_retrieval_as_input(
     gate_floor: float = 0.0,
     additive: bool = True,
     use_incremental: bool = True,
+    force_prefix_think: int = 0,
 ) -> tuple[torch.Tensor, dict]:
     """Retrieval-as-input thinking-token generation (2026-05-19).
+
+    `force_prefix_think` (>0): ignore the gate and run EXACTLY that many
+    retrieval-injected think steps BEFORE the first emitted token, then emit
+    gate-free for the rest. Mirrors `generate_latent_think`'s
+    force_prefix_think; the WM-kill-gate diagnostic needs this to actually
+    exercise the retrieval read on the deployment generator (the gate fires 0
+    thinks on recall at τ=0, so a gate-driven kill-gate never engages WM).
+    Default 0 → byte-identical to the gate-decides path.
 
     DIFFERENCE FROM `generate`:
       In the standard `generate`, when the gate decides to think we
@@ -345,12 +354,19 @@ def generate_with_retrieval_as_input(
                         else float(gate_t[0, -1].item()))
             if gate_floor > 0.0:
                 gate_val = max(gate_val, gate_floor)
-            force_emit = (
-                thinks_this_step >= max_think_per_step
-                or think_total >= total_think_budget
-            )
-            if gate_val >= emit_threshold or force_emit:
-                break
+            if force_prefix_think > 0:
+                # Forced burst before the first emit only; then no thinking.
+                want_think = (emit_count == 0
+                              and thinks_this_step < force_prefix_think)
+                if not want_think:
+                    break
+            else:
+                force_emit = (
+                    thinks_this_step >= max_think_per_step
+                    or think_total >= total_think_budget
+                )
+                if gate_val >= emit_threshold or force_emit:
+                    break
             # THINK STEP: replace the next input embedding with the WM
             # read at the current last position. _last_injection has
             # shape (B, T_current, d); we want the read AT the last

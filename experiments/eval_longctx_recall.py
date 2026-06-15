@@ -170,6 +170,7 @@ def eval_longctx_recall(
     gate_floor: float = 0.0,
     additive: bool | None = None,
     force_prefix_think: int = 0,
+    prompt_format: str = "comment_oneline",
     device: str = "cuda",
 ) -> dict:
     """Importable long-context recall eval — the WM-load-bearing probe.
@@ -233,7 +234,21 @@ def eval_longctx_recall(
         model.eval()
         with torch.no_grad(), abl_cm:
             for rec in records:
-                prompt = f"# {_flatten_to_oneline(rec['problem_prompt'])}\n"
+                # prompt_format selects how the recall task is presented:
+                #  - "comment_oneline" (default): `# {one-line program}\n` —
+                #    matches the SFT `sft_comment` distribution (sft_code.py),
+                #    correct for SFT-distilled ckpts.
+                #  - "training_matched": raw `problem_prompt + "\n\n"` — matches
+                #    the PRETRAIN recall stream (data_mix joins the list
+                #    text_field [problem_prompt, qwen_completion] with "\n\n").
+                #    Use this for pretrain (v10+) ckpts; the comment_oneline
+                #    format is OOD for them and reads a structural ~0 (validated
+                #    2026-06-14: same v12 1B ckpt 0.000 vs 0.438 under the two
+                #    formats).
+                if prompt_format == "training_matched":
+                    prompt = rec["problem_prompt"] + "\n\n"
+                else:
+                    prompt = f"# {_flatten_to_oneline(rec['problem_prompt'])}\n"
                 prompt_ids = tok.encode(prompt, add_special_tokens=False)
                 if len(prompt_ids) + max_gen + total_think_budget > eff_max_T:
                     continue
@@ -254,7 +269,7 @@ def eval_longctx_recall(
                         thinking_token_id=thinking_token_id,
                         total_think_budget=total_think_budget,
                         emit_threshold=emit_threshold, gate_floor=gate_floor,
-                        additive=additive)
+                        additive=additive, force_prefix_think=force_prefix_think)
                 else:
                     gen, diag = generate(
                         model, prompt_t, max_gen=max_gen, temperature=0.0,
@@ -324,6 +339,13 @@ def main() -> int:
                    help="Disable thinking entirely (total_think_budget=0 → "
                         "force-emit before any think token). The control "
                         "baseline for the 3-way recall probe.")
+    p.add_argument("--prompt_format", type=str, default="comment_oneline",
+                   choices=["comment_oneline", "training_matched"],
+                   help="How to present the recall task. 'comment_oneline' "
+                        "(default): `# {one-line program}` — matches SFT ckpts. "
+                        "'training_matched': raw problem_prompt + '\\n\\n' — "
+                        "matches PRETRAIN recall stream (data_mix join); use for "
+                        "v10+ pretrain ckpts (comment_oneline is OOD → reads ~0).")
     args = p.parse_args()
 
     from experiments.eval_bracket_structure import build_model_from_ckpt
@@ -393,7 +415,10 @@ def main() -> int:
             else __import__("contextlib").nullcontext())
     with _abl:
      for rec in records:
-        prompt = f"# {_flatten_to_oneline(rec['problem_prompt'])}\n"
+        if args.prompt_format == "training_matched":
+            prompt = rec["problem_prompt"] + "\n\n"
+        else:
+            prompt = f"# {_flatten_to_oneline(rec['problem_prompt'])}\n"
         prompt_ids = tok.encode(prompt, add_special_tokens=False)
         room = args.max_gen + args.total_think_budget
         if len(prompt_ids) + room > eff_max_T:
@@ -421,7 +446,9 @@ def main() -> int:
                     total_think_budget=eff_think_budget,
                     emit_threshold=args.emit_threshold,
                     gate_floor=args.gate_floor,
-                    additive=cfg.get("retrieval_input_additive", False))
+                    additive=cfg.get("retrieval_input_additive", False),
+                    force_prefix_think=(0 if args.no_think
+                                        else args.force_prefix_think))
             else:
                 gen, diag = generate(
                     model, prompt_t, max_gen=args.max_gen,

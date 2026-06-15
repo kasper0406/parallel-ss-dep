@@ -17,6 +17,21 @@
 # Changes vs v11: + --latent_cotrain_start_step 3500 --gate_calibration_start_step
 #   3500 ; feature_probe_wm_recall_path → multibind_recall_heldout.jsonl (mod-N).
 # Same auto-resume + 250M-ckpt + HF timeout robustness as run_v11_autoresume.sh.
+#
+# 2026-06-14 — AUX LOSSES DISABLED (latent_cotrain + gate_calibration weights → 0).
+#   When both engaged at step 3500 the run DESTABILIZED: VAL 7.22→7.95 (+10%),
+#   per-block gnorm ~20×, emit_ce 3×, latent(Δlogp) deeply negative & NOT climbing,
+#   AND it bled into the PKM routing (top-slot 0.008→0.17). Root cause (agent-
+#   confirmed): from-scratch the latent path is COLD at 3500, so latent_cotrain_loss
+#   = w·CE_after is huge and its gradient is a full R=4 unroll through the ENTIRE
+#   trunk (thinking.py:694-710,843) with NO ramp (instant full weight at start_step)
+#   — grad_clip=1.0 just renormalizes an aux-dominated direction. This is the
+#   documented "cold latent co-train is net-negative" path; the validated fix is
+#   adapter-only freeze-trunk post-hoc (latent_code_cotrain.py), NOT in-pretrain
+#   co-train. v12's PRIMARY goal is the WM load-bearing verdict (recall probe +
+#   kill-gate), which needs a CLEAN WM+PKM trunk — so we run aux-free and resume
+#   from the pre-aux step-2862 ckpt. Latent thinking is deferred to a post-hoc
+#   adapter-only phase on the finished base.
 set -u
 cd /home/knielsen/ml/parallel-ss-dep
 export PYTHONPATH="${PYTHONPATH:-}:."
@@ -38,9 +53,9 @@ common_args() {
 --pkm_use_output_gate --pkm_epsilon_start 0.5 --pkm_epsilon_warmup_steps 3000 --pkm_value_init_std 1.0
 --pkm_score_norm layer --pkm_diversity_weight 0.01 --pkm_alpha_floor_start 0.3 --pkm_alpha_floor_warmup_steps 3000
 --pkm_value_lr_mult 100.0 --gist_loss_weight 0.1 --gist_horizons 16,64,256
---latent_cotrain_weight 0.025 --latent_cotrain_R 4 --latent_cotrain_sample_frac 0.05 --latent_cotrain_max_positions 4
+--latent_cotrain_weight 0.0 --latent_cotrain_R 4 --latent_cotrain_sample_frac 0.05 --latent_cotrain_max_positions 4
 --latent_cotrain_start_step 3500
---gate_calibration_weight 0.05 --gate_calibration_R 4 --gate_calibration_sample_frac 0.05 --gate_calibration_max_positions 4
+--gate_calibration_weight 0.0 --gate_calibration_R 4 --gate_calibration_sample_frac 0.05 --gate_calibration_max_positions 4
 --gate_calibration_sigma_low 0.1 --gate_calibration_sigma_high 0.9 --gate_calibration_start_step 3500
 --feature_probe_every_tokens 500000000 --feature_probe_wm_recall_path data/multibind_recall_heldout.jsonl --feature_probe_wm_recall_n 64
 --data_mix configs/pretrain_mix_v11.yaml --tokenizer HuggingFaceTB/SmolLM2-135M

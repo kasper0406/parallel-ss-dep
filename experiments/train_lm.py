@@ -104,7 +104,8 @@ def _block_update_ratios(model, snapshot) -> list[float]:
 
 
 def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
-                           doc_ids=None, gist_horizons=None, fwd_model=None):
+                           doc_ids=None, gist_horizons=None, fwd_model=None,
+                           mem_read_mask=None):
     """Forward + LM loss for the non-thinking-token (pretrain) path.
 
     Returns (logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss,
@@ -128,13 +129,19 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
     # module for attribute reads (_last_gate, pkm_layer, …) which DDP doesn't
     # proxy. Default fwd_model=model preserves the single-GPU path exactly.
     fwd_model = fwd_model if fwd_model is not None else model
+    # v14: thread mem_read_mask ONLY when present, so the forward call is
+    # byte-identical to the pre-v14 `fwd_model(x, doc_ids=doc_ids)` when off
+    # (also keeps mock LMs that don't accept the kwarg working).
+    _fwd_kw = {"doc_ids": doc_ids}
+    if mem_read_mask is not None:
+        _fwd_kw["mem_read_mask"] = mem_read_mask
     want_gist = (gist_horizons is not None
                  and getattr(args, "gist_loss_weight", 0.0) > 0.0)
     if args.aux_brackets:
         if want_gist:
             raise SystemExit("--gist_loss_weight is not supported "
                              "together with --aux_brackets.")
-        logits, aux_logits = fwd_model(x, return_aux=True, doc_ids=doc_ids)
+        logits, aux_logits = fwd_model(x, return_aux=True, **_fwd_kw)
         depth = bracket_depth(x, bracket_deltas).clamp(0, args.aux_max_depth)
         aux_loss = F.cross_entropy(
             aux_logits.reshape(-1, args.aux_max_depth + 1),
@@ -145,10 +152,10 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
         # The model computes the gist loss inside the (compiled) forward
         # and returns it as a scalar — see TinyLM._finalize. This keeps
         # the hidden state from ever crossing the compile boundary.
-        logits, gist_loss = fwd_model(x, doc_ids=doc_ids)
+        logits, gist_loss = fwd_model(x, **_fwd_kw)
         aux_loss = logits.new_zeros(())
     else:
-        logits = fwd_model(x, doc_ids=doc_ids)
+        logits = fwd_model(x, **_fwd_kw)
         aux_loss = logits.new_zeros(())
         gist_loss = logits.new_zeros(())
     V = logits.shape[-1]
@@ -212,6 +219,22 @@ def _z_loss_term(logits, weight):
     if weight <= 0.0:
         return logits.new_zeros(())
     return weight * (torch.logsumexp(logits, dim=-1) ** 2).mean()
+
+
+def _latent_reasoning_ramp(step: int, start_step: int, warmup_steps: int) -> float:
+    """Linear 0->1 weight ramp for the latent-reasoning co-train.
+
+    Returns 0.0 before `start_step`, then ramps linearly to 1.0 over
+    `warmup_steps` after the start, clamped to [0, 1]. `warmup_steps <= 0`
+    means full weight immediately at/after the start (byte-identical to the
+    pre-ramp path). Keeps the aux gradient negligible while PKM bootstraps —
+    the v12-destabilization safety knob.
+    """
+    if step < start_step:
+        return 0.0
+    if warmup_steps <= 0:
+        return 1.0
+    return min(1.0, max(0.0, (step - start_step) / warmup_steps))
 
 
 def _pkm_diversity_loss(pkm) -> torch.Tensor:
@@ -440,6 +463,9 @@ def main():
             base_seed=args.seed + ddp_rank * 100_003,
             mask_eos_in_targets=bool(args.mask_eos_in_targets),
             emit_doc_ids=True,
+            # v14: emit the per-position recall read-mask as a 4th tuple element
+            # (default off → 3-tuple, byte-identical to v12).
+            emit_read_mask=bool(getattr(args, "emit_read_mask", False)),
         )
         # Val: same sources, different seed, burst injection off so val PPL
         # reflects the clean data distribution.
@@ -1004,12 +1030,13 @@ def main():
         except StopIteration:
             train_iter = iter(train_loader)
             batch = next(train_iter)
-        # Streams may yield (x, y) or (x, y, doc_ids); doc_ids drives
-        # cross-document state isolation in the model (None = one document
-        # per row, the leak-free default for the non-data_mix path).
+        # Streams may yield (x, y), (x, y, doc_ids), or (x, y, doc_ids,
+        # mem_read_mask) [v14]; doc_ids drives cross-document state isolation;
+        # mem_read_mask (when present) drives the WM read at recall answer spans.
         x, y, *_rest = batch
         x, y = x.to("cuda"), y.to("cuda")
         doc_ids = _rest[0].to("cuda") if _rest else None
+        mem_read_mask = _rest[1].to("cuda") if len(_rest) > 1 else None
         # K-self-feed curriculum: bypass FiLM (1-pass forward) until the
         # warmup boundary, then run the configured --feedback_self_k.
         if args.feedback_self_k_warmup_steps > 0:
@@ -1450,6 +1477,7 @@ def main():
                     x, y, *_rest = batch
                     x, y = x.to("cuda"), y.to("cuda")
                     doc_ids = _rest[0].to("cuda") if _rest else None
+                    mem_read_mask = _rest[1].to("cuda") if len(_rest) > 1 else None
                 # DDP: only all-reduce grads on the LAST microbatch; no_sync()
                 # suppresses the reduce on the intermediates (correctness +
                 # avoids n_micro× redundant comms). nullcontext when single-GPU.
@@ -1461,7 +1489,7 @@ def main():
                         gist_loss = _nonthink_forward_loss(
                             model, x, y, args, step, bracket_deltas,
                             doc_ids=doc_ids, gist_horizons=gist_horizons,
-                            fwd_model=ddp_model)
+                            fwd_model=ddp_model, mem_read_mask=mem_read_mask)
                     # Snapshot the MAIN-forward gate NOW, before any aux loss
                     # (latent_cotrain / gate_calibration) runs an extra forward
                     # that clobbers model._last_gate(_logits) — the documented
@@ -1477,6 +1505,19 @@ def main():
                     # wm(inj=) diagnostic below (IndexError).
                     main_wm_inj = getattr(getattr(model, "memory", None),
                                           "_last_injection", None)
+                    # Same hazard for PKM: the aux extra-forwards (latent_cotrain /
+                    # latent_reasoning / gate_calibration) run through PKM and
+                    # clobber _last_slot_idx/_last_weights — which BOTH the
+                    # _pkm_diversity_loss AND the pkm(slots/H,top) health log read.
+                    # Snapshot the MAIN forward's so the PKM-bootstrap monitor (the
+                    # one that caught v12's top 0.008→0.17) reflects the real corpus
+                    # batch, not the tiny batch-1 pointer-chase latent forward that
+                    # v13 newly enables. Restored just before those consumers below.
+                    _pkm_mon = getattr(model, "pkm_layer", None)
+                    main_pkm_slot_idx = (getattr(_pkm_mon, "_last_slot_idx", None)
+                                         if _pkm_mon is not None else None)
+                    main_pkm_weights = (getattr(_pkm_mon, "_last_weights", None)
+                                        if _pkm_mon is not None else None)
                     loss = lm_loss + args.aux_weight * aux_loss
                     loss = loss + _z_loss_term(logits, args.z_loss)
                     if args.output_gate and args.gate_entropy_aux_weight > 0.0:
@@ -1518,15 +1559,28 @@ def main():
                     # thread (WM off + film bypass inside the helper). Fires once
                     # per optimizer step; scaled by n_micro so the per-step
                     # gradient matches --latent_reasoning_weight after /n_micro.
+                    _lr_start = int(getattr(
+                        args, "latent_reasoning_start_step", 0))
                     if (_latent_reasoner is not None
-                            and _is_last_micro):
+                            and _is_last_micro
+                            and step >= _lr_start):
+                        # Linear 0->1 weight ramp over the warmup window after
+                        # the start step — keeps the aux gradient negligible
+                        # while PKM bootstraps (the v12-destabilization fix).
+                        _lr_ramp = _latent_reasoning_ramp(
+                            step, _lr_start,
+                            int(getattr(
+                                args,
+                                "latent_reasoning_weight_warmup_steps", 0)))
+                        # Curriculum measured relative to the start step so the
+                        # easy-first depth ramp aligns to the engaged window.
                         _lr_loss, _lr_rung = _latent_reasoner.step(
-                            model, step, args.steps,
+                            model, step - _lr_start, args.steps - _lr_start,
                             int(args.latent_reasoning_n))
-                        loss = loss + (n_micro * args.latent_reasoning_weight) \
-                            * _lr_loss
+                        loss = loss + (n_micro * args.latent_reasoning_weight
+                                       * _lr_ramp) * _lr_loss
                         _latent_reasoning_diag = (float(_lr_loss.detach()),
-                                                  int(_lr_rung))
+                                                  int(_lr_rung), float(_lr_ramp))
                     # Gate-calibration: train the OUTPUT GATE (not the trunk) to
                     # fire think exactly where a latent think raises
                     # logp(true_next). The BCE flows ONLY into the grad-carrying
@@ -1568,6 +1622,12 @@ def main():
                     # router itself isn't trained to produce high entropy — we
                     # only nudge the *distribution* (via the value-table grad
                     # this implies for diverse retrievals).
+                    # Restore the MAIN-forward PKM slot stats (clobbered by any
+                    # aux extra-forward above) so the diversity loss + the
+                    # post-loop pkm(...) health log read the real corpus batch.
+                    if _pkm_mon is not None and main_pkm_slot_idx is not None:
+                        _pkm_mon._last_slot_idx = main_pkm_slot_idx
+                        _pkm_mon._last_weights = main_pkm_weights
                     if (getattr(args, "use_pkm", False)
                             and getattr(args, "pkm_diversity_weight", 0.0) > 0.0):
                         div_loss = _pkm_diversity_loss(model.pkm_layer)
@@ -1620,8 +1680,8 @@ def main():
                 line += f"  latent(Δlogp={_d:+.3f},n={_n})"
             if _latent_reasoner is not None and \
                     _latent_reasoning_diag is not None:
-                _rl, _rr = _latent_reasoning_diag
-                line += f"  reason(loss={_rl:.3f},R={_rr})"
+                _rl, _rr, _rmp = _latent_reasoning_diag
+                line += f"  reason(loss={_rl:.3f},R={_rr},ramp={_rmp:.2f})"
             if getattr(args, "gate_calibration_weight", 0.0) > 0.0 and \
                     _gate_calib_diag is not None:
                 _t1, _sg, _gd, _gn = _gate_calib_diag
@@ -1877,9 +1937,10 @@ def main():
                     tb.add_scalar("latent_cotrain/delta_logp", _d, step)
                 if (_latent_reasoner is not None
                         and _latent_reasoning_diag is not None):
-                    _rl, _rr = _latent_reasoning_diag
+                    _rl, _rr, _rmp = _latent_reasoning_diag
                     tb.add_scalar("latent_reasoning/loss", _rl, step)
                     tb.add_scalar("latent_reasoning/rung", _rr, step)
+                    tb.add_scalar("latent_reasoning/weight_ramp", _rmp, step)
                 if args.enable_thinking_token and think_stats_window:
                     tb.add_scalar("think/rate", think_rate, step)
                     tb.add_scalar("think/explore_rate", explore_rate, step)
@@ -2002,6 +2063,44 @@ def main():
                                       _full["think_frac"], step)
                 except Exception as _e:  # never let the probe kill a 20h run
                     print(f"        [wm-recall] skipped ({_e})")
+                model.train()
+
+            # v14 live WM-usefulness probe on REALISTIC code/agentic recall.
+            # Teacher-forced exact recall ON (use_memory) vs full_off (WM
+            # disabled): Δ>0 ⇒ WM is load-bearing. Also logs the learned WM
+            # read_alpha and the copy gate (if present) — the two scalars whose
+            # growth tells us the addressing/readout is engaging. Default off
+            # (empty path) so non-v14 runs are unaffected.
+            _code_recall_path = getattr(
+                args, "feature_probe_code_recall_path", "") or ""
+            if (_code_recall_path and getattr(model, "memory", None) is not None):
+                try:
+                    from experiments.eval_code_recall import (
+                        eval_teacher_forced as _eval_cr, _load as _load_cr)
+                    _cr_n = int(getattr(args, "feature_probe_code_recall_n", 200))
+                    _cr_recs = _load_cr(_code_recall_path, n=_cr_n)
+                    _cr_on = _eval_cr(model, tok, _cr_recs, wm_arm="on",
+                                      max_T=int(args.T))
+                    _cr_off = _eval_cr(model, tok, _cr_recs, wm_arm="full_off",
+                                       max_T=int(args.T))
+                    _cr_delta = _cr_on["recall"] - _cr_off["recall"]
+                    _ra = float(getattr(model.memory, "read_alpha",
+                                        torch.zeros(())).item())
+                    _cg = getattr(model, "_last_copy_gate", None)
+                    _cg_s = (f" copy_g={float(_cg.mean().item()):.3f}"
+                             if _cg is not None else "")
+                    print(f"        [code-recall] recall_on={_cr_on['recall']:.3f}"
+                          f" off={_cr_off['recall']:.3f} Δ={_cr_delta:+.3f}"
+                          f" first_on={_cr_on['first_recall']:.3f}"
+                          f" read_alpha={_ra:+.3f}{_cg_s}"
+                          f" (n={int(_cr_on['n_total'])})")
+                    if tb is not None:
+                        tb.add_scalar("probe/code_recall_on",
+                                      _cr_on["recall"], step)
+                        tb.add_scalar("probe/code_recall_delta", _cr_delta, step)
+                        tb.add_scalar("probe/code_recall_read_alpha", _ra, step)
+                except Exception as _e:  # never let the probe kill a 20h run
+                    print(f"        [code-recall] skipped ({_e})")
                 model.train()
             torch.cuda.empty_cache()
             while next_feature_probe_at <= tokens_seen:
@@ -2178,6 +2277,14 @@ def main():
                 "tokenizer_base_vocab_size": tok.vocab_size,
                 "use_memory": bool(args.use_memory),
                 "mem_size": (int(args.mem_size) if args.use_memory else 0),
+                "mem_decoupled_kv": bool(getattr(args, "mem_decoupled_kv", False)),
+                # v14 WM-recall plumbing (no/with state-dict footprint as noted
+                # in eval_bracket_structure.build_model_from_ckpt). Saved so a
+                # reloaded ckpt reconstructs the same addressing/readout.
+                "mem_key_from_embedding": bool(
+                    getattr(args, "mem_key_from_embedding", False)),
+                "mem_key_window": int(getattr(args, "mem_key_window", 4)),
+                "use_copy_head": bool(getattr(args, "use_copy_head", False)),
                 "mem_dim": ((int(args.mem_dim) if args.mem_dim > 0
                              else int(args.d_model)) if args.use_memory else 0),
                 "use_pkm": bool(getattr(args, "use_pkm", False)),

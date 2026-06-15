@@ -101,6 +101,11 @@ def build_model_from_args(args, *, vocab_size: int,
                 getattr(args, "mem_read_alpha_floor_start", 0.0)),
             mem_read_alpha_floor_warmup_steps=int(
                 getattr(args, "mem_read_alpha_floor_warmup_steps", 0)),
+            # v14 WM-recall plumbing (default off → byte-identical legacy WM).
+            mem_key_from_embedding=bool(
+                getattr(args, "mem_key_from_embedding", False)),
+            mem_key_window=int(getattr(args, "mem_key_window", 4)),
+            use_copy_head=bool(getattr(args, "use_copy_head", False)),
         )
 
     pkm_kwargs: dict = {}

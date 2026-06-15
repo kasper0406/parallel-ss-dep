@@ -103,13 +103,16 @@ class LatentFeedbackAdapter(nn.Module):
 
         z_adapted = z + α · Linear(RMSNorm(z))
 
-    Init so behaviour is UNCHANGED at start: the `Linear` is zero-init AND a
-    learnable scalar α (init 0) wraps it, so a fresh / untrained adapter is the
-    identity `z_adapted == z` — i.e. byte-identical to the no-adapter latent
-    path, and an existing ckpt without the adapter loads identically (the module
-    is only built when the flag is on, and its zero-init makes its first forward
-    a no-op). The optimizer opts in only via gradient (the FiLM-α / ThinkAdapter
-    pattern). The Linear weights route to AdamW (matched by
+    Init so behaviour is UNCHANGED at start: the `Linear` is ZERO-init, so a
+    fresh / untrained adapter is the identity `z_adapted == z` (the output is
+    `z + α·proj(norm(z))` and proj≡0 ⇒ output==z for ANY α) — byte-identical to
+    the no-adapter latent path, and an existing ckpt without the adapter loads
+    identically (the module is only built when the flag is on). The scalar α is
+    init **1.0, NOT 0** — with proj zero-init the cold-start identity comes from
+    proj, and α MUST be non-zero or ∂loss/∂proj.weight ∝ α would be 0 and the
+    adapter would be permanently dead. proj.weight then receives gradient from
+    the LM loss flowing through z and moves off zero, bootstrapping the adapter.
+    The Linear weights route to AdamW (matched by
     `optim_utils._is_latent_feedback_adapter`).
     """
 
@@ -1005,6 +1008,8 @@ class WorkingMemory(nn.Module):
         read_alpha_floor_start: float = 0.0,
         read_alpha_floor_warmup_steps: int = 0,
         decoupled_kv: bool = False,
+        key_from_embedding: bool = False,
+        key_window: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
@@ -1047,6 +1052,24 @@ class WorkingMemory(nn.Module):
             self.logit_scale = nn.Parameter(torch.tensor(math.log(math.sqrt(d_mem))))
             self.gate_bias_beta = nn.Parameter(torch.tensor(0.1))
 
+        # EMBEDDING-KEY addressing (v14, validated 2026-06-15 — see
+        # experiments/wm_namekey_probe.py). When on (requires decoupled_kv), the
+        # MATCH key + query for the cosine address are a short, order-sensitive,
+        # CAUSAL pool of the recent INPUT EMBEDDINGS (the identifier's token
+        # identity), NOT the trunk hidden h. This makes near-identical bindings
+        # (`v17 = …` vs `v31 = …`, or two similar function names) perfectly
+        # separable — top1 addressing 1.00 vs chance for cosine-on-hidden — which
+        # is the documented root cause of "WM inert for recall". The VALUE path
+        # (W_v) stays on h, so retrieved CONTENT is still the trunk's
+        # representation. The address uses RAW pooled embeddings (no extra params;
+        # reuses the decoupled-kv learned temperature + gate-bias), so it is
+        # effective immediately on a continuation ckpt. Default OFF → the read
+        # uses W_k(h)/W_q(h) exactly as before (byte-identical); old ckpts load
+        # unchanged (no new params). `key_window` = number of recent tokens
+        # pooled (position-weighted so order matters).
+        self.key_from_embedding = bool(key_from_embedding)
+        self.key_window = int(key_window)
+
         # Output α gate on the READ injection (added 2026-06-04). Every other
         # side-module in this repo (FiLM, PKM, RefinementHead, LineSelector)
         # has a learned scalar α that lets the model dial its contribution to
@@ -1088,16 +1111,35 @@ class WorkingMemory(nn.Module):
         self._last_read_attn = None
         self._last_top_idx = None
 
+    def _causal_emb_window(self, emb: torch.Tensor) -> torch.Tensor:
+        """Position-weighted CAUSAL pool of input embeddings over the last
+        `key_window` tokens. The token at t gets the largest weight so the pool
+        is order-sensitive (`v13` != `v31`); positions t-i<0 contribute 0.
+        Reuses the `name_emb_key` recipe from wm_namekey_probe.py. Only called
+        on the embedding-key addressing path (key_from_embedding=True)."""
+        T = emb.shape[1]
+        W = max(1, self.key_window)
+        pooled = float(W) * emb
+        for i in range(1, W):
+            shifted = F.pad(emb, (0, 0, i, 0))[:, :T, :]
+            pooled = pooled + float(W - i) * shifted
+        return pooled
+
     def forward(self, h: torch.Tensor, input_ids: torch.Tensor,
                 read_mask: torch.Tensor | None = None,
-                doc_ids: torch.Tensor | None = None) -> torch.Tensor:
+                doc_ids: torch.Tensor | None = None,
+                input_emb: torch.Tensor | None = None) -> torch.Tensor:
         """`read_mask` (B, T) bool/float: 1 where memory should be injected.
         If None, derived from `input_ids == thinking_token_id`.
 
         `doc_ids` (B, T): when given, a query position may only read buffer
         slots from its own document — a think token in document 2 never
         attends to document 1's hidden states. None → no document masking
-        (behaviour unchanged)."""
+        (behaviour unchanged).
+
+        `input_emb` (B, T, d_model): the input embeddings, only used when
+        `key_from_embedding` is on to build the embedding-key address. None on
+        the legacy path (the address keys on h)."""
         B, T, _ = h.shape
         device = h.device
 
@@ -1134,8 +1176,19 @@ class WorkingMemory(nn.Module):
         if self.decoupled_kv:
             # Cosine addressing: match query to the slot KEY (not the value),
             # sharpness via a learned clamped temperature; β-scaled gate-bias.
-            qn = F.normalize(q, dim=-1)
-            kn = F.normalize(buf_k, dim=-1)
+            if self.key_from_embedding and input_emb is not None:
+                # EMBEDDING-KEY (v14): address on the causal input-embedding
+                # window (token identity), not on h. Query + buffer keys are the
+                # RAW pooled embeddings (d_model); cosine + the same learned
+                # temperature. Value path below is unchanged (W_v(h)).
+                key_src = self._causal_emb_window(input_emb)         # (B, T, d_model)
+                gather_idx_full = top_idx.unsqueeze(-1).expand(-1, -1, self.d_model)
+                buf_key = torch.gather(key_src, dim=1, index=gather_idx_full)  # (B, K, d_model)
+                qn = F.normalize(key_src, dim=-1)
+                kn = F.normalize(buf_key, dim=-1)
+            else:
+                qn = F.normalize(q, dim=-1)
+                kn = F.normalize(buf_k, dim=-1)
             tau = self.logit_scale.exp().clamp(2.0, 100.0)
             scores = torch.einsum("btd,bkd->btk", qn, kn) * tau
             scores = scores + self.gate_bias_beta * torch.log(buf_g.clamp_min(1e-6)).unsqueeze(1)
@@ -1185,6 +1238,16 @@ class WorkingMemory(nn.Module):
             self._last_read_attn = attn.detach()                  # (B, T, K)
             self._last_top_idx = top_idx.detach()                 # (B, K)
 
+        # Grad-keeping stashes for an optional direct attention-PLACEMENT aux
+        # (diagnostic: can the read attention be DRIVEN onto a target slot at
+        # all?). `_last_read_attn_grad` keeps the autograd graph; `_last_top_idx_buf`
+        # maps buffer slot k -> its source token position (long, no grad). Gated
+        # behind `_stash_read_attn_grad` (default off) so normal pretrain/SFT
+        # forwards carry ZERO extra retained-tensor overhead.
+        if getattr(self, "_stash_read_attn_grad", False):
+            self._last_read_attn_grad = attn                      # (B, T, K) w/ grad
+            self._last_top_idx_buf = top_idx                      # (B, K) src positions
+
         read = torch.einsum("btk,bkd->btd", attn, buf_v)          # (B, T, d_mem)
         injection = self.W_proj(read)                             # (B, T, d_model)
         # Stash per-position pre-mask injection. Two versions:
@@ -1217,6 +1280,32 @@ class WorkingMemory(nn.Module):
             sign = torch.where(sign == 0, torch.ones_like(sign), sign)
             alpha = alpha + sign * floor
         return h + alpha * injection * inj
+
+
+class CopyReadout(nn.Module):
+    """Pointer/copy readout over the WM-addressed source span (v14).
+
+    The validated multi-token recall readout (experiments/wm_multitok_readout.py
+    ARM B: 100% exact recall vs ~0 base). At each `mem_read_mask` position the LM
+    distribution is mixed with a COPY distribution that scatters the WM read
+    attention onto the SOURCE token ids — read at (addressed source position +
+    answer-token offset), so each successive answer token copies the next token
+    of the addressed value span:
+
+        g       = sigmoid(Linear(h))                       # copy gate, per pos
+        p_copy  = Σ_k attn[t,k] · onehot(src_tok[t,k])     # pointer
+        p_final = (1 - g) · softmax(lm_logits) + g · p_copy
+
+    The gate bias inits very negative so cold-start g ≈ 0 → the mix is ≈ the
+    plain LM (training starts stable). A single additive read can only shift ONE
+    position, so the copy/pointer is what makes 4-digit / multi-token values
+    recallable. Default off everywhere (TinyLM.use_copy_head) → byte-identical."""
+
+    def __init__(self, d_model: int, gate_bias_init: float = -6.0):
+        super().__init__()
+        self.gate = nn.Linear(d_model, 1, bias=True)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, float(gate_bias_init))
 
 
 class RefinementHead(nn.Module):
@@ -1514,6 +1603,22 @@ class TinyLM(nn.Module):
         mem_decoupled_kv: bool = False,       # DKV-WM: decoupled key/value +
                                               # cosine addressing (reliable
                                               # semantic addressing).
+        mem_key_from_embedding: bool = False, # v14 EMBEDDING-KEY addressing:
+                                              # key the WM read on a causal
+                                              # input-embedding window over the
+                                              # identifier (validated top1=1.00).
+                                              # Requires mem_decoupled_kv. Default
+                                              # off → byte-identical legacy read.
+        mem_key_window: int = 4,              # # recent tokens pooled for the
+                                              # embedding-key (order-sensitive).
+        use_copy_head: bool = False,          # v14 COPY/POINTER readout: at
+                                              # mem_read_mask positions mix the LM
+                                              # dist with a copy dist over the
+                                              # WM-addressed source span (100%
+                                              # exact multi-token recall). Default
+                                              # off → byte-identical; old ckpts
+                                              # load (no copy_head.* keys).
+        copy_head_gate_bias_init: float = -6.0,
         cooperative_latent_wm: bool = False,  # WM×latent cooperation: register a
                                               # learned `mem_alpha` so a latent
                                               # think step can add an α-gated WM
@@ -1884,6 +1989,8 @@ class TinyLM(nn.Module):
                 read_alpha_floor_start=float(mem_read_alpha_floor_start),
                 read_alpha_floor_warmup_steps=int(mem_read_alpha_floor_warmup_steps),
                 decoupled_kv=bool(mem_decoupled_kv),
+                key_from_embedding=bool(mem_key_from_embedding),
+                key_window=int(mem_key_window),
             )
             # Re-init the thinking-token embedding row to the mean of the
             # other rows. PyTorch's default init makes it random noise, which
@@ -1923,6 +2030,21 @@ class TinyLM(nn.Module):
             # byte-identical to pre-cooperation ckpts.
             if cooperative_latent_wm:
                 self.mem_alpha = nn.Parameter(torch.tensor(0.1))
+
+        # v14 COPY/POINTER readout (CopyReadout). Built here so state-dict
+        # round-trips. When on (requires use_memory), the WM read attention is
+        # stashed WITH GRAD so the copy distribution can flow gradient back into
+        # the addressing. Cold-start gate ≈ 0 → mix ≈ plain LM. Default off →
+        # byte-identical, and an existing ckpt loads strict=False (no copy_head.*
+        # keys). Applied at `mem_read_mask` positions in `_finalize`.
+        self.use_copy_head = bool(use_copy_head)
+        if self.use_copy_head:
+            self.copy_head = CopyReadout(d_model,
+                                         gate_bias_init=float(copy_head_gate_bias_init))
+            if self.use_memory:
+                # Retain the read-attention graph so the copy/pointer trains the
+                # cosine addressing (W_v/temperature/gate-bias/embeddings).
+                self.memory._stash_read_attn_grad = True
 
         # Persistent learned-RAG (Product-Key Memory). Drop-in residual
         # at one mid-depth block. See PKM_PLAN.md.
@@ -2079,8 +2201,66 @@ class TinyLM(nn.Module):
         `doc_ids` (when given) confines reads/writes to within a document."""
         if not self.use_memory:
             return h_normed
+        # v14 embedding-key addressing needs the input embeddings. Only computed
+        # when the flag is on (default off → input_emb=None → byte-identical).
+        input_emb = None
+        if getattr(self.memory, "key_from_embedding", False) and input_ids is not None:
+            input_emb = self.embed(input_ids)
         return self.memory(h_normed, input_ids, read_mask=read_mask,
-                           doc_ids=doc_ids)
+                           doc_ids=doc_ids, input_emb=input_emb)
+
+    @staticmethod
+    def _contiguous_run_index(mask: torch.Tensor) -> torch.Tensor:
+        """Per-token 0-indexed position within its contiguous True run of a
+        boolean (B, T) mask (0 for the first True in a run, 1 for the next, …;
+        0 at False positions). Same cumsum-reset trick as `_compute_burst_index`
+        but for an arbitrary mask. Used as the answer-token OFFSET for the copy
+        readout (which value-span token to copy at each answer position)."""
+        m_int = mask.to(torch.int64)
+        c = m_int.cumsum(dim=1)
+        reset = (c * (1 - m_int)).cummax(dim=1).values
+        return (c - reset - 1).clamp(min=0)
+
+    def _apply_copy_head(self, lm_logits: torch.Tensor, h: torch.Tensor,
+                         input_ids: torch.Tensor,
+                         mem_read_mask: torch.Tensor | None) -> torch.Tensor:
+        """v14 copy/pointer mix at `mem_read_mask` positions (default off).
+
+        Replaces the logits at masked positions with log(p_final) where
+        p_final = (1-g)·softmax(lm) + g·p_copy, so the downstream
+        cross-entropy (which re-applies log_softmax) is exact:
+        softmax(log p_final) == p_final. Only fires when use_copy_head AND
+        mem_read_mask has True positions AND the WM stashed its read attention —
+        otherwise returns lm_logits unchanged (byte-identical)."""
+        if (not getattr(self, "use_copy_head", False)
+                or mem_read_mask is None or not self.use_memory):
+            return lm_logits
+        mask = mem_read_mask.bool()
+        if not bool(mask.any()):
+            return lm_logits
+        mem = self.memory
+        attn = getattr(mem, "_last_read_attn_grad", None)     # (B, T, K) w/ grad
+        top_idx = getattr(mem, "_last_top_idx_buf", None)     # (B, K) src positions
+        if attn is None or top_idx is None:
+            return lm_logits
+        B, T, V = lm_logits.shape
+        offset = self._contiguous_run_index(mask)             # (B, T) long
+        b_idx, t_idx = mask.nonzero(as_tuple=True)            # (N,)
+        h_m = h[b_idx, t_idx]                                  # (N, d)
+        attn_m = attn[b_idx, t_idx]                            # (N, K)
+        top_m = top_idx[b_idx]                                 # (N, K)
+        off_m = offset[b_idx, t_idx]                           # (N,)
+        # source token = the (addressed slot's source position + answer offset)
+        src_pos = (top_m + off_m.unsqueeze(-1)).clamp(0, T - 1)   # (N, K)
+        src_tok = input_ids[b_idx.unsqueeze(-1), src_pos]      # (N, K) token ids
+        p_copy = lm_logits.new_zeros(b_idx.shape[0], V)
+        p_copy.scatter_add_(1, src_tok, attn_m.to(p_copy.dtype))  # (N, V)
+        p_lm = torch.softmax(lm_logits[b_idx, t_idx], dim=-1)  # (N, V)
+        g = torch.sigmoid(self.copy_head.gate(h_m))            # (N, 1)
+        self._last_copy_gate = g.detach()
+        p_final = (1.0 - g) * p_lm + g * p_copy
+        log_p = torch.log(p_final.clamp_min(1e-9))
+        return lm_logits.index_put((b_idx, t_idx), log_p.to(lm_logits.dtype))
 
     def apply_latent_feedback_adapter(self, z: torch.Tensor) -> torch.Tensor:
         """Map a fed-back latent hidden `z` into the input-embedding manifold.
@@ -2180,6 +2360,9 @@ class TinyLM(nn.Module):
             maybe_gate(h)
             return h
         lm_logits = self.lm_head(h)
+        # v14 copy/pointer mix at mem_read_mask positions (default off →
+        # returns lm_logits unchanged, byte-identical).
+        lm_logits = self._apply_copy_head(lm_logits, h, input_ids, mem_read_mask)
         outs = (lm_logits,)
         if return_aux and self.aux_dim > 0:
             outs = outs + (self.aux_head(h),)

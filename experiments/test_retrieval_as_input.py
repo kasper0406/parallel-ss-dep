@@ -152,6 +152,35 @@ def test_generate_with_retrieval_as_input_runs(tiny_model_with_memory):
     assert diag["emit_count"] <= 4
 
 
+def test_force_prefix_think_forces_exact_burst(tiny_model_with_memory):
+    """force_prefix_think=R must run EXACTLY R retrieval-injected thinks
+    before the first emit, then emit gate-free (0 thinks) — regardless of
+    the gate. This closes the WM-kill-gate tooling gap (the gate fires 0
+    thinks on recall, so without this the retrieval read is never exercised).
+    Also asserts force_prefix_think=0 is byte-identical to the default."""
+    from experiments.eval_humaneval import generate_with_retrieval_as_input
+    model, thinking_id = tiny_model_with_memory
+    model = model.cuda().eval()
+    prompt = torch.randint(0, 15, (1, 4)).cuda()
+    R = 3
+    out_f, diag_f = generate_with_retrieval_as_input(
+        model, prompt, max_gen=4, temperature=0.0,
+        thinking_token_id=thinking_id, force_prefix_think=R)
+    assert diag_f["think_steps_used"][0] == R, diag_f["think_steps_used"]
+    assert all(s == 0 for s in diag_f["think_steps_used"][1:]), \
+        diag_f["think_steps_used"]
+    assert diag_f["think_total"] == R
+
+    # force_prefix_think=0 must match the gate-decides default exactly.
+    out_a, _ = generate_with_retrieval_as_input(
+        model, prompt, max_gen=4, temperature=0.0,
+        thinking_token_id=thinking_id, force_prefix_think=0)
+    out_b, _ = generate_with_retrieval_as_input(
+        model, prompt, max_gen=4, temperature=0.0,
+        thinking_token_id=thinking_id)
+    assert out_a.shape == out_b.shape and torch.equal(out_a, out_b)
+
+
 # ---------------------------------------------------------------------------
 # v7: additive α-gated injection (Fix B)
 # ---------------------------------------------------------------------------

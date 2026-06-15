@@ -465,6 +465,35 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Anneal --mem_read_alpha_floor_start to 0 over this "
                         "many WM forwards. A few thousand is the validated "
                         "range. 0 disables the floor curriculum (default).")
+    # ---- v14 WM-recall plumbing (validated embedding-key + copy readout) -----
+    # All default OFF → byte-identical to the legacy WM, so an in-flight run
+    # (e.g. v12) that re-imports this file on autoresume is unaffected.
+    p.add_argument("--mem_key_from_embedding", action="store_true",
+                   help="v14: key the WM read on a short CAUSAL input-embedding "
+                        "window over the identifier (token identity) instead of "
+                        "the trunk hidden. Validated top1 addressing 1.00 vs "
+                        "chance — the documented fix for 'WM inert for recall'. "
+                        "Requires --mem_decoupled_kv. Adds NO new params (raw "
+                        "pooled embeddings + the existing DKV temperature) so a "
+                        "continuation ckpt loads byte-identically. Default OFF.")
+    p.add_argument("--mem_key_window", type=int, default=4,
+                   help="Number of recent tokens pooled (order-sensitive) for "
+                        "--mem_key_from_embedding. Default 4.")
+    p.add_argument("--use_copy_head", action="store_true",
+                   help="v14: add a COPY/POINTER readout. At --emit_read_mask "
+                        "answer positions, mix the LM distribution with a copy "
+                        "distribution over the WM-addressed source span "
+                        "(p=(1-g)·p_lm + g·p_copy, g=sigmoid(Linear(h)) with a "
+                        "very-negative bias so cold-start g≈0). The validated "
+                        "100%-exact multi-token recall readout. Default OFF → "
+                        "byte-identical; old ckpts load (no copy_head.* keys).")
+    p.add_argument("--emit_read_mask", action="store_true",
+                   help="v14: have the data mix emit a per-position mem_read_mask "
+                        "(4th tuple element) = 1 over recall-source answer spans, "
+                        "aligned through think-burst insertion. Threaded into "
+                        "TinyLM.forward(mem_read_mask=) on the pretrain path so "
+                        "answer-token CE flows into the WM read (the gradient "
+                        "missing in v10-v13). Default OFF → 3-tuple as before.")
     # ----- Persistent learned-RAG (Product-Key Memory) -----
     p.add_argument("--use_pkm", action="store_true",
                    help="Add a Product-Key Memory layer (Lample 2019 / "
@@ -727,6 +756,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "at the last). Fixes 'capability baked but gate never "
                         "fires it' (avg_steps≈0.77 vs target n). 0 = capability "
                         "only.")
+    p.add_argument("--latent_reasoning_start_step", type=int, default=0,
+                   help="Step at which the latent-reasoning co-train begins "
+                        "firing (default 0 = from scratch). Use to start it on a "
+                        "warm trunk; the depth curriculum is measured relative to "
+                        "this start.")
+    p.add_argument("--latent_reasoning_weight_warmup_steps", type=int, default=0,
+                   help="Linearly ramp the latent-reasoning weight 0->target over "
+                        "this many steps after --latent_reasoning_start_step "
+                        "(default 0 = full weight immediately, byte-identical to "
+                        "the old path). Set to the PKM α-floor window (e.g. 3000) "
+                        "so the aux gradient stays negligible while PKM bootstraps "
+                        "— the v12-destabilization safety knob.")
     # --- Gate-calibration aux loss (latent "think only where helpful") ---
     # Trains the OUTPUT GATE (not the trunk) toward firing think exactly where
     # a latent think actually raises logp(true_next). Uses the shared latent
@@ -778,6 +819,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--feature_probe_wm_recall_n", type=int, default=64,
                    help="Cap the number of recall tasks for the WM probe "
                         "(generation is CUDA-heavy; keep small).")
+    p.add_argument("--feature_probe_code_recall_path", type=str, default="",
+                   help="v14: held-out REALISTIC code/agentic recall JSONL "
+                        "(data/code_recall_heldout.jsonl) for the live "
+                        "WM-usefulness probe. Runs eval_code_recall teacher-"
+                        "forced ON vs full_off (Δ>0 ⇒ WM load-bearing) and logs "
+                        "read_alpha + addressing mass-on-binding. Empty = skip "
+                        "(default) so non-v14 runs are unaffected.")
+    p.add_argument("--feature_probe_code_recall_n", type=int, default=200,
+                   help="Cap the number of tasks for the v14 code-recall probe "
+                        "(teacher-forced is one forward each; ~200 is cheap).")
     p.add_argument("--bf16_optim_state", action="store_true",
                    help="Store optimizer state (AdamW exp_avg/exp_avg_sq, "
                         "Muon momentum_buffer) in bf16 instead of fp32. "

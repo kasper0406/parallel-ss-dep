@@ -494,6 +494,56 @@ def build_parser() -> argparse.ArgumentParser:
                         "TinyLM.forward(mem_read_mask=) on the pretrain path so "
                         "answer-token CE flows into the WM read (the gradient "
                         "missing in v10-v13). Default OFF → 3-tuple as before.")
+    # ----- v15 DISCRETE-KEY WM (validated in wm_recall_cotrain.py) ----------
+    # The discrete-hash WM addressing + copy/pointer readout, wired into the
+    # real pretrain trainer (2026-06-16). All default OFF / no new params →
+    # byte-identical to the legacy WM, so an in-flight run that re-imports this
+    # file on autoresume is unaffected and old ckpts load strict=False.
+    p.add_argument("--mem_discrete_key", action="store_true",
+                   help="v15: DISCRETE-HASH WM addressing — key the read on a "
+                        "deterministic per-position integer code (the carried "
+                        "BOUND-identifier run-hash) → onehot match → zero "
+                        "cross-talk. No new params. The validated "
+                        "content-addressable recall mechanism. Requires "
+                        "--use_memory. Default OFF → byte-identical legacy read.")
+    p.add_argument("--mem_discrete_key_vstart", action="store_true",
+                   help="v15: use the task-specific `vN` value-start parser for "
+                        "the discrete key INSTEAD of the GENERAL lexical "
+                        "identifier-span extractor (default). Only meaningful "
+                        "with --mem_discrete_key.")
+    p.add_argument("--mem_discrete_key_match_window", type=int, default=32,
+                   help="v15: locality window for the discrete match-existence "
+                        "gate — the addressing identifier must be re-mentioned "
+                        "within this many tokens for the copy to fire (rejects "
+                        "stale cross-family false matches). 0 disables. "
+                        "Default 32.")
+    p.add_argument("--mem_always_read", action="store_true",
+                   help="v15: ALWAYS-ON WM read — compute/inject the WM read at "
+                        "EVERY position (not just think positions) when no "
+                        "explicit read_mask is given, so WM is always on the "
+                        "gradient path (PKM-style). Default OFF → byte-identical "
+                        "legacy think-only read.")
+    p.add_argument("--mem_copy_require_match", action="store_true", default=True,
+                   help="v15: MATCH-EXISTENCE copy gating — the copy/pointer head "
+                        "only fires where the discrete address matched a real "
+                        "buffered binding (no-match → recurrence fallback, no "
+                        "harm). Default ON; no-op on the non-discrete path.")
+    p.add_argument("--mem_no_copy_require_match", dest="mem_copy_require_match",
+                   action="store_false",
+                   help="Disable the match-existence copy gate (let the copy head "
+                        "fire wherever its learned gate opens).")
+    p.add_argument("--copy_gate_bias_init", type=float, default=-6.0,
+                   help="v15: init bias of the copy-head gate Linear. Very "
+                        "negative (default -6.0) → cold/closed cold-start gate "
+                        "g≈0 so the mix begins ≈ the plain LM (stable). Maps to "
+                        "TinyLM(copy_head_gate_bias_init=).")
+    p.add_argument("--mem_freeze_read_alpha", action="store_true",
+                   help="v15: pin the WM read-injection α to --mem_read_alpha_init "
+                        "and freeze it (requires_grad=False) AFTER loading the "
+                        "ckpt. With --mem_read_alpha_init 0.0 this turns the "
+                        "additive W_proj injection fully OFF (copy-head-only — the "
+                        "validated no-harm config: WM helps via the copy/pointer "
+                        "at recall spans and can never corrupt general text).")
     # ----- Persistent learned-RAG (Product-Key Memory) -----
     p.add_argument("--use_pkm", action="store_true",
                    help="Add a Product-Key Memory layer (Lample 2019 / "

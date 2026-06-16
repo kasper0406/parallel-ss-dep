@@ -1016,6 +1016,7 @@ class WorkingMemory(nn.Module):
         discrete_key_tau: float = 30.0,
         discrete_key_lexical: bool = True,
         copy_require_match: bool = True,
+        discrete_key_match_window: int = 32,
     ):
         super().__init__()
         self.d_model = d_model
@@ -1132,6 +1133,19 @@ class WorkingMemory(nn.Module):
         # discrete branch (None otherwise → the gate in `_apply_copy_head` is
         # skipped). Inference-time, no params, no state-dict footprint.
         self.copy_require_match = bool(copy_require_match)
+        # LOCALITY window for the match-existence copy gate (discrete-key). A
+        # code-equality match only counts as a GENUINE name-reuse recall if the
+        # addressing identifier was (re-)mentioned within this many tokens before
+        # the query — `NAME = <value>` re-states NAME right before the recalled
+        # value (dist ~5-6), whereas a STALE carried code that drifted through
+        # unrelated prose (the userinstr/toolout cross-family false-match) is
+        # 60-320 tokens from its bound-name mention. NOTE: this gates the NAME
+        # RE-MENTION distance, NOT the binding/value distance — long-range recall
+        # is preserved (the value can be arbitrarily far; the query just has to
+        # actually name what it recalls). 0 disables locality (pure code-equality
+        # match-existence). Default 32 (clean gap: genuine ≤6, stale ≥58).
+        self.discrete_key_match_window = int(discrete_key_match_window)
+        self._dk_last_code_src = None    # (B,T) src pos of carried code (no grad)
         self._last_match_exists = None   # (B,T) bool, discrete-key branch only
         self._dk_v_id = None          # `v` token id (int)
         self._dk_digit_val = None     # {token_id: digit_value}
@@ -1419,6 +1433,15 @@ class WorkingMemory(nn.Module):
         # ---- carry-forward: update only on bound-name positions ---------------
         carry_assert = is_ident & run_is_name & in_bound
         code = self._dk_ffill(code_run, carry_assert, fill=-1)       # (B,T)
+        # SOURCE position of the carried code = the most-recent bound-name
+        # mention (carry_assert). The query→source distance is what separates a
+        # GENUINE local name-reuse recall (the bound name is re-mentioned right
+        # before the recalled value, dist ~5-6) from a STALE carried code that
+        # persisted through hundreds of tokens of unrelated prose (dist ~60-320,
+        # the userinstr/toolout cross-family false-match). Stashed (no grad) for
+        # the match-existence locality gate in forward(). -1 before the first.
+        ar = torch.arange(T, device=dev).view(1, T).expand(B, T)
+        self._dk_last_code_src = self._dk_ffill(ar, carry_assert, fill=-1)
 
         # ---- vstart: first ident in [q+1, q+4] after `name =` (q = eq pos) ----
         prev_run_is_name = F.pad(run_is_name[:, :-1], (1, 0), value=False)
@@ -1521,10 +1544,12 @@ class WorkingMemory(nn.Module):
         eq_ids = self._dk_eq_ids
         ids = input_ids.tolist()
         code_l = [[-1] * T for _ in range(B)]
+        src_l = [[-1] * T for _ in range(B)]   # source pos of the carried code
         vstart = torch.zeros((B, T), dtype=torch.bool, device=input_ids.device)
         for b in range(B):
             row = ids[b]
             cur = -1
+            cur_src = -1
             t = 0
             while t < T:
                 tid = row[t]
@@ -1535,8 +1560,10 @@ class WorkingMemory(nn.Module):
                         num = num * 10 + digit_val[row[j]]
                         j += 1
                     cur = num
+                    cur_src = t
                     for k in range(t, j):
                         code_l[b][k] = num
+                        src_l[b][k] = t
                     # Binding? the v-run is immediately followed by an `=` token
                     # → the value start is the first digit after it (skip the
                     # ` =`/` ` separators). References (`print(v5)`) are not
@@ -1551,8 +1578,11 @@ class WorkingMemory(nn.Module):
                     t = j
                 else:
                     code_l[b][t] = cur
+                    src_l[b][t] = cur_src
                     t += 1
         code = torch.tensor(code_l, dtype=torch.long, device=input_ids.device)
+        self._dk_last_code_src = torch.tensor(
+            src_l, dtype=torch.long, device=input_ids.device)
         return code, vstart
 
     def forward(self, h: torch.Tensor, input_ids: torch.Tensor,
@@ -1687,7 +1717,17 @@ class WorkingMemory(nn.Module):
         # the copy where the address landed on nothing (no-match → recurrence
         # fallback, no harm). None for the non-discrete path → copy unchanged.
         if dk_match is not None:
-            self._last_match_exists = (dk_match & ~blocked).any(dim=-1).detach()
+            me = (dk_match & ~blocked).any(dim=-1)              # (B, T) code-eq
+            # LOCALITY: require the addressing identifier to have been re-mentioned
+            # within `discrete_key_match_window` tokens — rejects stale carried
+            # codes (cross-family false matches) without harming long-range recall.
+            csrc = getattr(self, "_dk_last_code_src", None)
+            if self.discrete_key_match_window > 0 and csrc is not None:
+                posT = torch.arange(T, device=device).view(1, T)
+                local = (csrc >= 0) & ((posT - csrc)
+                                       <= self.discrete_key_match_window)
+                me = me & local
+            self._last_match_exists = me.detach()
         else:
             self._last_match_exists = None
 
@@ -2103,6 +2143,11 @@ class TinyLM(nn.Module):
                                               # buffered binding (no-match → no
                                               # copy, recurrence fallback). Default
                                               # on; no-op on the non-discrete path.
+        mem_discrete_key_match_window: int = 32,  # locality window for the match-
+                                              # existence gate (the addressing name
+                                              # must be re-mentioned within this
+                                              # many tokens → rejects stale cross-
+                                              # family false matches). 0 disables.
         use_copy_head: bool = False,          # v14 COPY/POINTER readout: at
                                               # mem_read_mask positions mix the LM
                                               # dist with a copy dist over the
@@ -2489,6 +2534,7 @@ class TinyLM(nn.Module):
                 discrete_key_tau=float(mem_discrete_key_tau),
                 discrete_key_lexical=bool(mem_discrete_key_lexical),
                 copy_require_match=bool(mem_copy_require_match),
+                discrete_key_match_window=int(mem_discrete_key_match_window),
             )
             # Re-init the thinking-token embedding row to the mean of the
             # other rows. PyTorch's default init makes it random noise, which

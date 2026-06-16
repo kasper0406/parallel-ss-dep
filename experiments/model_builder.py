@@ -106,6 +106,17 @@ def build_model_from_args(args, *, vocab_size: int,
                 getattr(args, "mem_key_from_embedding", False)),
             mem_key_window=int(getattr(args, "mem_key_window", 4)),
             use_copy_head=bool(getattr(args, "use_copy_head", False)),
+            copy_head_gate_bias_init=float(
+                getattr(args, "copy_gate_bias_init", -6.0)),
+            # v15 DISCRETE-KEY WM (default off → byte-identical, no new params).
+            mem_always_read=bool(getattr(args, "mem_always_read", False)),
+            mem_discrete_key=bool(getattr(args, "mem_discrete_key", False)),
+            mem_discrete_key_lexical=(
+                not bool(getattr(args, "mem_discrete_key_vstart", False))),
+            mem_copy_require_match=bool(
+                getattr(args, "mem_copy_require_match", True)),
+            mem_discrete_key_match_window=int(
+                getattr(args, "mem_discrete_key_match_window", 32)),
         )
 
     pkm_kwargs: dict = {}
@@ -182,6 +193,35 @@ def build_model_from_args(args, *, vocab_size: int,
             print(f"  first missing: {missing[:5]}")
         if unexpected:
             print(f"  first unexpected: {unexpected[:5]}")
+
+    # v15 DISCRETE-KEY WM post-build wiring (runs AFTER any --load_ckpt so the
+    # ckpt cannot un-do it). The discrete-hash lexical extractor needs the
+    # tokenizer's identifier/digit/`=` vocab (no state-dict footprint) — detect
+    # it once here exactly as eval_bracket_structure.build_model_from_ckpt does,
+    # so the model is self-contained. Default off → this whole block is skipped.
+    if args.use_memory and bool(getattr(args, "mem_discrete_key", False)):
+        from transformers import AutoTokenizer
+        _tok = AutoTokenizer.from_pretrained(
+            getattr(args, "tokenizer", "HuggingFaceTB/SmolLM2-135M"))
+        model.memory.set_discrete_key_vocab(_tok)
+        print(f"  discrete-key WM: lexical="
+              f"{bool(getattr(model.memory, 'discrete_key_lexical', True))} "
+              f"always_read={bool(model.memory.always_read)} "
+              f"copy_require_match={bool(model.memory.copy_require_match)} "
+              f"match_window={int(model.memory.discrete_key_match_window)} "
+              f"use_copy_head={bool(getattr(model, 'use_copy_head', False))}")
+    # Pin + freeze the WM read-injection α (no-harm copy-head-only config).
+    # Done AFTER load so the ckpt's stored α (e.g. v12's decayed value) is
+    # overridden by the requested init, then frozen so it never drifts.
+    if args.use_memory and bool(getattr(args, "mem_freeze_read_alpha", False)):
+        import torch as _torch
+        with _torch.no_grad():
+            model.memory.read_alpha.fill_(
+                float(getattr(args, "mem_read_alpha_init", 0.0)))
+        model.memory.read_alpha.requires_grad_(False)
+        print(f"  WM read_alpha pinned + frozen at "
+              f"{float(model.memory.read_alpha):.3f} (additive injection "
+              f"{'OFF' if float(model.memory.read_alpha) == 0.0 else 'ON'})")
 
     return model, ModelBuildInfo(
         fb_pairs=fb_pairs, fb_xattn_pairs=fb_xattn_pairs,

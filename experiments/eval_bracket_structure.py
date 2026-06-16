@@ -59,6 +59,7 @@ def build_model_from_ckpt(ckpt_path: str,
                           force_mem_discrete_key: bool | None = None,
                           force_mem_discrete_key_lexical: bool | None = None,
                           force_mem_copy_require_match: bool | None = None,
+                          force_mem_discrete_key_match_window: int | None = None,
                           force_mem_size: int | None = None):
     """Construct a TinyLM from a saved ckpt.
 
@@ -159,6 +160,11 @@ def build_model_from_ckpt(ckpt_path: str,
     mem_copy_require_match = bool(cfg.get("mem_copy_require_match", True))
     if force_mem_copy_require_match is not None:
         mem_copy_require_match = bool(force_mem_copy_require_match)
+    # Locality window for the match-existence gate (the addressing name must be
+    # re-mentioned within this many tokens). Default 32. 0 disables locality.
+    mem_discrete_key_match_window = int(cfg.get("mem_discrete_key_match_window", 32))
+    if force_mem_discrete_key_match_window is not None:
+        mem_discrete_key_match_window = int(force_mem_discrete_key_match_window)
     mem_size_eff = int(cfg.get("mem_size", 1024))
     if force_mem_size is not None:
         mem_size_eff = int(force_mem_size)
@@ -182,6 +188,7 @@ def build_model_from_ckpt(ckpt_path: str,
             mem_discrete_key=bool(mem_discrete_key),
             mem_discrete_key_lexical=bool(mem_discrete_key_lexical),
             mem_copy_require_match=bool(mem_copy_require_match),
+            mem_discrete_key_match_window=int(mem_discrete_key_match_window),
             use_copy_head=bool(use_copy_head),
         )
     pkm_kwargs = {}

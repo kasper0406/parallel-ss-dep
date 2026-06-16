@@ -248,7 +248,8 @@ def general_ce_killgate(model, general_examples, *, n, device, gen_stride=8):
 def load_model(ckpt, device, *, mem_always_read=False, force_wm=False,
                mem_key_from_embedding=False, mem_key_window=4,
                use_copy_head=False, mem_discrete_key=False, force_mem_size=None,
-               mem_discrete_key_lexical=True, copy_require_match=True):
+               mem_discrete_key_lexical=True, copy_require_match=True,
+               match_window=32):
     from experiments.eval_bracket_structure import build_model_from_ckpt
     from transformers import AutoTokenizer
     # FORCE-ATTACH the validated v14 WM-recall mechanism onto the base. None ->
@@ -267,6 +268,8 @@ def load_model(ckpt, device, *, mem_always_read=False, force_wm=False,
                                         if mem_discrete_key else None),
         force_mem_copy_require_match=(bool(copy_require_match)
                                       if mem_discrete_key else None),
+        force_mem_discrete_key_match_window=(int(match_window)
+                                            if mem_discrete_key else None),
         force_mem_size=(int(force_mem_size) if force_mem_size else None),
     )
     model.to(device).eval()
@@ -748,6 +751,12 @@ def main():
                     action="store_false",
                     help="Disable match-existence gating (reproduce the pre-fix "
                          "cross-family over-firing behaviour).")
+    ap.add_argument("--match_window", type=int, default=32,
+                    help="LOCALITY window for the match-existence gate: a code "
+                         "match only counts if the addressing identifier was re-"
+                         "mentioned within this many tokens (rejects stale cross-"
+                         "family false matches; preserves long-range recall). "
+                         "0 disables locality (pure code-equality).")
     ap.add_argument("--mem_size_override", type=int, default=2048,
                     help="WM buffer size when discrete-key is on (must span the "
                          "whole sequence so every value-start is buffered).")
@@ -793,6 +802,7 @@ def main():
         mem_discrete_key=args.mem_discrete_key,
         mem_discrete_key_lexical=(not args.mem_discrete_key_vstart),
         copy_require_match=args.copy_require_match,
+        match_window=args.match_window,
         force_mem_size=(args.mem_size_override if args.mem_discrete_key else None))
     # Open the copy gate so the short cotrain has gradient to climb it (base
     # copy head is built at bias -6 → g≈0.0025, near-flat gradient).
@@ -808,6 +818,7 @@ def main():
           f"key_window={model.memory.key_window} "
           f"use_copy_head={getattr(model, 'use_copy_head', False)} "
           f"copy_require_match={getattr(model.memory, 'copy_require_match', False)} "
+          f"match_window={getattr(model.memory, 'discrete_key_match_window', 0)} "
           f"zero_shot_copy={args.zero_shot_copy} "
           f"force_wm={args.force_wm} state_readonly={model.state_readonly_at_think}")
 
@@ -956,6 +967,8 @@ def main():
         getattr(model.memory, "discrete_key_lexical", True))
     save_cfg["mem_copy_require_match"] = bool(
         getattr(model.memory, "copy_require_match", True))
+    save_cfg["mem_discrete_key_match_window"] = int(
+        getattr(model.memory, "discrete_key_match_window", 32))
     save_cfg["mem_size"] = int(model.memory.mem_size)
     save_cfg["use_copy_head"] = bool(getattr(model, "use_copy_head", False))
     torch.save({"state_dict": model.state_dict(),

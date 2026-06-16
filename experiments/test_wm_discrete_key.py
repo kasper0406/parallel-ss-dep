@@ -177,6 +177,39 @@ def test_match_existence_true_only_where_a_binding_matches():
     assert bool(me[qpos]), "reference query failed to find its binding"
 
 
+def test_match_locality_rejects_stale_carried_code():
+    """LOCALITY: a code-equality match counts only if the addressing identifier
+    was re-mentioned within `discrete_key_match_window` tokens. A binding whose
+    name drifted far from the query (carried through prose, never re-mentioned)
+    is rejected — this is the cross-family false-match fix — while a LOCAL
+    re-mention is accepted. Long-range recall is preserved because the gate is on
+    the NAME-mention distance, not the binding/value distance."""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    wm = _wm(discrete=True)
+    wm.set_discrete_key_vocab(tok)
+    # binding, then a long unrelated-prose gap with NO re-mention of v53.
+    prog = "v53 = 9016\n" + "the cat sat on a mat and ran far away today okay\n" * 2
+    ids = torch.tensor([tok.encode(prog, add_special_tokens=False)])
+    h = torch.randn(1, ids.shape[1], 32)
+    qpos = ids.shape[1] - 1               # deep in prose, carries stale code 53
+    # window 0 (locality off) → pure code-equality match is True (stale matches).
+    wm.discrete_key_match_window = 0
+    wm(h, ids)
+    assert bool(wm._last_match_exists[0, qpos]), "code-equality match expected"
+    # window 8 → the bound name is >8 tokens back → match rejected (no harm).
+    wm.discrete_key_match_window = 8
+    wm(h, ids)
+    assert not bool(wm._last_match_exists[0, qpos]), "stale match not rejected"
+    # a LOCAL re-mention (print(v53) right after the binding) is still accepted.
+    prog2 = "v53 = 9016\nprint(v53)\n"
+    ids2 = torch.tensor([tok.encode(prog2, add_special_tokens=False)])
+    h2 = torch.randn(1, ids2.shape[1], 32)
+    wm(h2, ids2)
+    toks2 = [tok.decode([i]) for i in ids2[0].tolist()]
+    assert bool(wm._last_match_exists[0, len(toks2) - 2]), "local re-mention lost"
+
+
 def test_match_existence_gating_suppresses_copy_on_no_match():
     """The match-existence copy gate: with copy_require_match ON, the copy head
     fires at a MATCH position but is SUPPRESSED at a NO-MATCH position (falls

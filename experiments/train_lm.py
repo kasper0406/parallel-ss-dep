@@ -1505,6 +1505,16 @@ def main():
                     # wm(inj=) diagnostic below (IndexError).
                     main_wm_inj = getattr(getattr(model, "memory", None),
                                           "_last_injection", None)
+                    # v15 discrete-key copy-head activity, snapshotted from the
+                    # MAIN forward (same clobber hazard as the WM injection: aux
+                    # extra-forwards overwrite _last_copy_gate_eff / the WM's
+                    # _last_match_exists). copy_g_eff is (N_recall, 1) at the
+                    # mem_read_mask answer positions; match_exists is (B, T) over
+                    # the whole batch. Both None unless use_copy_head + discrete.
+                    main_copy_g_eff = getattr(model, "_last_copy_gate_eff", None)
+                    main_match_exists = getattr(
+                        getattr(model, "memory", None), "_last_match_exists", None)
+                    main_read_mask = mem_read_mask
                     # Same hazard for PKM: the aux extra-forwards (latent_cotrain /
                     # latent_reasoning / gate_calibration) run through PKM and
                     # clobber _last_slot_idx/_last_weights — which BOTH the
@@ -1859,6 +1869,28 @@ def main():
                     wproj = float(model.memory.W_proj.weight.float().norm())
                 line += (f"  wm(inj={inj_norm:.3f},think%={think_frac*100:.1f},"
                          f"Wproj={wproj:.2f})")
+            # v15 discrete-key copy-head diagnostic. Proves the WM is ACTIVE:
+            # copy_g = mean effective copy gate at recall (mem_read_mask)
+            # positions; m%R / m%G = discrete-address match rate at recall vs
+            # general positions (recall ≫ general ⇒ the discrete addressing is
+            # firing where the answer-token CE wants it and staying quiet on
+            # general text — the "don't copy" the 84% general mix teaches).
+            if (getattr(args, "use_copy_head", False)
+                    and main_copy_g_eff is not None):
+                with torch.no_grad():
+                    cg = float(main_copy_g_eff.float().mean())
+                    m_recall = m_gen = 0.0
+                    if (main_match_exists is not None
+                            and main_read_mask is not None
+                            and main_match_exists.shape == main_read_mask.shape):
+                        rm = main_read_mask.bool()
+                        me = main_match_exists.bool()
+                        if bool(rm.any()):
+                            m_recall = float(me[rm].float().mean())
+                        if bool((~rm).any()):
+                            m_gen = float(me[~rm].float().mean())
+                line += (f"  copy(g={cg:.4f},m%R={m_recall*100:.1f},"
+                         f"m%G={m_gen*100:.2f})")
             if is_main:
                 print(line)
             if tb is not None:
@@ -2168,6 +2200,23 @@ def main():
                 mem_size=int(args.mem_size) if args.use_memory else 0,
                 mem_dim=(int(args.mem_dim) if args.mem_dim > 0
                           else int(args.d_model)) if args.use_memory else 0,
+                # WM addressing/readout cfg (no/with state-dict footprint) so a
+                # mid-eval ckpt reloads with the same WM as the final ckpt.
+                mem_decoupled_kv=bool(getattr(args, "mem_decoupled_kv", False)),
+                mem_key_from_embedding=bool(
+                    getattr(args, "mem_key_from_embedding", False)),
+                mem_key_window=int(getattr(args, "mem_key_window", 4)),
+                use_copy_head=bool(getattr(args, "use_copy_head", False)),
+                mem_discrete_key=bool(getattr(args, "mem_discrete_key", False)),
+                mem_discrete_key_lexical=(
+                    not bool(getattr(args, "mem_discrete_key_vstart", False))),
+                mem_always_read=bool(getattr(args, "mem_always_read", False)),
+                mem_copy_require_match=bool(
+                    getattr(args, "mem_copy_require_match", True)),
+                mem_discrete_key_match_window=int(
+                    getattr(args, "mem_discrete_key_match_window", 32)),
+                copy_head_gate_bias_init=float(
+                    getattr(args, "copy_gate_bias_init", -6.0)),
                 use_pkm=bool(getattr(args, "use_pkm", False)),
                 pkm_after_layer=int(getattr(args, "pkm_after_layer", 14)),
                 pkm_n_keys=int(getattr(args, "pkm_n_keys", 256)),
@@ -2285,6 +2334,20 @@ def main():
                     getattr(args, "mem_key_from_embedding", False)),
                 "mem_key_window": int(getattr(args, "mem_key_window", 4)),
                 "use_copy_head": bool(getattr(args, "use_copy_head", False)),
+                # v15 discrete-key WM (no state-dict footprint → MUST be in cfg so
+                # eval_bracket_structure.build_model_from_ckpt re-activates the
+                # discrete addressing + copy gating on reload, else the trained
+                # copy head would address on the legacy cosine scores).
+                "mem_discrete_key": bool(getattr(args, "mem_discrete_key", False)),
+                "mem_discrete_key_lexical": (
+                    not bool(getattr(args, "mem_discrete_key_vstart", False))),
+                "mem_always_read": bool(getattr(args, "mem_always_read", False)),
+                "mem_copy_require_match": bool(
+                    getattr(args, "mem_copy_require_match", True)),
+                "mem_discrete_key_match_window": int(
+                    getattr(args, "mem_discrete_key_match_window", 32)),
+                "copy_head_gate_bias_init": float(
+                    getattr(args, "copy_gate_bias_init", -6.0)),
                 "mem_dim": ((int(args.mem_dim) if args.mem_dim > 0
                              else int(args.d_model)) if args.use_memory else 0),
                 "use_pkm": bool(getattr(args, "use_pkm", False)),

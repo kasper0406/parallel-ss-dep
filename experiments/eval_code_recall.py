@@ -53,16 +53,19 @@ def extract_answer(text: str) -> str | None:
     m = _ANS_RE.search(text)
     if m:
         cand = m.group(1).splitlines()[0]
-        cand = cand.strip().strip("`").strip().rstrip(".,;:")
+        cand = cand.strip().strip("`\"'").strip().rstrip(".,;:")
         # answers are single tokens/identifiers/filenames — take first ws run
         cand = cand.split()[0] if cand.split() else cand
-        return cand.strip("`.,;:") or None
+        # strip wrapping quotes/backticks the copy head faithfully copies from a
+        # quoted source value (e.g. `"8129e6a6"` → the trailing `"` is part of the
+        # copied span) so the strict==gold comparison isn't defeated by a quote.
+        return cand.strip("`.,;:\"'") or None
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return lines[-1] if lines else None
 
 
 def _norm(s: str) -> str:
-    return s.strip().strip("`").strip().rstrip(".,;:")
+    return s.strip().strip("`\"'").strip().rstrip(".,;:").strip("`\"'")
 
 
 def bucket_of(record: dict) -> int:
@@ -182,9 +185,56 @@ def eval_teacher_forced(model, tok, records, *, wm_arm="on", device="cuda",
                 per_dn={f"d{b}_N{nb}": v for (b, nb), v in sorted(per_dn.items())})
 
 
+@torch.no_grad()
+def generate_copy_full(model, tok, prompt_ids, *, max_gen=24, device="cuda",
+                       force_answer_prefix=False, eos_token_id=None):
+    """Greedy FULL-FORWARD decode that FIRES the v14 discrete-WM copy head.
+
+    The standard `generate` never passes a `mem_read_mask`, so `_apply_copy_head`
+    is a structural no-op (returns lm_logits unchanged) and the discrete-WM copy
+    mechanism — the SOLE recall path on `wm_discrete_v12` since `read_alpha=0` —
+    never fires in free generation. Here we run the full forward each step with an
+    explicit `mem_read_mask` = a CONTIGUOUS run over the value span as it is
+    emitted, so the copy-head per-token OFFSET (`_contiguous_run_index`) copies
+    successive value tokens (`src+0, src+1, ...`). This is the autoregressive twin
+    of the validated teacher-forced answer-span mask.
+
+    The run starts at the token that completes the `"Answer: "` prefix
+    (ids `[21350, 42, 216]`); before that the mask is all-zero → base `lm_head`
+    decides the output policy (whether to emit `"Answer:"` at all). With
+    `force_answer_prefix` the prefix is appended up-front (the recall mechanism is
+    isolated from the output-policy question). WM-OFF (`use_memory=False`) makes
+    the whole path a no-op → pure base greedy (the honest control).
+    """
+    ANS_PREFIX = tok.encode("Answer: ", add_special_tokens=False)
+    out = prompt_ids.clone()
+    run_start = None
+    emit0 = out.shape[1]
+    if force_answer_prefix:
+        pref = torch.tensor([ANS_PREFIX], dtype=out.dtype, device=device)
+        out = torch.cat([out, pref], dim=1)
+        run_start = out.shape[1] - 1     # last prefix token = query for value[0]
+    for _ in range(max_gen):
+        mask = torch.zeros_like(out, dtype=torch.float)
+        if run_start is not None:
+            mask[0, run_start:] = 1.0
+        o = model(out, mem_read_mask=mask)
+        logits = o[0] if isinstance(o, tuple) else o
+        nxt = int(logits[0, -1].argmax().item())
+        out = torch.cat([out, torch.tensor([[nxt]], dtype=out.dtype,
+                                            device=device)], dim=1)
+        if eos_token_id is not None and nxt == eos_token_id:
+            break
+        if run_start is None and out.shape[1] >= len(ANS_PREFIX):
+            if out[0, -len(ANS_PREFIX):].tolist() == ANS_PREFIX:
+                run_start = out.shape[1] - 1
+    return out, {"think_total": 0, "emit_count": out.shape[1] - emit0}
+
+
 def eval_generate(model, tok, records, *, wm_arm="on", generator="retrieval_as_input",
                   max_gen=40, total_think_budget=64, emit_threshold=0.5,
-                  gate_floor=0.0, device="cuda", max_T=2048):
+                  gate_floor=0.0, device="cuda", max_T=2048,
+                  force_answer_prefix=False):
     """Greedy decode in training-matched format; strict (Answer:) + lenient
     (gold substring) recall vs distance. wm_arm in {on, full_off, no_think}."""
     from experiments.eval_humaneval import generate, generate_with_retrieval_as_input
@@ -205,7 +255,12 @@ def eval_generate(model, tok, records, *, wm_arm="on", generator="retrieval_as_i
                 n_skip += 1
                 continue
             pt = torch.tensor([pids], dtype=torch.long, device=device)
-            if generator == "retrieval_as_input" and hasattr(model, "memory") \
+            if generator == "copy_full":
+                gen, diag = generate_copy_full(
+                    model, tok, pt, max_gen=max_gen, device=device,
+                    force_answer_prefix=force_answer_prefix,
+                    eos_token_id=tok.eos_token_id)
+            elif generator == "retrieval_as_input" and hasattr(model, "memory") \
                     and thinking_token_id is not None and wm_arm != "no_think":
                 gen, diag = generate_with_retrieval_as_input(
                     model, pt, max_gen=max_gen, temperature=0.0,
@@ -262,7 +317,11 @@ def main():
                    default="teacher_forced")
     p.add_argument("--wm_arm", choices=["on", "full_off", "no_think"], default="on")
     p.add_argument("--generator", default="retrieval_as_input",
-                   choices=["standard", "retrieval_as_input"])
+                   choices=["standard", "retrieval_as_input", "copy_full"])
+    p.add_argument("--force_answer_prefix", action="store_true",
+                   help="copy_full only: append the 'Answer: ' prefix up-front so "
+                        "the recall mechanism is measured in ISOLATION from the "
+                        "output-policy (does-the-model-emit-Answer) question.")
     p.add_argument("--max_problems", type=int, default=None)
     p.add_argument("--family", type=str, default=None,
                    help="restrict to one family (const/signature/import/fname/"
@@ -318,7 +377,8 @@ def main():
                           generator=args.generator, max_gen=args.max_gen,
                           total_think_budget=args.total_think_budget,
                           emit_threshold=args.emit_threshold,
-                          gate_floor=args.gate_floor, device=args.device, max_T=max_T)
+                          gate_floor=args.gate_floor, device=args.device, max_T=max_T,
+                          force_answer_prefix=args.force_answer_prefix)
         print(f"\n{'='*64}\nGENERATE recall — {pathlib.Path(args.ckpt).name}"
               f"  [wm_arm={args.wm_arm} gen={args.generator}]\n{'='*64}")
         print(f"{'distance':>10} {'strict':>8} {'lenient':>9} {'(tot)':>7}")

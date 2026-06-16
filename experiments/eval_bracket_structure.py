@@ -157,7 +157,11 @@ def build_model_from_ckpt(ckpt_path: str,
     # MATCH-EXISTENCE copy gating (discrete-key). Default True (the Pareto-safe
     # fix: copy only where the address matched a real binding). cfg / force can
     # turn it OFF to reproduce the pre-fix cross-family over-firing behaviour.
-    mem_copy_require_match = bool(cfg.get("mem_copy_require_match", True))
+    # NB: a cfg that stores the key *explicitly as None* (some trainers do, to
+    # mean "unset") must NOT collapse to False via bool(None) — treat None as the
+    # default True so the Pareto-safe gate isn't silently disabled.
+    _crm = cfg.get("mem_copy_require_match", True)
+    mem_copy_require_match = True if _crm is None else bool(_crm)
     if force_mem_copy_require_match is not None:
         mem_copy_require_match = bool(force_mem_copy_require_match)
     # Locality window for the match-existence gate (the addressing name must be

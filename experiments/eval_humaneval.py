@@ -85,6 +85,91 @@ def _truncate_at_stop(text: str) -> str:
     return text[:earliest]
 
 
+def _model_has_copy_head(model) -> bool:
+    """True iff the model carries a wired discrete-WM copy/pointer readout."""
+    return (getattr(model, "use_copy_head", False)
+            and getattr(model, "use_memory", False)
+            and getattr(model, "memory", None) is not None)
+
+
+@torch.no_grad()
+def _wm_copy_decode(model, prompt_ids: torch.Tensor, *, max_gen: int = 256,
+                    temperature: float = 0.0, eos_token_id: int | None = None,
+                    min_emit_before_eos: int = 0,
+                    copy_gate_threshold: float = 0.5,
+                    ) -> tuple[torch.Tensor, dict]:
+    """Full-forward decode that FIRES the discrete-WM copy head during normal
+    autoregressive generation, DRIVEN BY THE MATCH-EXISTENCE GATE.
+
+    The canonical incremental `generate` / `forward_step` path never passes a
+    `mem_read_mask`, so `_apply_copy_head` is a structural no-op there and the
+    discrete-WM recall mechanism (the SOLE recall path on a frozen-WM ckpt where
+    `read_alpha=0`) never fires in deployment. Here each step runs the FULL
+    forward with a `mem_read_mask` so `_apply_copy_head` runs; the per-token copy
+    OFFSET is the existing `_contiguous_run_index` over the run (NOT reinvented).
+
+    No forced "Answer:" trigger: the copy is allowed to fire at every step (the
+    mask always covers the current position), and the discrete addressing's
+    MATCH-EXISTENCE gate (`copy_require_match` → `g_eff = g · 1{match exists}`)
+    plus the learned copy gate decide WHERE the copy actually drives the output.
+    Where no buffered binding matches the query identifier, `g_eff = 0` → copy
+    suppressed → the plain LM (recurrence) decides → no harm.
+
+    A literal all-ones `mem_read_mask` would break the offset: `_contiguous_run_
+    index` of all-ones is the ABSOLUTE position, so a value-start copy would read
+    `src + absolute_pos` (garbage). Instead the contiguous run's anchor is held
+    fixed while `g_eff ≥ copy_gate_threshold` (i.e. a value is being copied) so
+    successive value tokens read `src+0, src+1, …`, and resets once `g_eff` drops.
+    For the frozen-WM ckpt `g_eff` and the trunk hidden are mask-independent
+    (`read_alpha=0`), so a single forward per step both EMITS the copied token and
+    yields the anchor decision for the next one.
+
+    B == 1 only (mirrors `eval_code_recall.generate_copy_full`).
+    """
+    assert prompt_ids.shape[0] == 1, "wm_copy decode supports batch size 1"
+    device = prompt_ids.device
+    out = prompt_ids.clone()
+    copy_anchor: int | None = None   # contiguous-run start while copying a value
+    emit_count = 0
+    copy_fired = 0
+    for _ in range(max_gen):
+        last = out.shape[1] - 1
+        run_start = copy_anchor if copy_anchor is not None else last
+        mask = torch.zeros_like(out, dtype=torch.float)
+        mask[0, run_start:last + 1] = 1.0
+        o = model(out, mem_read_mask=mask)
+        logits = o[0] if isinstance(o, tuple) else o
+        # Effective copy gate at the current position. `_last_copy_gate_eff` is
+        # stored over the masked positions in (b, t) order; the current position
+        # is the LAST masked entry (the mask always ends at `last`).
+        ge = getattr(model, "_last_copy_gate_eff", None)
+        g_eff_last = float(ge[-1].item()) if ge is not None and ge.numel() else 0.0
+        active = g_eff_last >= copy_gate_threshold
+        next_logits = logits[0, -1]
+        if (eos_token_id is not None and min_emit_before_eos > 0
+                and emit_count < min_emit_before_eos):
+            next_logits = next_logits.clone()
+            next_logits[int(eos_token_id)] = -float("inf")
+        if temperature == 0.0:
+            nxt = int(next_logits.argmax().item())
+        else:
+            probs = torch.softmax(next_logits / temperature, dim=-1)
+            nxt = int(torch.multinomial(probs, num_samples=1).item())
+        out = torch.cat([out, torch.tensor([[nxt]], dtype=out.dtype,
+                                           device=device)], dim=1)
+        if active:
+            copy_anchor = run_start          # hold anchor → next offset = +1
+            copy_fired += 1
+        else:
+            copy_anchor = None
+        emit_count += 1
+        if eos_token_id is not None and nxt == eos_token_id:
+            break
+    diag = {"emit_count": emit_count, "think_total": 0, "think_rate": 0.0,
+            "copy_fired": copy_fired, "decode_path": "wm_copy_full"}
+    return out, diag
+
+
 @torch.no_grad()
 def generate(model, prompt_ids: torch.Tensor, max_gen: int = 256,
              temperature: float = 0.0, eos_token_id: int | None = None,
@@ -96,6 +181,8 @@ def generate(model, prompt_ids: torch.Tensor, max_gen: int = 256,
              min_emit_before_eos: int = 0,
              gate_floor: float = 0.0,
              use_incremental: bool = True,
+             wm_copy: bool = False,
+             copy_gate_threshold: float = 0.5,
              ) -> tuple[torch.Tensor, dict]:
     """Token-by-token generation.
 
@@ -107,9 +194,20 @@ def generate(model, prompt_ids: torch.Tensor, max_gen: int = 256,
     emit when the budget is exhausted. `total_think_budget` (default 2×max_gen)
     caps the lifetime sum of think tokens.
 
+    When `wm_copy=True` AND the model carries a discrete-WM copy head, decoding
+    is delegated to `_wm_copy_decode` (full-forward, match-existence-driven copy)
+    so the discrete-WM recall mechanism fires during normal generation. Default
+    off → byte-identical to the standard path; also a silent no-op (falls through
+    to the standard path) on ckpts without a copy head.
+
     Returns (out_ids_including_thinks, diagnostics_dict). The caller is
     responsible for stripping `thinking_token_id` from `out` before grading.
     """
+    if wm_copy and _model_has_copy_head(model):
+        return _wm_copy_decode(
+            model, prompt_ids, max_gen=max_gen, temperature=temperature,
+            eos_token_id=eos_token_id, min_emit_before_eos=min_emit_before_eos,
+            copy_gate_threshold=copy_gate_threshold)
     if use_thinking:
         assert thinking_token_id is not None, \
             "use_thinking=True requires thinking_token_id"

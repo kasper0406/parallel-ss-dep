@@ -1010,6 +1010,12 @@ class WorkingMemory(nn.Module):
         decoupled_kv: bool = False,
         key_from_embedding: bool = False,
         key_window: int = 4,
+        always_read: bool = False,
+        discrete_key: bool = False,
+        discrete_key_K: int = 512,
+        discrete_key_tau: float = 30.0,
+        discrete_key_lexical: bool = True,
+        copy_require_match: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
@@ -1017,6 +1023,15 @@ class WorkingMemory(nn.Module):
         self.mem_size = int(mem_size)
         self.thinking_token_id = int(thinking_token_id)
         self.pad_token_id = pad_token_id
+        # ALWAYS-ON read (2026-06-16). The legacy WM injects the read ONLY at
+        # think-token positions (or an explicit read_mask). On natural recall
+        # text there are NO think tokens, so the default read_mask is empty and
+        # the WM read gets ZERO gradient — the documented "WM inert for recall"
+        # failure. With always_read, when no read_mask is supplied the WM reads
+        # at EVERY position, so its W_proj injection is on the gradient path at
+        # every token (like PKM's always-on residual). Default False →
+        # byte-identical (the read_mask-None branch is unchanged).
+        self.always_read = bool(always_read)
 
         # Write side
         self.W_write = nn.Linear(d_model, 1, bias=True)
@@ -1069,6 +1084,62 @@ class WorkingMemory(nn.Module):
         # pooled (position-weighted so order matters).
         self.key_from_embedding = bool(key_from_embedding)
         self.key_window = int(key_window)
+
+        # DISCRETE-HASH key addressing (2026-06-16, the fundamentally-sound fix
+        # for the v+digit-name recall the pooled embedding-key could not
+        # separate). When on, the read address is a deterministic, NON-
+        # differentiable per-position integer CODE derived from input_ids (the
+        # variable number of the most-recent `vN = ...` binding). The buffer
+        # write-key at a binding's VALUE-START is onehot(code); the read
+        # query-key at a recall position is onehot(carried code); scores are the
+        # onehot dot-product (integer equality) × a fixed temperature → a SHARP,
+        # ZERO-CROSS-TALK address on the slot whose binding shares the code. The
+        # differentiable VALUE is carried by the copy/pointer readout (reuses
+        # `_apply_copy_head`), so addressing need not be differentiable. No new
+        # parameters → default off is byte-identical and old ckpts load unchanged.
+        # `discrete_key_K` caps the onehot dim (var index + 1; 0 reserved null);
+        # 512 covers var indices ≤ 510 (the N≤256 multibind regime). The token
+        # vocab (`v` id, digit ids, `=` ids) is detected from the tokenizer at
+        # build time via `set_discrete_key_vocab` (no state-dict footprint).
+        self.discrete_key = bool(discrete_key)
+        # LEXICAL code extractor (2026-06-16, the GENERAL replacement for the
+        # task-specific `vN` parser): the address code is a hash of the
+        # contiguous IDENTIFIER token-run (carried forward, only updated on
+        # identifiers that were BOUND as an assignment LHS — the general version
+        # of "is a variable"). Default ON when discrete_key is on; set
+        # discrete_key_lexical=False to fall back to the `vN` parser.
+        self.discrete_key_lexical = bool(discrete_key_lexical)
+        self.discrete_key_K = int(discrete_key_K)
+        # Lexical codes are hashes of identifier text — they need a large modulus
+        # to avoid birthday collisions (the vN parser used the literal var index,
+        # so 512 sufficed; ~128 distinct names mod 512 ≈ 16 collisions). Bump to
+        # 2**24 (free: the onehot is never materialized — match is an integer-
+        # equality over the K_buffer slots, NOT over discrete_key_K). At 2**24 a
+        # 128-binding sequence has birthday-collision prob ≈ C(128,2)/2**24 ≈ 0.05%.
+        if self.discrete_key_lexical and self.discrete_key_K < (1 << 16):
+            self.discrete_key_K = (1 << 24)
+        self.discrete_key_tau = float(discrete_key_tau)
+        # MATCH-EXISTENCE copy gating (2026-06-16). The discrete address already
+        # computes, for free, whether the query position's identifier code
+        # actually equals SOME buffered binding code (causally, same-doc). When
+        # `copy_require_match`, the copy readout is suppressed (effective copy
+        # prob → 0) at positions where NO such match exists, so the copy/pointer
+        # head can only fire when the address genuinely landed on a binding — it
+        # can no longer copy garbage on families that are NOT name-reuse bindings
+        # (the userinstr / toolout cross-family over-firing regression). Default
+        # ON for the discrete path; a no-op (and byte-identical) for the non-
+        # discrete path because `_last_match_exists` is only populated by the
+        # discrete branch (None otherwise → the gate in `_apply_copy_head` is
+        # skipped). Inference-time, no params, no state-dict footprint.
+        self.copy_require_match = bool(copy_require_match)
+        self._last_match_exists = None   # (B,T) bool, discrete-key branch only
+        self._dk_v_id = None          # `v` token id (int)
+        self._dk_digit_val = None     # {token_id: digit_value}
+        self._dk_eq_ids = None        # set of token ids whose text contains "="
+        # Lexical-extractor vocab (built by set_discrete_key_vocab; no params):
+        self._dk_ident_tok = None     # frozenset of identifier-char token ids
+        self._dk_tok_rawtext = None   # {token_id: raw decoded text} (ident toks)
+        self._dk_name_start = None    # frozenset of token ids starting [A-Za-z_]
 
         # Output α gate on the READ injection (added 2026-06-04). Every other
         # side-module in this repo (FiLM, PKM, RefinementHead, LineSelector)
@@ -1125,6 +1196,365 @@ class WorkingMemory(nn.Module):
             pooled = pooled + float(W - i) * shifted
         return pooled
 
+    def set_discrete_key_vocab(self, tok) -> None:
+        """Detect the `v` token id, the per-digit token ids, and the `=`-bearing
+        token ids from a HuggingFace tokenizer (decode-verified) and stash them
+        on the module (no params, no state-dict footprint). Required before the
+        discrete-key addressing path can run; called at build/load time."""
+        v_ids = tok.encode("v", add_special_tokens=False)
+        assert len(v_ids) == 1 and tok.decode(v_ids) == "v", \
+            f"`v` did not tokenize to a single id: {v_ids} -> {tok.decode(v_ids)!r}"
+        self._dk_v_id = int(v_ids[0])
+        digit_val = {}
+        for d in "0123456789":
+            di = tok.encode(d, add_special_tokens=False)
+            assert len(di) == 1, f"digit {d!r} not a single token: {di}"
+            digit_val[int(di[0])] = int(d)
+        self._dk_digit_val = digit_val
+        eq = set()
+        for s in (" =", "=", " = ", "x = 1"):
+            for tid in tok.encode(s, add_special_tokens=False):
+                if "=" in tok.decode([tid]):
+                    eq.add(int(tid))
+        assert eq, "no `=`-bearing token found in the tokenizer"
+        self._dk_eq_ids = eq
+        # ---- LEXICAL extractor vocab (general identifier-span hash) ----------
+        # Classify EVERY token id by its decoded text: a token is an
+        # "identifier-char" token iff its decoded text stripped of surrounding
+        # whitespace is non-empty and matches ^[A-Za-z0-9_]+$ (a maximal run of
+        # such tokens is one programming identifier / number). A token "starts a
+        # name" iff that stripped text's first char is a letter or underscore
+        # (vs a digit → a NUMBER run, which carries the binding's code forward).
+        # `_dk_tok_rawtext` keeps the RAW decoded text (with leading space) so a
+        # run's identifier text is reconstructed by concatenation+strip — robust
+        # to leading-space tokenization (` foo` vs `foo` → same identifier text
+        # → same hash, the key generality property).
+        import re as _re
+        ident_re = _re.compile(r"^[A-Za-z0-9_]+$")
+        try:
+            vocab_size = int(len(tok))
+        except Exception:
+            vocab_size = int(getattr(tok, "vocab_size", 0))
+        texts = tok.batch_decode([[i] for i in range(vocab_size)])
+        ident_tok = set()
+        name_start = set()
+        rawtext = {}
+        for i, raw in enumerate(texts):
+            s = raw.strip()
+            if s and ident_re.match(s):
+                ident_tok.add(i)
+                rawtext[i] = raw
+                if s[0].isalpha() or s[0] == "_":
+                    name_start.add(i)
+        self._dk_ident_tok = frozenset(ident_tok)
+        self._dk_name_start = frozenset(name_start)
+        self._dk_tok_rawtext = rawtext
+        self._dk_vocab_size = int(vocab_size)
+        # Per-token-id hash of the token's STRIPPED text (2026-06-16). Used by
+        # BOTH the (vectorized) device path and the python reference loop so an
+        # identifier's run code is a fold over PER-TOKEN text-hashes (not a
+        # char-level fold) — this is the form that vectorizes via a segmented
+        # affine scan (a char-level FNV fold cannot, the XOR breaks the affine
+        # composition). The per-token text-hash captures the STRIPPED text, so
+        # leading-space variants (` CACHE` vs `CACHE`) share a hash → the binding
+        # vs reference identity property survives tokenization differences.
+        self._dk_tok_text_hash_host = [
+            self._poly_str_hash(t.strip(), self._DK_HASH_M) for t in texts]
+        # invalidate any cached device tensors (vocab changed).
+        self._dk_tensors_device = None
+        self._dk_is_ident_t = None
+
+    # Hash constants. Chosen so the int64 modular fold never overflows:
+    #   h < M=2**42; h*P < 2**42 * 2**20 = 2**62 < 2**63 (int64 max). Then
+    #   h = (h*P + tok_hash + 1) % M stays < 2**63 at every step on-device.
+    _DK_HASH_M = (1 << 42)
+    _DK_HASH_P = 1000003
+
+    @staticmethod
+    def _poly_str_hash(s: str, M: int) -> int:
+        """Deterministic polynomial char hash of `s` into [0, M-1]. Salt-free
+        (Python's built-in str hash is PYTHONHASHSEED-salted) so the SAME text →
+        the SAME code across processes. Unlike FNV-1a (XOR fold), the polynomial
+        `h = h*base + c` fold is an AFFINE map → composable → vectorizable as a
+        segmented scan over tokens."""
+        h = 0
+        for ch in s:
+            h = (h * 257 + ord(ch) + 1) % M
+        return h
+
+    @staticmethod
+    def _fnv1a(s: str, K: int) -> int:
+        """Deterministic (salt-free) FNV-1a hash of `s` into [0, K-1]. Used so
+        the SAME identifier text → the SAME code across processes (Python's
+        built-in str hash is PYTHONHASHSEED-salted)."""
+        h = 1469598903143975227
+        for ch in s:
+            h = ((h ^ ord(ch)) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        return h % K
+
+    def _ensure_dk_tensors(self, device) -> None:
+        """Build (and cache, per-device) the per-token-id lookup tensors used by
+        the vectorized lexical extractor: identifier-char mask, name-start mask,
+        `=`-bearing mask, and per-token stripped-text hash. No params / no
+        state-dict footprint — derived from the vocab set by
+        `set_discrete_key_vocab`."""
+        if (getattr(self, "_dk_tensors_device", None) == device
+                and getattr(self, "_dk_is_ident_t", None) is not None):
+            return
+        assert getattr(self, "_dk_vocab_size", None) is not None, \
+            "lexical discrete_key on but vocab unset — call set_discrete_key_vocab(tok)"
+        V = self._dk_vocab_size
+        is_ident = torch.zeros(V, dtype=torch.bool)
+        name_start = torch.zeros(V, dtype=torch.bool)
+        is_eq = torch.zeros(V, dtype=torch.bool)
+        if self._dk_ident_tok:
+            is_ident[list(self._dk_ident_tok)] = True
+        if self._dk_name_start:
+            name_start[list(self._dk_name_start)] = True
+        if self._dk_eq_ids:
+            is_eq[[i for i in self._dk_eq_ids if 0 <= i < V]] = True
+        th = torch.tensor(self._dk_tok_text_hash_host, dtype=torch.long)
+        self._dk_is_ident_t = is_ident.to(device)
+        self._dk_is_name_start_t = name_start.to(device)
+        self._dk_is_eq_t = is_eq.to(device)
+        self._dk_tok_text_hash_t = th.to(device)
+        self._dk_tensors_device = device
+
+    @staticmethod
+    def _dk_run_pos(mask: torch.Tensor) -> torch.Tensor:
+        """0-indexed position within each contiguous True run of a (B,T) bool
+        mask (0 at False positions). cumsum-reset trick (no python loop)."""
+        m = mask.to(torch.int64)
+        c = m.cumsum(dim=1)
+        reset = (c * (1 - m)).cummax(dim=1).values
+        return (c - reset - 1).clamp(min=0)
+
+    @staticmethod
+    def _dk_ffill(val: torch.Tensor, assert_mask: torch.Tensor,
+                  fill: int = -1) -> torch.Tensor:
+        """Forward-fill: out[b,t] = val[b,s] for the largest s<=t with
+        assert_mask[b,s] True; `fill` before the first asserted position."""
+        B, T = assert_mask.shape
+        ar = torch.arange(T, device=assert_mask.device).view(1, T).expand(B, T)
+        idx = torch.where(assert_mask, ar, torch.full_like(ar, -1))
+        last = torch.cummax(idx, dim=1).values                    # (B,T), -1 pre
+        gathered = torch.gather(val, 1, last.clamp_min(0))
+        return torch.where(last >= 0, gathered,
+                           torch.full_like(val, fill))
+
+    def _identifier_code_lexical(self, input_ids: torch.Tensor):
+        """GENERAL lexical-identifier-span hash — VECTORIZED (2026-06-16).
+
+        Same (code, vstart) contract as the vN parser, but format-agnostic and
+        computed entirely with tensor ops on `input_ids.device` (no per-position
+        python loop, no `.tolist()` host round-trip — required for training
+        speed). `_identifier_code_lexical_loop` is the byte-identical python
+        reference (asserted equal by test_wm_discrete_key).
+
+          code[b,t]   = run-code of the most-recent BOUND identifier run (a
+                        maximal run of identifier-char tokens that was, somewhere
+                        in the sequence, the LHS of an `=` assignment), carried
+                        forward; -1 before the first. Restricting carry-forward
+                        to BOUND names is the general version of the vN parser's
+                        "only `vN` patterns create codes" trick — it stops prose
+                        words between the name and the value from clobbering it.
+          vstart[b,t] = True at the first token of the VALUE run that immediately
+                        follows a bound name + `=`.
+
+        A run-code is a polynomial fold over the run's PER-TOKEN stripped-text
+        hashes (see `_poly_str_hash` / `_ensure_dk_tensors`): `CACHE_SIZE = 256`
+        (binding) and `return CACHE_SIZE` (reference) → SAME run-code → exact
+        match; a different identifier → a different code → no cross-talk."""
+        self._ensure_dk_tensors(input_ids.device)
+        B, T = input_ids.shape
+        dev = input_ids.device
+        V = self._dk_vocab_size
+        K = self.discrete_key_K
+        M, P = self._DK_HASH_M, self._DK_HASH_P
+        if T == 0:
+            z = torch.zeros((B, T), dtype=torch.long, device=dev)
+            return z - 1, torch.zeros((B, T), dtype=torch.bool, device=dev)
+
+        in_range = (input_ids >= 0) & (input_ids < V)
+        ids_safe = input_ids.clamp(0, V - 1)
+        is_ident = self._dk_is_ident_t[ids_safe] & in_range          # (B,T)
+        name_start = self._dk_is_name_start_t[ids_safe] & in_range
+        is_eq = self._dk_is_eq_t[ids_safe] & in_range
+        tok_h = self._dk_tok_text_hash_t[ids_safe]                   # (B,T) int64
+
+        # ---- run structure ---------------------------------------------------
+        prev_ident = F.pad(is_ident[:, :-1], (1, 0), value=False)
+        next_ident = F.pad(is_ident[:, 1:], (0, 1), value=False)
+        run_start = is_ident & ~prev_ident
+        run_end = is_ident & ~next_ident
+        run_pos = self._dk_run_pos(is_ident)                         # (B,T)
+
+        # ---- run code = polynomial fold of per-token text-hashes --------------
+        # acc[t] = running fold within the run; iterate r over run-relative idx.
+        acc = torch.where(is_ident, (tok_h + 1) % M, torch.zeros_like(tok_h))
+        max_rp = int(run_pos.max().item()) if is_ident.any() else 0
+        for r in range(1, max_rp + 1):
+            prev_acc = F.pad(acc[:, :-1], (1, 0), value=0)
+            new = (prev_acc * P + tok_h + 1) % M
+            acc = torch.where(is_ident & (run_pos == r), new, acc)
+        # full run hash lives at the run's LAST token → broadcast back over the
+        # run (forward-fill on the reversed sequence, asserting at run_end).
+        full_rev = self._dk_ffill(torch.flip(acc, dims=[1]),
+                                  torch.flip(run_end, dims=[1]), fill=0)
+        run_full = torch.flip(full_rev, dims=[1])                    # (B,T)
+        code_run = run_full % K                                      # (B,T) >=0
+
+        # is_name per run = is_name_start of its first token, carried over the run
+        run_is_name = (self._dk_ffill(name_start.to(torch.long), run_start,
+                                      fill=0) > 0) & is_ident
+
+        # ---- bound codes: a name run whose run_end is followed by `=` ---------
+        eq_after = F.pad(is_eq[:, 1:], (0, 1), value=False)          # is_eq[t+1]
+        lhs_end = run_end & run_is_name & eq_after                   # (B,T)
+        lhs_code = torch.where(lhs_end, code_run, torch.full_like(code_run, -1))
+        # membership: is code_run one of THIS row's lhs codes? (B,T,T) any.
+        in_bound = ((code_run.unsqueeze(2) == lhs_code.unsqueeze(1))
+                    & lhs_end.unsqueeze(1)).any(dim=2)               # (B,T)
+
+        # ---- carry-forward: update only on bound-name positions ---------------
+        carry_assert = is_ident & run_is_name & in_bound
+        code = self._dk_ffill(code_run, carry_assert, fill=-1)       # (B,T)
+
+        # ---- vstart: first ident in [q+1, q+4] after `name =` (q = eq pos) ----
+        prev_run_is_name = F.pad(run_is_name[:, :-1], (1, 0), value=False)
+        eq_after_name = is_eq & prev_ident & prev_run_is_name        # at q
+        searching = eq_after_name
+        vstart = torch.zeros((B, T), dtype=torch.bool, device=dev)
+        for _ in range(4):                                           # q+1 .. q+4
+            cand = F.pad(searching[:, :-1], (1, 0), value=False)
+            vstart = vstart | (cand & is_ident)
+            searching = cand & ~is_ident
+        return code, vstart
+
+    def _identifier_code_lexical_loop(self, input_ids: torch.Tensor):
+        """Python-loop REFERENCE for `_identifier_code_lexical` (byte-identical;
+        asserted by test_wm_discrete_key). Kept for testing/debugging only — the
+        forward path uses the vectorized version. Uses the SAME per-token
+        text-hash fold so the two agree exactly."""
+        assert getattr(self, "_dk_tok_text_hash_host", None) is not None, \
+            "lexical discrete_key on but vocab unset — call set_discrete_key_vocab(tok)"
+        B, T = input_ids.shape
+        ident = self._dk_ident_tok
+        name_start = self._dk_name_start
+        eq_ids = self._dk_eq_ids
+        th_host = self._dk_tok_text_hash_host
+        K = self.discrete_key_K
+        M, P = self._DK_HASH_M, self._DK_HASH_P
+
+        def run_code(run_ids):
+            h = 0
+            for x in run_ids:
+                h = (h * P + th_host[x] + 1) % M
+            return h % K
+
+        ids = input_ids.tolist()
+        code_l = [[-1] * T for _ in range(B)]
+        vstart = torch.zeros((B, T), dtype=torch.bool, device=input_ids.device)
+        for b in range(B):
+            row = ids[b]
+            runs = []
+            t = 0
+            while t < T:
+                if row[t] in ident:
+                    j = t
+                    while j < T and row[j] in ident:
+                        j += 1
+                    is_name = row[t] in name_start
+                    code = run_code(row[t:j]) if is_name else -1
+                    runs.append((t, j, code, is_name))
+                    t = j
+                else:
+                    t += 1
+            bound = set()
+            run_at = {}
+            for (s, e, code, is_name) in runs:
+                run_at[s] = (e, code, is_name)
+                if is_name and e < T and row[e] in eq_ids:
+                    bound.add(code)
+                    p, steps = e + 1, 0
+                    while p < T and row[p] not in ident and steps < 3:
+                        p += 1
+                        steps += 1
+                    if p < T and row[p] in ident:
+                        vstart[b][p] = True
+            cur = -1
+            t = 0
+            while t < T:
+                if t in run_at:
+                    e, code, is_name = run_at[t]
+                    if is_name and code in bound:
+                        cur = code
+                    for k in range(t, e):
+                        code_l[b][k] = cur
+                    t = e
+                else:
+                    code_l[b][t] = cur
+                    t += 1
+        code = torch.tensor(code_l, dtype=torch.long, device=input_ids.device)
+        return code, vstart
+
+    def _identifier_code_vstart(self, input_ids: torch.Tensor):
+        """Deterministic per-position identifier CODE + value-start mask for the
+        multibind recall format (`vN = VVVV`). Non-differentiable.
+
+        Returns (code, vstart):
+          code[b,t]   = integer of the most-recent `v`+digits run, carried
+                        forward; -1 before the first run (a `vN` REFERENCE like
+                        `print(v5)` also updates the carried code, which is what
+                        a recall query at the answer span keys on).
+          vstart[b,t] = True at the FIRST value digit of a BINDING (`vN =`<vs>),
+                        i.e. the single position whose copy-source span is the
+                        recalled value. Only these positions carry a real
+                        write-key; everything else is the reserved null code.
+        """
+        assert self._dk_v_id is not None and self._dk_digit_val is not None \
+            and self._dk_eq_ids is not None, \
+            "discrete_key on but vocab unset — call set_discrete_key_vocab(tok)"
+        B, T = input_ids.shape
+        V = self._dk_v_id
+        digit_val = self._dk_digit_val
+        eq_ids = self._dk_eq_ids
+        ids = input_ids.tolist()
+        code_l = [[-1] * T for _ in range(B)]
+        vstart = torch.zeros((B, T), dtype=torch.bool, device=input_ids.device)
+        for b in range(B):
+            row = ids[b]
+            cur = -1
+            t = 0
+            while t < T:
+                tid = row[t]
+                if tid == V and t + 1 < T and row[t + 1] in digit_val:
+                    j = t + 1
+                    num = 0
+                    while j < T and row[j] in digit_val:
+                        num = num * 10 + digit_val[row[j]]
+                        j += 1
+                    cur = num
+                    for k in range(t, j):
+                        code_l[b][k] = num
+                    # Binding? the v-run is immediately followed by an `=` token
+                    # → the value start is the first digit after it (skip the
+                    # ` =`/` ` separators). References (`print(v5)`) are not
+                    # followed by `=` → no value-start, only the carried code.
+                    if j < T and row[j] in eq_ids:
+                        p, steps = j + 1, 0
+                        while p < T and row[p] not in digit_val and steps < 3:
+                            p += 1
+                            steps += 1
+                        if p < T and row[p] in digit_val:
+                            vstart[b][p] = True
+                    t = j
+                else:
+                    code_l[b][t] = cur
+                    t += 1
+        code = torch.tensor(code_l, dtype=torch.long, device=input_ids.device)
+        return code, vstart
+
     def forward(self, h: torch.Tensor, input_ids: torch.Tensor,
                 read_mask: torch.Tensor | None = None,
                 doc_ids: torch.Tensor | None = None,
@@ -1173,7 +1603,29 @@ class WorkingMemory(nn.Module):
         # gather-only-think indices but keeps the implementation uniform.
         q = self.W_q(h)                                          # (B, T, d_mem)
         # scores: (B, T, K)
-        if self.decoupled_kv:
+        dk_match = None   # set by the discrete branch → match-existence gating
+        if self.discrete_key:
+            # DISCRETE-HASH addressing: onehot(code) match. The write-key index
+            # is (var# + 1) at binding value-starts, else 0 (null); the query
+            # index is (carried var# + 1), else 0. A query matches a buffered
+            # slot iff their indices are equal AND non-null → a sharp, zero-
+            # cross-talk address on the binding that shares the variable number.
+            if self.discrete_key_lexical:
+                code, vstart = self._identifier_code_lexical(input_ids)  # (B,T),(B,T)
+            else:
+                code, vstart = self._identifier_code_vstart(input_ids)   # (B,T),(B,T)
+            Kc = self.discrete_key_K
+            idx = (code + 1).clamp_(0, Kc - 1)                        # (B,T) >=0
+            key_idx = torch.where(vstart, idx,
+                                  torch.zeros_like(idx))             # write side
+            qry_idx = torch.where(code >= 0, idx,
+                                  torch.zeros_like(idx))             # read side
+            buf_key_idx = torch.gather(key_idx, 1, top_idx)          # (B, K)
+            match = ((qry_idx.unsqueeze(-1) == buf_key_idx.unsqueeze(1))
+                     & (qry_idx.unsqueeze(-1) > 0))                  # (B, T, K)
+            scores = match.to(h.dtype) * float(self.discrete_key_tau)
+            dk_match = match   # keep for causal/doc-masked match-existence below
+        elif self.decoupled_kv:
             # Cosine addressing: match query to the slot KEY (not the value),
             # sharpness via a learned clamped temperature; β-scaled gate-bias.
             if self.key_from_embedding and input_emb is not None:
@@ -1227,6 +1679,18 @@ class WorkingMemory(nn.Module):
             scores = scores.masked_fill(doc_mask, float("-inf"))
             blocked = causal_mask | doc_mask
 
+        # MATCH-EXISTENCE (discrete-key only): does a REAL code-equality exist on
+        # a causally-valid, same-document buffer slot for this query position?
+        # `dk_match` is the raw integer-equality (non-fallback) match; AND with
+        # `~blocked` so a binding that is not yet visible (or in another doc) does
+        # not count. (B, T) bool, no grad — used by `_apply_copy_head` to suppress
+        # the copy where the address landed on nothing (no-match → recurrence
+        # fallback, no harm). None for the non-discrete path → copy unchanged.
+        if dk_match is not None:
+            self._last_match_exists = (dk_match & ~blocked).any(dim=-1).detach()
+        else:
+            self._last_match_exists = None
+
         # Some rows (t < min source position, or no in-document predecessor)
         # get all -inf. Softmax of all -inf is NaN; replace those rows with
         # zero attention so the read is zero (and the injection is zero).
@@ -1262,9 +1726,13 @@ class WorkingMemory(nn.Module):
 
         # Inject only at "read positions" — either an explicit mask the
         # caller provided (e.g. MQAR query positions) or the default
-        # thinking-token-based mask.
+        # thinking-token-based mask. With always_read and no explicit mask,
+        # read at EVERY position (PKM-style always-on residual).
         if read_mask is None:
-            inj = (input_ids == self.thinking_token_id).unsqueeze(-1).to(h.dtype)
+            if self.always_read:
+                inj = torch.ones((B, T, 1), dtype=h.dtype, device=device)
+            else:
+                inj = (input_ids == self.thinking_token_id).unsqueeze(-1).to(h.dtype)
         else:
             inj = read_mask.to(h.dtype).unsqueeze(-1)
 
@@ -1611,6 +2079,30 @@ class TinyLM(nn.Module):
                                               # off → byte-identical legacy read.
         mem_key_window: int = 4,              # # recent tokens pooled for the
                                               # embedding-key (order-sensitive).
+        mem_always_read: bool = False,        # ALWAYS-ON WM read: inject the WM
+                                              # read at EVERY position (not just
+                                              # think tokens) when no read_mask
+                                              # is given, so WM is always on the
+                                              # gradient path (PKM-style). Default
+                                              # off → byte-identical legacy read.
+        mem_discrete_key: bool = False,       # DISCRETE-HASH WM addressing: key
+                                              # the WM read on a deterministic
+                                              # per-position integer code (the
+                                              # most-recent `vN` binding number)
+                                              # → onehot match → zero cross-talk.
+                                              # No new params. Default off →
+                                              # byte-identical legacy read.
+        mem_discrete_key_K: int = 512,        # onehot cap (var index + 1).
+        mem_discrete_key_tau: float = 30.0,   # match temperature.
+        mem_discrete_key_lexical: bool = True, # GENERAL lexical identifier-span
+                                              # hash extractor (default); False →
+                                              # the task-specific `vN` parser.
+        mem_copy_require_match: bool = True,  # MATCH-EXISTENCE copy gating: the
+                                              # copy/pointer head only fires where
+                                              # the discrete address matched a real
+                                              # buffered binding (no-match → no
+                                              # copy, recurrence fallback). Default
+                                              # on; no-op on the non-discrete path.
         use_copy_head: bool = False,          # v14 COPY/POINTER readout: at
                                               # mem_read_mask positions mix the LM
                                               # dist with a copy dist over the
@@ -1991,6 +2483,12 @@ class TinyLM(nn.Module):
                 decoupled_kv=bool(mem_decoupled_kv),
                 key_from_embedding=bool(mem_key_from_embedding),
                 key_window=int(mem_key_window),
+                always_read=bool(mem_always_read),
+                discrete_key=bool(mem_discrete_key),
+                discrete_key_K=int(mem_discrete_key_K),
+                discrete_key_tau=float(mem_discrete_key_tau),
+                discrete_key_lexical=bool(mem_discrete_key_lexical),
+                copy_require_match=bool(mem_copy_require_match),
             )
             # Re-init the thinking-token embedding row to the mean of the
             # other rows. PyTorch's default init makes it random noise, which
@@ -2257,8 +2755,29 @@ class TinyLM(nn.Module):
         p_copy.scatter_add_(1, src_tok, attn_m.to(p_copy.dtype))  # (N, V)
         p_lm = torch.softmax(lm_logits[b_idx, t_idx], dim=-1)  # (N, V)
         g = torch.sigmoid(self.copy_head.gate(h_m))            # (N, 1)
-        self._last_copy_gate = g.detach()
-        p_final = (1.0 - g) * p_lm + g * p_copy
+        # Optional override (default None): force the copy gate to a fixed value
+        # so a near-ZERO-SHOT lookup can be measured (g=1 → p_final == p_copy,
+        # i.e. exact discrete-addressed copy with no copy-gate training). Has no
+        # effect when unset.
+        force_g = getattr(self, "_force_copy_gate", None)
+        if force_g is not None:
+            g = torch.full_like(g, float(force_g))
+        self._last_copy_gate = g.detach()       # raw learned/forced gate (diag)
+        # MATCH-EXISTENCE gating (discrete-key, default-on): the copy can only
+        # fire where the discrete address actually matched a buffered binding for
+        # this position. effective copy prob = g · 1{match exists}. Where no real
+        # code-match exists (cross-family / non-name-reuse positions) the copy is
+        # suppressed and p_final falls back to the plain LM (the recurrence) — no
+        # garbage copy, no harm. No-op (g_eff == g) when match-gating is off or
+        # the WM is not discrete-key (`_last_match_exists` is None there).
+        g_eff = g
+        if getattr(mem, "copy_require_match", False):
+            me = getattr(mem, "_last_match_exists", None)
+            if me is not None:
+                me_m = me[b_idx, t_idx].to(g.dtype).unsqueeze(-1)   # (N, 1)
+                g_eff = g * me_m
+        self._last_copy_gate_eff = g_eff.detach()
+        p_final = (1.0 - g_eff) * p_lm + g_eff * p_copy
         log_p = torch.log(p_final.clamp_min(1e-9))
         return lm_logits.index_put((b_idx, t_idx), log_p.to(lm_logits.dtype))
 
@@ -2397,6 +2916,7 @@ class TinyLM(nn.Module):
                 doc_ids: torch.Tensor | None = None,
                 inputs_embeds: torch.Tensor | None = None,
                 skip_lm_head: bool = False,
+                force_wm_mask: torch.Tensor | None = None,
                 ) -> torch.Tensor | tuple:
         """
         inputs_embeds (B, T, d_model) | None: when provided, BYPASSES the
@@ -2471,6 +2991,27 @@ class TinyLM(nn.Module):
             think_mask = (input_ids == int(self.thinking_token_id))
         else:
             think_mask = None
+        # FORCE-WM curriculum (2026-06-16). `force_wm_mask` (B, T) bool marks
+        # positions where the DeltaNet recurrent WRITE must be disabled (β=0)
+        # — the state-readonly hook keys off `think_mask`, so OR'ing the
+        # force-mask into it makes those positions state-readonly even though
+        # they are not literal think tokens. This forces recall across the
+        # masked span to flow through WorkingMemory (the recurrence can no
+        # longer carry the binding), so the WM read MUST learn the address.
+        # Requires the model built with state_readonly_at_think=True (else the
+        # b_proj hook is not installed and this is a silent no-op — warn once).
+        if force_wm_mask is not None:
+            fm = force_wm_mask.to(torch.bool)
+            think_mask = fm if think_mask is None else (think_mask | fm)
+            need_think_mask = True
+            if not self.state_readonly_at_think and not getattr(
+                    self, "_warned_force_wm_no_sr", False):
+                import warnings
+                warnings.warn(
+                    "force_wm_mask given but state_readonly_at_think=False — "
+                    "the β=0 hook is not installed, so force-WM is a no-op. "
+                    "Build the model with state_readonly_at_think=True.")
+                self._warned_force_wm_no_sr = True
 
         if self.max_T > 0:
             T = input_ids.shape[1]

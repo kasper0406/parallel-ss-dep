@@ -51,7 +51,15 @@ def build_model_from_ckpt(ckpt_path: str,
                           force_use_line_selector: bool | None = None,
                           force_think_index_emb_size: int | None = None,
                           force_cooperative_latent_wm: bool | None = None,
-                          force_mem_decoupled_kv: bool | None = None):
+                          force_mem_decoupled_kv: bool | None = None,
+                          force_mem_key_from_embedding: bool | None = None,
+                          force_mem_key_window: int | None = None,
+                          force_use_copy_head: bool | None = None,
+                          force_mem_always_read: bool | None = None,
+                          force_mem_discrete_key: bool | None = None,
+                          force_mem_discrete_key_lexical: bool | None = None,
+                          force_mem_copy_require_match: bool | None = None,
+                          force_mem_size: int | None = None):
     """Construct a TinyLM from a saved ckpt.
 
     `force_use_think_adapter` (optional) overrides the auto-detect:
@@ -108,9 +116,52 @@ def build_model_from_ckpt(ckpt_path: str,
     # auto-detect from the state-dict (cfg as fallback). Both default off →
     # back-compat with every pre-v14 ckpt.
     mem_key_from_embedding = bool(cfg.get("mem_key_from_embedding", False))
-    mem_key_window = int(cfg.get("mem_key_window", 4))
+    mem_key_window = int(cfg.get("mem_key_window") or 4)
     has_copy_head = any(k.startswith("copy_head.") for k in sd_keys)
     use_copy_head = has_copy_head or bool(cfg.get("use_copy_head", False))
+    mem_always_read = bool(cfg.get("mem_always_read", False))
+    # FORCE-ATTACH the validated v14 WM-recall mechanism onto a base whose cfg
+    # is silent (2026-06-16, mirrors the force_use_think_adapter pattern). The
+    # embedding-key address pools RAW input embeddings (NO new params), so it
+    # attaches to any DKV ckpt for free. The copy head DOES add params
+    # (copy_head.gate.{weight,bias}) — those are zero/`-6` init in CopyReadout
+    # (cold-start g≈0 → copy mix ≈ plain LM), so a base without them loads via
+    # strict=False (missing keys = fresh init, reported below).
+    if force_mem_key_from_embedding is not None:
+        mem_key_from_embedding = bool(force_mem_key_from_embedding)
+        if mem_key_from_embedding:
+            # embedding-key addressing only fires inside the decoupled-kv branch
+            has_dkv = True
+    if force_mem_key_window is not None:
+        mem_key_window = int(force_mem_key_window)
+    if force_use_copy_head is not None:
+        use_copy_head = bool(force_use_copy_head)
+    if force_mem_always_read is not None:
+        mem_always_read = bool(force_mem_always_read)
+    # DISCRETE-HASH WM addressing (2026-06-16). No state-dict footprint (the
+    # address is a deterministic code from input_ids; no new params), so it can
+    # only be read from cfg / forced on. force_mem_size lets the caller bump the
+    # WM buffer so it covers the whole sequence (discrete addressing needs every
+    # value-start position in the buffer; v12's default mem_size=1024 is < the
+    # ~1378-token N=128 sequences).
+    mem_discrete_key = bool(cfg.get("mem_discrete_key", False))
+    if force_mem_discrete_key is not None:
+        mem_discrete_key = bool(force_mem_discrete_key)
+    # Lexical (general) vs vN-parser (task-specific) code extractor for the
+    # discrete-key path. Default True (lexical) — the general identifier-span
+    # hash; cfg / force can pin the vN fallback.
+    mem_discrete_key_lexical = bool(cfg.get("mem_discrete_key_lexical", True))
+    if force_mem_discrete_key_lexical is not None:
+        mem_discrete_key_lexical = bool(force_mem_discrete_key_lexical)
+    # MATCH-EXISTENCE copy gating (discrete-key). Default True (the Pareto-safe
+    # fix: copy only where the address matched a real binding). cfg / force can
+    # turn it OFF to reproduce the pre-fix cross-family over-firing behaviour.
+    mem_copy_require_match = bool(cfg.get("mem_copy_require_match", True))
+    if force_mem_copy_require_match is not None:
+        mem_copy_require_match = bool(force_mem_copy_require_match)
+    mem_size_eff = int(cfg.get("mem_size", 1024))
+    if force_mem_size is not None:
+        mem_size_eff = int(force_mem_size)
     has_pkm = any(k.startswith("pkm_layer.") for k in sd_keys)
     mem_kwargs = {}
     if has_memory:
@@ -120,13 +171,17 @@ def build_model_from_ckpt(ckpt_path: str,
         mem_kwargs = dict(
             use_memory=True,
             mem_dim=int(mem_dim_inferred),
-            mem_size=int(cfg.get("mem_size", 1024)),
+            mem_size=int(mem_size_eff),
             thinking_token_id=int(cfg.get("thinking_token_id",
                                           cfg["vocab_size"] - 1)),
             mem_decoupled_kv=bool(has_dkv),
             cooperative_latent_wm=bool(coop_latent_wm),
             mem_key_from_embedding=bool(mem_key_from_embedding),
             mem_key_window=int(mem_key_window),
+            mem_always_read=bool(mem_always_read),
+            mem_discrete_key=bool(mem_discrete_key),
+            mem_discrete_key_lexical=bool(mem_discrete_key_lexical),
+            mem_copy_require_match=bool(mem_copy_require_match),
             use_copy_head=bool(use_copy_head),
         )
     pkm_kwargs = {}
@@ -311,7 +366,21 @@ def build_model_from_ckpt(ckpt_path: str,
             else:
                 new_sd[k] = v
         sd = new_sd
-    model.load_state_dict(sd, strict=False)
+    incompat = model.load_state_dict(sd, strict=False)
+    # Report freshly-attached params (missing keys) so a force-attach caller can
+    # see exactly which params are cold-init (e.g. copy_head.gate.* when a base
+    # without a copy head is loaded with force_use_copy_head=True). Unexpected
+    # keys are likewise reported. Kept quiet when both are empty (the common
+    # path) so existing eval callers stay clean.
+    model._load_missing_keys = list(incompat.missing_keys)
+    model._load_unexpected_keys = list(incompat.unexpected_keys)
+    if incompat.missing_keys or incompat.unexpected_keys:
+        if incompat.missing_keys:
+            print(f"[build_model_from_ckpt] fresh-init (missing) keys "
+                  f"({len(incompat.missing_keys)}): {incompat.missing_keys}")
+        if incompat.unexpected_keys:
+            print(f"[build_model_from_ckpt] unexpected (dropped) keys "
+                  f"({len(incompat.unexpected_keys)}): {incompat.unexpected_keys}")
     # WM×latent cooperation: the latent thread must carry the PRE-memory hidden
     # so the WM injection shapes emit logits without contaminating the adapter's
     # input. COOPERATION IMPLIES PREMEM — a cooperation ckpt (has mem_alpha) must
@@ -322,6 +391,14 @@ def build_model_from_ckpt(ckpt_path: str,
     # honour an explicit cfg flag for non-cooperation premem ckpts.
     if bool(cfg.get("latent_feedback_premem", False)) or coop_latent_wm:
         model._latent_feedback_premem = True
+    # Discrete-hash WM addressing needs the tokenizer's `v`/digit/`=` ids; detect
+    # them once here so the reloaded model is self-contained (no state-dict
+    # footprint). Only when the mode is on.
+    if has_memory and mem_discrete_key:
+        from transformers import AutoTokenizer
+        _tok = AutoTokenizer.from_pretrained(
+            cfg.get("tokenizer", "HuggingFaceTB/SmolLM2-135M"))
+        model.memory.set_discrete_key_vocab(_tok)
     model = model.to("cuda").eval()
     return model, cfg
 

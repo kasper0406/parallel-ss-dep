@@ -249,7 +249,9 @@ def load_model(ckpt, device, *, mem_always_read=False, force_wm=False,
                mem_key_from_embedding=False, mem_key_window=4,
                use_copy_head=False, mem_discrete_key=False, force_mem_size=None,
                mem_discrete_key_lexical=True, copy_require_match=True,
-               match_window=32):
+               match_window=32, mem_soft_namekey=False, soft_namekey_dim=64,
+               soft_namekey_match_threshold=0.5, mem_ctx_namekey=False,
+               ctx_namekey_dim=192, ctx_namekey_match_threshold=0.5):
     from experiments.eval_bracket_structure import build_model_from_ckpt
     from transformers import AutoTokenizer
     # FORCE-ATTACH the validated v14 WM-recall mechanism onto the base. None ->
@@ -263,13 +265,33 @@ def load_model(ckpt, device, *, mem_always_read=False, force_wm=False,
         force_mem_key_window=(int(mem_key_window) if mem_key_from_embedding else None),
         force_use_copy_head=(True if use_copy_head else None),
         force_mem_always_read=(True if mem_always_read else None),
-        force_mem_discrete_key=(True if mem_discrete_key else None),
+        # soft-namekey / ctx-namekey / discrete-key are mutually exclusive (the
+        # WorkingMemory ctor asserts it) — force discrete OFF when soft/ctx is
+        # requested so a base whose cfg carries discrete_key=True doesn't trip it.
+        force_mem_discrete_key=(False if (mem_soft_namekey or mem_ctx_namekey)
+                                else (True if mem_discrete_key else None)),
         force_mem_discrete_key_lexical=(bool(mem_discrete_key_lexical)
                                         if mem_discrete_key else None),
+        # match-existence gate + locality window are SHARED by the discrete,
+        # soft-namekey, and ctx-namekey paths (copy head reads `_last_match_exists`).
         force_mem_copy_require_match=(bool(copy_require_match)
-                                      if mem_discrete_key else None),
+                                      if (mem_discrete_key or mem_soft_namekey
+                                          or mem_ctx_namekey) else None),
         force_mem_discrete_key_match_window=(int(match_window)
-                                            if mem_discrete_key else None),
+                                             if (mem_discrete_key
+                                                 or mem_soft_namekey
+                                                 or mem_ctx_namekey) else None),
+        force_mem_soft_namekey=(True if mem_soft_namekey else
+                                (False if mem_ctx_namekey else None)),
+        force_mem_soft_namekey_dim=(int(soft_namekey_dim)
+                                    if mem_soft_namekey else None),
+        force_mem_soft_namekey_match_threshold=(
+            float(soft_namekey_match_threshold) if mem_soft_namekey else None),
+        force_mem_ctx_namekey=(True if mem_ctx_namekey else None),
+        force_mem_ctx_namekey_dim=(int(ctx_namekey_dim)
+                                   if mem_ctx_namekey else None),
+        force_mem_ctx_namekey_match_threshold=(
+            float(ctx_namekey_match_threshold) if mem_ctx_namekey else None),
         force_mem_size=(int(force_mem_size) if force_mem_size else None),
     )
     model.to(device).eval()
@@ -292,7 +314,8 @@ def _mem_forward(model, h, ids, read_mask=None):
     where `input_emb` is normally computed — without this the embedding-key path
     (`key_from_embedding=True`) silently falls back to cosine-on-h."""
     input_emb = None
-    if getattr(model.memory, "key_from_embedding", False):
+    if (getattr(model.memory, "key_from_embedding", False)
+            or getattr(model.memory, "soft_namekey", False)):
         input_emb = model.embed(ids)
     return model.memory(h, ids, read_mask=read_mask, input_emb=input_emb)
 
@@ -708,6 +731,10 @@ def main():
                     help="extra recall-POSITIVE rows: the `const` family of the "
                          "code_recall corpus (real NAME = value identifiers).")
     ap.add_argument("--train_const_limit", type=int, default=2000)
+    ap.add_argument("--train_setvar_data", default="",
+                    help="extra recall-POSITIVE rows: the `setvar` family of the "
+                         "agentic_recall corpus (NAME = \"value\" name-reuse).")
+    ap.add_argument("--train_setvar_limit", type=int, default=2000)
     ap.add_argument("--train_n_vars", default="48,64,96,128")
     ap.add_argument("--train_limit", type=int, default=8000)
     ap.add_argument("--train_max_len", type=int, default=1800)
@@ -741,6 +768,28 @@ def main():
     ap.add_argument("--mem_discrete_key_vstart", action="store_true",
                     help="Use the task-specific `vN` parser for the discrete-key "
                          "code instead of the general lexical identifier hash.")
+    ap.add_argument("--mem_soft_namekey", action="store_true",
+                    help="SOFT NAME-SPAN addressing: learned continuous key = "
+                         "enc(pooled name-span input emb); cosine soft read over "
+                         "binding slots. Adds surface-variant robustness the hash "
+                         "cannot. Mutually exclusive with --mem_discrete_key.")
+    ap.add_argument("--soft_namekey_dim", type=int, default=64,
+                    help="soft name-key vector dim.")
+    ap.add_argument("--soft_namekey_match_threshold", type=float, default=0.5,
+                    help="min top-attn over binding slots to count a soft match "
+                         "(gates the copy head).")
+    ap.add_argument("--mem_ctx_namekey", action="store_true",
+                    help="CONTEXTUAL NAME-SPAN addressing (2026-06-17): a "
+                         "FULLY-LEARNED, NO-static-hash addresser. Key/query = "
+                         "the trunk's CONTEXTUAL HIDDEN pooled over the "
+                         "identifier name-span; DOT-PRODUCT read (learned scale). "
+                         "Train with --addr_aux_weight (attention supervision). "
+                         "Mutually exclusive with discrete/soft.")
+    ap.add_argument("--ctx_namekey_dim", type=int, default=192,
+                    help="ctx name-key vector dim (matches the probe's d_key).")
+    ap.add_argument("--ctx_namekey_match_threshold", type=float, default=0.5,
+                    help="min top-attn over binding slots to count a ctx match "
+                         "(gates the copy head).")
     ap.add_argument("--copy_require_match", dest="copy_require_match",
                     action="store_true", default=True,
                     help="MATCH-EXISTENCE copy gating (default ON for discrete): "
@@ -803,7 +852,16 @@ def main():
         mem_discrete_key_lexical=(not args.mem_discrete_key_vstart),
         copy_require_match=args.copy_require_match,
         match_window=args.match_window,
-        force_mem_size=(args.mem_size_override if args.mem_discrete_key else None))
+        mem_soft_namekey=args.mem_soft_namekey,
+        soft_namekey_dim=args.soft_namekey_dim,
+        soft_namekey_match_threshold=args.soft_namekey_match_threshold,
+        mem_ctx_namekey=args.mem_ctx_namekey,
+        ctx_namekey_dim=args.ctx_namekey_dim,
+        ctx_namekey_match_threshold=args.ctx_namekey_match_threshold,
+        force_mem_size=(args.mem_size_override
+                        if (args.mem_discrete_key or args.mem_soft_namekey
+                            or args.mem_ctx_namekey)
+                        else None))
     # Open the copy gate so the short cotrain has gradient to climb it (base
     # copy head is built at bias -6 → g≈0.0025, near-flat gradient).
     if args.use_copy_head and getattr(model, "use_copy_head", False):
@@ -813,6 +871,8 @@ def main():
         model._force_copy_gate = 1.0
     print(f"[revive-WM] always_read={model.memory.always_read} "
           f"discrete_key={getattr(model.memory, 'discrete_key', False)} "
+          f"soft_namekey={getattr(model.memory, 'soft_namekey', False)} "
+          f"ctx_namekey={getattr(model.memory, 'ctx_namekey', False)} "
           f"mem_size={model.memory.mem_size} "
           f"key_from_emb={model.memory.key_from_embedding} "
           f"key_window={model.memory.key_window} "
@@ -849,7 +909,27 @@ def main():
         if not spec:
             continue
         name, path = spec.split(":", 1)
-        fam = "const" if name.lower().startswith(("const", "realconst")) else None
+        # Family filter inferred from the eval-set NAME prefix so a mixed-family
+        # file (code_recall_heldout has const/import/signature/fname; agentic has
+        # toolout/userinstr/setvar) is sliced to one family. Synthetic multibind
+        # files have NO `family` field → None keeps all rows.
+        low = name.lower()
+        if low.startswith(("const", "realconst")):
+            fam = "const"
+        elif low.startswith("setvar"):
+            fam = "setvar"
+        elif low.startswith("import"):
+            fam = "import"
+        elif low.startswith(("sig", "signature")):
+            fam = "signature"
+        elif low.startswith(("fname", "func")):
+            fam = "fname"
+        elif low.startswith(("toolout", "tool")):
+            fam = "toolout"
+        elif low.startswith(("userinstr", "instr")):
+            fam = "userinstr"
+        else:
+            fam = None
         exs = build_examples(path, tok, max_len=args.eval_max_len,
                              limit=args.n_recall * 2, family=fam)
         eval_sets.append((name, exs))
@@ -922,6 +1002,12 @@ def main():
                                   limit=args.train_const_limit, skip_first=0)
         train_ex = train_ex + const_ex
         print(f"[train] +{len(const_ex)} real const recall rows")
+    if args.train_setvar_data:
+        setvar_ex = build_examples(args.train_setvar_data, tok, family="setvar",
+                                   max_len=args.train_max_len,
+                                   limit=args.train_setvar_limit, skip_first=0)
+        train_ex = train_ex + setvar_ex
+        print(f"[train] +{len(setvar_ex)} real setvar recall rows")
     print(f"\n[train] {len(train_ex)} recall-positive examples "
           f"(multibind={n_mb} n_vars={sorted(nv)} + const={len(train_ex)-n_mb})  "
           f"steps={args.steps} batch={args.batch} lr={args.lr} "
@@ -969,6 +1055,18 @@ def main():
         getattr(model.memory, "copy_require_match", True))
     save_cfg["mem_discrete_key_match_window"] = int(
         getattr(model.memory, "discrete_key_match_window", 32))
+    save_cfg["mem_soft_namekey"] = bool(
+        getattr(model.memory, "soft_namekey", False))
+    if getattr(model.memory, "soft_namekey", False):
+        save_cfg["mem_soft_namekey_dim"] = int(model.memory.soft_namekey_dim)
+        save_cfg["mem_soft_namekey_match_threshold"] = float(
+            model.memory.soft_namekey_match_threshold)
+    save_cfg["mem_ctx_namekey"] = bool(
+        getattr(model.memory, "ctx_namekey", False))
+    if getattr(model.memory, "ctx_namekey", False):
+        save_cfg["mem_ctx_namekey_dim"] = int(model.memory.ctx_namekey_dim)
+        save_cfg["mem_ctx_namekey_match_threshold"] = float(
+            model.memory.ctx_namekey_match_threshold)
     save_cfg["mem_size"] = int(model.memory.mem_size)
     save_cfg["use_copy_head"] = bool(getattr(model, "use_copy_head", False))
     torch.save({"state_dict": model.state_dict(),

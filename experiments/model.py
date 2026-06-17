@@ -1017,6 +1017,12 @@ class WorkingMemory(nn.Module):
         discrete_key_lexical: bool = True,
         copy_require_match: bool = True,
         discrete_key_match_window: int = 32,
+        soft_namekey: bool = False,
+        soft_namekey_dim: int = 64,
+        soft_namekey_match_threshold: float = 0.5,
+        ctx_namekey: bool = False,
+        ctx_namekey_dim: int = 192,
+        ctx_namekey_match_threshold: float = 0.5,
     ):
         super().__init__()
         self.d_model = d_model
@@ -1154,6 +1160,92 @@ class WorkingMemory(nn.Module):
         self._dk_ident_tok = None     # frozenset of identifier-char token ids
         self._dk_tok_rawtext = None   # {token_id: raw decoded text} (ident toks)
         self._dk_name_start = None    # frozenset of token ids starting [A-Za-z_]
+
+        # SOFT NAME-SPAN addressing key (2026-06-16, validated head-to-head by
+        # experiments/wm_vqkey_probe.py: a learned CONTINUOUS soft-attention key
+        # over a SEPARABLE NAME-SPAN beats the deployed discrete lexical hash —
+        # it matches the hash's separability (1.0 @N=128) AND adds surface-variant
+        # robustness (case/camel) the spelling-locked hash structurally cannot).
+        # The historical soft key failed ONLY because it pooled a CONTAMINATED
+        # fixed window (name+arrow+value, `_causal_emb_window`); pooling the NAME-
+        # SPAN ONLY is the fix. Mechanism: REUSE the lexical span detector to find
+        # the identifier NAME run; mean-pool its INPUT EMBEDDINGS; a small learned
+        # encoder (Linear→GELU→Linear) maps the pool to a query vector q; the read
+        # is softmax(cos(q_query, q_buf)/temp) over the BINDING (value-start) buffer
+        # slots, restricted to causal + same-document (the existing masks). The
+        # VALIDATED copy/pointer readout (`_apply_copy_head`) drives the actual
+        # value emission downstream — identical to the discrete path; only the
+        # hash code-match is replaced by the soft attention. Default OFF → NO new
+        # params → byte-identical and old ckpts load unchanged (strict=False).
+        # Reuses `set_discrete_key_vocab` / `_ensure_dk_tensors` for span detection
+        # (so it requires the lexical vocab the discrete path also needs).
+        self.soft_namekey = bool(soft_namekey)
+        self.soft_namekey_match_threshold = float(soft_namekey_match_threshold)
+        if self.soft_namekey:
+            if self.discrete_key:
+                raise ValueError(
+                    "soft_namekey and discrete_key are mutually exclusive "
+                    "addressing modes — pick one.")
+            nk_dim = int(soft_namekey_dim)
+            nk_hidden = max(nk_dim, d_model // 2)
+            # Encoder over the pooled NAME-SPAN input embeddings → q vector.
+            # Mirrors wm_vqkey_probe.py::NameEncoder (masked mean-pool → MLP).
+            self.namekey_enc = nn.Sequential(
+                nn.Linear(d_model, nk_hidden), nn.GELU(),
+                nn.Linear(nk_hidden, nk_dim))
+            # Learned, CLAMPED softmax temperature (sharpness without growing
+            # weight norms — same trick as the decoupled-kv path).
+            self.namekey_log_tau = nn.Parameter(torch.tensor(math.log(20.0)))
+            self.soft_namekey_dim = nk_dim
+
+        # CONTEXTUAL NAME-SPAN addressing key (2026-06-17, the FULLY-LEARNED,
+        # NO-static-hash addresser). Motivated by alias_addressing_probe.py's
+        # DECISIVE result: the trunk's NAME-SPAN CONTEXTUAL HIDDEN linearly
+        # encodes which earlier binding a query name refers to (learned-linear /
+        # PCA holder-id 0.87-0.94 heldout on EXACT recall), yet the end-to-end
+        # attention head under-trained to only 0.31 recall. This mode closes that
+        # gap, applying the probe's two load-bearing lessons:
+        #   (1) KEY/QUERY = the trunk's CONTEXTUAL HIDDEN pooled over the
+        #       identifier NAME-SPAN (the `ctx_namepool` anchor that won the
+        #       probe), NOT the input embedding (soft_namekey) and NOT the
+        #       value-start hidden (which the probe found carries value, not name
+        #       identity). Reuses `_name_span_keys` for the span pool — passing
+        #       the trunk hidden `h` (not input_emb) as the pool source.
+        #   (2) READ = DOT-PRODUCT attention with a learned scale, NOT cosine
+        #       (the probe's learned-linear/dot key hit ~0.9 while the
+        #       cosine-normalized arm under-performed). Separate q/k GELU MLP
+        #       encoders (capacity-matched to the probe, d_key=192).
+        # Trained with the attention-supervision aux (CE that the read attention
+        # puts mass on the correct binding slot — the objective that reached 0.9
+        # in the probe). Frozen trunk + lm_head; only these encoders + the copy
+        # head train. The VALIDATED copy/pointer readout (`_apply_copy_head`)
+        # emits the value, identical to the discrete / soft paths. Restricted to
+        # causal + same-document BINDING (value-start) slots. Mutually exclusive
+        # with discrete_key / soft_namekey. Default OFF → NO new params →
+        # byte-identical and old ckpts load unchanged (strict=False). Reuses
+        # `set_discrete_key_vocab` / `_ensure_dk_tensors` for span detection.
+        self.ctx_namekey = bool(ctx_namekey)
+        self.ctx_namekey_match_threshold = float(ctx_namekey_match_threshold)
+        if self.ctx_namekey:
+            if self.discrete_key or self.soft_namekey:
+                raise ValueError(
+                    "ctx_namekey is mutually exclusive with discrete_key / "
+                    "soft_namekey — pick one addressing mode.")
+            cn_dim = int(ctx_namekey_dim)
+            cn_hidden = max(cn_dim, d_model // 2)
+            # Separate q/k encoders over the pooled NAME-SPAN CONTEXTUAL HIDDEN.
+            self.ctxkey_q_enc = nn.Sequential(
+                nn.Linear(d_model, cn_hidden), nn.GELU(),
+                nn.Linear(cn_hidden, cn_dim))
+            self.ctxkey_k_enc = nn.Sequential(
+                nn.Linear(d_model, cn_hidden), nn.GELU(),
+                nn.Linear(cn_hidden, cn_dim))
+            # Learned DOT-PRODUCT scale (clamped). Init at the standard attention
+            # 1/sqrt(d_key) so cold-start scores are bounded; the attention-CE
+            # pushes it up for sharpness as the encoders learn.
+            self.ctxkey_log_scale = nn.Parameter(
+                torch.tensor(math.log(1.0 / math.sqrt(cn_dim))))
+            self.ctx_namekey_dim = cn_dim
 
         # Output α gate on the READ injection (added 2026-06-04). Every other
         # side-module in this repo (FiLM, PKM, RefinementHead, LineSelector)
@@ -1355,6 +1447,122 @@ class WorkingMemory(nn.Module):
         gathered = torch.gather(val, 1, last.clamp_min(0))
         return torch.where(last >= 0, gathered,
                            torch.full_like(val, fill))
+
+    @staticmethod
+    def _dk_ffill_vec(val: torch.Tensor, assert_mask: torch.Tensor,
+                      fill: float = 0.0) -> torch.Tensor:
+        """Vector forward-fill for (B,T,D): out[b,t]=val[b,s] for the largest
+        s<=t with assert_mask[b,s] True; `fill` before the first asserted
+        position. The (B,T) twin of `_dk_ffill`, used by the soft name-span key
+        to broadcast a name run's pooled embedding over the run and carry it
+        forward to the recall-query position."""
+        B, T, D = val.shape
+        ar = torch.arange(T, device=assert_mask.device).view(1, T).expand(B, T)
+        idx = torch.where(assert_mask, ar, torch.full_like(ar, -1))
+        last = torch.cummax(idx, dim=1).values                    # (B,T)
+        gathered = torch.gather(
+            val, 1, last.clamp_min(0).unsqueeze(-1).expand(B, T, D))
+        valid = (last >= 0).unsqueeze(-1)
+        return torch.where(valid, gathered, torch.full_like(val, fill))
+
+    def _name_span_keys(self, input_ids: torch.Tensor,
+                        input_emb: torch.Tensor,
+                        carry_bound_only: bool = False):
+        """Soft / ctx name-span addressing inputs (2026-06-16). Returns
+        (name_key, vstart, last_name_src):
+
+          name_key[b,t,d_model] = the MEAN-POOLED `input_emb` of the most-recent
+            identifier NAME run, carried forward. `carry_bound_only=False`
+            (soft_namekey default) carries over ANY name reference (a
+            surface-variant query like `CACHE_SIZE` referencing `cache_size`
+            still updates the key). `carry_bound_only=True` (ctx_namekey) carries
+            ONLY over references to an `=`-BOUND name — the general version of the
+            discrete extractor's "is a variable" trick. This is the load-bearing
+            fix for natural recall PROSE: in "`QUEUE_CAPACITY` is assigned the
+            value 1994" the prose words `is/assigned/the/value` are name runs that
+            would clobber the all-name carry, but they are NOT bound, so the
+            bound-only carry keeps the binding name's pool at the recall position.
+            0 before the first (bound) name.
+          vstart[b,t] bool = binding value-start (reused verbatim from
+            `_identifier_code_lexical`) — the buffer slots eligible to be
+            addressed (each carries its binding's value as the copy source).
+          last_name_src[b,t] = source position of the most-recent name token
+            (drives the locality gate on the match-existence signal — a genuine
+            local name-reuse vs a stale carried key drifting through prose).
+
+        Pools the NAME SPAN ONLY (the documented fix for the historical soft-key
+        failure, which pooled the contaminated name+arrow+value window). Fully
+        vectorized; no python per-position loop. Requires the lexical vocab set
+        by `set_discrete_key_vocab`."""
+        self._ensure_dk_tensors(input_ids.device)
+        B, T = input_ids.shape
+        dev = input_ids.device
+        V = self._dk_vocab_size
+        in_range = (input_ids >= 0) & (input_ids < V)
+        ids_safe = input_ids.clamp(0, V - 1)
+        is_ident = self._dk_is_ident_t[ids_safe] & in_range
+        name_start = self._dk_is_name_start_t[ids_safe] & in_range
+
+        prev_ident = F.pad(is_ident[:, :-1], (1, 0), value=False)
+        next_ident = F.pad(is_ident[:, 1:], (0, 1), value=False)
+        run_start = is_ident & ~prev_ident
+        run_end = is_ident & ~next_ident
+        run_pos = self._dk_run_pos(is_ident)                         # (B,T)
+        run_is_name = (self._dk_ffill(name_start.to(torch.long), run_start,
+                                      fill=0) > 0) & is_ident
+        nm = is_ident & run_is_name                                  # name tokens
+
+        # ---- mean-pool input_emb over each NAME run, broadcast over the run ---
+        # The run-sum is a cumsum DIFFERENCE (cs - base); in bf16 at long context
+        # this is catastrophic-cancellation-prone (a late run's small sum = the
+        # difference of two large cumulative sums). Compute the pool math in fp32
+        # so an eventual bf16 pretrain (M3 wiring exists) stays numerically safe;
+        # cast the key back to the input dtype at the end. (M2 cotrain is fp32 so
+        # this is a no-op there.)
+        in_dtype = input_emb.dtype
+        emb = input_emb.float()
+        emb_nm = emb * nm.unsqueeze(-1).to(emb.dtype)
+        cs = emb_nm.cumsum(dim=1)                                    # (B,T,d) fp32
+        prev_cs = F.pad(cs[:, :-1], (0, 0, 1, 0))                    # cs[t-1]
+        name_run_start = run_start & run_is_name
+        name_run_end = run_end & run_is_name
+        # base = cumsum just before this run's start → partial = run-sum up to t.
+        base = self._dk_ffill_vec(prev_cs, name_run_start, fill=0.0)
+        partial = cs - base
+        # full run-sum lives at run_end → broadcast back over the run (flip-ffill).
+        full_rev = self._dk_ffill_vec(torch.flip(partial, dims=[1]),
+                                      torch.flip(name_run_end, dims=[1]),
+                                      fill=0.0)
+        run_sum = torch.flip(full_rev, dims=[1])                     # (B,T,d)
+        rp1 = (run_pos + 1)                                          # run length-so-far
+        len_rev = self._dk_ffill(torch.flip(rp1, dims=[1]),
+                                 torch.flip(name_run_end, dims=[1]), fill=1)
+        run_len = torch.flip(len_rev, dims=[1]).clamp_min(1).unsqueeze(-1)
+        name_pool = run_sum / run_len.to(emb.dtype)                  # (B,T,d) fp32
+        # vstart from the (reused) lexical extractor — single source of truth.
+        # NB: `_identifier_code_lexical` ALSO populates `self._dk_last_code_src`
+        # (the source position of the most-recent BOUND-name reference), reused
+        # below for the bound-only carry.
+        _, vstart = self._identifier_code_lexical(input_ids)
+        if carry_bound_only:
+            # Carry the name pool forward only over references to an `=`-bound
+            # name (prose words never enter the key). `_dk_last_code_src[t]` is a
+            # token of the most-recent bound-name run, where `name_pool` holds
+            # that run's pool (broadcast over the run); -1 before the first.
+            last_bound = self._dk_last_code_src                       # (B,T)
+            valid = (last_bound >= 0)
+            gathered = torch.gather(
+                name_pool, 1,
+                last_bound.clamp_min(0).unsqueeze(-1).expand(B, T, name_pool.shape[-1]))
+            name_key = torch.where(valid.unsqueeze(-1), gathered,
+                                   torch.zeros_like(gathered)).to(in_dtype)
+            last_name_src = last_bound
+        else:
+            # carry-forward over ANY name run (captures the variant recall query).
+            name_key = self._dk_ffill_vec(name_pool, nm, fill=0.0).to(in_dtype)
+            ar = torch.arange(T, device=dev).view(1, T).expand(B, T)
+            last_name_src = self._dk_ffill(ar, nm, fill=-1)
+        return name_key, vstart, last_name_src
 
     def _identifier_code_lexical(self, input_ids: torch.Tensor):
         """GENERAL lexical-identifier-span hash — VECTORIZED (2026-06-16).
@@ -1634,7 +1842,58 @@ class WorkingMemory(nn.Module):
         q = self.W_q(h)                                          # (B, T, d_mem)
         # scores: (B, T, K)
         dk_match = None   # set by the discrete branch → match-existence gating
-        if self.discrete_key:
+        sn_active = False  # set by the soft / ctx name-span branches
+        sn_match_threshold = 0.5  # threshold for the soft/ctx match-existence gate
+        buf_is_binding = None
+        last_name_src = None
+        if self.soft_namekey:
+            # SOFT NAME-SPAN addressing: cosine(q_query, q_buf) over the BINDING
+            # (value-start) buffer slots, where q = enc(pooled name-span input
+            # embeddings). Replaces the discrete hash code-match; everything
+            # downstream (copy readout, match/locality gate, read_alpha) is shared.
+            if input_emb is None:
+                raise ValueError(
+                    "soft_namekey on but input_emb is None — pass the input "
+                    "embeddings (TinyLM._apply_memory does this when the flag is "
+                    "on; direct callers must too).")
+            name_key, vstart, last_name_src = self._name_span_keys(
+                input_ids, input_emb)
+            qk = self.namekey_enc(name_key)                          # (B, T, d_key)
+            qn = F.normalize(qk, dim=-1)
+            gather_idx_k = top_idx.unsqueeze(-1).expand(-1, -1, qk.shape[-1])
+            buf_qk = torch.gather(qk, dim=1, index=gather_idx_k)     # (B, K, d_key)
+            kn = F.normalize(buf_qk, dim=-1)
+            tau = self.namekey_log_tau.exp().clamp(2.0, 100.0)
+            scores = torch.einsum("btd,bkd->btk", qn, kn) * tau
+            # Only BINDING (value-start) buffer slots are addressable — they
+            # carry a real value to copy. Non-binding slots → -inf.
+            buf_is_binding = torch.gather(vstart, dim=1, index=top_idx)  # (B,K) bool
+            scores = scores.masked_fill(~buf_is_binding.unsqueeze(1),
+                                        float("-inf"))
+            sn_active = True
+            sn_match_threshold = self.soft_namekey_match_threshold
+        elif getattr(self, "ctx_namekey", False):
+            # CONTEXTUAL NAME-SPAN addressing: DOT-PRODUCT attention over the
+            # trunk's CONTEXTUAL HIDDEN pooled over the identifier name-span.
+            # Same buffer / mask / copy machinery as soft_namekey; the key SOURCE
+            # is h (not input_emb), the read is dot (not cosine), and the pool is
+            # carried ONLY over `=`-bound name references (carry_bound_only) so
+            # prose between the query name and the value can't clobber the key.
+            name_key, vstart, last_name_src = self._name_span_keys(
+                input_ids, h, carry_bound_only=True)
+            q_all = self.ctxkey_q_enc(name_key)                      # (B, T, d_key)
+            k_all = self.ctxkey_k_enc(name_key)                      # (B, T, d_key)
+            gather_idx_k = top_idx.unsqueeze(-1).expand(-1, -1, q_all.shape[-1])
+            buf_qk = torch.gather(k_all, dim=1, index=gather_idx_k)  # (B, K, d_key)
+            scale = self.ctxkey_log_scale.exp().clamp(1e-3, 1e3)
+            scores = torch.einsum("btd,bkd->btk", q_all, buf_qk) * scale
+            # Only BINDING (value-start) buffer slots are addressable.
+            buf_is_binding = torch.gather(vstart, dim=1, index=top_idx)  # (B,K) bool
+            scores = scores.masked_fill(~buf_is_binding.unsqueeze(1),
+                                        float("-inf"))
+            sn_active = True
+            sn_match_threshold = self.ctx_namekey_match_threshold
+        elif self.discrete_key:
             # DISCRETE-HASH addressing: onehot(code) match. The write-key index
             # is (var# + 1) at binding value-starts, else 0 (null); the query
             # index is (carried var# + 1), else 0. A query matches a buffered
@@ -1728,15 +1987,43 @@ class WorkingMemory(nn.Module):
                                        <= self.discrete_key_match_window)
                 me = me & local
             self._last_match_exists = me.detach()
+        elif sn_active:
+            pass  # soft match-existence computed after the softmax below
         else:
             self._last_match_exists = None
 
-        # Some rows (t < min source position, or no in-document predecessor)
-        # get all -inf. Softmax of all -inf is NaN; replace those rows with
-        # zero attention so the read is zero (and the injection is zero).
-        all_masked = blocked.all(dim=-1, keepdim=True)            # (B, T, 1)
+        # Some rows (t < min source position, no in-document predecessor, or —
+        # on the soft name-span path — no causally-valid BINDING slot) get all
+        # -inf. Softmax of all -inf is NaN; replace those rows with zero
+        # attention so the read is zero (and the injection is zero). Detect from
+        # the scores directly so it also catches the soft branch's binding mask
+        # (equivalent to `blocked.all` on the legacy/discrete paths).
+        all_masked = (scores == float("-inf")).all(dim=-1, keepdim=True)  # (B,T,1)
         attn = torch.softmax(scores, dim=-1)
         attn = torch.where(all_masked, torch.zeros_like(attn), attn)
+
+        # MATCH-EXISTENCE (soft / ctx name-span path): the learned address has no
+        # exact code-equality, so "did it land on a binding?" is read off the
+        # attention itself — the top attention weight over the (causal, same-doc)
+        # BINDING slots must clear `sn_match_threshold` (the soft / ctx
+        # threshold). AND the queried name
+        # must have been mentioned within the locality window (any name run, via
+        # `last_name_src`) — this is what lets a SURFACE-VARIANT query fire (its
+        # name is not a bound code, but it IS a name run) while a stale carried
+        # key drifting through prose is rejected. Used by `_apply_copy_head` to
+        # gate the copy → recall where addressed, no harm elsewhere.
+        if sn_active:
+            valid_b = (~blocked) & buf_is_binding.unsqueeze(1)    # (B, T, K)
+            attn_b = attn.masked_fill(~valid_b, 0.0)
+            top_attn = attn_b.amax(dim=-1)                        # (B, T)
+            me = top_attn >= sn_match_threshold
+            if (self.discrete_key_match_window > 0
+                    and last_name_src is not None):
+                posT = torch.arange(T, device=device).view(1, T)
+                local = (last_name_src >= 0) & (
+                    (posT - last_name_src) <= self.discrete_key_match_window)
+                me = me & local
+            self._last_match_exists = me.detach()
 
         if self._capture_read:
             self._last_read_attn = attn.detach()                  # (B, T, K)
@@ -2148,6 +2435,27 @@ class TinyLM(nn.Module):
                                               # must be re-mentioned within this
                                               # many tokens → rejects stale cross-
                                               # family false matches). 0 disables.
+        mem_soft_namekey: bool = False,       # SOFT NAME-SPAN addressing: learned
+                                              # continuous key = enc(pooled name-
+                                              # span input emb); cosine soft read
+                                              # over binding slots. Matches the
+                                              # hash on exact + adds surface-variant
+                                              # robustness. Mutually exclusive with
+                                              # mem_discrete_key. Default off → NO
+                                              # new params → byte-identical.
+        mem_soft_namekey_dim: int = 64,       # soft name-key vector dim.
+        mem_soft_namekey_match_threshold: float = 0.5,  # min top-attn to count a
+                                              # match (gates the copy head).
+        mem_ctx_namekey: bool = False,        # CONTEXTUAL NAME-SPAN addressing:
+                                              # fully-learned addresser keyed on
+                                              # the trunk's CONTEXTUAL HIDDEN
+                                              # pooled over the name-span, with a
+                                              # DOT-PRODUCT read (learned scale).
+                                              # No static hash. Mutually exclusive
+                                              # with discrete_key / soft_namekey.
+                                              # Default off → byte-identical.
+        mem_ctx_namekey_dim: int = 192,       # ctx name-key vector dim (probe).
+        mem_ctx_namekey_match_threshold: float = 0.5,  # min top-attn for a match.
         use_copy_head: bool = False,          # v14 COPY/POINTER readout: at
                                               # mem_read_mask positions mix the LM
                                               # dist with a copy dist over the
@@ -2535,6 +2843,14 @@ class TinyLM(nn.Module):
                 discrete_key_lexical=bool(mem_discrete_key_lexical),
                 copy_require_match=bool(mem_copy_require_match),
                 discrete_key_match_window=int(mem_discrete_key_match_window),
+                soft_namekey=bool(mem_soft_namekey),
+                soft_namekey_dim=int(mem_soft_namekey_dim),
+                soft_namekey_match_threshold=float(
+                    mem_soft_namekey_match_threshold),
+                ctx_namekey=bool(mem_ctx_namekey),
+                ctx_namekey_dim=int(mem_ctx_namekey_dim),
+                ctx_namekey_match_threshold=float(
+                    mem_ctx_namekey_match_threshold),
             )
             # Re-init the thinking-token embedding row to the mean of the
             # other rows. PyTorch's default init makes it random noise, which
@@ -2748,7 +3064,9 @@ class TinyLM(nn.Module):
         # v14 embedding-key addressing needs the input embeddings. Only computed
         # when the flag is on (default off → input_emb=None → byte-identical).
         input_emb = None
-        if getattr(self.memory, "key_from_embedding", False) and input_ids is not None:
+        if (getattr(self.memory, "key_from_embedding", False)
+                or getattr(self.memory, "soft_namekey", False)
+                ) and input_ids is not None:
             input_emb = self.embed(input_ids)
         return self.memory(h_normed, input_ids, read_mask=read_mask,
                            doc_ids=doc_ids, input_emb=input_emb)

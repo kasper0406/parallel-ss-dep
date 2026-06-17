@@ -60,6 +60,12 @@ def build_model_from_ckpt(ckpt_path: str,
                           force_mem_discrete_key_lexical: bool | None = None,
                           force_mem_copy_require_match: bool | None = None,
                           force_mem_discrete_key_match_window: int | None = None,
+                          force_mem_soft_namekey: bool | None = None,
+                          force_mem_soft_namekey_dim: int | None = None,
+                          force_mem_soft_namekey_match_threshold: float | None = None,
+                          force_mem_ctx_namekey: bool | None = None,
+                          force_mem_ctx_namekey_dim: int | None = None,
+                          force_mem_ctx_namekey_match_threshold: float | None = None,
                           force_mem_size: int | None = None):
     """Construct a TinyLM from a saved ckpt.
 
@@ -169,6 +175,46 @@ def build_model_from_ckpt(ckpt_path: str,
     mem_discrete_key_match_window = int(cfg.get("mem_discrete_key_match_window", 32))
     if force_mem_discrete_key_match_window is not None:
         mem_discrete_key_match_window = int(force_mem_discrete_key_match_window)
+    # SOFT NAME-SPAN addressing (2026-06-16). DOES add params (memory.namekey_enc.*
+    # + memory.namekey_log_tau), so auto-detect from the state-dict; cfg / force as
+    # fallback. Default off → back-compat with every prior ckpt. Mutually exclusive
+    # with discrete_key (the WorkingMemory ctor asserts this).
+    has_namekey = any(k.startswith("memory.namekey_enc.") for k in sd_keys)
+    mem_soft_namekey = (has_namekey or bool(cfg.get("mem_soft_namekey", False)))
+    if force_mem_soft_namekey is not None:
+        mem_soft_namekey = bool(force_mem_soft_namekey)
+    # Infer the key dim from the trained encoder's last Linear (out_features);
+    # fall back to cfg / force / default 64.
+    mem_soft_namekey_dim = int(cfg.get("mem_soft_namekey_dim", 64))
+    if has_namekey and "memory.namekey_enc.2.weight" in sd_keys:
+        mem_soft_namekey_dim = int(
+            ckpt["state_dict"]["memory.namekey_enc.2.weight"].shape[0])
+    if force_mem_soft_namekey_dim is not None:
+        mem_soft_namekey_dim = int(force_mem_soft_namekey_dim)
+    mem_soft_namekey_match_threshold = float(
+        cfg.get("mem_soft_namekey_match_threshold", 0.5))
+    if force_mem_soft_namekey_match_threshold is not None:
+        mem_soft_namekey_match_threshold = float(
+            force_mem_soft_namekey_match_threshold)
+    # CONTEXTUAL NAME-SPAN addressing (2026-06-17). DOES add params
+    # (memory.ctxkey_q_enc.* / ctxkey_k_enc.* / ctxkey_log_scale), so auto-detect
+    # from the state-dict; cfg / force as fallback. Default off → back-compat.
+    # Mutually exclusive with discrete_key / soft_namekey (the WM ctor asserts).
+    has_ctxkey = any(k.startswith("memory.ctxkey_q_enc.") for k in sd_keys)
+    mem_ctx_namekey = (has_ctxkey or bool(cfg.get("mem_ctx_namekey", False)))
+    if force_mem_ctx_namekey is not None:
+        mem_ctx_namekey = bool(force_mem_ctx_namekey)
+    mem_ctx_namekey_dim = int(cfg.get("mem_ctx_namekey_dim", 192))
+    if has_ctxkey and "memory.ctxkey_q_enc.2.weight" in sd_keys:
+        mem_ctx_namekey_dim = int(
+            ckpt["state_dict"]["memory.ctxkey_q_enc.2.weight"].shape[0])
+    if force_mem_ctx_namekey_dim is not None:
+        mem_ctx_namekey_dim = int(force_mem_ctx_namekey_dim)
+    mem_ctx_namekey_match_threshold = float(
+        cfg.get("mem_ctx_namekey_match_threshold", 0.5))
+    if force_mem_ctx_namekey_match_threshold is not None:
+        mem_ctx_namekey_match_threshold = float(
+            force_mem_ctx_namekey_match_threshold)
     mem_size_eff = int(cfg.get("mem_size", 1024))
     if force_mem_size is not None:
         mem_size_eff = int(force_mem_size)
@@ -193,6 +239,14 @@ def build_model_from_ckpt(ckpt_path: str,
             mem_discrete_key_lexical=bool(mem_discrete_key_lexical),
             mem_copy_require_match=bool(mem_copy_require_match),
             mem_discrete_key_match_window=int(mem_discrete_key_match_window),
+            mem_soft_namekey=bool(mem_soft_namekey),
+            mem_soft_namekey_dim=int(mem_soft_namekey_dim),
+            mem_soft_namekey_match_threshold=float(
+                mem_soft_namekey_match_threshold),
+            mem_ctx_namekey=bool(mem_ctx_namekey),
+            mem_ctx_namekey_dim=int(mem_ctx_namekey_dim),
+            mem_ctx_namekey_match_threshold=float(
+                mem_ctx_namekey_match_threshold),
             use_copy_head=bool(use_copy_head),
         )
     pkm_kwargs = {}
@@ -405,7 +459,7 @@ def build_model_from_ckpt(ckpt_path: str,
     # Discrete-hash WM addressing needs the tokenizer's `v`/digit/`=` ids; detect
     # them once here so the reloaded model is self-contained (no state-dict
     # footprint). Only when the mode is on.
-    if has_memory and mem_discrete_key:
+    if has_memory and (mem_discrete_key or mem_soft_namekey or mem_ctx_namekey):
         from transformers import AutoTokenizer
         _tok = AutoTokenizer.from_pretrained(
             cfg.get("tokenizer", "HuggingFaceTB/SmolLM2-135M"))

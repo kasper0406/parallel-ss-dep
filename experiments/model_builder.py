@@ -117,6 +117,17 @@ def build_model_from_args(args, *, vocab_size: int,
                 getattr(args, "mem_copy_require_match", True)),
             mem_discrete_key_match_window=int(
                 getattr(args, "mem_discrete_key_match_window", 32)),
+            # SOFT NAME-SPAN addressing (default off → byte-identical, no params).
+            mem_soft_namekey=bool(getattr(args, "mem_soft_namekey", False)),
+            mem_soft_namekey_dim=int(getattr(args, "mem_soft_namekey_dim", 64)),
+            mem_soft_namekey_match_threshold=float(
+                getattr(args, "mem_soft_namekey_match_threshold", 0.5)),
+            # CONTEXTUAL NAME-SPAN addressing (learned, no static hash; default
+            # off → byte-identical, no new params until ctx_namekey is on).
+            mem_ctx_namekey=bool(getattr(args, "mem_ctx_namekey", False)),
+            mem_ctx_namekey_dim=int(getattr(args, "ctx_namekey_dim", 192)),
+            mem_ctx_namekey_match_threshold=float(
+                getattr(args, "ctx_namekey_match_threshold", 0.5)),
         )
 
     pkm_kwargs: dict = {}
@@ -199,12 +210,18 @@ def build_model_from_args(args, *, vocab_size: int,
     # tokenizer's identifier/digit/`=` vocab (no state-dict footprint) — detect
     # it once here exactly as eval_bracket_structure.build_model_from_ckpt does,
     # so the model is self-contained. Default off → this whole block is skipped.
-    if args.use_memory and bool(getattr(args, "mem_discrete_key", False)):
+    if args.use_memory and (bool(getattr(args, "mem_discrete_key", False))
+                            or bool(getattr(args, "mem_soft_namekey", False))
+                            or bool(getattr(args, "mem_ctx_namekey", False))):
         from transformers import AutoTokenizer
         _tok = AutoTokenizer.from_pretrained(
             getattr(args, "tokenizer", "HuggingFaceTB/SmolLM2-135M"))
         model.memory.set_discrete_key_vocab(_tok)
-        print(f"  discrete-key WM: lexical="
+        _addr_mode = ("ctx_namekey" if getattr(model.memory, "ctx_namekey", False)
+                      else "soft_namekey" if getattr(model.memory, "soft_namekey",
+                                                      False)
+                      else "discrete_key")
+        print(f"  WM addressing[{_addr_mode}]: lexical="
               f"{bool(getattr(model.memory, 'discrete_key_lexical', True))} "
               f"always_read={bool(model.memory.always_read)} "
               f"copy_require_match={bool(model.memory.copy_require_match)} "

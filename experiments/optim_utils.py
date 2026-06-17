@@ -133,6 +133,8 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                     decay_frac: float = 0.15,
                     bf16_optim_state: bool = False,
                     pkm_value_lr_mult: float = 1.0,
+                    soap_precond_freq: int = 10,
+                    soap_normalize_grads: bool = False,
                     verbose: bool = True
                     ) -> tuple[list[torch.optim.Optimizer], list]:
     """Build optimizer(s) + LR schedulers. See module docstring.
@@ -141,6 +143,17 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
     `bf16_optim_state`: if True, AdamW exp_avg/exp_avg_sq and Muon
         momentum_buffer are stored as bf16 (saves ~550 MB persistent
         on the 218 M v4 model). See `experiments/bf16_optim.py`.
+
+    `optimizer == "soap"`: SOAP (Shampoo-in-Adam-eigenbasis, Vyas et al.
+        2024, vendored in `experiments/soap.py`) replaces Muon on EXACTLY
+        the same 2D hidden-matrix params Muon would handle; embeddings /
+        lm_head / PKM value tables / 1D / α scalars still route to AdamW,
+        identical to the muon split — so a muon-vs-soap A/B isolates the
+        matrix optimizer. The SOAP matrix LR is taken from `lr_muon` (the
+        "matrix-optimizer LR" slot); SOAP's per-tensor preconditioner is
+        refreshed every `soap_precond_freq` steps. `bf16_optim_state` is
+        ignored for the SOAP group (the vendored impl is fp32-state only);
+        the AdamW group still honours it.
     """
     if bf16_optim_state:
         from experiments.bf16_optim import BF16StateAdamW, BF16StateMuon
@@ -184,10 +197,10 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                      if lr_schedule == "wsd" else ""))
         return opts, scheds
 
-    if optimizer != "muon":
+    if optimizer not in ("muon", "soap"):
         raise ValueError(f"unknown optimizer {optimizer!r}")
 
-    # Muon: 2D hidden matrices only. Embeddings, lm_head, 1D, 3D+ → AdamW.
+    # Muon / SOAP: 2D hidden matrices only. Embeddings, lm_head, 1D, 3D+ → AdamW.
     # ThinkAdapter (Phase B, 2026-05-26): both the 2D fc weights AND the
     # 1D α scalar route to AdamW — the adapter is a small specialized
     # head, not a general d×d hidden matrix Newton-Schulz should normalize.
@@ -233,13 +246,35 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
             print(f"  PKM-value LR boost: {len(adamw_pkm_values)} value "
                   f"tables get lr={lr * pkm_value_lr_mult:.2e} "
                   f"({pkm_value_lr_mult}× base lr={lr:.2e})")
+    if optimizer == "muon":
+        matrix_opt = MuonCls(muon_params, lr=lr_muon, momentum=0.95,
+                             weight_decay=wd)
+        if verbose:
+            print(f"  Muon weight_decay={wd}; AdamW(regular) weight_decay={wd}"
+                  + ("  [bf16 optimizer state]" if bf16_optim_state else ""))
+    else:  # soap — Shampoo-in-Adam-eigenbasis on the same 2D matrix params.
+        from experiments.soap import SOAP
+        matrix_opt = SOAP(muon_params, lr=lr_muon, betas=(0.95, 0.95),
+                          weight_decay=wd, precondition_frequency=soap_precond_freq,
+                          # vocab-sized dims excluded by max_precond_dim; our 2D
+                          # hidden matrices are all <= max_precond_dim so both
+                          # sides get a full preconditioner. 1D excluded here
+                          # anyway (1D params route to AdamW above).
+                          precondition_1d=False,
+                          # SOAP-recommended companion to large precond_freq
+                          # (~100): per-layer grad normalization (helps at high
+                          # freq, hurts at low freq per the paper).
+                          normalize_grads=soap_normalize_grads)
+        if verbose:
+            print(f"  SOAP(matrix) lr={lr_muon:.2e} betas=(0.95,0.95) "
+                  f"wd={wd} precond_freq={soap_precond_freq}; "
+                  f"AdamW(regular) weight_decay={wd}"
+                  + ("  [AdamW bf16 state; SOAP state fp32]"
+                     if bf16_optim_state else ""))
     opts = [
-        MuonCls(muon_params, lr=lr_muon, momentum=0.95, weight_decay=wd),
+        matrix_opt,
         AdamWCls(adamw_groups, lr=lr, betas=(0.9, 0.95)),
     ]
-    if verbose:
-        print(f"  Muon weight_decay={wd}; AdamW(regular) weight_decay={wd}"
-              + ("  [bf16 optimizer state]" if bf16_optim_state else ""))
     scheds = [
         _make_scheduler(opts[0], base_lr=lr_muon, schedule=lr_schedule,
                         steps=steps, warmup_steps=warmup_steps,

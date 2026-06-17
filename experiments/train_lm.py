@@ -275,6 +275,70 @@ def _pkm_diversity_loss(pkm) -> torch.Tensor:
     return neg_entropy.mean()
 
 
+def _ctx_addr_aux_loss(model, input_ids, mem_read_mask, doc_ids=None):
+    """Attention-supervision aux for the LEARNED ctx_namekey WM addresser.
+
+    Trains the ctx_namekey read attention to place mass on the SAME binding slot
+    the deterministic lexical discrete-code identifies as correct (the teacher),
+    at recall answer-span (mem_read_mask) positions. The discrete code is
+    parameter-free + vectorized; the learned ctx addresser is the student
+    (general at inference, no hash). Mirrors wm_recall_cotrain.py's addr_aux
+    (cross-entropy on the read attention onto the queried binding), with the
+    binding TARGET derived from the lexical code rather than per-example metadata
+    (which the pretrain recall stream does not carry — it only carries the
+    answer-span mem_read_mask the discrete path also uses).
+
+    Gradient flows ONLY through the (grad-keeping) read attention; the code /
+    vstart / masks are integer/bool teacher signals with no grad. Returns
+    (loss, n_positions, mean_p_bind) or None when it cannot fire (ctx_namekey
+    off, no mask, no stashed attention graph, or no recall position with a
+    causally-valid matching binding in the buffer).
+    """
+    mem = getattr(model, "memory", None)
+    if (mem is None or not getattr(mem, "ctx_namekey", False)
+            or mem_read_mask is None):
+        return None
+    attn = getattr(mem, "_last_read_attn_grad", None)   # (B, T, K) w/ grad
+    top_idx = getattr(mem, "_last_top_idx_buf", None)   # (B, K) src positions
+    if attn is None or top_idx is None:
+        return None
+    recall = mem_read_mask.bool()
+    if not bool(recall.any()):
+        return None
+    B, T, K = attn.shape
+    device = attn.device
+    # Deterministic lexical-code TEACHER (parameter-free, vectorized, on-device)
+    # → the correct binding for each position. Construction mirrors the WM
+    # discrete branch's `match` tensor exactly (model.py).
+    code, vstart = mem._identifier_code_lexical(input_ids)        # (B,T),(B,T)
+    Kc = int(getattr(mem, "discrete_key_K", 1 << 24))
+    idx = (code + 1).clamp(0, Kc - 1)                             # (B,T) >=0
+    zeros = torch.zeros_like(idx)
+    key_idx = torch.where(vstart, idx, zeros)                     # write side
+    qry_idx = torch.where(code >= 0, idx, zeros)                  # read side
+    buf_key_idx = torch.gather(key_idx, 1, top_idx)              # (B, K)
+    match = ((qry_idx.unsqueeze(-1) == buf_key_idx.unsqueeze(1))
+             & (qry_idx.unsqueeze(-1) > 0))                      # (B, T, K) bool
+    # Causal + same-document validity: only count target slots the attention
+    # could actually attend (the softmax already masked these to ~0, so this
+    # keeps the teacher consistent with the student's support).
+    pos = torch.arange(T, device=device).view(1, T, 1)
+    src = top_idx.unsqueeze(1)                                    # (B, 1, K)
+    valid_slot = src < pos                                        # causal
+    if doc_ids is not None:
+        buf_doc = torch.gather(doc_ids, 1, top_idx)              # (B, K)
+        valid_slot = valid_slot & (buf_doc.unsqueeze(1)
+                                   == doc_ids.unsqueeze(-1))
+    target = match & valid_slot                                   # (B, T, K)
+    has_target = target.any(dim=-1) & recall                     # (B, T)
+    if not bool(has_target.any()):
+        return None
+    p_bind = (attn * target.to(attn.dtype)).sum(dim=-1).clamp_min(1e-9)  # (B,T)
+    sel = p_bind[has_target]
+    addr = -(torch.log(sel)).mean()
+    return addr, int(has_target.sum()), float(sel.mean().detach())
+
+
 class TokenisedStream(IterableDataset):
     """Streaming IterableDataset of fixed-length tokenised chunks."""
 
@@ -519,6 +583,12 @@ def main():
     fb_xattn_pairs = _build_info.fb_xattn_pairs
     n_layers_actual = _build_info.n_layers
     aux_dim = _build_info.aux_dim
+    # ctx_namekey addressing aux needs the WM read-attention graph stashed (the
+    # copy head also turns this on in TinyLM.__init__; set it explicitly so the
+    # addr-aux works even if --use_copy_head is absent). No-op when WM is off.
+    if (float(getattr(args, "ctx_addr_aux_weight", 0.0)) > 0.0
+            and getattr(model, "memory", None) is not None):
+        model.memory._stash_read_attn_grad = True
     # ---- Speed knobs (must run AFTER model is built but BEFORE the train
     # loop touches it). See experiments/speed_knobs.py.
     # The latent co-train aux losses run extra eager forwards at short/odd
@@ -1467,6 +1537,7 @@ def main():
             _latent_cotrain_diag = None
             _latent_reasoning_diag = None
             _gate_calib_diag = None
+            _ctx_addr_diag = None
             for micro in range(n_micro):
                 if micro > 0:
                     try:
@@ -1534,6 +1605,33 @@ def main():
                         loss = loss + args.gate_entropy_aux_weight * gate_aux_loss
                     if args.gist_loss_weight > 0.0:
                         loss = loss + args.gist_loss_weight * gist_loss
+                    # CTX-NAMEKEY addressing aux (learned WM addresser): train the
+                    # ctx read attention to land on the binding the deterministic
+                    # lexical code identifies as correct, ONLY at recall answer-
+                    # span (mem_read_mask) positions. RAMPED weight (0 before
+                    # start_step, linear to target over warmup) keeps it negligible
+                    # while the trunk/PKM settle. Computed HERE — before the
+                    # latent/gate_calib extra forwards clobber the WM's
+                    # _last_read_attn_grad / _last_top_idx_buf. Fires every
+                    # microbatch (NO n_micro scale — like lm_loss, averaged at the
+                    # /n_micro backward). Default weight 0 = OFF (no aux added).
+                    _ctx_addr_w = float(getattr(args, "ctx_addr_aux_weight", 0.0))
+                    if (_ctx_addr_w > 0.0
+                            and getattr(model, "use_memory", False)
+                            and getattr(getattr(model, "memory", None),
+                                        "ctx_namekey", False)):
+                        _ctx_ramp = _latent_reasoning_ramp(
+                            step,
+                            int(getattr(args, "ctx_addr_aux_start_step", 0)),
+                            int(getattr(args, "ctx_addr_aux_warmup_steps", 0)))
+                        if _ctx_ramp > 0.0:
+                            _ca = _ctx_addr_aux_loss(
+                                model, x, mem_read_mask, doc_ids=doc_ids)
+                            if _ca is not None:
+                                _ca_loss, _ca_n, _ca_p = _ca
+                                loss = loss + (_ctx_addr_w * _ctx_ramp) * _ca_loss
+                                _ctx_addr_diag = (float(_ca_loss.detach()),
+                                                  _ca_n, _ca_p, _ctx_ramp)
                     # v9: latent-thinking co-training — grad CE on the
                     # post-R-latent-think prediction so the trunk learns to do
                     # useful computation during thinking. Logs mean Δlogp (the
@@ -1700,6 +1798,14 @@ def main():
                 # latent-think benefit. tgt1>σ ⇒ gate UNDER-fires (miscal).
                 line += (f"  gc(tgt1={_t1:.2f},σ={_sg:.2f},"
                          f"Δlogp={_gd:+.2f},n={_gn})")
+            if getattr(args, "ctx_addr_aux_weight", 0.0) > 0.0 and \
+                    _ctx_addr_diag is not None:
+                # loss = attention-CE onto the correct binding (falls as the ctx
+                # addresser learns); p = mean attention mass on the binding;
+                # n = supervised recall positions; ramp = current weight ramp.
+                _cal, _can, _cap, _car = _ctx_addr_diag
+                line += (f"  addr(loss={_cal:.3f},p={_cap:.3f},"
+                         f"n={_can},ramp={_car:.2f})")
             if args.feedback != "none" or fb_xattn_pairs:
                 alphas = model.feedback_alphas()
                 if not alphas:
@@ -2215,6 +2321,21 @@ def main():
                     getattr(args, "mem_copy_require_match", True)),
                 mem_discrete_key_match_window=int(
                     getattr(args, "mem_discrete_key_match_window", 32)),
+                # SOFT NAME-SPAN addressing cfg (round-trip parity with the
+                # discrete/ctx paths; eval_bracket reads these keys).
+                mem_soft_namekey=bool(getattr(args, "mem_soft_namekey", False)),
+                mem_soft_namekey_dim=int(
+                    getattr(args, "mem_soft_namekey_dim", 64)),
+                mem_soft_namekey_match_threshold=float(
+                    getattr(args, "mem_soft_namekey_match_threshold", 0.5)),
+                # CONTEXTUAL NAME-SPAN addressing (learned, no static hash). No
+                # state-dict footprint beyond the ctxkey_* encoders → MUST be in
+                # cfg so eval_bracket_structure.build_model_from_ckpt rebuilds the
+                # same addresser on reload (matches the discrete-key handling).
+                mem_ctx_namekey=bool(getattr(args, "mem_ctx_namekey", False)),
+                mem_ctx_namekey_dim=int(getattr(args, "ctx_namekey_dim", 192)),
+                mem_ctx_namekey_match_threshold=float(
+                    getattr(args, "ctx_namekey_match_threshold", 0.5)),
                 copy_head_gate_bias_init=float(
                     getattr(args, "copy_gate_bias_init", -6.0)),
                 use_pkm=bool(getattr(args, "use_pkm", False)),
@@ -2346,6 +2467,22 @@ def main():
                     getattr(args, "mem_copy_require_match", True)),
                 "mem_discrete_key_match_window": int(
                     getattr(args, "mem_discrete_key_match_window", 32)),
+                # SOFT NAME-SPAN addressing cfg (round-trip parity with the
+                # discrete/ctx paths; eval_bracket reads these keys).
+                "mem_soft_namekey": bool(
+                    getattr(args, "mem_soft_namekey", False)),
+                "mem_soft_namekey_dim": int(
+                    getattr(args, "mem_soft_namekey_dim", 64)),
+                "mem_soft_namekey_match_threshold": float(
+                    getattr(args, "mem_soft_namekey_match_threshold", 0.5)),
+                # CONTEXTUAL NAME-SPAN addressing (learned, no static hash) — cfg
+                # so the reload path (eval_bracket_structure) rebuilds the same
+                # ctx addresser. ctxkey_* encoders ARE in the state-dict; these
+                # scalars are not, so they must travel in cfg.
+                "mem_ctx_namekey": bool(getattr(args, "mem_ctx_namekey", False)),
+                "mem_ctx_namekey_dim": int(getattr(args, "ctx_namekey_dim", 192)),
+                "mem_ctx_namekey_match_threshold": float(
+                    getattr(args, "ctx_namekey_match_threshold", 0.5)),
                 "copy_head_gate_bias_init": float(
                     getattr(args, "copy_gate_bias_init", -6.0)),
                 "mem_dim": ((int(args.mem_dim) if args.mem_dim > 0

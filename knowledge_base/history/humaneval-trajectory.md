@@ -1,7 +1,7 @@
 # HumanEval trajectory
 
 ## Summary
-The headline coding number over the project's arc: **0 → 8 → 10 → 14 → 16/164 (9.8 %)**, current best `rl_grader_phase_c_v2_step300`. The big levers were distillation + SFT and **execution-grounded RL with a KL anchor**; latent thinking contributed a modest, noise-band selective lift (7→11) on a side branch. Source: `CLAUDE.md`, `THINKING_HUMANEVAL_2026_06_06.md`, the `project_*` SFT/RL memory files.
+The headline coding number was historically reported as **0 → 8 → 10 → 14 → 16/164**, but a 2026-06-16 SAME-CONFIG re-measurement (see the section below + memory `project_humaneval_config_artifact`) shows the **robust best is ~14/164**, reached by BOTH Phase C SFT (no thinking) and RL v2_step300 (with thinking) — the "16" was a noisy peak and the SFT→RL gain ≈0 at consistent config. The real lever was **distillation + SFT onto a code-focused base** (the data); execution-grounded RL and latent thinking did **not** reliably add on top once eval config + greedy noise are controlled. HumanEval-164 greedy is too noisy as the dev signal. Source: `project_humaneval_config_artifact`, `CLAUDE.md`, the `project_*` SFT/RL memory files.
 
 ## The trajectory
 | stage | HumanEval | note |
@@ -13,6 +13,14 @@ The headline coding number over the project's arc: **0 → 8 → 10 → 14 → 1
 | Phase C SFT (Chinchilla base + additive + trunk gist) | **10/164** | +2; PKM load-bearing here (−5 ablation) |
 | RL v1 step-100 (peak, then collapse ~step 350) | **14/164** | first RL lift; collapsed (no KL anchor) |
 | **RL v2 step-300 (KL-stable GRPO)** | **16/164 (9.8 %)** | **current best**, monotonic climb |
+
+## Same-config re-measurement (2026-06-16) — eval config matters; v12 is a worse code base
+Re-evaluating with **fixed flags** (`--prompt_style sft_comment --extract_code_block --min_emit_before_eos 30 --max_gen 512`, thinking-off, greedy, full 164):
+- **Phase C SFT = 14/164** (not the earlier "10" — the original likely truncated at a shorter `max_gen`; HumanEval numbers are eval-config-sensitive, so only compare same-config).
+- **v12 SFT = 8/164.** v12 (recall-heavy WM-experiment pretrain mix) is a **materially worse CODE base** than Phase C (code-focused mix), confirming [[thinking-on-code-verdict]] / the mechanisms-synthesis: the code headline tracks code-data content, and pouring pretrain capacity into recall/WM/PKM *costs* code (data-mix opportunity cost).
+- **RL v2_step300 (the documented "16/164") = 13 thinking-off / 14 thinking-ON (native)** — ≈ its own SFT base (14). And RL **v11c = 8**. The `eval_rl_*.log` numbers cluster 7–14; **"16/164" is not robustly reproducible**. ⇒ the celebrated **+6 SFT→RL gain compresses to ≈0** at consistent config: **robust best = 14/164**, reached by BOTH Phase C SFT (no thinking) and RL (with thinking); thinking on-vs-off ≈ +1 (noise). The trajectory over-read eval-config changes as capability.
+- **Drop-broken data hygiene = 9/164 (−5 vs dirty 14)** — pruning verified-broken targets HURTS (exec_error rows are mostly-valid code + MBPP coverage; only 632 true syntax garbage). Naive data hygiene ≠ pruning.
+- **Load-bearing lesson** ([[fair-baselines]]): fix ONE eval harness before quoting any delta; HumanEval-164 greedy is too noisy to be the dev signal (use temp pass@k / a bigger bench). See memory `project_humaneval_config_artifact`. The headline path needs real data-regeneration or scale, not the cheap levers (all negative tonight).
 
 ## What worked
 - **Distillation** (Qwen 3.6 AWQ, ~38 k (problem, CoT, code) pairs) replaced the tiny codeparrot distill — the student learns reasoning prose around the code.

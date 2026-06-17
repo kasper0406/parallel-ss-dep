@@ -192,6 +192,34 @@ Mixed-corpus pretrain with EOS at small-document boundaries teaches the model `"
 
 `experiments/code_grader.py` returns a **dense** `GradingResult`, not binary pass/fail — so GRPO groups have advantage variance before the model can fully solve a task. Tier ladder + `score ∈ [0,1]`: `syntax_error` 0.0 < `exec_error` 0.05 < `runtime_error` 0.2 < `partial` 0.2 + 0.7·(n_passed/n_tests) < `pass` 1.0. `_exec_target` compiles, exec's the solution, then AST-splits `check()` and runs it statement-by-statement so one failing assert doesn't mask the rest. `GradingResult.error_text` carries the formatted diagnosis (SyntaxError + line, exec traceback, failed-assert sources) — the feedback the **iterative self-repair loop** will put back into a re-added prompt so the model learns to diagnose. Do **not** use embedding-similarity-to-reference as a reward: hackable, no single target, code embeddings barely track correctness — lean into the verifier. Tests: `experiments/test_code_grader.py` (15).
 
+## Current state (2026-06-17) — WM made to work (no-hash), now co-trained into pretrain
+
+**WM recall is solved with a LEARNED, no-hash addresser and is load-bearing.** This arc:
+- **Discrete lexical-hash WM** (address by hash of the identifier token-span → one-hot copy readout) revived WM:
+  validated leak-free, Pareto-safe, deployable (frozen-trunk `checkpoints/wm_discrete_v12.pt`; output-policy SFT
+  → free-gen const 100% / setvar 92.8% strict, WM-OFF 0%). But the hash is **spelling-locked** (not general).
+- **KEY-DESIGN INVERSION (do NOT reintroduce discreteness):** a 3-arm probe (`wm_vqkey_probe.py`) showed the
+  WM-addressing mistake was never softmax — it was the non-separable KEY. Given a SEPARABLE **name-span** key, a
+  **continuous SOFT attention read** beats both the hash and VQ (matches separability AND adds surface-variant
+  robustness; VQ/hash are spelling-locked or lose separability). ⟹ the right addresser is a **learned continuous
+  name-span key**, not a discrete hash.
+- **`mem_ctx_namekey` (the no-hash learned addresser, model.py, default-off byte-identical):** dot-product attention
+  over the trunk's CONTEXTUAL HIDDEN pooled on the identifier NAME-SPAN (bound-only carry), copy readout,
+  attention-supervision aux (`--ctx_addr_aux_weight`). Frozen-trunk it matches the hash (setvar full, const ~0.86);
+  **co-trained into pretrain (`train_lm` wiring) it is load-bearing leak-free at 500M tokens:** const recall
+  0.03→0.98, syn64 +0.59, syn128 +0.41 (WM-ON vs recurrence-OFF). The WM-pretrain run is a v12-continuation at
+  **lower LR (lr 6e-4/muon 2e-3; the 5e-3 peak degraded the base)**; cost ~+0.2 ppl general VAL (lower LR slowed
+  but did NOT cure the recall-mix drift — a data-mix opportunity cost, not an LR artifact). Latent thinking
+  co-trains delayed to step 2000 (cold `latent_cotrain` destabilizes earlier — gnorm spike + Δlogp<0 on engagement;
+  the general `latent_cotrain` is step-function, prefer the ramped depth-matched `latent_reasoning` if it shocks).
+- **MANDATE — measure WM recall LEAK-FREE.** `eval_code_recall.py --mode teacher_forced` on the *_recall_heldout
+  files is LEAKY (scores the restated answer → recurrence recency-copies → WM-ON==WM-OFF==~100%, uninformative).
+  Use `wm_recall_cotrain.py --mode validate` (first-occurrence kill-gate) or the saturating multibind probe — there
+  WM-OFF on const is ~0.03, not 1.0.
+- **Optimizer: keep Muon.** SOAP/Sketchy-Shampoo benchmarked (`bench_optimizer.py`, `soap.py`): ~0.9% better val
+  per-step but ~1.8× slower wall-clock + amortizing the preconditioner (freq=100) collapses convergence → Muon
+  (already Shampoo-adjacent) is Pareto-dominant at 287M. Don't re-run at this scale.
+
 ## Current state (2026-05-23)
 
 Headline (full arc): SFT v7 8/164 → Phase C SFT 10/164 → grader-RL v2

@@ -532,6 +532,60 @@ def build_parser() -> argparse.ArgumentParser:
                    action="store_false",
                    help="Disable the match-existence copy gate (let the copy head "
                         "fire wherever its learned gate opens).")
+    p.add_argument("--mem_soft_namekey", action="store_true",
+                   help="SOFT NAME-SPAN addressing — learned continuous key = "
+                        "enc(pooled name-span input emb); cosine soft read over "
+                        "binding slots. Matches the hash on exact recall and adds "
+                        "surface-variant (case/camel) robustness the spelling-"
+                        "locked hash cannot. Mutually exclusive with "
+                        "--mem_discrete_key. Default OFF → no new params, byte-"
+                        "identical.")
+    p.add_argument("--mem_soft_namekey_dim", type=int, default=64,
+                   help="soft name-key vector dim (default 64).")
+    p.add_argument("--mem_soft_namekey_match_threshold", type=float, default=0.5,
+                   help="min top-attention over binding slots for the soft "
+                        "address to count as a match (gates the copy head). "
+                        "Default 0.5.")
+    # --- CONTEXTUAL NAME-SPAN addressing (mem_ctx_namekey, validated 2026-06-17:
+    #     the FULLY-LEARNED, NO-static-hash WM addresser; key/query = the trunk's
+    #     contextual hidden pooled over the identifier name-span, dot-product read,
+    #     copy/pointer readout, attention-supervision aux). All default OFF / no
+    #     new params (until ctx_namekey on) → byte-identical to the legacy WM, so
+    #     an in-flight run that re-imports this file on autoresume is unaffected
+    #     and old ckpts load strict=False. Wired into pretrain (train_lm) so it
+    #     can be CO-TRAINED with the trunk (mirrors the mem_discrete_key wiring).
+    p.add_argument("--mem_ctx_namekey", action="store_true",
+                   help="CONTEXTUAL NAME-SPAN addressing — learned key/query = "
+                        "enc(pooled name-span TRUNK HIDDEN), dot-product attention "
+                        "read over binding slots, carried only over `=`-bound name "
+                        "refs. The general (no static token-hash) addresser. Train "
+                        "with --ctx_addr_aux_weight (attention supervision). "
+                        "Mutually exclusive with --mem_discrete_key / "
+                        "--mem_soft_namekey. Requires --use_memory + --use_copy_head "
+                        "for the recall readout. Default OFF → byte-identical.")
+    p.add_argument("--ctx_namekey_dim", type=int, default=192,
+                   help="ctx name-key q/k encoder output dim (default 192, the "
+                        "capacity-matched probe value).")
+    p.add_argument("--ctx_namekey_match_threshold", type=float, default=0.5,
+                   help="min top-attention over binding slots for the ctx address "
+                        "to count as a match (gates the copy head). Default 0.5.")
+    p.add_argument("--ctx_addr_aux_weight", type=float, default=0.0,
+                   help="weight of the ctx_namekey ADDRESSING aux — attention-"
+                        "supervision CE that trains the learned ctx read attention "
+                        "to land on the binding slot the deterministic lexical code "
+                        "identifies as correct, ONLY at recall answer-span "
+                        "(mem_read_mask) positions. The teacher is the parameter-"
+                        "free lexical hash; the ctx addresser is the general "
+                        "student. RAMPED + SMALL (target ~0.1-0.3). Default 0.0 = "
+                        "OFF (byte-identical: no aux term added).")
+    p.add_argument("--ctx_addr_aux_warmup_steps", type=int, default=0,
+                   help="linear 0->1 ramp of --ctx_addr_aux_weight over this many "
+                        "steps after --ctx_addr_aux_start_step (keeps the aux "
+                        "gradient negligible while the trunk/PKM settle). 0 = full "
+                        "weight immediately at/after the start step.")
+    p.add_argument("--ctx_addr_aux_start_step", type=int, default=0,
+                   help="step at which the ctx addressing aux begins (weight 0 "
+                        "before this). Default 0.")
     p.add_argument("--copy_gate_bias_init", type=float, default=-6.0,
                    help="v15: init bias of the copy-head gate Linear. Very "
                         "negative (default -6.0) → cold/closed cold-start gate "

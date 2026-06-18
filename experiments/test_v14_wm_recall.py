@@ -330,6 +330,72 @@ def test_emit_read_mask_substring_fallback_no_charspan():
     assert nxt and all(t == ans_id for t in nxt)
 
 
+def test_mask_first_occurrence_default_off():
+    """mask_first_occurrence defaults False → annotated answer_char_span is used
+    (byte-identical to pre-fix behaviour)."""
+    src = SourceConfig(name="s", dataset_id="x", text_field="text", weight=1.0)
+    assert src.mask_first_occurrence is False
+
+
+def test_mask_first_occurrence_targets_first_not_restated():
+    """MASK FIX (project_const_recall_mask_mismatch): with a completion that has
+    the value TWICE (a recall-hard first mention + a recency-trivial restated
+    'Answer: V'), the annotated answer_char_span points at the SECOND occurrence.
+    mask_first_occurrence=True must instead mask the FIRST occurrence (the position
+    the leak-free eval scores), while default (False) keeps the annotated second."""
+    from experiments.data_mix import _build_read_mask
+    tok = _OffsetTok()
+    prompt = "context line one and two with many distractor words here today"
+    comp = "the value is ZEBRA and is later restated as Answer: ZEBRA"
+    c0_restated = comp.rindex("ZEBRA")          # SECOND occurrence
+    rec = {"problem_prompt": prompt, "qwen_completion": comp, "answer": "ZEBRA",
+           "answer_char_span": [c0_restated, c0_restated + len("ZEBRA")]}
+    text = prompt + "\n\n" + comp               # list text_field is joined with \n\n
+    zid = tok._id("ZEBRA")
+
+    def masked_positions(flag):
+        src = SourceConfig(name="rec", dataset_id="x",
+                           text_field=["problem_prompt", "qwen_completion"],
+                           weight=1.0, emit_read_mask=True,
+                           mask_first_occurrence=flag)
+        ids, mask = _build_read_mask(rec, text, src, tok)
+        pos = [i for i, m in enumerate(mask) if m == 1]
+        # every masked position must PREDICT the value token (logits[p] -> p+1)
+        assert pos and all(ids[p + 1] == zid for p in pos if p + 1 < len(ids))
+        return pos
+
+    pos_annotated = masked_positions(False)     # second / restated occurrence
+    pos_firstocc = masked_positions(True)       # first occurrence
+    # first-occurrence supervision must land strictly EARLIER than the annotated
+    # restated occurrence.
+    assert max(pos_firstocc) < min(pos_annotated), (
+        f"first-occ mask {pos_firstocc} must precede restated mask {pos_annotated}")
+
+
+def test_mask_first_occurrence_word_boundary_skips_embedded_substring():
+    """MASK FIX edge case (import family, review finding b): a short alias value
+    like `it` must NOT match the embedded `it` inside an earlier word (`itertools`).
+    The word-boundary search picks the standalone alias occurrence, so the masked
+    position predicts the alias token, not the longer word it is embedded in."""
+    from experiments.data_mix import _build_read_mask
+    tok = _OffsetTok()
+    prompt = "module header with import statements and distractor words here"
+    comp = "itertools is imported and then aliased to it"   # 'it' embedded then standalone
+    rec = {"problem_prompt": prompt, "qwen_completion": comp, "answer": "it"}
+    text = prompt + "\n\n" + comp
+    src = SourceConfig(name="imp", dataset_id="x",
+                       text_field=["problem_prompt", "qwen_completion"],
+                       weight=1.0, emit_read_mask=True, mask_first_occurrence=True)
+    ids, mask = _build_read_mask(rec, text, src, tok)
+    pos = [i for i, m in enumerate(mask) if m == 1]
+    assert pos, "alias must be masked"
+    it_id = tok._id("it")
+    nxt = [ids[p + 1] for p in pos if p + 1 < len(ids)]
+    assert nxt and all(t == it_id for t in nxt), (
+        f"masked positions must predict the standalone alias 'it' ({it_id}), "
+        f"not the embedded substring inside 'itertools'; got {nxt}")
+
+
 @pytestmark_cuda
 def test_copy_head_answer_ce_gradient_reaches_addressing_and_copy():
     """The load-bearing v14 property: answer-span CE gradient flows into the

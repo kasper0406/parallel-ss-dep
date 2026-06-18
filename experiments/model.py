@@ -3221,6 +3221,19 @@ class TinyLM(nn.Module):
         # identity for any σ → byte-identical to no-head training.
         h_raw = self._apply_refinement_head(h_raw)
         h = self.out_norm(h_raw)
+        # DDP fix (2026-06-18): the latent_feedback_adapter is used ONLY in the
+        # aux latent-reasoning forward, never in this main forward. Under DDP
+        # (find_unused_parameters=True) the reducer marks its params "ready" after
+        # the main forward, then the single combined backward (main LM loss +
+        # latent-reasoning aux loss, added together → one .backward()) delivers
+        # their real grad → `marked ready only once` crash. Touch the adapter
+        # params here with an EXACTLY-ZERO contribution so they're in the main-
+        # forward graph (DDP counts them used); the combined backward then fires
+        # each hook once. Numerically byte-identical (×0); only active when the
+        # adapter exists + training. (Latent had never run under DDP before v17.)
+        if self.training and getattr(self, "use_latent_feedback_adapter", False):
+            h = h + 0.0 * sum(p.sum() for p in
+                              self.latent_feedback_adapter.parameters())
         # Pre-memory hidden = the CLEAN latent-thread source. With WM on, the
         # post-memory `h` (below) carries a WM retrieval injected at think
         # positions; feeding THAT back as the latent thread overwrites the

@@ -23,6 +23,7 @@ import argparse
 import json
 import pathlib
 import random
+import re
 import sys
 from dataclasses import dataclass
 from typing import Callable, Iterator
@@ -156,6 +157,21 @@ class SourceConfig:
     answer_value_field: str = "answer"   # fallback when the char span is absent:
                                           # locate this answer STRING inside the
                                           # answer_field (first occurrence).
+    mask_first_occurrence: bool = False  # WM-recall mask FIX (2026-06-17): when
+                                          # True, IGNORE answer_span_field and mask
+                                          # the FIRST occurrence of the value in the
+                                          # answer_field (the recall-HARD position
+                                          # the leak-free eval scores), not the
+                                          # annotated span. The code_recall /
+                                          # agentic_recall annotations point at the
+                                          # RESTATED "Answer: V" occurrence, which
+                                          # is recency-trivial → the copy gate never
+                                          # learns to fire where recall is actually
+                                          # needed (const Δacc +0.00). First-occ
+                                          # supervision flips it (+0.83, validated
+                                          # via wm_recall_cotrain). Mirrors what the
+                                          # multibind fallback + the cotrain already
+                                          # do. See project_const_recall_mask_mismatch.
 
 
 # ---------------------------------------------------------------------------
@@ -312,15 +328,27 @@ def _build_read_mask(ex: dict, text: str, src: "SourceConfig", tok):
         ids = tok.encode(text, add_special_tokens=False)
         return ids, [0] * len(ids)
     base = len(text) - len(ans_text)   # answer_field is the LAST joined part
-    span = ex.get(src.answer_span_field)
+    # mask_first_occurrence FIX: skip the annotated span (it points at the
+    # recency-trivial RESTATED "Answer: V" occurrence on code_recall/agentic_recall)
+    # and fall through to first-occurrence-of-value masking — the recall-HARD
+    # position the leak-free kill-gate scores. See project_const_recall_mask_mismatch.
+    span = None if getattr(src, "mask_first_occurrence", False) \
+        else ex.get(src.answer_span_field)
     if span:
         c0 = base + int(span[0])
         c1 = base + int(span[1])
     else:
-        # Fallback: no annotated char span (e.g. the synthetic multibind set).
-        # Mark the first occurrence of the answer STRING inside answer_field.
+        # Fallback: no annotated char span (synthetic multibind), OR
+        # mask_first_occurrence — mark the first occurrence of the answer STRING
+        # inside answer_field. Use a WORD-BOUNDARY match first so a short alias
+        # (e.g. import `it`/`np`) doesn't match inside a longer word (`itertools`);
+        # fall back to a raw substring find only if no bounded occurrence exists,
+        # so values that legitimately appear only as a substring still get a mask.
         val = ex.get(src.answer_value_field)
-        pos = ans_text.find(val) if isinstance(val, str) and val else -1
+        pos = -1
+        if isinstance(val, str) and val:
+            m = re.search(r"(?<!\w)" + re.escape(val) + r"(?!\w)", ans_text)
+            pos = m.start() if m else ans_text.find(val)
         if pos < 0:
             ids = tok.encode(text, add_special_tokens=False)
             return ids, [0] * len(ids)
@@ -701,6 +729,7 @@ def load_sources_from_yaml(path: str) -> list[SourceConfig]:
             answer_span_field=str(src.get("answer_span_field",
                                           "answer_char_span")),
             answer_value_field=str(src.get("answer_value_field", "answer")),
+            mask_first_occurrence=bool(src.get("mask_first_occurrence", False)),
         ))
     if not out:
         raise ValueError(f"YAML at {path} has no enabled sources")

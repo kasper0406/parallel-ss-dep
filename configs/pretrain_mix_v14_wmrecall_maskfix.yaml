@@ -1,20 +1,7 @@
-# Mixed-corpus pretrain v15 — DISCRETE-KEY WM continuation (2026-06-16).
+# Mixed-corpus pretrain v14 — make the VALIDATED WM recall mechanism load-bearing
+# on the PROJECT'S REAL workload (coding + agentic), without forgetting code.
 #
-# IDENTICAL data mix to v14_wmrecall (recall streams ~16%, full code/wiki bulk
-# ~84%). The change vs v14 is on the MODEL side, in the launcher: the VALIDATED
-# discrete-key WM addressing + copy/pointer readout (wm_recall_cotrain.py) is now
-# wired into the real pretrain trainer and engaged here from a v12 continuation:
-#   --mem_discrete_key --mem_always_read --use_copy_head --emit_read_mask
-#   --mem_read_alpha_init 0.0 --mem_freeze_read_alpha   (copy-head-only no-harm
-#   config: the additive W_proj injection is OFF so general text can never be
-#   corrupted; WM helps ONLY via the copy/pointer at recall answer spans).
-# The recall docs' answer tokens are LM targets → with always_read + copy, the
-# copy head gets gradient where it helps; the ~84% general mix teaches the gate
-# "don't copy" (discrete match-existence + locality gate suppress it off-recall).
-#
-# Below is the v14 rationale, unchanged (the streams + emit_read_mask spec):
-#
-# WHY (read project_recall_discrete_key_direction +
+# WHY v14 EXISTS (read project_recall_discrete_key_direction +
 #   project_wm_recall_probe_broken_and_routed_around before changing).
 #   The WM recall mechanism is now VALIDATED end-to-end on a SATURATING probe:
 #   name-keyed addressing (key = the identifier's INPUT-EMBEDDING window) +
@@ -84,9 +71,10 @@ sources:
     # v14 WM-recall: read mask over the answer span.
     emit_read_mask: true
     # MASK FIX (2026-06-17): the annotated answer_char_span points at the RESTATED
-    # "Answer: V" (recurrence-trivial → copy gate never learns to fire). Mask the
-    # FIRST occurrence instead (recall-HARD; what the leak-free eval scores).
-    # Validated: const Δacc +0.00→+0.83. See project_const_recall_mask_mismatch.
+    # "Answer: V" occurrence (recency-trivial → copy gate never learns to fire).
+    # Mask the FIRST occurrence of the value instead (recall-HARD; the position the
+    # leak-free eval scores). Validated: const Δacc +0.00 → +0.83. See
+    # project_const_recall_mask_mismatch.
     mask_first_occurrence: true
 
   # (C) REALISTIC AGENTIC recall (NEW, gen_agentic_recall_tasks.py): recall an
@@ -101,8 +89,8 @@ sources:
     filter: always
     # v14 WM-recall: read mask over the answer span.
     emit_read_mask: true
-    # MASK FIX (2026-06-17): same restated-answer issue — mask the FIRST
-    # occurrence (recall-HARD), not the annotated restatement.
+    # MASK FIX (2026-06-17): same restated-answer issue as code_recall_train —
+    # mask the FIRST occurrence (recall-HARD), not the annotated restatement.
     mask_first_occurrence: true
 
   # (D) multi-step synthetic memory families (variety; kept from v10/v11)

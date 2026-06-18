@@ -671,16 +671,21 @@ def main():
         from torch.nn.parallel import DistributedDataParallel as DDP
         ddp_model = DDP(model, device_ids=[ddp_local_rank],
                         output_device=ddp_local_rank,
-                        find_unused_parameters=False,
+                        find_unused_parameters=True,
                         broadcast_buffers=False,
                         gradient_as_bucket_view=True)
-        # static_graph: REQUIRED with --activation_checkpointing. Reentrant
-        # checkpoint fires each param's grad hook twice per backward; DDP's
-        # default reducer rejects the second mark ("marked ready twice",
-        # e.g. gate_head.bias). static_graph tells DDP the param-usage set is
-        # fixed across iterations (true at K=3 steady state), so it tolerates
-        # the double-fire and also subsumes find_unused_parameters.
-        ddp_model._set_static_graph()
+        # NOTE (2026-06-18): do NOT use _set_static_graph() here.
+        #   (1) static_graph records the graph on the FIRST backward, but with
+        #       grad_accum>1 the first (n_micro-1) microbatches run under
+        #       ddp_model.no_sync() — so the reducer is never prepared on that
+        #       first backward → `expect_autograd_hooks_ INTERNAL ASSERT FAILED`
+        #       crash at step 1 (the v16 from-scratch DDP failure, 2026-06-18).
+        #   (2) the original justification (reentrant activation-checkpoint
+        #       double-fires each grad hook) no longer holds: _ckpt_run_block
+        #       uses use_reentrant=False (model.py), which fires each hook once.
+        # find_unused_parameters=True handles the genuinely varying param-usage
+        # set (PKM selects a subset of value rows per step; the FiLM K-warmup
+        # bypass) and is compatible with no_sync gradient accumulation.
         # bf16 gradient compression: this rig has NO P2P (GPU0<->GPU1 is PHB /
         # chipset-not-supported), so all-reduce is host-staged at ~4 GB/s.
         # Compressing grads fp32->bf16 halves the per-step all-reduce bytes

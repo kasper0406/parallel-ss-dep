@@ -27,7 +27,7 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 nohup .venv/bin/torchrun \
   --pkm_n_heads 4 --pkm_n_keys 256 --pkm_k_dim 128 --pkm_top_k 32 \
   --pkm_use_output_gate \
   --pkm_epsilon_start 0.5 --pkm_epsilon_warmup_steps 2000 \
-  --pkm_value_init_std 1.0 --pkm_score_norm layer --pkm_diversity_weight 0.01 \
+  --pkm_value_init_std 1.0 --pkm_score_norm layer \
   --pkm_alpha_floor_start 0.3 --pkm_alpha_floor_warmup_steps 2000 \
   --pkm_value_lr_mult 100.0 \
   --data_mix configs/pretrain_mix_v4.yaml --tokenizer HuggingFaceTB/SmolLM2-135M \

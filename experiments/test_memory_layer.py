@@ -408,21 +408,7 @@ def test_pkm_value_lr_mult_disabled_at_1():
     assert lrs == {1e-3}
 
 
-def test_pkm_v7_diversity_loss_helper():
-    """train_lm._pkm_diversity_loss returns the negative entropy of the
-    per-head slot-selection distribution; lower (more negative) = more
-    diverse (higher entropy)."""
-    from experiments.train_lm import _pkm_diversity_loss
-    layer = PKMLayer(d_model=16, n_heads=2, n_keys=8, k_dim=8, top_k=4,
-                      value_bf16=False, use_output_gate=False)
-    x = torch.randn(4, 6, 16)
-    layer(x)
-    div1 = float(_pkm_diversity_loss(layer))
-    # Now FORCE concentration: stash all-zeros slot indices (every retrieval
-    # picks slot 0). Entropy collapses to 0, neg-entropy = 0 (higher than div1).
-    layer._last_slot_idx = torch.zeros_like(layer._last_slot_idx)
-    layer._last_weights = torch.ones_like(layer._last_weights)
-    div_concentrated = float(_pkm_diversity_loss(layer))
-    assert div_concentrated > div1, (
-        f"concentrated-slot loss {div_concentrated:.4f} should be larger "
-        f"(less negative entropy) than diverse-slot loss {div1:.4f}")
+# test_pkm_v7_diversity_loss_helper REMOVED 2026-06-18: _pkm_diversity_loss was
+# deleted (--pkm_diversity_weight dropped) — it was an inert no-op (detached grad
+# path, 0% measured gradient). PKM diversity is held by ε-greedy + LayerNorm
+# score-norm + value-LR. See project_pkm_diversity_inert / LOSS_BALANCE_REPORT.md.

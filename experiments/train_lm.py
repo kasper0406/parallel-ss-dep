@@ -237,42 +237,12 @@ def _latent_reasoning_ramp(step: int, start_step: int, warmup_steps: int) -> flo
     return min(1.0, max(0.0, (step - start_step) / warmup_steps))
 
 
-def _pkm_diversity_loss(pkm) -> torch.Tensor:
-    """Negative entropy of the per-head slot-selection distribution.
-
-    Aggregates the per-head top-k retrievals into a (n_heads, n_slots)
-    histogram and returns the mean of (-H_per_head). Minimising this loss
-    increases entropy — encouraging the model to spread retrievals across
-    the full table rather than concentrate on a handful of hot slots.
-
-    Operates on the STASHED detached indices/weights from the last forward,
-    so this aux loss does NOT backprop through the router. It only affects
-    the value-table grads (which see a slightly more diverse retrieval
-    pattern across a training run).
-    """
-    if pkm._last_slot_idx is None:
-        # Forward hasn't been called yet (curriculum order during start);
-        # return a no-op zero.
-        device = next(pkm.parameters()).device
-        return torch.zeros((), device=device)
-    slot_idx = pkm._last_slot_idx       # (B, T, H, top_k), int64
-    weights = pkm._last_weights         # (B, T, H, top_k), float
-    H = pkm.n_heads
-    n_slots = pkm.n_keys * pkm.n_keys
-    B, T, _, tk = slot_idx.shape
-    # Build a per-head slot mass: (H, n_slots).
-    # Flatten (B,T,top_k) → mass scatter-adds into slot bins.
-    device = slot_idx.device
-    mass = torch.zeros(H, n_slots, device=device, dtype=torch.float32)
-    for h in range(H):
-        idx_h = slot_idx[:, :, h, :].reshape(-1)
-        w_h = weights[:, :, h, :].reshape(-1).float()
-        mass[h].scatter_add_(0, idx_h, w_h)
-    # Normalise per head so each row sums to 1.
-    mass = mass / mass.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-    # H(p) = -sum p log p ; we MAXIMISE entropy → minimise neg_entropy.
-    neg_entropy = (mass * (mass.clamp_min(1e-12).log())).sum(dim=-1)  # (H,)
-    return neg_entropy.mean()
+# _pkm_diversity_loss REMOVED 2026-06-18 (--pkm_diversity_weight dropped):
+# it was an inert NO-OP — it operated on the STASHED *detached* slot indices +
+# weights, so it had zero autograd path to any parameter (measured 0% gradient
+# share on the v17 ckpt). PKM slot diversity is actually maintained by ε-greedy
+# random slot replacement + LayerNorm score-norm + the 100× value-LR — not this
+# loss. See memory project_pkm_diversity_inert / LOSS_BALANCE_REPORT.md.
 
 
 def _ctx_addr_aux_loss(model, input_ids, mem_read_mask, doc_ids=None):
@@ -1736,15 +1706,11 @@ def main():
                     # only nudge the *distribution* (via the value-table grad
                     # this implies for diverse retrievals).
                     # Restore the MAIN-forward PKM slot stats (clobbered by any
-                    # aux extra-forward above) so the diversity loss + the
-                    # post-loop pkm(...) health log read the real corpus batch.
+                    # aux extra-forward above) so the post-loop pkm(...) health
+                    # log reads the real corpus batch.
                     if _pkm_mon is not None and main_pkm_slot_idx is not None:
                         _pkm_mon._last_slot_idx = main_pkm_slot_idx
                         _pkm_mon._last_weights = main_pkm_weights
-                    if (getattr(args, "use_pkm", False)
-                            and getattr(args, "pkm_diversity_weight", 0.0) > 0.0):
-                        div_loss = _pkm_diversity_loss(model.pkm_layer)
-                        loss = loss + args.pkm_diversity_weight * div_loss
                     (loss / n_micro).backward()
         _log_this_step = (step % args.log_every == 0 or step == args.steps)
         # Per-layer diagnostics: grad norms must be read before clip; the

@@ -649,12 +649,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pkm_epsilon_warmup_steps", type=int, default=2000,
                    help="Anneal --pkm_epsilon_start linearly to 0 over this "
                         "many steps. 0 = no anneal (fixed ε throughout).")
-    p.add_argument("--pkm_diversity_weight", type=float, default=0.01,
-                   help="FIX 5: weight on slot-selection-entropy bonus. "
-                        "Penalises peaky retrieval distributions (the "
-                        "head_2/slot_8824 'one-slot-eats-40%%-of-the-mass' "
-                        "pattern observed in v5-pkm). Encourages full table "
-                        "usage. 0 disables. v7 default 0.01 = a gentle nudge.")
+    # --pkm_diversity_weight REMOVED 2026-06-18: it was an inert no-op (the
+    # slot-entropy loss ran on detached indices+weights → zero grad path,
+    # measured 0% gradient share). PKM diversity is held by ε-greedy + LayerNorm
+    # score-norm + value-LR. Stripped from launchers too. (See project_pkm_diversity_inert.)
     # ---- v7.1 PKM bootstrap follow-ups (after v7 α-decay observation) ----
     # Step-440 trace showed α grew 0 → 0.085 (step 280) then *shrank* back
     # to 0.04 because value rows hadn't moved (v_std = 1.000 throughout)

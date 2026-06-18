@@ -44,7 +44,7 @@ CUDA_VISIBLE_DEVICES=$GPU PYTHONUNBUFFERED=1 PYTHONPATH=$PYTHONPATH:. nohup .ven
   --state_readonly_at_think \
   --use_memory --mem_size 1536 \
   --use_pkm --pkm_after_layer 5 --pkm_n_heads 4 --pkm_n_keys 384 --pkm_k_dim 128 --pkm_top_k 32 \
-  --pkm_use_output_gate --pkm_value_init_std 1.0 --pkm_score_norm layer --pkm_diversity_weight 0.01 \
+  --pkm_use_output_gate --pkm_value_init_std 1.0 --pkm_score_norm layer \
   --pkm_epsilon_start 0.5 --pkm_epsilon_warmup_steps 3000 \
   --pkm_alpha_floor_start 0.3 --pkm_alpha_floor_warmup_steps 3000 --pkm_value_lr_mult 100.0 \
   --gist_loss_weight 0.1 --gist_horizons "16,64,256" \

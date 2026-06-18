@@ -22,7 +22,7 @@
 #                                          PKM contribution was 1% of resid).
 #   FIX 4: --pkm_score_norm layer          LayerNorm on scores (vs BN's noisy
 #                                          running stats at our token scale).
-#   FIX 5: --pkm_diversity_weight 0.01     Aux loss on -H(slot distribution).
+#   FIX 5:     Aux loss on -H(slot distribution).
 #                                          Penalises peaky retrieval pattern.
 #
 # All other knobs identical to v6_shallow. Pinned to GPU 1 (v7_xattn on 0).
@@ -50,7 +50,7 @@ CUDA_VISIBLE_DEVICES=${GPU:-1} nohup .venv/bin/python -u experiments/train_lm.py
     --pkm_epsilon_start 0.5 --pkm_epsilon_warmup_steps 2000 \
     --pkm_value_init_std 1.0 \
     --pkm_score_norm layer \
-    --pkm_diversity_weight 0.01 \
+    \
     --pkm_alpha_floor_start 0.3 --pkm_alpha_floor_warmup_steps 2000 \
     --pkm_value_lr_mult 100.0 \
     --data_mix configs/pretrain_mix_v4.yaml \

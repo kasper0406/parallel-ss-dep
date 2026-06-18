@@ -50,7 +50,7 @@ CUDA_VISIBLE_DEVICES=${GPU:-1} nohup .venv/bin/python -u experiments/train_lm.py
     --use_pkm --pkm_after_layer 5 \
     --pkm_n_heads 4 --pkm_n_keys 384 --pkm_k_dim 128 --pkm_top_k 32 \
     --pkm_use_output_gate --pkm_value_init_std 1.0 --pkm_score_norm layer \
-    --pkm_diversity_weight 0.01 \
+    \
     --pkm_epsilon_start 0.5 --pkm_epsilon_warmup_steps 3000 \
     --pkm_alpha_floor_start 0.3 --pkm_alpha_floor_warmup_steps 3000 \
     --pkm_value_lr_mult 100.0 \

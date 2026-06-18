@@ -77,7 +77,7 @@ common_args() {
 --mem_key_from_embedding --mem_key_window 4 --use_copy_head --emit_read_mask
 --use_pkm --pkm_after_layer 5 --pkm_n_heads 4 --pkm_n_keys 256 --pkm_k_dim 128 --pkm_top_k 32
 --pkm_use_output_gate --pkm_epsilon_start 0.5 --pkm_epsilon_warmup_steps 3000 --pkm_value_init_std 1.0
---pkm_score_norm layer --pkm_diversity_weight 0.01 --pkm_alpha_floor_start 0.3 --pkm_alpha_floor_warmup_steps 3000
+--pkm_score_norm layer --pkm_alpha_floor_start 0.3 --pkm_alpha_floor_warmup_steps 3000
 --pkm_value_lr_mult 100.0 --gist_loss_weight 0.1 --gist_horizons 16,64,256
 --latent_cotrain_weight 0.0 --latent_cotrain_R 4 --latent_cotrain_sample_frac 0.05 --latent_cotrain_max_positions 4
 --latent_cotrain_start_step 99999999

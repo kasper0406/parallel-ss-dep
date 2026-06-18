@@ -70,7 +70,7 @@ CUDA_VISIBLE_DEVICES=${GPU:-1} nohup .venv/bin/python -u experiments/train_lm.py
     --pkm_epsilon_start 0.0 --pkm_epsilon_warmup_steps 0 \
     --pkm_value_init_std 1.0 \
     --pkm_score_norm layer \
-    --pkm_diversity_weight 0.01 \
+    \
     --pkm_alpha_floor_start 0.0 --pkm_alpha_floor_warmup_steps 0 \
     --pkm_value_lr_mult 100.0 \
     --gist_loss_weight 0.1 --gist_horizons "16,64,256" \

@@ -42,6 +42,16 @@ def test_filter_min_content_len() -> None:
     assert f({}) is False
     # Wrong type rejected (rare but possible from malformed HF rows).
     assert f({"text": 12345}) is False
+    # BUGFIX 2026-06-18: sources whose text is in OTHER fields (no content/text)
+    # must NOT be rejected wholesale — fall back to the longest string field.
+    # magicoder-style ([problem, solution]):
+    assert f({"problem": "x", "solution": "long enough to pass"}) is True
+    assert f({"problem": "x", "solution": "short"}) is False
+    # textbooks-style (completion / markdown):
+    assert f({"completion": "long enough to pass", "title": "t"}) is True
+    assert f({"markdown": "long enough to pass", "topic": "z"}) is True
+    # No string fields at all → rejected.
+    assert f({"n": 5, "ok": True}) is False
 
 
 def test_filter_bigvul_vulnerable() -> None:

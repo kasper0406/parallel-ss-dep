@@ -42,8 +42,22 @@ from experiments.sft_code import insert_think_bursts
 # (dict) and returns bool. Register new filters here.
 
 def _filter_min_content_len(min_chars: int) -> Callable[[dict], bool]:
+    """Length floor on the example's text.
+
+    BUGFIX 2026-06-18: this previously only inspected `content`/`text`, so any
+    source whose text lives in OTHER fields (e.g. magicoder `[problem,solution]`,
+    textbooks `completion`/`markdown`) saw length 0 and was rejected 100% — that
+    source contributed ZERO tokens to the mix (silently dead across v10–v17;
+    magicoder at weight 0.09 was the biggest casualty). The filter runs on the
+    raw example BEFORE `_extract_text`, so it can't see the configured text_field
+    directly; fall back to the longest string field, which is a correct length
+    FLOOR for those sources (sources that DO have content/text are byte-identical
+    to the old behaviour). Regression test: test_data_mix_min_content_len.py."""
     def f(ex):
-        c = ex.get("content") or ex.get("text") or ""
+        c = ex.get("content") or ex.get("text")
+        if not isinstance(c, str):
+            strs = [v for v in ex.values() if isinstance(v, str)]
+            c = max(strs, key=len) if strs else ""
         return isinstance(c, str) and len(c) >= min_chars
     return f
 

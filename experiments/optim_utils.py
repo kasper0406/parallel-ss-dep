@@ -136,6 +136,8 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                     soap_precond_freq: int = 10,
                     soap_normalize_grads: bool = False,
                     matrix_optimizer: str = "muon",
+                    embed_lr_mult: float = 1.0,
+                    embed_optimizer: str = "adam",
                     verbose: bool = True
                     ) -> tuple[list[torch.optim.Optimizer], list]:
     """Build optimizer(s) + LR schedulers. See module docstring.
@@ -172,6 +174,22 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
           isolates ONLY the q/k/v/b orthogonalization boundary. See
           `experiments/exp_deltanet_precond_fused.py` and
           DELTANET_PRECONDITIONER{,_PERF}.md.
+
+    `embed_lr_mult` / `embed_optimizer` (only consulted when
+        `optimizer == "muon"`): how to treat the embedding/lm_head AdamW group
+        (the params matched by `_is_embedding_like`, excluding PKM value tables
+        which keep their own `--pkm_value_lr_mult` path). Both default to the
+        legacy behaviour (mult 1.0, "adam") which is BYTE-IDENTICAL — the
+        embed-like params then stay in the shared AdamW group at the base lr.
+        - `embed_lr_mult X` (X != 1.0): split the embed-like params into their
+          own AdamW group at `lr * X` (the μP-flavoured higher embedding LR).
+        - `embed_optimizer "rownorm"`: route the embed-like params to a SEPARATE
+          `RowNormEmbed` optimizer (per-row / per-token RMS-normalized update —
+          the modular-norm dualizer for embedding tables) at `lr * embed_lr_mult`,
+          momentum/wd mirroring Muon. See `experiments/embed_optim.py`.
+        Non-default embed treatment requires `--optimizer muon` (it splits the
+        Muon-mode AdamW group); it is rejected otherwise rather than silently
+        ignored, mirroring the matrix_optimizer guard.
     """
     if bf16_optim_state:
         from experiments.bf16_optim import BF16StateAdamW, BF16StateMuon
@@ -189,6 +207,19 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
         raise ValueError(
             "matrix_optimizer='fused_deltanet_ns' requires --optimizer muon "
             f"(got {optimizer!r}); it replaces the Muon matrix optimizer only.")
+
+    if embed_optimizer not in ("adam", "rownorm"):
+        raise ValueError(f"unknown embed_optimizer {embed_optimizer!r}")
+    # Non-default embedding treatment is implemented only for the muon split
+    # (it carves the embed-like params out of the Muon-mode AdamW group). Reject
+    # rather than silently ignore on other base optimizers (mirrors the
+    # matrix_optimizer guard — the adamw branch would otherwise return early).
+    embed_special = (embed_lr_mult != 1.0) or (embed_optimizer == "rownorm")
+    if embed_special and optimizer != "muon":
+        raise ValueError(
+            f"non-default embedding treatment (embed_lr_mult={embed_lr_mult}, "
+            f"embed_optimizer={embed_optimizer!r}) requires --optimizer muon "
+            f"(got {optimizer!r}).")
 
     if optimizer == "adamw":
         regular, alphas, pkm_values = [], [], []
@@ -232,6 +263,7 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
     # 1D α scalar route to AdamW — the adapter is a small specialized
     # head, not a general d×d hidden matrix Newton-Schulz should normalize.
     muon_params, adamw_regular, adamw_alpha, adamw_pkm_values = [], [], [], []
+    adamw_embed = []  # embed/lm_head split out only when embed_special
     seen = set()
     for name, p in model.named_parameters():
         if not p.requires_grad or id(p) in seen:
@@ -251,15 +283,18 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                 adamw_pkm_values.append(p)
             elif is_film_alpha(name):
                 adamw_alpha.append(p)
+            elif embed_special and _is_embedding_like(name) and not _is_pkm_value(name):
+                adamw_embed.append(p)
             else:
                 adamw_regular.append(p)
         else:
             muon_params.append(p)
     if verbose:
+        _all_adamw = adamw_regular + adamw_alpha + adamw_pkm_values + adamw_embed
         print(f"  optimizer split: {len(muon_params)} Muon params "
               f"({sum(p.numel() for p in muon_params)/1e6:.1f}M), "
-              f"{len(adamw_regular) + len(adamw_alpha) + len(adamw_pkm_values)} AdamW params "
-              f"({sum(p.numel() for p in adamw_regular + adamw_alpha + adamw_pkm_values)/1e6:.1f}M)")
+              f"{len(_all_adamw)} AdamW params "
+              f"({sum(p.numel() for p in _all_adamw)/1e6:.1f}M)")
     adamw_groups = [{"params": adamw_regular, "weight_decay": wd}]
     if adamw_alpha:
         adamw_groups.append({"params": adamw_alpha, "weight_decay": alpha_wd})
@@ -273,6 +308,16 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
             print(f"  PKM-value LR boost: {len(adamw_pkm_values)} value "
                   f"tables get lr={lr * pkm_value_lr_mult:.2e} "
                   f"({pkm_value_lr_mult}× base lr={lr:.2e})")
+    # Embedding/lm_head with a higher AdamW LR (embed_optimizer == "adam").
+    # When embed_optimizer == "rownorm", adamw_embed is instead handed to a
+    # separate RowNormEmbed optimizer below (NOT added to the AdamW groups).
+    if adamw_embed and embed_optimizer == "adam":
+        adamw_groups.append({"params": adamw_embed, "weight_decay": wd,
+                             "lr": lr * embed_lr_mult})
+        if verbose:
+            print(f"  embed LR mult: {len(adamw_embed)} embed/lm_head params "
+                  f"get AdamW lr={lr * embed_lr_mult:.2e} "
+                  f"({embed_lr_mult}× base lr={lr:.2e})")
     if optimizer == "muon":
         if matrix_optimizer == "fused_deltanet_ns":
             # Per-head Newton-Schulz on DeltaNet q/k/v/b + whole-matrix Muon
@@ -349,6 +394,24 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                         steps=steps, warmup_steps=warmup_steps,
                         decay_frac=decay_frac),
     ]
+    # RowNorm dualizer for embed/lm_head: a SEPARATE optimizer (+ its own
+    # WSD/cosine scheduler) on the carved-out embed group. Added only when
+    # requested, so the default path is byte-identical (no extra optimizer).
+    if adamw_embed and embed_optimizer == "rownorm":
+        from experiments.embed_optim import RowNormEmbed
+        embed_lr = lr * embed_lr_mult
+        rownorm_opt = RowNormEmbed(adamw_embed, lr=embed_lr, momentum=0.95,
+                                   nesterov=True, weight_decay=wd)
+        opts.append(rownorm_opt)
+        scheds.append(_make_scheduler(rownorm_opt, base_lr=embed_lr,
+                                      schedule=lr_schedule, steps=steps,
+                                      warmup_steps=warmup_steps,
+                                      decay_frac=decay_frac))
+        if verbose:
+            print(f"  embed_optimizer=rownorm: {len(adamw_embed)} embed/lm_head "
+                  f"params get per-row RMS-normalized (modular-norm dualizer) "
+                  f"updates at lr={embed_lr:.2e} "
+                  f"({embed_lr_mult}× base lr={lr:.2e}), momentum=0.95, wd={wd}")
     if verbose:
         print(f"  lr_schedule={lr_schedule}"
               + (f" (warmup={warmup_steps}, decay_frac={decay_frac})"

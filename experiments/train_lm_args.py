@@ -377,6 +377,22 @@ def build_parser() -> argparse.ArgumentParser:
                         "muon arm, so a muon-vs-fused A/B isolates only the "
                         "q/k/v/b orthogonalization. See "
                         "DELTANET_PRECONDITIONER.md. Requires --arch deltanet.")
+    p.add_argument("--embed_lr_mult", type=float, default=1.0,
+                   help="Multiplier on the AdamW LR for the embedding/lm_head "
+                        "group (the largest non-Muon chunk) when --optimizer "
+                        "muon. Default 1.0 is BYTE-IDENTICAL to the legacy "
+                        "shared-LR path. >1.0 splits embed/lm_head into their "
+                        "own group at lr*mult (the μP-flavoured higher "
+                        "embedding LR). Requires --optimizer muon when != 1.0.")
+    p.add_argument("--embed_optimizer", type=str, default="adam",
+                   choices=["adam", "rownorm"],
+                   help="Optimizer for the embedding/lm_head group when "
+                        "--optimizer muon. 'adam' (default) keeps the legacy "
+                        "AdamW (byte-identical at embed_lr_mult=1.0). 'rownorm' "
+                        "routes embed/lm_head to a per-row RMS-normalized update "
+                        "(the modular-norm dualizer: each token vector takes a "
+                        "step of fixed RMS magnitude lr*embed_lr_mult). See "
+                        "experiments/embed_optim.py. Requires --optimizer muon.")
     p.add_argument("--lr_muon", type=float, default=5e-3,
                    help="Muon learning rate (used only when --optimizer muon). "
                         "Default 5e-3 — the sqrt-batch-scaled v4 value (was "

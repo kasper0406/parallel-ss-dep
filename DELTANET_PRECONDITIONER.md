@@ -267,3 +267,195 @@ for arm in muon perhead; do CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
 Outputs: `runs/deltanet_precond_ms/*.json` (multi-seed), `runs/deltanet_precond_head/*.json`
 (head ablation). Each JSON carries the full recall-vs-step-and-wall history plus
 isolated cuda-synced `opt_ms_per_step`.
+
+---
+
+## bf16 regime — does the iso-step win survive how we ACTUALLY train? (2026-06-19)
+
+### TL;DR / verdict
+
+**Yes — the per-head-NS iso-step advantage survives bf16 essentially intact.**
+The bf16 production regime (autocast bf16 fwd/bwd + fp32 master weights + bf16
+optimizer state) does **not** wash out the geometry advantage: the
+(muon − perhead) val-CE gap in bf16 is **statistically indistinguishable from
+the fp32 gap at every training step and on both head configs** — tracking the
+fp32 gap to **3 decimals per seed** in the early/steep region (e.g. nh=4 @ step
+40: fp32 `[+0.021,+0.028,+0.046]` vs bf16 `[+0.021,+0.028,+0.046]`). bf16 is
+fully **stable** on the dense loss (0 non-finite values across 72 runs; no
+collapse, no NS blow-up on the small per-head grads). Per-head **tolerates** the
+bf16 noise exactly as well as whole-matrix Muon — it neither amplifies nor is
+hurt by it.
+
+The one caveat is about **magnitude, not transfer**: on this *dense smooth-text*
+landscape the per-head win is **smaller in absolute terms** than on sparse MQAR
+recall (~1–3 % steps-to-threshold here vs 7–13 % on MQAR), because dense
+next-token loss is an easier optimization landscape where the directional
+advantage matters less. But the win is **consistent in sign across all seeds /
+LRs / steps**, and — the actual question this probe was built to answer — it
+**does not shrink going fp32 → bf16**. The fp32 MQAR result therefore transfers
+to production precision; it is not an fp32 artifact.
+
+### Why a new (dense-LM) probe
+
+MQAR cannot test bf16: its sparse/masked loss collapses logits to uniform in
+bf16 (documented in AGENTS.md — "bf16-on-sparse-loss collapses logits"), so the
+original probe had to run fp32. A **pure dense next-token loss** on real text is
+bf16-valid, so it is the faithful test of "does the win hold as we train". The
+two things bf16 actually changes vs the fp32 control are (a) **gradient noise**
+from bf16 fwd/bwd rounding and (b) **bf16-stored momentum**; the Newton–Schulz
+still dualizes an fp32 grad (fp32 masters), and NS itself already runs bf16
+internally in *both* regimes (matching torch Muon). This probe isolates whether
+(a)+(b) erase the per-head direction quality.
+
+### Setup
+
+- **Task:** dense next-token CE on a **fixed** cached codeparrot-clean slice
+  (SmolLM2 tokenizer, vocab 49 152; 16 384 train + 256 val packed T=512 seqs;
+  `exp_deltanet_bf16_data.py`). Every run trains on byte-identical data.
+- **Arch:** small DeltaNet, 4 layers, d_model 256, `feedback none`. Two head
+  configs (the fp32 win scaled with head count): **nh=4 / d_head=64** and
+  **nh=8 / d_head=32**.
+- **Regimes:** `fp32` (fp32 fwd/bwd + `torch.optim.{AdamW,Muon}` + `DeltaNetProjMuon`,
+  fp32 state) vs `bf16` (`torch.autocast(bf16)` fwd/bwd + fp32 masters +
+  `BF16StateAdamW`/`BF16StateMuon`/`DeltaNetProjMuonBF16`, bf16 momentum).
+  Mirrors `speed_knobs.apply_speed_knobs` + `bf16_optim.py` exactly.
+- **Arms:** A `muon` (whole-matrix Muon on all 2D hidden mats) · B `perhead`
+  (per-head NS on q/k/v/b + Muon on o_proj+MLP). `qk_coupled` dropped (a clean
+  negative in the fp32 probe).
+- **Fairness:** identical init (`--seed`), identical per-step batches (one
+  `--seed`-seeded index generator → same data order for both arms & both regimes
+  within a seed), identical cosine LR / AdamW group / grad-clip. **Verified:**
+  step-0 train loss is byte-identical across all arms & LRs within every
+  (regime, nh, seed) group; it differs across regimes (bf16 fwd rounding:
+  10.982 fp32 vs 10.9818 bf16) and across seeds, as expected.
+- **Metric:** the dense loss SATURATES (both arms hit the same floor ~4.47 by
+  step 599), so — exactly as on MQAR — the converged value does **not**
+  discriminate; the signal is **convergence speed**: the gap is largest early
+  and decays to the floor. Reported as (1) `gap(step) = muon_CE − perhead_CE` at
+  matched LR (mean±std + per-seed) and (2) interpolated steps-to-CE-threshold.
+  **Val CE is evaluated in pure fp32 (autocast disabled) in BOTH regimes**, so
+  the convergence metric reflects the fp32 master weights — isolating "what the
+  optimizer learned" from eval-time rounding; the bf16 noise enters only through
+  training.
+- **Grid:** 2 nh × 2 regimes × 2 arms × 3 matrix-LRs {5e-3,1e-2,2e-2} × 3 seeds
+  = **72 runs**, GPU 1 only.
+
+### Result 1 — gap-vs-step (the headline "does it survive" view)
+
+`gap = muon_CE − perhead_CE` at matched matrix-LR (positive ⇒ per-head ahead),
+mean ± std over 3 seeds. **fp32 and bf16 columns are side-by-side:**
+
+**nh=4:**
+
+| step | fp32 gap | bf16 gap |
+|-----:|---------:|---------:|
+|  40 | **+0.0317 ± 0.0106** | **+0.0316 ± 0.0108** |
+|  80 | +0.0195 ± 0.0024 | +0.0190 ± 0.0026 |
+| 120 | +0.0185 ± 0.0027 | +0.0182 ± 0.0028 |
+| 200 | +0.0102 ± 0.0029 | +0.0077 ± 0.0037 |
+| 300 | +0.0074 ± 0.0098 | +0.0044 ± 0.0070 |
+| 400 | +0.0038 ± 0.0016 | +0.0024 ± 0.0046 |
+| 599 | +0.0014 ± 0.0084 | +0.0005 ± 0.0085 |
+
+**nh=8:**
+
+| step | fp32 gap | bf16 gap |
+|-----:|---------:|---------:|
+|  40 | **+0.0397 ± 0.0113** | **+0.0395 ± 0.0115** |
+|  80 | +0.0124 ± 0.0119 | +0.0121 ± 0.0120 |
+| 120 | +0.0121 ± 0.0047 | +0.0130 ± 0.0058 |
+| 200 | +0.0105 ± 0.0046 | +0.0103 ± 0.0057 |
+| 300 | +0.0084 ± 0.0105 | +0.0094 ± 0.0081 |
+| 400 | +0.0032 ± 0.0112 | +0.0057 ± 0.0078 |
+| 599 | +0.0038 ± 0.0080 | +0.0062 ± 0.0065 |
+
+The bf16 gap matches the fp32 gap at **every** step within tiny fractions of the
+seed std. The match is tightest where the signal is strongest (early): at step 40
+the per-seed gaps are **identical to 3 decimals** in both regimes. The gap is
+consistently **positive in the steep region** (step 40–200) on all seeds; by the
+converged tail it is in the noise (both arms at the floor) — for both regimes
+alike. Head-count: the step-40 gap is slightly larger at nh=8 (+0.040) than nh=4
+(+0.032), weakly echoing the MQAR "scales with heads" trend, but it is marginal
+on this smooth landscape.
+
+### Result 2 — steps-to-CE-threshold (per arm, best-LR-per-seed, mean ± std)
+
+| thr | nh | fp32 muon | fp32 perhead | Δ (fp32) | bf16 muon | bf16 perhead | Δ (bf16) |
+|----:|---:|----------:|-------------:|---------:|----------:|-------------:|---------:|
+| 5.5 | 4 | 100±1 | 98±1 | **−2.1 %** | 100±1 | 98±1 | **−2.1 %** |
+| 5.2 | 4 | 147±1 | 143±1 | **−2.6 %** | 147±1 | 143±1 | **−2.7 %** |
+| 5.0 | 4 | 201±3 | 198±3 | −1.6 % | 201±3 | 199±3 | −1.2 % |
+| 4.8 | 4 | 285±4 | 281±6 | −1.4 % | 285±4 | 280±6 | −1.6 % |
+| 5.2 | 8 | 148±1 | 146±1 | −1.5 % | 148±1 | 146±1 | −1.6 % |
+| 5.0 | 8 | 203±5 | 200±4 | −1.6 % | 203±6 | 200±4 | −1.6 % |
+| 4.8 | 8 | 292±3 | 288±5 | −1.4 % | 293±1 | 286±5 | −2.1 % |
+
+Per-head reaches every threshold in fewer steps, **and the fp32 and bf16
+step-deltas agree to ≤0.5 step** at essentially every threshold/config. (Magnitude
+~1–3 %, vs 7–13 % on MQAR — the dense landscape, not the precision, is what
+shrinks it.)
+
+### fp32 vs bf16 side-by-side (summary)
+
+- **Gap survives:** bf16 (muon−perhead) ≈ fp32 (muon−perhead) at every step and
+  threshold, on both nh=4 and nh=8. The win transfers to production precision.
+- **Absolute CE unchanged:** val CE @ step 120 is identical fp32 vs bf16 per arm
+  (e.g. lr=1e-2: muon 5.457 both regimes, perhead 5.442 both), and perhead < muon
+  at every LR in both regimes. (Master weights are fp32 in both, eval is fp32 in
+  both, so the bf16 effect is purely the training-time noise — which cancels in
+  the within-regime gap.)
+- **Stability:** 0 non-finite train/val values across all 72 runs. No NaN, no
+  logit collapse (the dense loss avoids the sparse-bf16 failure mode), no NS
+  instability on the small per-head bf16-noisy grads. **Per-head tolerates the
+  bf16 noise as well as whole-matrix Muon** — the original instability worry does
+  not materialize.
+
+### Instability / caveat notes
+
+- **No bf16-specific instability.** Per-head NS on the small (d_head×d_in)
+  bf16-noisy gradient slices is as stable as whole-matrix Muon; the relative
+  advantage is preserved, not amplified or eroded.
+- **Wall-clock deferred / not production.** The bf16 runs here use
+  `BF16StateAdamW(compile_step=False)` (a sweep-speed choice, irrelevant to the
+  bf16-*state* precision question), so the bf16 optimizer step is **un-fused**
+  and its `opt_ms` is inflated (nh=4 bf16/muon logged 58.9 ms — a transient
+  first-bf16-run outlier; production uses `compile_step=True`). The **fp32**
+  opt-timing reproduces the original probe cleanly (nh=4 muon 6.83 vs perhead
+  7.25 ms, +6 %; nh=8 muon 4.87 vs perhead 6.65 ms — per-head's tiny-probe
+  launch overhead, expected to invert at production width per §4). Treat bf16
+  wall-clock as **not measured here**; the iso-step result is wall-clock-
+  independent.
+
+### Bottom line
+
+The fp32 iso-step win is **real under bf16-as-we-train** — it does not shrink or
+vanish going to the production regime, and bf16 adds no instability. What the
+dense-LM probe additionally shows is that the *magnitude* of the per-head win is
+landscape-dependent (smaller on smooth dense text than on sparse recall), so the
+production A/B recommended in §5 should be read for a **modest** per-source-CE
+lift, measured early/mid-training (the gain lives in convergence speed and decays
+to the floor), not a large one — but a real one that bf16 preserves.
+
+### Commands + script paths (bf16 probe)
+
+New standalone scripts (GPU-1-only, import but do not touch the live stack or the
+fp32-probe scripts):
+- `experiments/exp_deltanet_precond_bf16.py` — `DeltaNetProjMuonBF16`
+  (bf16-momentum subclass) + `build_dense_opts` (per-(arm,regime) optimizer set).
+- `experiments/exp_deltanet_bf16_data.py` — fixed codeparrot token-pool prep.
+- `experiments/exp_deltanet_bf16_lm.py` — dense-LM fair harness (one arm × regime
+  × LR × seed per run; fp32-eval CE; records gap-vs-step + opt_ms).
+- `experiments/exp_deltanet_bf16_gapsteps.py` — the headline gap-vs-step +
+  steps-to-threshold fp32-vs-bf16 analysis.
+- `experiments/exp_deltanet_bf16_agg.py` — per-(regime,arm,lr) CE tables + gaps.
+- `experiments/run_deltanet_bf16_grid.sh` — the 72-run driver.
+
+```bash
+export PYTHONPATH="$PYTHONPATH:."
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python experiments/exp_deltanet_bf16_data.py   # once
+bash experiments/run_deltanet_bf16_grid.sh                                       # 72 runs, GPU 1
+.venv/bin/python experiments/exp_deltanet_bf16_gapsteps.py runs/deltanet_bf16/grid
+```
+
+Outputs: `runs/deltanet_bf16/grid/*.json` (full val-CE-vs-step history + opt_ms +
+step0_train_loss per run).

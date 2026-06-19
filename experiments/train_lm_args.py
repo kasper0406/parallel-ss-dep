@@ -364,6 +364,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "for embeddings, lm_head, and 1D params. Typically "
                         "30-50% faster convergence per Keller Jordan / NanoGPT "
                         "speedrunning. Pair with --lr_muon ~1.5e-3.")
+    p.add_argument("--matrix_optimizer", type=str, default="muon",
+                   choices=["muon", "fused_deltanet_ns"],
+                   help="Which orthogonalizing matrix optimizer to use on the "
+                        "2D hidden matrices when --optimizer muon. 'muon' "
+                        "(default) is BYTE-IDENTICAL to the legacy path. "
+                        "'fused_deltanet_ns' uses per-head Newton-Schulz on "
+                        "the DeltaNet q/k/v/b projections (head-structured "
+                        "modular-norm dualizer) + whole-matrix Muon on "
+                        "o_proj/MLP/other 2D matrices; the matrix-optimizer "
+                        "param set and all AdamW groups are IDENTICAL to the "
+                        "muon arm, so a muon-vs-fused A/B isolates only the "
+                        "q/k/v/b orthogonalization. See "
+                        "DELTANET_PRECONDITIONER.md. Requires --arch deltanet.")
     p.add_argument("--lr_muon", type=float, default=5e-3,
                    help="Muon learning rate (used only when --optimizer muon). "
                         "Default 5e-3 — the sqrt-batch-scaled v4 value (was "

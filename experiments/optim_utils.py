@@ -135,6 +135,7 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                     pkm_value_lr_mult: float = 1.0,
                     soap_precond_freq: int = 10,
                     soap_normalize_grads: bool = False,
+                    matrix_optimizer: str = "muon",
                     verbose: bool = True
                     ) -> tuple[list[torch.optim.Optimizer], list]:
     """Build optimizer(s) + LR schedulers. See module docstring.
@@ -154,6 +155,23 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
         refreshed every `soap_precond_freq` steps. `bf16_optim_state` is
         ignored for the SOAP group (the vendored impl is fp32-state only);
         the AdamW group still honours it.
+
+    `matrix_optimizer` (only consulted when `optimizer == "muon"`): which
+        orthogonalizing matrix optimizer to use on the EXACT SAME 2D
+        hidden-matrix set Muon would handle.
+        - "muon" (default) → `torch.optim.Muon` / `BF16StateMuon`, i.e.
+          BYTE-IDENTICAL to the legacy path (every existing launcher /
+          checkpoint is unaffected — the flag is purely additive).
+        - "fused_deltanet_ns" → `FusedDeltaNetMuon`: per-head Newton–Schulz
+          on the DeltaNet q/k/v/b projections (head-structured modular-norm
+          dualizer) + whole-matrix Muon on o_proj / MLP / every other 2D
+          matrix. The matrix-optimizer PARAM SET is identical to the muon
+          arm by construction (units ∪ other_2d == muon_params), and ALL
+          other param groups (AdamW for embeds/norms/1D, the FiLM-α group,
+          the PKM-value LR group) are untouched — so a muon-vs-fused A/B
+          isolates ONLY the q/k/v/b orthogonalization boundary. See
+          `experiments/exp_deltanet_precond_fused.py` and
+          DELTANET_PRECONDITIONER{,_PERF}.md.
     """
     if bf16_optim_state:
         from experiments.bf16_optim import BF16StateAdamW, BF16StateMuon
@@ -162,6 +180,15 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
     else:
         AdamWCls = torch.optim.AdamW
         MuonCls = torch.optim.Muon
+
+    # Validate matrix_optimizer up front (covers the adamw branch too — it would
+    # otherwise silently ignore the flag and return before the muon-branch check).
+    if matrix_optimizer not in ("muon", "fused_deltanet_ns"):
+        raise ValueError(f"unknown matrix_optimizer {matrix_optimizer!r}")
+    if matrix_optimizer == "fused_deltanet_ns" and optimizer != "muon":
+        raise ValueError(
+            "matrix_optimizer='fused_deltanet_ns' requires --optimizer muon "
+            f"(got {optimizer!r}); it replaces the Muon matrix optimizer only.")
 
     if optimizer == "adamw":
         regular, alphas, pkm_values = [], [], []
@@ -247,11 +274,50 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                   f"tables get lr={lr * pkm_value_lr_mult:.2e} "
                   f"({pkm_value_lr_mult}× base lr={lr:.2e})")
     if optimizer == "muon":
-        matrix_opt = MuonCls(muon_params, lr=lr_muon, momentum=0.95,
-                             weight_decay=wd)
-        if verbose:
-            print(f"  Muon weight_decay={wd}; AdamW(regular) weight_decay={wd}"
-                  + ("  [bf16 optimizer state]" if bf16_optim_state else ""))
+        if matrix_optimizer == "fused_deltanet_ns":
+            # Per-head Newton-Schulz on DeltaNet q/k/v/b + whole-matrix Muon
+            # on everything else. CRUCIAL fairness property: the matrix
+            # optimizer must touch EXACTLY `muon_params` (the same set the
+            # plain-muon arm uses), so we derive the per-head units from the
+            # model but route every muon_param NOT captured by a q/k/v/b unit
+            # to whole-matrix Muon. union(units, other_2d) == muon_params.
+            from experiments.exp_deltanet_precond_optim import (
+                build_units_from_model)
+            from experiments.exp_deltanet_precond_fused import FusedDeltaNetMuon
+            _, _all_units, _ = build_units_from_model(model, mode="perhead")
+            muon_ids = {id(p) for p in muon_params}
+            kept_units, unit_ids = [], set()
+            for u in _all_units:
+                if all(id(p) in muon_ids for p in u["params"]):
+                    kept_units.append(u)
+                    unit_ids.update(id(p) for p in u["params"])
+            other_2d = [p for p in muon_params if id(p) not in unit_ids]
+            if not kept_units:
+                raise ValueError(
+                    "matrix_optimizer='fused_deltanet_ns' found no DeltaNet "
+                    "q/k/v/b projections — is --arch deltanet set? The fused "
+                    "per-head optimizer only applies to DeltaNet blocks.")
+            matrix_opt = FusedDeltaNetMuon(
+                kept_units, other_2d, lr=lr_muon, momentum=0.95,
+                weight_decay=wd, nesterov=True, ns_steps=5,
+                bf16_state=bf16_optim_state, batch_across_layers=False)
+            if verbose:
+                _n_unit = sum(p.numel() for u in kept_units for p in u["params"])
+                _n_other = sum(p.numel() for p in other_2d)
+                print(f"  matrix_optimizer=fused_deltanet_ns: "
+                      f"{len(kept_units)} per-head q/k/v/b units "
+                      f"({_n_unit/1e6:.1f}M) + {len(other_2d)} whole-matrix "
+                      f"Muon params ({_n_other/1e6:.1f}M); "
+                      f"matrix set == muon arm ({len(muon_params)} params); "
+                      f"weight_decay={wd}"
+                      + ("  [bf16 optimizer state]" if bf16_optim_state else ""))
+        else:
+            matrix_opt = MuonCls(muon_params, lr=lr_muon, momentum=0.95,
+                                 weight_decay=wd)
+            if verbose:
+                print(f"  Muon weight_decay={wd}; AdamW(regular) "
+                      f"weight_decay={wd}"
+                      + ("  [bf16 optimizer state]" if bf16_optim_state else ""))
     else:  # soap — Shampoo-in-Adam-eigenbasis on the same 2D matrix params.
         from experiments.soap import SOAP
         matrix_opt = SOAP(muon_params, lr=lr_muon, betas=(0.95, 0.95),

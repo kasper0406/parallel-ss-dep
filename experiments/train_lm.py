@@ -678,6 +678,7 @@ def main():
         decay_frac=args.lr_decay_frac,
         bf16_optim_state=args.bf16_optim_state,
         pkm_value_lr_mult=float(getattr(args, "pkm_value_lr_mult", 1.0)),
+        matrix_optimizer=getattr(args, "matrix_optimizer", "muon"),
     )
     # Backwards-compat aliases used elsewhere in the loop.
     opt = opts[0]

@@ -310,7 +310,8 @@ class FeedbackProjection(nn.Module):
 
     def __init__(self, d_model: int, mode: str,
                  per_channel_alpha: bool = False,
-                 alpha_mode: str = "scalar"):
+                 alpha_mode: str = "scalar",
+                 alpha_init: float = 0.0):
         super().__init__()
         self.mode = mode
         self.per_channel_alpha = per_channel_alpha
@@ -341,8 +342,12 @@ class FeedbackProjection(nn.Module):
             # feedback use, but the gradient on α is non-zero (because
             # W_* are non-zero) so the optimizer can move it.
             # Scalar (1,) by default; per-channel (d_model,) when requested.
+            # `alpha_init` (default 0.0) lets a fresh build warm-start α at a
+            # non-zero value — torch.full(shape, 0.0) == torch.zeros(shape) so
+            # the default is byte-identical to the prior behaviour.
             alpha_shape = (d_model,) if per_channel_alpha else (1,)
-            self.alpha = nn.Parameter(torch.zeros(alpha_shape))
+            self.alpha = nn.Parameter(
+                torch.full(alpha_shape, float(alpha_init)))
         else:
             # alpha_mode == 'surprise_modulated'.
             # α(t) = alpha_zero · σ(surprise_scale · surprise_z(t) + surprise_bias).
@@ -2213,11 +2218,11 @@ class LineSelectorAttn(nn.Module):
     content access WITHOUT overwriting the carried latent thread (additive, not
     replacement; and never touches non-think positions).
 
-    Cold start: `out_proj.weight` is zero-init AND a learnable scalar `alpha`
-    (init 0) wraps the output, so a fresh / untrained selector returns EXACTLY
-    zero at every position — the additive term is a no-op and the trunk is
-    byte-identical to "no selector". The model opts in only via gradient (the
-    FiLM-α / ThinkAdapter / LatentFeedbackAdapter pattern).
+    Cold start: `out_proj.weight` is zero-init (with `alpha` FIXED at 1.0 —
+    see the init comment below), so a fresh / untrained selector returns
+    EXACTLY zero at every position — the additive term is a no-op and the
+    trunk is byte-identical to "no selector". The model opts in only via
+    gradient on out_proj (zero-init-residual trick, not the FiLM-α pattern).
 
     The prompt is segmented into "lines" by a running cumsum of the newline
     token over the non-think prefix; each line's value is the mean of its
@@ -2374,6 +2379,15 @@ class TinyLM(nn.Module):
                                               # Adds 3 learnable scalars per
                                               # FiLM target. Requires
                                               # feedback_self_k >= 2.
+        feedback_alpha_init: float = 0.0,     # Init value for the scalar
+                                              # sparse-FiLM α (default 0.0 =
+                                              # byte-identical to the old
+                                              # zeros-init). >0 warm-starts the
+                                              # feedback strength so a freshly
+                                              # attached FiLM contributes from
+                                              # step 0 (alpha_mode='scalar'
+                                              # only; surprise_modulated path
+                                              # is unaffected).
         output_gate: bool = False,            # Learned per-position output gate.
                                               # When True, adds a gate_head
                                               # (d_model → 1) whose sigmoid
@@ -2702,6 +2716,7 @@ class TinyLM(nn.Module):
                 f"'surprise_modulated' (got {feedback_alpha_mode!r})"
             )
         self.feedback_alpha_mode = feedback_alpha_mode
+        self.feedback_alpha_init = float(feedback_alpha_init)
         if (feedback_alpha_mode == "surprise_modulated"
                 and self.feedback_self_k < 2):
             raise ValueError(
@@ -2777,6 +2792,7 @@ class TinyLM(nn.Module):
                     d_model, mode=feedback_mode,
                     per_channel_alpha=feedback_per_channel_alpha,
                     alpha_mode=feedback_alpha_mode,
+                    alpha_init=self.feedback_alpha_init,
                 )
                 for t, _ in self.feedback_pairs
             })

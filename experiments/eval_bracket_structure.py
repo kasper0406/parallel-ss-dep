@@ -391,10 +391,36 @@ def build_model_from_ckpt(ckpt_path: str,
         refinement_head_mlp_mult = int(force_refinement_head_mlp_mult)
     if force_refinement_head_alpha_init is not None:
         refinement_head_alpha_init = float(force_refinement_head_alpha_init)
+    # FFN width: honor an explicit cfg d_ff (inherited/linearized donors whose d_ff
+    # != mlp_mult x d_model, e.g. SmolLM2-360M = 2560 at d_model 960). If cfg lacks
+    # it, INFER from the saved MLP up-proj weight shape (blocks.0.mlp.W_u.weight is
+    # [d_ff, d_model]) so ckpts trained via train_lm BEFORE d_ff was persisted to
+    # cfg still reconstruct. Only when both are absent fall back to TinyLM's default.
+    d_ff_cfg = int(cfg.get("d_ff", 0) or 0)
+    if d_ff_cfg > 0:
+        d_ff_arg = d_ff_cfg
+    else:
+        d_ff_arg = None
+        for _k in ("blocks.0.mlp.W_u.weight", "blocks.0.mlp.W_g.weight"):
+            if _k in sd_keys:
+                d_ff_arg = int(ckpt["state_dict"][_k].shape[0])
+                break
+    # Tied embeddings (2026-07-01 fix): no state-dict footprint difference
+    # (a tied ckpt's `embed.weight`/`lm_head.weight` are saved as two keys
+    # with IDENTICAL values either way — the sharing is a Parameter-object
+    # identity, not a distinct tensor), so a ckpt trained with
+    # --tie_embeddings silently reconstructed UNTIED on reload before this
+    # cfg key existed: load_state_dict still "worked" (values matched at
+    # load time) but gradients would then update embed/lm_head
+    # independently from that point on. Absent key -> False, i.e. old
+    # ckpts (and ckpts saved before this fix) reload exactly as before.
+    tie_embeddings = bool(cfg.get("tie_embeddings", False))
     model = TinyLM(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"],
         n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
         d_head=cfg["d_head"], max_T=max_T_inferred,
+        d_ff=d_ff_arg,
+        tie_embeddings=tie_embeddings,
         feedback_mode=cfg.get("feedback_mode", "none"),
         feedback_distances=tuple(cfg.get("feedback_distances", (1,))),
         feedback_pairs=tuple(cfg.get("feedback_pairs", ()) or ()),

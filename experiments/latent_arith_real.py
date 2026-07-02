@@ -85,7 +85,8 @@ def latent_perhop_loss(model, comment_ids, inter_ids, R, thinking_id, device):
 
 
 def autonomous_halt_loss(model, comment_ids, sol_ids, eos_id, R, thinking_id,
-                         device, gate_weight=1.0, route_emit_all=False):
+                         device, gate_weight=1.0, route_emit_all=False,
+                         inter_ids=None, per_hop_weight=1.0):
     """Answer-span CE + gate halt-schedule BCE: teach the model to think R times
     then HALT on its own (handles multi-token answers).
 
@@ -119,6 +120,17 @@ def autonomous_halt_loss(model, comment_ids, sol_ids, eos_id, R, thinking_id,
     shift_labels[:, :start] = -100
     ans_loss = F.cross_entropy(shift_logits.reshape(-1, shift_logits.shape[-1]),
                                shift_labels.reshape(-1), ignore_index=-100)
+    # OPTIONAL per-hop CAPABILITY supervision (so depth + halt-gate train together):
+    # think slot j (position P+j) decodes the j-th intermediate f^j(s). This is the
+    # latent_perhop_loss term; without it the answer-CE-only thread degrades past
+    # ~2 hops on the real model (validated 2026-06-26), so the gate would halt-gate
+    # a SHALLOW capability. Default off (inter_ids=None) => identical to before.
+    if inter_ids is not None and R > 0 and len(inter_ids) >= R:
+        slot_logits = logits[:, P:P + R, :]                          # (1,R,V)
+        itgt = torch.tensor([list(inter_ids[:R])], dtype=torch.long, device=device)
+        perhop = F.cross_entropy(slot_logits.reshape(-1, slot_logits.shape[-1]),
+                                 itgt.reshape(-1))
+        ans_loss = ans_loss + per_hop_weight * perhop
     # Gate halt schedule at the R+1 decision positions.
     dec = list(range(P - 1, P + R))
     gl = gate_logits[0, dec]
@@ -411,8 +423,13 @@ def train(args):
         for _ in range(args.accum):
             c, s, _ans, inter = next_example(n)
             if args.autonomous_halt:
+                # Combine the halt-gate (efficiency) with per-hop intermediate
+                # supervision (capability) when --per_hop is also set + intermediates
+                # exist, so the model learns DEEP latent AND to recruit it efficiently.
+                ih = inter if (args.per_hop and R > 0 and len(inter) >= R) else None
                 loss = autonomous_halt_loss(model, c, s, eos_id, R, thinking_id,
-                                            device, gate_weight=args.gate_weight)
+                                            device, gate_weight=args.gate_weight,
+                                            inter_ids=ih)
             elif args.per_hop and R > 0 and len(inter) >= R:
                 loss = latent_perhop_loss(model, c, inter, R, thinking_id, device)
             else:

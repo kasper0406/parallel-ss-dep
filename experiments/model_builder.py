@@ -146,9 +146,50 @@ def build_model_from_args(args, *, vocab_size: int,
             pkm_use_output_gate=bool(getattr(args, "pkm_use_output_gate", True)),
         )
 
+    # Resume-cfg peek (2026-07-01 footgun fix). `--load_ckpt` continuation
+    # constructs the model from CLI `args` BEFORE ever looking at the ckpt —
+    # same as every other architecture flag here (d_model, n_layers, ...), so
+    # this stays consistent with that contract. But d_ff / tie_embeddings are
+    # easy to forget to re-pass on a resume command line, and the ckpt is
+    # loaded here anyway (reused below for load_state_dict, so this is not an
+    # extra file read):
+    #   - d_ff has an unambiguous "not overridden" sentinel (0, same as the
+    #     --d_ff CLI default), so it's safe to AUTO-FILL from the ckpt's cfg
+    #     when the user didn't override it. Without this, resuming an
+    #     inherited/linearized-donor ckpt (d_ff != 4*d_model, e.g. SmolLM2-
+    #     360M's 2560) without re-passing --d_ff crashes with a shape
+    #     mismatch inside load_state_dict below.
+    #   - tie_embeddings has NO such sentinel (`store_true`'s False default is
+    #     indistinguishable from an intentional untie override), so silently
+    #     auto-filling it risks overriding real user intent. WARN instead —
+    #     turning the audited "silently reconstructs UNTIED on continuation"
+    #     footgun loud, without changing the args-is-authoritative contract.
+    _resume_ckpt = None
+    _resume_cfg: dict = {}
+    if args.load_ckpt is not None:
+        _resume_ckpt = torch.load(args.load_ckpt, weights_only=False,
+                                  map_location="cuda")
+        _resume_cfg = (_resume_ckpt.get("config", {})
+                       if isinstance(_resume_ckpt, dict) else {}) or {}
+    _d_ff_arg = int(getattr(args, "d_ff", 0))
+    if _d_ff_arg <= 0 and int(_resume_cfg.get("d_ff", 0) or 0) > 0:
+        _d_ff_arg = int(_resume_cfg["d_ff"])
+        print(f"  resume: --d_ff not set, using ckpt cfg d_ff={_d_ff_arg}")
+    if (_resume_cfg.get("tie_embeddings") is not None
+            and bool(_resume_cfg["tie_embeddings"])
+            != bool(getattr(args, "tie_embeddings", False))):
+        print(f"  WARNING: resume ckpt cfg has "
+              f"tie_embeddings={bool(_resume_cfg['tie_embeddings'])} but "
+              f"--tie_embeddings={bool(getattr(args, 'tie_embeddings', False))} "
+              f"is in effect for THIS run — embed/lm_head will "
+              f"{'TIE' if getattr(args, 'tie_embeddings', False) else 'UNTIE'} "
+              f"from this resume onward. Pass --tie_embeddings to match the "
+              f"ckpt if that's not intended.")
+
     model = TinyLM(
         vocab_size=vocab_size, d_model=args.d_model, n_layers=n_layers,
         n_heads=args.n_heads, d_head=args.d_head, aux_dim=aux_dim,
+        d_ff=(_d_ff_arg if _d_ff_arg > 0 else None),
         max_T=args.max_T,
         feedback_mode=args.feedback,
         feedback_pairs=fb_pairs,
@@ -159,6 +200,7 @@ def build_model_from_args(args, *, vocab_size: int,
         feedback_position=args.feedback_position,
         feedback_self_k=args.feedback_self_k,
         feedback_alpha_mode=args.feedback_alpha_mode,
+        feedback_alpha_init=float(getattr(args, "feedback_alpha_init", 0.0)),
         output_gate=(args.output_gate
                      or (args.enable_thinking_token
                          and args.think_decision == "gate")),
@@ -184,6 +226,7 @@ def build_model_from_args(args, *, vocab_size: int,
             getattr(args, "refinement_head_alpha_init", 0.3)),
         use_latent_feedback_adapter=bool(
             getattr(args, "use_latent_feedback_adapter", False)),
+        tie_embeddings=bool(getattr(args, "tie_embeddings", False)),
         **mem_kwargs,
         **pkm_kwargs,
         **attn_kw,
@@ -193,9 +236,10 @@ def build_model_from_args(args, *, vocab_size: int,
         print("Activation checkpointing ON for transformer blocks "
               "(~30% extra compute, large activation-memory savings)")
 
-    # Optional resume.
+    # Optional resume. `_resume_ckpt` was already loaded above (to peek cfg
+    # for d_ff/tie_embeddings) — reuse it instead of reading the file twice.
     if args.load_ckpt is not None:
-        ck = torch.load(args.load_ckpt, weights_only=False, map_location="cuda")
+        ck = _resume_ckpt
         sd = ck["state_dict"] if isinstance(ck, dict) and "state_dict" in ck else ck
         missing, unexpected = model.load_state_dict(sd, strict=False)
         print(f"Loaded ckpt {args.load_ckpt!r} "

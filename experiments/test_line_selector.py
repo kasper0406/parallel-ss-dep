@@ -80,8 +80,11 @@ def test_default_off_no_param():
 def test_module_exists_when_on():
     m = _make_model(use_line_selector=True)
     assert isinstance(m.line_selector, LineSelectorAttn)
-    # Cold-start invariants: α==0 and out_proj zero-init.
-    assert torch.all(m.line_selector.alpha == 0)
+    # Cold-start invariants: out_proj zero-init (the no-op guarantee) with
+    # α fixed at 1.0 so out_proj gets nonzero gradient from step 0 — the
+    # 2026-06-04 init revision (see LineSelectorAttn.__init__); α==0 variants
+    # were tried and had dead/oscillating gradient.
+    assert torch.all(m.line_selector.alpha == 1)
     assert torch.all(m.line_selector.out_proj.weight == 0)
 
 

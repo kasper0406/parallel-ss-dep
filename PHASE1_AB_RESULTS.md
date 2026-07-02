@@ -1,5 +1,41 @@
 # Phase-1 A/B — Do OUR features help on a COMPETENT, INHERITED base?
 
+> ⚠️ **FORENSIC CORRECTIONS (2026-07-02, workflow `wf_7b7baabc-011` — checkpoint
+> autopsies + log forensics + a new stratified probe; findings adversarially
+> verified).** This doc's negative verdict OVER-REACHES; read with these:
+> 1. **The 32L Arm B never tested engaged features.** Checkpoint autopsy of
+>    `phase1_ab_B.pt`: PKM αL=−0.0005 with value rows at 1.004× init (dead
+>    table; ε=0.18/φ=0.11 still active — 3000-step curricula in a 1900-step
+>    run), FiLM α ≤ 1.5e-4 (100–1000× below any committed run; zero-grad for
+>    the first 300 steps by K-warmup, then lr 3e-4 with WSD hitting 0.00 at
+>    step 1900), WM read_alpha frozen 0 + copy gate σ≈0.0026 (moved −6.00→−5.95
+>    all run), latent adapter proj EXACTLY 0.0. The treatment table above lists
+>    latent, but the RUN-OF-RECORD never trained it (two earlier attempts ran
+>    the aux and died at step 620; the final run has no startup banner / no
+>    reason() diags / no latent TB tags).
+> 2. **The 10L "committed ≠ help" is weaker than stated:** PKM's α committed
+>    (+0.461) but the VALUE TABLE was only ~13% drifted from init (row 1.13 vs
+>    2.5–3.9 in committed references) — it amplified near-random values.
+>    Latent was never configured in that arm (launcher lacks the weight flag).
+> 3. **The deltas are n=1 and statistically null:** paired problem-level
+>    bootstrap on the 10L pair's HE-solution CE gives B−A = +0.0030 with 95% CI
+>    [−0.0009, +0.0070] (p≈0.13). No A/B here carries a seed error bar.
+> 4. **A stratified probe the repo never had now shows the features arm WINS on
+>    natural long-file code:** `experiments/probe_depdist_stratified_ce.py`
+>    (1.84M paired tokens, 600 codeparrot files ≥3072 tokens): 10L B−A =
+>    **−0.0045 CE overall (p<1e-4)**, monotone with dependency distance
+>    (−0.0016 first-occurrence → −0.0102 at 1024–2047-token identifier reuse),
+>    features better in 11/12 strata — while tied on HE-solution CE. The evals
+>    this doc used are ≤512-token context and structurally blind to the strata
+>    where the features act. Results: `runs/depdist_probe/`.
+> 5. **Honest cap (full-attention control):** SmolLM2-135M shows nearly the same
+>    CE-vs-distance rise (~93% of the far-distance hardness is intrinsic token
+>    rarity, not bounded-state forgetting) — the recall-mechanism upside on
+>    natural code is real but small (~1% relative at these budgets).
+> Net: this experiment measured [aux-loss/compute taxes + inert modules] vs
+> control, not [working features] vs control. It cannot support "features are
+> orthogonal to code." See SESSION_FINDINGS.md 2026-07-02 for the full record.
+
 **Question.** Architectural add-ons (FiLM feedback, WorkingMemory, PKM, latent
 thinking, output-gate) have repeatedly looked load-bearing on a *from-scratch*
 287 M base. Do they still add value when bolted onto a **competent inherited

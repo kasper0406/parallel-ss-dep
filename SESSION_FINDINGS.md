@@ -201,9 +201,14 @@ adversarial verification of every major finding + full pytest (779/781 pass; the
    gate_calibration / latent_cotrain via their
    `thinking_token_id != pad_token_id` guards; `train_lm.py` now hard-errors
    on those two combinations. NOTE (post-review correction): latent_reasoning
-   is NOT pad-guarded and works under the alias — Phase-1 arm B legitimately
-   combined it with keep_base_vocab — so it is deliberately excluded from the
-   guard.
+   is NOT pad-guarded in HEAD code so it is excluded from the guard.
+   **CORRECTION (2026-07-02, forensics):** an earlier version here said arm B
+   "legitimately combined" latent_reasoning with keep_base_vocab — true of the
+   LAUNCHER, false of the RUN-OF-RECORD: the final arm-B run never trained the
+   latent aux (adapter proj bit-exact 0.0; no startup banner / reason() diags /
+   TB tags; two earlier attempts ran it and died at step 620). The audit error
+   was checking HEAD code instead of the run's own log — see the 2026-07-02
+   forensics section below.
 
 ### CONFIRMED, open — **ALL FIXED later the same day** (5 Sonnet-5 subagents,
 ### each fix reviewed by the orchestrator + full pytest; see the fix list below)
@@ -288,3 +293,119 @@ numbers were inflated in our favor (6-binding tail, one OOM-frontier cell, the
 tax ratio) and one pipeline defect (KD doc-isolation) understates our own next
 lever. Bug-class to watch: OUR arm gets an accommodation the baseline doesn't
 (chunked prefill, early-bound keys) — the recurring asymmetry trap.
+
+---
+
+## 2026-07-02 — FORENSICS: why don't the features help on code? (workflow `wf_7b7baabc-011`, 46 agents: log/ckpt autopsies + impl review + detection-power analysis + a NEW stratified probe; all high-confidence findings adversarially verified)
+
+The owner challenged the "features are orthogonal to code" verdict. The forensic
+answer: **the verdict rests mostly on runs where the mechanisms were inert,
+absent, or structurally invisible to the eval — plus one genuinely-measured
+null (latent-on-code).** A new probe shows the first statistically-real
+iso-token feature WIN on natural code, in exactly the strata every prior eval
+was blind to.
+
+### The negative experiments, autopsied
+
+- **Phase-1 32L arm B (the "net-tax on a competent base" headline): all four
+  mechanisms numerically inert at eval.** Ckpt `phase1_ab_B.pt`: PKM αL=−0.0005,
+  value rows 1.004× init (dead; ε=0.18/φ=0.11 still active — 3000-step windows
+  in a 1900-step run; WSD LR hit literally 0.00 at step 1900); FiLM α≤1.5e-4
+  (100–1000× below committed scale; zero-grad first 300 steps by K-warmup);
+  WM read_alpha frozen 0 by flag + copy gate σ≈0.0026 (moved −6.00→−5.95);
+  latent adapter proj EXACTLY 0.0 — **the latent aux never ran in the
+  run-of-record** (two earlier attempts died at step 620; final run has no
+  banner/diags/TB tags). Arm B paid the taxes (K=3 at 2.4× wall-clock with α≈0,
+  gist 0.1, addr 0.2, gate-entropy with floor≥0.95) for zero function → "B
+  slightly worse than A" measures taxes, not mechanisms.
+- **10L arm B nuance:** PKM α committed (+0.461, monotone — shallow IS more
+  receptive) but the VALUE TABLE was only ~13% drifted (row 1.13 vs 2.5–3.9
+  committed refs) = amplified near-random values; latent never configured
+  (launcher lacks the weight flag). The recorded "even COMMITTED features don't
+  help" overstates commitment. HE-CE delta B−A=+0.0030 is a statistical null
+  (paired bootstrap CI [−0.0009,+0.0070]).
+- **Iso-token ablation (2000 steps):** valid COST result (mechanisms ~free),
+  weak BENEFIT result: WM structurally inert (v4 mix has NO recall streams; 0
+  addr-aux firings; W_proj purely weight-decaying), gate floored 0.95+ all run
+  (warmup 20000), latent at full weight only the last 40%, PKM mid-trajectory
+  and still rising at cutoff, eval capped at T=512.
+- **v18 (the one genuinely-engaged run):** mechanisms committed (PKM row
+  3.70–3.94, latent proj fro 110, copy path trained) and PKM/FiLM are strongly
+  load-bearing WITHIN-MODEL (see probe below). Its HumanEval regression was
+  mix-dilution (already documented). But within-model kill-gates measure
+  co-adaptation, not counterfactual value → **a clean engaged-features
+  iso-data A/B at real length still does not exist anywhere in the repo.**
+- **No A/B in the record has a seed error bar (all n=1)** — every ±0.003–0.018
+  CE feature delta, in either direction, is unverdictable at unknown variance.
+
+### Detection power: the evals could not have seen success
+
+- Every code eval behind the verdicts lives at ≤512-token context (per-source
+  probe T=512; HE-solution CE median ~175 tokens, max identifier reuse distance
+  ~540, ZERO >1024) — entirely inside the recurrence-is-perfect regime.
+- WM's validated niche (N≥48 bindings / >512 distance) occurs in **0 tokens of
+  HumanEval** and ~0 of the SFT corpus, but in ~1.5–2% of ALL tokens (11–12% of
+  identifier reuses) of natural ≥800-line Python files, where 97.5% of NAME
+  positions sit in the ≥48-live-identifier saturation regime. A perfect WM
+  cannot move HumanEval.
+- HumanEval-164 greedy noise (±3–4) exceeds the expected effect of everything
+  except a fully-engaged PKM at the optimistic end (+2–4 passes via the repo's
+  own CE→pass slope) — which is why the +0.04..0.14 CE PKM effect kept reading
+  as zero there. PKM was detected EVERY time it actually engaged (v7.1 toggles,
+  v18 claw-back, Phase-C pkm_off −5).
+- **Latent-on-code is the one genuine, well-measured null**: the per-position
+  probe had power, found the ceiling (~10–13% of positions × +0.3 logp, flat in
+  R, gate anti-aimed) → aggregate ≤0.03–0.04 nats even oracle-placed. Stands.
+
+### NEW probe (experiments/probe_depdist_stratified_ce.py, runs/depdist_probe/)
+
+Per-token CE on 600 natural codeparrot files (≥3072 SmolLM2 tokens; 1.84M
+scored tokens/arm), stratified by identifier reuse distance ×
+identifier-vs-other, with paired mechanism toggles:
+
+- **First statistically-real iso-token feature win on natural code:** 10L
+  features-vs-lean pair (same base/data/seed/steps): B−A = **−0.0045 CE overall
+  (paired bootstrap p<1e-4)**, monotone with dependency distance (−0.0016
+  first-occurrence → −0.0102 at 1024–2047), features better in 11/12 strata —
+  while TIED on HE-solution CE. The standard evals are blind to exactly the
+  strata where the features act. (And 10L_B was itself mid-bootstrap → likely
+  an underestimate.)
+- **v18 within-model:** pkm_off +0.1198 CE total, concentrated at
+  first-occurrence (+0.26) and far identifier strata (+0.25 at 1024–2047);
+  film_off +0.70; all_off +0.98. Fully-engaged mechanisms carry major function.
+- **WM confirmed structurally zero on code CE in every deployed ckpt** (read
+  frozen; copy head requires a data mask evals never pass; force-engaging the
+  untrained gate HURTS +0.007..+0.12). WM-on-code = untested, not refuted.
+- **Honest cap (verifier's full-attention control):** SmolLM2-135M shows nearly
+  the same CE-vs-distance curve (0.68→3.26 vs ours 0.67→3.42) → ~93% of the
+  far-reuse hardness is intrinsic token rarity, NOT bounded-state forgetting.
+  The recall-feature upside on natural code is real but ~1% relative at these
+  budgets. The features' larger payoff remains the >2k-context / agentic regime
+  (the north-star axis), not aggregate code CE.
+
+### Verdict per mechanism
+
+| mechanism | verdict | basis |
+|---|---|---|
+| PKM | **works when engaged** (+0.04..0.14 CE, sample-efficiency lever); every "no effect" came from mid-bootstrap runs | v7.1/v18/Phase-C detections; arm-B autopsy |
+| FiLM | engaged=load-bearing within-model (film_off +0.70 on v18); iso-token effect small-positive at far strata; arm-B null = cold-start stall (no toll-payer), NOT the LineSelector init trap (CPU test: α=0×random-W opts in fine when first-order signal exists) | probe + CPU gradient test |
+| WM | **never tested on code** — output channel structurally zero in every negative run (frozen read + mask-gated copy); niche absent from HumanEval by census, present in natural long files | wiring analysis + census |
+| latent | genuine null ON CODE (well-measured ceiling); arm-B "test" trained it at exactly zero | probe_gate_placement + autopsy |
+
+### Recipe rules (so the next feature run is a real test)
+
+1. **Engagement kill-gates in-run:** assert at step ~N/3 that αL/row/copy-fire/
+   reason-loss have moved (and the latent banner printed at step 1) or ABORT —
+   a feature run that ends inert is a wasted launch, not a negative result.
+2. **Curricula ≤ ~40% of run length; never let WSD hit 0 at curriculum end**
+   (leave a constant-LR plateau after bootstrap completes).
+3. **Converged-base attach needs toll-payers per feature:** PKM has one (floor/
+   ε/value-LR — schedule it INSIDE the run); FiLM needs α warm-start or an
+   α-floor; WM needs read_alpha unfrozen with its floor curriculum (or a
+   trained, eval-time copy trigger — supervise the copy gate at natural-code
+   reuse positions ≥256 distance, the 2–3.4-nat regime the probe exposed);
+   latent needs its OOM at step 620 root-caused first.
+4. **≥2 seeds (or a variance estimate) for any ≤0.02-nat claim.**
+5. **Adopt dependency-distance-stratified CE as the standing feature dev
+   signal** (the probe is now in-repo); stop deciding feature questions on
+   HumanEval greedy or ≤512-token CE.

@@ -101,6 +101,12 @@ def build_model_from_args(args, *, vocab_size: int,
                 getattr(args, "mem_read_alpha_floor_start", 0.0)),
             mem_read_alpha_floor_warmup_steps=int(
                 getattr(args, "mem_read_alpha_floor_warmup_steps", 0)),
+            # 2026-07-02 design review FIX 3. getattr fallback "none" is the
+            # safe/legacy value for any caller (e.g. a hand-built args
+            # namespace) that lacks this attribute; a real parsed
+            # train_lm_args namespace defaults to "match_rms" (the CLI-level
+            # fixed-by-default choice) unless overridden.
+            mem_inj_norm=str(getattr(args, "mem_inj_norm", "none")),
             # v14 WM-recall plumbing (default off → byte-identical legacy WM).
             mem_key_from_embedding=bool(
                 getattr(args, "mem_key_from_embedding", False)),
@@ -144,6 +150,7 @@ def build_model_from_args(args, *, vocab_size: int,
             pkm_score_norm=str(getattr(args, "pkm_score_norm", "layer")),
             pkm_value_init_std=float(getattr(args, "pkm_value_init_std", 1.0)),
             pkm_use_output_gate=bool(getattr(args, "pkm_use_output_gate", True)),
+            pkm_out_alpha_init=float(getattr(args, "pkm_out_alpha_init", 0.0)),
         )
 
     # Resume-cfg peek (2026-07-01 footgun fix). `--load_ckpt` continuation
@@ -185,6 +192,37 @@ def build_model_from_args(args, *, vocab_size: int,
               f"{'TIE' if getattr(args, 'tie_embeddings', False) else 'UNTIE'} "
               f"from this resume onward. Pass --tie_embeddings to match the "
               f"ckpt if that's not intended.")
+    # 2026-07-02 design review FIX 2 / FIX 3 continuation check. Like
+    # tie_embeddings, "none" (the legacy value) has no unambiguous CLI
+    # sentinel now that --feedback_src_norm / --mem_inj_norm default to the
+    # FIXED behaviour ("rms" / "match_rms") — so this follows the SAME
+    # args-is-authoritative-but-WARN-loud contract as tie_embeddings, not the
+    # silent d_ff auto-fill (these add no new params, so nothing crashes
+    # either way — it's a genuine behaviour change, not a shape mismatch).
+    # A ckpt cfg MISSING the key is treated as "none" (legacy-default-on-
+    # missing-key — matches what an old, pre-fix ckpt actually trained
+    # with); this only matters for surfacing the mismatch, never for
+    # silently overriding `args`.
+    _ckpt_fsn = str(_resume_cfg.get("feedback_src_norm", "none") or "none")
+    _args_fsn = str(getattr(args, "feedback_src_norm", "none"))
+    if _resume_ckpt is not None and _ckpt_fsn != _args_fsn:
+        print(f"  WARNING: resume ckpt cfg has feedback_src_norm={_ckpt_fsn!r} "
+              f"but --feedback_src_norm={_args_fsn!r} is in effect for THIS "
+              f"run — FeedbackProjection's source normalization changes from "
+              f"this resume onward (no new params, so load_state_dict is "
+              f"unaffected, but the forward math changes). Pass "
+              f"--feedback_src_norm {_ckpt_fsn!r} to match the ckpt if "
+              f"that's not intended.")
+    _ckpt_min = str(_resume_cfg.get("mem_inj_norm", "none") or "none")
+    _args_min = str(getattr(args, "mem_inj_norm", "none"))
+    if _resume_ckpt is not None and _ckpt_min != _args_min:
+        print(f"  WARNING: resume ckpt cfg has mem_inj_norm={_ckpt_min!r} but "
+              f"--mem_inj_norm={_args_min!r} is in effect for THIS run — "
+              f"WorkingMemory's read-injection scaling changes from this "
+              f"resume onward (no new params, so load_state_dict is "
+              f"unaffected, but the forward math changes). Pass "
+              f"--mem_inj_norm {_ckpt_min!r} to match the ckpt if that's not "
+              f"intended.")
 
     model = TinyLM(
         vocab_size=vocab_size, d_model=args.d_model, n_layers=n_layers,
@@ -201,6 +239,10 @@ def build_model_from_args(args, *, vocab_size: int,
         feedback_self_k=args.feedback_self_k,
         feedback_alpha_mode=args.feedback_alpha_mode,
         feedback_alpha_init=float(getattr(args, "feedback_alpha_init", 0.0)),
+        # 2026-07-02 design review FIX 2. getattr fallback "none" is the
+        # safe/legacy value; a real parsed train_lm_args namespace defaults
+        # to "rms" (the CLI-level fixed-by-default choice) unless overridden.
+        feedback_src_norm=str(getattr(args, "feedback_src_norm", "none")),
         output_gate=(args.output_gate
                      or (args.enable_thinking_token
                          and args.think_decision == "gate")),

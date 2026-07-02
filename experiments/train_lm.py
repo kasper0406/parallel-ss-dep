@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import pathlib
 import sys
 import time
@@ -586,6 +587,259 @@ def _ctx_addr_aux_loss(model, input_ids, mem_read_mask, doc_ids=None):
     return addr, int(has_target.sum()), float(sel.mean().detach())
 
 
+# --- Engagement kill-gates (SESSION_FINDINGS.md 2026-07-02 "recipe rules") --
+# The 2026-07-02 forensics pass found that most "features are orthogonal to
+# code" verdicts rested on runs where the mechanisms were numerically INERT
+# the whole time (PKM alpha stuck at ~init, WM copy-gate never fired, the
+# latent aux never even entered its construction branch) — a wasted launch
+# masquerading as a negative result. Two independent guards close this hole:
+#   1. curricula-must-fit (`validate_curricula_fit`): a warmup/curriculum
+#      that can't finish inside the run either wastes the whole run on
+#      cold-start (latent) or never reaches a verdict (everything else).
+#      Checked ONCE at startup, pure-args, before any GPU/model work.
+#   2. engagement kill-gate (`engagement_report` + the per-mechanism
+#      evaluators below): at --engagement_check_step, verify each ENABLED
+#      mechanism has actually MOVED (not just that its module exists — the
+#      separate STARTUP CONSTRUCTION ASSERTS in main() catch the "the
+#      construction branch was silently not entered" half of the failure).
+
+
+def _curriculum_end_frac(steps: int, start: int, warmup: int) -> float:
+    """Fraction of the run consumed before a (start, warmup) curriculum
+    finishes ramping. >1.0 means the curriculum never completes inside the
+    run; steps<=0 returns 0.0 (nothing to validate)."""
+    if steps <= 0:
+        return 0.0
+    return (max(0, int(start)) + max(0, int(warmup))) / float(steps)
+
+
+def validate_curricula_fit(args) -> None:
+    """Curricula-must-fit rule (recipe rule #2). Pure-args; call once at
+    startup before any GPU/model work. Two severities:
+      - latent_reasoning is HARD-ERRORed past 40% of the run: its cold-start
+        destabilizes pretrain when it engages late/abruptly (gnorm spike,
+        Δlogp<0 on engagement — see the memory note
+        project_cold_latent_cotrain_destabilizes_pretrain, 2026-06-14).
+      - everything else (PKM epsilon/floor warmup, ctx_addr aux warmup,
+        feedback_self_k warmup, the output-gate floor warmup) WARNS loudly
+        past 40% of --steps and ABORTS past 100% (a curriculum that
+        literally never finishes before the run ends is a config bug, not a
+        slow ramp).
+    """
+    steps = int(getattr(args, "steps", 0))
+    if steps <= 0:
+        return
+
+    if float(getattr(args, "latent_reasoning_weight", 0.0)) > 0.0:
+        frac = _curriculum_end_frac(
+            steps,
+            int(getattr(args, "latent_reasoning_start_step", 0)),
+            int(getattr(args, "latent_reasoning_weight_warmup_steps", 0)))
+        if frac > 0.4:
+            raise SystemExit(
+                "[curricula-fit] ABORT: --latent_reasoning_start_step + "
+                f"--latent_reasoning_weight_warmup_steps ends at "
+                f"{frac * 100:.0f}% of --steps={steps} (> 40%). Cold-start "
+                "latent co-training destabilizes pretrain when it engages "
+                "late/abruptly (gnorm spike, Δlogp<0 on engagement — "
+                "SESSION_FINDINGS.md 2026-06-14). Shorten the warmup, start "
+                "it earlier, or lengthen the run.")
+
+    # (cli_label, enabled, start_step, warmup_steps)
+    checks: list[tuple[str, bool, int, int]] = []
+    if getattr(args, "use_pkm", False):
+        checks.append((
+            "--pkm_epsilon_warmup_steps",
+            float(getattr(args, "pkm_epsilon_start", 0.0)) > 0.0,
+            0, int(getattr(args, "pkm_epsilon_warmup_steps", 0))))
+        checks.append((
+            "--pkm_alpha_floor_warmup_steps",
+            float(getattr(args, "pkm_alpha_floor_start", 0.0)) > 0.0,
+            0, int(getattr(args, "pkm_alpha_floor_warmup_steps", 0))))
+    if float(getattr(args, "ctx_addr_aux_weight", 0.0)) > 0.0:
+        checks.append((
+            "--ctx_addr_aux_start_step + --ctx_addr_aux_warmup_steps", True,
+            int(getattr(args, "ctx_addr_aux_start_step", 0)),
+            int(getattr(args, "ctx_addr_aux_warmup_steps", 0))))
+    if int(getattr(args, "feedback_self_k_warmup_steps", 0)) > 0:
+        checks.append((
+            "--feedback_self_k_warmup_steps", True,
+            0, int(getattr(args, "feedback_self_k_warmup_steps", 0))))
+    if bool(getattr(args, "output_gate", False)):
+        checks.append((
+            "--gate_warmup_steps", True,
+            0, int(getattr(args, "gate_warmup_steps", 0))))
+
+    aborts, warns = [], []
+    for label, enabled, start, warmup in checks:
+        if not enabled:
+            continue
+        frac = _curriculum_end_frac(steps, start, warmup)
+        if frac > 1.0:
+            aborts.append(f"{label} ends at {frac * 100:.0f}% of "
+                          f"--steps={steps} (> 100% — never finishes)")
+        elif frac > 0.4:
+            warns.append(f"{label} ends at {frac * 100:.0f}% of "
+                         f"--steps={steps} (> 40%)")
+    for w in warns:
+        print(f"[curricula-fit] WARNING: {w}. A curriculum attached this "
+              "late may still be bootstrapping when the run ends.",
+              flush=True)
+    if aborts:
+        raise SystemExit(
+            f"[curricula-fit] ABORT: the following curricula never finish "
+            f"inside --steps={steps}:\n  - " + "\n  - ".join(aborts) +
+            "\nShorten the warmup(s), start them earlier, or lengthen the "
+            "run.")
+
+
+def _max_abs_alpha(alphas: list) -> float:
+    """Extract max |alpha| from `TinyLM.feedback_alphas()`'s format-
+    polymorphic output (sparse/xattn (target,source,alpha) tuples,
+    dense-single flat floats, dense-multi per-layer lists — see that
+    method's docstring). Returns 0.0 for an empty list (feedback off)."""
+    vals: list[float] = []
+    for a in alphas:
+        if isinstance(a, tuple):
+            vals.append(abs(float(a[-1])))
+        elif isinstance(a, list):
+            vals.extend(abs(float(x)) for x in a)
+        else:
+            vals.append(abs(float(a)))
+    return max(vals) if vals else 0.0
+
+
+def _pkm_engaged(alpha_l: float, row_ratio: float, *,
+                  alpha_min: float, row_min: float) -> tuple[bool, str]:
+    """PKM engagement verdict, reusing the pkm(αL=...,row=...) live
+    diagnostic values (never recomputed). `alpha_l` may be nan when
+    `pkm.use_output_gate` is off — nan comparisons are False, so that just
+    falls through to the row-ratio check."""
+    ok = (abs(alpha_l) >= alpha_min) or (row_ratio >= row_min)
+    detail = (f"|alphaL|={abs(alpha_l):.4f} (min {alpha_min}), "
+              f"row_ratio={row_ratio:.3f} (min {row_min})")
+    return ok, detail
+
+
+def _film_engaged(alphas: list, *, alpha_min: float) -> tuple[bool, str]:
+    max_a = _max_abs_alpha(alphas)
+    ok = max_a >= alpha_min
+    detail = f"max|alpha| over pairs/layers = {max_a:.4g} (min {alpha_min})"
+    return ok, detail
+
+
+def _wm_copy_engaged(bias_now: float, bias_init: float, fire_count: int, *,
+                      bias_delta_min: float) -> tuple[bool, str]:
+    delta = abs(bias_now - bias_init)
+    ok = (delta >= bias_delta_min) or (fire_count > 0)
+    detail = (f"gate_bias={bias_now:.4f} (init {bias_init:.4f}, "
+              f"|Δ|={delta:.4f}, min {bias_delta_min}), "
+              f"cumulative_match_fires={fire_count}")
+    return ok, detail
+
+
+def _latent_engaged(constructed: bool, fire_count: int, all_finite: bool, *,
+                     step: int, start_step: int, end_step: int
+                     ) -> tuple[bool, str]:
+    """`end_step` = start_step + weight_warmup_steps (full-weight point). If
+    the check runs before the curriculum has even reached full weight, we
+    can only verify `constructed` (the real judgement is deferred) — return
+    a NOTE-tagged pass rather than a false failure."""
+    if end_step > step:
+        return True, (
+            f"NOTE: constructed={constructed}; engagement scheduled to ramp "
+            f"{start_step}->{end_step}, step {step} is still inside that "
+            "window — not evaluated as a failure yet.")
+    ok = constructed and fire_count > 0 and all_finite
+    detail = (f"constructed={constructed}, fires_since_start={fire_count}, "
+              f"all_finite={all_finite}")
+    return ok, detail
+
+
+def engagement_report(step: int, results: list[tuple[str, bool, str]], *,
+                       action: str, is_main: bool = True) -> None:
+    """Print the loud multi-line engagement report and abort/warn.
+
+    `results` is (mechanism_name, engaged, detail) for every mechanism that
+    was actually CHECKED — a mechanism whose flag is off is simply absent
+    (an off feature made no claim the run needs to keep).
+
+    The abort/warn DECISION is computed identically regardless of `is_main`
+    (every DDP rank has in-sync model state, so every rank reaches the same
+    verdict) — only the printing is gated on `is_main`, so 'abort' kills the
+    whole distributed job together instead of hanging one dead rank while
+    the others wait at the next collective op.
+    """
+    inert = [r for r in results if not r[1]]
+    if is_main:
+        print("=" * 78, flush=True)
+        if results:
+            print(f"[engagement-check] step {step}: "
+                  f"{len(results) - len(inert)}/{len(results)} mechanism(s) "
+                  "engaged", flush=True)
+        else:
+            print(f"[engagement-check] step {step}: no mechanisms enabled "
+                  "to check", flush=True)
+        for name, engaged, detail in results:
+            status = "ENGAGED" if engaged else "INERT"
+            print(f"  [{status}] {name}: {detail}", flush=True)
+        print("=" * 78, flush=True)
+    if not inert:
+        return
+    names = ", ".join(r[0] for r in inert)
+    msg = (f"[engagement-check] step {step}: {len(inert)} mechanism(s) "
+           f"still INERT: {names}. A feature run that ends inert is a "
+           "wasted launch, not a negative result (SESSION_FINDINGS.md "
+           "2026-07-02).")
+    if action == "abort":
+        raise SystemExit(msg)
+    if is_main:
+        print(f"[engagement-check] WARNING (action=warn, continuing past "
+              f"inert mechanisms): {msg}", flush=True)
+
+
+# --- Engagement kill-gate, STARTUP construction asserts (recipe rule #1) ---
+# Extracted into small testable functions (rather than left inline in
+# main()) so a synthetic model/args pair missing an expected attribute can
+# be exercised directly in tests, without needing a real TinyLM/GPU. Each
+# is a no-op when its flag is off, and asserts when the flag is on but the
+# corresponding module was never attached — the exact "construction branch
+# silently not entered" failure mode from the Phase-1 arm-B autopsy.
+def assert_pkm_constructed(args, model) -> None:
+    if not getattr(args, "use_pkm", False):
+        return
+    assert getattr(model, "pkm_layer", None) is not None, (
+        "--use_pkm is set but model.pkm_layer was never constructed — "
+        "the PKM branch in TinyLM.__init__ was silently skipped.")
+
+
+def assert_memory_constructed(args, model) -> None:
+    if not getattr(args, "use_memory", False):
+        return
+    assert getattr(model, "memory", None) is not None, (
+        "--use_memory is set but model.memory was never constructed — "
+        "the WorkingMemory branch in TinyLM.__init__ was silently skipped.")
+
+
+def assert_sparse_feedback_constructed(args, model) -> None:
+    if not (getattr(args, "feedback", "none") == "film"
+            and getattr(args, "feedback_pairs", "")):
+        return
+    assert (getattr(model, "sparse_feedback", None) is not None
+            and len(model.sparse_feedback) > 0), (
+        "--feedback film --feedback_pairs '...' is set but "
+        "model.sparse_feedback was never constructed (or is empty) — the "
+        "sparse-FiLM branch in TinyLM.__init__ was silently skipped.")
+
+
+def assert_latent_reasoner_constructed(args, latent_reasoner) -> None:
+    if not (float(getattr(args, "latent_reasoning_weight", 0.0)) > 0.0):
+        return
+    assert latent_reasoner is not None, (
+        "--latent_reasoning_weight > 0 but _latent_reasoner was never "
+        "constructed — the construction branch above was silently skipped.")
+
+
 class TokenisedStream(IterableDataset):
     """Streaming IterableDataset of fixed-length tokenised chunks."""
 
@@ -808,6 +1062,10 @@ def main():
         )
         args.think_burst_prob = 0.0
 
+    # Engagement kill-gate, part 1: curricula-must-fit (recipe rule #2). Pure
+    # args, no GPU/model work yet — fail fast before wasting a launch.
+    validate_curricula_fit(args)
+
     torch.manual_seed(args.seed)
     arch_label = args.arch if args.arch else f"layers={args.layers}"
     print(f"GPU: {torch.cuda.get_device_name(0)}  arch={arch_label}")
@@ -965,6 +1223,17 @@ def main():
     fb_xattn_pairs = _build_info.fb_xattn_pairs
     n_layers_actual = _build_info.n_layers
     aux_dim = _build_info.aux_dim
+    # Engagement kill-gate, part 2a: STARTUP construction asserts (recipe
+    # rule #1). Independent of --engagement_check_step — always on when the
+    # corresponding feature flag is set. Catches the "construction branch
+    # silently not entered" failure mode BEFORE a multi-hour launch, not at
+    # some step N deep into it. (The latent-reasoning analogue of this assert
+    # lives further below, right where `_latent_reasoner` is constructed —
+    # that object needs the tokenizer/thinking_token_id, which aren't ready
+    # yet here.)
+    assert_pkm_constructed(args, model)
+    assert_memory_constructed(args, model)
+    assert_sparse_feedback_constructed(args, model)
     # ctx_namekey addressing aux needs the WM read-attention graph stashed (the
     # copy head also turns this on in TinyLM.__init__; set it explicitly so the
     # addr-aux works even if --use_copy_head is absent). No-op when WM is off.
@@ -1145,6 +1414,7 @@ def main():
         matrix_optimizer=getattr(args, "matrix_optimizer", "muon"),
         embed_lr_mult=float(getattr(args, "embed_lr_mult", 1.0)),
         embed_optimizer=getattr(args, "embed_optimizer", "adam"),
+        feature_lr_mult=float(getattr(args, "feature_lr_mult", 1.0)),
     )
     # Backwards-compat aliases used elsewhere in the loop.
     opt = opts[0]
@@ -1244,6 +1514,23 @@ def main():
               f"n/step={args.latent_reasoning_n} "
               f"(examples/rung: "
               f"{ {n: len(_latent_reasoner.data[n]) for n in _latent_reasoner.rungs} })")
+    # Engagement kill-gate, part 2b: STARTUP construction assert (recipe rule
+    # #1). If --latent_reasoning_weight>0 said "on", the reasoner object MUST
+    # exist by here — this is exactly the Phase-1 arm-B failure mode (the
+    # construction branch above silently not entered: two dead attempts died
+    # at step 620 with no banner ever printed, and the run-of-record trained
+    # this aux at literally zero the whole run — SESSION_FINDINGS.md
+    # 2026-07-02). Trivial today by construction; the point is to keep
+    # failing loudly if a future edit adds a path around it.
+    assert_latent_reasoner_constructed(args, _latent_reasoner)
+
+    # Engagement kill-gate, part 3: per-mechanism counters for the step-N
+    # evaluation. Cheap (a couple of int/bool locals); zero runtime cost when
+    # --engagement_check_step is 0 (the counters are still updated at their
+    # real computation sites below, but nothing ever reads them).
+    _copy_fire_count = 0                # cumulative WM copy-gate match-fires
+    _latent_reason_fire_count = 0       # times the reason() loss actually ran
+    _latent_reason_all_finite = True    # AND of finite-ness across all fires
 
     # TensorBoard writer — no-op context when --tb_dir is not set. Under DDP
     # only rank 0 writes (multiple ranks → the same event file would corrupt).
@@ -2189,6 +2476,14 @@ def main():
                                        * _lr_ramp) * _lr_loss
                         _latent_reasoning_diag = (float(_lr_loss.detach()),
                                                   int(_lr_rung), float(_lr_ramp))
+                        # Engagement kill-gate counters (recipe rule #1): the
+                        # reason loss ACTUALLY ran this step — count it and
+                        # track whether it stayed finite (a NaN/inf reason
+                        # loss would silently corrupt the trunk gradient).
+                        _latent_reason_fire_count += 1
+                        _latent_reason_all_finite = (
+                            _latent_reason_all_finite
+                            and math.isfinite(_latent_reasoning_diag[0]))
                     # Gate-calibration: train the OUTPUT GATE (not the trunk) to
                     # fire think exactly where a latent think raises
                     # logp(true_next). The BCE flows ONLY into the grad-carrying
@@ -2237,7 +2532,15 @@ def main():
                         _pkm_mon._last_slot_idx = main_pkm_slot_idx
                         _pkm_mon._last_weights = main_pkm_weights
                     (loss / n_micro).backward()
-        _log_this_step = (step % args.log_every == 0 or step == args.steps)
+        _engagement_check_now = (int(getattr(args, "engagement_check_step", 0)) > 0
+                                 and step == int(args.engagement_check_step))
+        # Force the log-diagnostics block to also run at the engagement-check
+        # step (even off the --log_every cadence) so the per-mechanism
+        # engagement evaluation below can REUSE the diagnostics it computes
+        # (pkm(αL=...,row=...), FiLM α, copy-gate stats) instead of
+        # recomputing them — see "Engagement kill-gate" below.
+        _log_this_step = (step % args.log_every == 0 or step == args.steps
+                          or _engagement_check_now)
         # Per-layer diagnostics: grad norms must be read before clip; the
         # weight snapshot must be taken before opt.step().
         _blk_gnorms = _block_grad_norms(model) if _log_this_step else None
@@ -2266,7 +2569,7 @@ def main():
                 emit_ce,
             ))
 
-        if step % args.log_every == 0 or step == args.steps:
+        if _log_this_step:
             now = time.perf_counter()
             # ×ddp_world_size so this is GLOBAL throughput (all ranks), directly
             # comparable to the single-GPU baseline. Per-rank does batch*T*ga.
@@ -2329,6 +2632,21 @@ def main():
                     line += f"  max|α|=[{','.join(f'{a:.3f}' for a in summary)}]"
                 else:
                     line += f"  α=[{','.join(f'{a:+.3f}' for a in alphas)}]"
+                # Effective FiLM modulation per pair: RMS(out−x)/RMS(x) from
+                # the last loss-bearing forward (stashed detached by
+                # FeedbackProjection._stash_mod_rms; .item() only here at
+                # log cadence). α alone is NOT a utilization measure — the
+                # contribution is α·‖W·h‖ (2026-07-02 forensics) — THIS is
+                # the live number that tracks whether FiLM is doing work.
+                _sf = getattr(model, "sparse_feedback", None)
+                if _sf is not None:
+                    _effs = []
+                    for _k in sorted(_sf.keys(), key=int):
+                        _m = getattr(_sf[_k], "_last_mod_rms", None)
+                        if _m is not None:
+                            _effs.append(f"{_k}:{float(_m):.3f}")
+                    if _effs:
+                        line += "  filmEff=[" + ",".join(_effs) + "]"
             if args.output_gate and losses_gate_window:
                 recent = losses_gate_window[-args.log_every:]
                 mean_g = sum(r[0] for r in recent) / len(recent)
@@ -2492,10 +2810,61 @@ def main():
                         me = main_match_exists.bool()
                         if bool(rm.any()):
                             m_recall = float(me[rm].float().mean())
+                            # Engagement kill-gate counter (recipe rule #1):
+                            # cumulative count of recall positions where a
+                            # matched binding existed, i.e. where the copy
+                            # gate's g_eff = g·1{match} COULD have fired
+                            # (`_apply_copy_head` in model.py). Hooked here
+                            # (the existing per-log-step copy diagnostic) per
+                            # the recipe rather than every microbatch.
+                            _copy_fire_count += int((me & rm).sum().item())
                         if bool((~rm).any()):
                             m_gen = float(me[~rm].float().mean())
                 line += (f"  copy(g={cg:.4f},m%R={m_recall*100:.1f},"
                          f"m%G={m_gen*100:.2f})")
+            # Engagement kill-gate, part 4: the step-N per-mechanism
+            # evaluation (recipe rule #1). Runs at most ONCE (the loop only
+            # reaches step==engagement_check_step a single time). Reuses the
+            # diagnostics computed above (aL/rn_ratio for PKM, `alphas` for
+            # FiLM, the copy-gate bias + _copy_fire_count for WM) instead of
+            # recomputing them; only the latent-reasoning counters are its
+            # own state (tracked at their real computation sites, not here).
+            if _engagement_check_now:
+                _eng_results: list[tuple[str, bool, str]] = []
+                if getattr(args, "use_pkm", False) and hasattr(model, "pkm_layer"):
+                    _ok, _detail = _pkm_engaged(
+                        aL, rn_ratio,
+                        alpha_min=float(getattr(args, "engage_pkm_alpha_min", 0.02)),
+                        row_min=float(getattr(args, "engage_pkm_row_min", 1.02)))
+                    _eng_results.append(("PKM", _ok, _detail))
+                if args.feedback == "film":
+                    _ok, _detail = _film_engaged(
+                        alphas, alpha_min=float(
+                            getattr(args, "engage_film_alpha_min", 1e-3)))
+                    _eng_results.append(("FiLM", _ok, _detail))
+                if getattr(args, "use_copy_head", False):
+                    _bias_now = float(
+                        model.copy_head.gate.bias.detach().mean())
+                    _bias_init = float(getattr(args, "copy_gate_bias_init", -6.0))
+                    _ok, _detail = _wm_copy_engaged(
+                        _bias_now, _bias_init, _copy_fire_count,
+                        bias_delta_min=float(
+                            getattr(args, "engage_copy_bias_delta_min", 0.05)))
+                    _eng_results.append(("WM-copy", _ok, _detail))
+                if float(getattr(args, "latent_reasoning_weight", 0.0)) > 0.0:
+                    _lre_start = int(getattr(
+                        args, "latent_reasoning_start_step", 0))
+                    _lre_end = _lre_start + int(getattr(
+                        args, "latent_reasoning_weight_warmup_steps", 0))
+                    _ok, _detail = _latent_engaged(
+                        _latent_reasoner is not None,
+                        _latent_reason_fire_count, _latent_reason_all_finite,
+                        step=step, start_step=_lre_start, end_step=_lre_end)
+                    _eng_results.append(("latent-reasoning", _ok, _detail))
+                engagement_report(
+                    step, _eng_results,
+                    action=str(getattr(args, "engagement_check_action", "abort")),
+                    is_main=is_main)
             if is_main:
                 print(line)
             if tb is not None:
@@ -2803,6 +3172,11 @@ def main():
                 feedback_alpha_mode=args.feedback_alpha_mode,
                 feedback_alpha_init=float(
                     getattr(args, "feedback_alpha_init", 0.0)),
+                # 2026-07-02 design review FIX 2/3 — persist the ACTUAL mode
+                # this run used (not a hardcoded default) so reload is always
+                # faithful: cfg.get(key, "none") on a ckpt saved before this
+                # key existed correctly falls back to "none" (legacy).
+                feedback_src_norm=str(getattr(args, "feedback_src_norm", "none")),
                 arch=args.arch, layers_spec=args.layers,
                 tokenizer=args.tokenizer,
                 thinking_token_id=thinking_token_id,
@@ -2810,6 +3184,7 @@ def main():
                 mem_size=int(args.mem_size) if args.use_memory else 0,
                 mem_dim=(int(args.mem_dim) if args.mem_dim > 0
                           else int(args.d_model)) if args.use_memory else 0,
+                mem_inj_norm=str(getattr(args, "mem_inj_norm", "none")),
                 # WM addressing/readout cfg (no/with state-dict footprint) so a
                 # mid-eval ckpt reloads with the same WM as the final ckpt.
                 mem_decoupled_kv=bool(getattr(args, "mem_decoupled_kv", False)),
@@ -3002,6 +3377,9 @@ def main():
                     getattr(args, "copy_gate_bias_init", -6.0)),
                 "mem_dim": ((int(args.mem_dim) if args.mem_dim > 0
                              else int(args.d_model)) if args.use_memory else 0),
+                # 2026-07-02 design review FIX 3 — see the matching comment at
+                # the mid-eval save site above.
+                "mem_inj_norm": str(getattr(args, "mem_inj_norm", "none")),
                 "use_pkm": bool(getattr(args, "use_pkm", False)),
                 "pkm_after_layer": int(getattr(args, "pkm_after_layer", 14)),
                 "pkm_n_keys": int(getattr(args, "pkm_n_keys", 256)),
@@ -3027,6 +3405,11 @@ def main():
                 "feedback_alpha_mode": args.feedback_alpha_mode,
                 "feedback_alpha_init": float(
                     getattr(args, "feedback_alpha_init", 0.0)),
+                # 2026-07-02 design review FIX 2 — persist the ACTUAL mode
+                # this run used; cfg.get(key, "none") on a ckpt saved before
+                # this key existed correctly falls back to "none" (legacy).
+                "feedback_src_norm": str(
+                    getattr(args, "feedback_src_norm", "none")),
                 "arch": args.arch, "layers_spec": args.layers,
                 "tokenizer": args.tokenizer,
                 "enable_thinking_token": bool(args.enable_thinking_token),

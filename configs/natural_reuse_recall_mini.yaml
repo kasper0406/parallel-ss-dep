@@ -1,0 +1,26 @@
+# Mini single-source config for validating experiments/gen_natural_reuse_recall.py
+# end-to-end through the REAL MixedSourceStream pipeline (data_mix.py). Not a
+# training mix — see configs/pretrain_mix_v18_arxiv.yaml for the production
+# recall-stream stanzas this should eventually be folded into (weight ~0.03-0.05,
+# alongside multibind_recall_pretrain / code_recall_train / agentic_recall_train).
+#
+# SCHEMA NOTE: text_field == answer_field == "text" (a single field, not the
+# [problem_prompt, qwen_completion] two-field join the synthetic recall
+# sources use) so that data_mix._build_read_mask's `base = len(text) -
+# len(ans_text)` is always 0 and `answer_char_span` is a plain absolute char
+# offset into the emitted chunk. See the generator's module docstring for the
+# full rationale. mask_first_occurrence is left at its default (False): the
+# annotated span already points at the far/hard occurrence, not a restated
+# answer, so no re-derivation is needed (see docstring for why this differs
+# from code_recall_train / agentic_recall_train).
+
+sources:
+  - name: natural_reuse_recall
+    jsonl_path: data/natural_reuse_recall.jsonl
+    text_field: text
+    answer_field: text
+    answer_span_field: answer_char_span
+    split: train
+    weight: 1.0
+    filter: always
+    emit_read_mask: true

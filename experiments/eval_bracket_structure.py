@@ -248,6 +248,12 @@ def build_model_from_ckpt(ckpt_path: str,
             mem_ctx_namekey_match_threshold=float(
                 mem_ctx_namekey_match_threshold),
             use_copy_head=bool(use_copy_head),
+            # 2026-07-02 design review FIX 3. No state-dict footprint (a pure
+            # forward-math change) → MUST come from cfg. Missing key (a ckpt
+            # saved before this fix existed) → "none", i.e. the ckpt
+            # re-evaluates with the LEGACY behaviour it was actually trained
+            # with — byte-identical old-ckpt eval is the whole point.
+            mem_inj_norm=str(cfg.get("mem_inj_norm", "none")),
         )
     pkm_kwargs = {}
     if has_pkm:
@@ -425,6 +431,9 @@ def build_model_from_ckpt(ckpt_path: str,
         feedback_distances=tuple(cfg.get("feedback_distances", (1,))),
         feedback_pairs=tuple(cfg.get("feedback_pairs", ()) or ()),
         feedback_self_k=int(cfg.get("feedback_self_k", 0)),
+        # 2026-07-02 design review FIX 2. Same legacy-default-on-missing-key
+        # rule as mem_inj_norm above — see that comment for the rationale.
+        feedback_src_norm=str(cfg.get("feedback_src_norm", "none")),
         output_gate=bool(has_gate),
         state_readonly_at_think=sr_at_think,
         think_index_emb_size=think_idx_emb,

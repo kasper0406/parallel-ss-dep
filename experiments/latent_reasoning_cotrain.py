@@ -23,12 +23,85 @@ import json
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from experiments.thinking import clean_latent_thread
 
 
+def _run_latent_forward(model, ids, embeds, return_hidden):
+    """Free function (not a closure) so torch.utils.checkpoint's
+    non-reentrant recompute can re-invoke it cleanly — mirrors
+    experiments/model.py::_run_block, which notes closures over `self`
+    cause occasional issues with the non-reentrant checkpoint path.
+
+    Re-asserts `clean_latent_thread` on EVERY invocation (not just once for
+    the whole `step()` call) — this is load-bearing, not cosmetic. Found
+    empirically (2026-07-02) verifying the checkpoint fix on the real 32L
+    config: `torch.utils.checkpoint`'s non-reentrant recompute can fire
+    later, from an UN-NESTED `.backward()` call the caller (train_lm.py)
+    issues after combining this loss with the rest of the step's loss terms
+    — by which time `LatentReasoningCotrain.step()`'s own
+    `with clean_latent_thread(...):` block (scoped only around the
+    FORWARD) has already exited, restoring `model.use_memory` /
+    `model._film_bypass` / `model.activation_checkpointing` to the real
+    pretrain-config values. Without re-asserting here, the recompute
+    silently runs a DIFFERENT graph than the original forward (WM
+    re-enabled, K=3 self-feed engaged, per-block checkpointing nested
+    inside this outer one) — caught as
+    `torch.utils.checkpoint.CheckpointError: a different number of tensors
+    was saved during the original forward and recomputation` (1600 vs 218)
+    on the first real-config verification run. Wrapping HERE makes both the
+    original call and any later recompute call see the identical toggled
+    state, independent of what the outer `with` block has since restored.
+    """
+    with clean_latent_thread(model, film_bypass=True, no_activation_ckpt=True):
+        return model(ids, inputs_embeds=embeds, return_hidden=return_hidden)
+
+
+def _latent_model_call(model, ids, embeds, return_hidden, use_checkpoint):
+    """One latent-thread forward, optionally activation-checkpointed.
+
+    ROOT CAUSE (2026-07-02 OOM postmortem): `clean_latent_thread(...,
+    no_activation_ckpt=True)` forces `model.activation_checkpointing =
+    False` for the whole latent thread — that flag guards the model's
+    PER-BLOCK checkpoint (`model.py::_ckpt_run_block`), which intermittently
+    hits a Blackwell "unspecified launch failure" when it recomputes FLA
+    kernels at the latent thread's short/odd sequence lengths (documented in
+    `thinking.clean_latent_thread`'s docstring — do NOT flip that flag back
+    on for this path). The consequence: every latent-thread forward keeps
+    its FULL ~32-layer activation trace alive until the caller's single
+    combined `(loss / n_micro).backward()`. With `--latent_reasoning_n 4`
+    and rungs up to 8, one `step()` call does up to (R+1)*n_examples = 36
+    such forwards, ALL summed into one graph before that one backward —
+    ~16 GB by itself on the 32L x 960d config (see the
+    project_phase1_ab_features_nettax memory note; this is what killed both
+    Arm-B attempts at step 620).
+
+    Fix: checkpoint EACH latent forward at the OUTER (whole-model) grain
+    instead — one `torch.utils.checkpoint.checkpoint(..., use_reentrant=
+    False)` boundary per `model(...)` call, not one per Block. This is a
+    coarser, DIFFERENT checkpoint boundary than the per-block one the
+    Blackwell bug was hit on (1 recompute per model call vs. 1 recompute per
+    block per model call — far fewer, less nested checkpoint/recompute
+    transitions), while still discarding the full internal activation trace
+    between calls, cutting retained memory per call from O(layers) to O(1)
+    boundary tensor. `model.activation_checkpointing` itself is left
+    strictly OFF throughout (untouched) — this is a second, independent
+    checkpoint layer wrapped from the outside, not a reversion of the
+    Blackwell workaround. `use_reentrant=False` composes safely with the
+    outer grad-accum microbatch loop (no reentrant-autograd nesting hazard,
+    and the documented DDP+latent incompatibility is a separate, orthogonal
+    static_graph issue — this path is single-GPU only regardless).
+    """
+    if use_checkpoint and torch.is_grad_enabled():
+        return _torch_checkpoint(_run_latent_forward, model, ids, embeds,
+                                 return_hidden, use_reentrant=False)
+    return _run_latent_forward(model, ids, embeds, return_hidden)
+
+
 def _answer_span_latent_loss(model, comment_ids, sol_ids, eos_id, R,
-                             thinking_id, device, gate_weight=0.0):
+                             thinking_id, device, gate_weight=0.0,
+                             checkpoint_latent=True):
     """Answer-span CE after an R-step latent ponder burst (one example).
 
     Self-contained twin of latent_sft.latent_sft_loss, but robust to the
@@ -42,6 +115,15 @@ def _answer_span_latent_loss(model, comment_ids, sol_ids, eos_id, R,
     supervised at the R+1 decision positions P-1..P+R-1 → THINK (0) for the
     first R, EMIT (1) at the last. Without this the bake installs the reasoning
     CAPABILITY but the gate never fires it (avg_steps≈0.77 vs target n).
+
+    ``checkpoint_latent`` (default True) wraps every latent-thread forward in
+    an outer activation checkpoint — see `_latent_model_call`'s docstring for
+    the OOM this fixes. Exact (not approximate): checkpointing recomputes the
+    identical forward during backward, so the loss VALUE and gradients are
+    unchanged from the unchecked path (bar bit-level nondeterminism from
+    re-running the same kernels twice, which `use_reentrant=False` handles
+    deterministically via RNG-state save/restore for anything stochastic,
+    e.g. PKM's epsilon-greedy slot replacement).
     """
     base_ids = torch.tensor([comment_ids], dtype=torch.long, device=device)
     cur_ids = base_ids
@@ -50,7 +132,8 @@ def _answer_span_latent_loss(model, comment_ids, sol_ids, eos_id, R,
                            device=device)
     P = len(comment_ids)
     for _ in range(int(R)):
-        out = model(cur_ids, inputs_embeds=cur_emb, return_hidden=True)
+        out = _latent_model_call(model, cur_ids, cur_emb, True,
+                                 checkpoint_latent)
         h = out[1]                                   # hidden = index 1 always
         z = h[:, -1:, :].to(cur_emb.dtype)
         z = model.apply_latent_feedback_adapter(z).to(cur_emb.dtype)
@@ -60,7 +143,8 @@ def _answer_span_latent_loss(model, comment_ids, sol_ids, eos_id, R,
                          device=device)
     full_ids = torch.cat([cur_ids, sol_t], dim=1)
     full_emb = torch.cat([cur_emb, model.embed(sol_t)], dim=1)
-    out = model(full_ids, inputs_embeds=full_emb)
+    out = _latent_model_call(model, full_ids, full_emb, False,
+                             checkpoint_latent)
     logits = out[0] if isinstance(out, tuple) else out
     shift_logits = logits[:, :-1, :]
     shift_labels = full_ids[:, 1:].clone()
@@ -105,12 +189,18 @@ class LatentReasoningCotrain:
 
     def __init__(self, train_prefix: str, rungs, tok, thinking_id: int,
                  eos_id: int, device, max_len: int = 256, no_ramp: bool = False,
-                 gate_weight: float = 0.0, seed: int = 0):
+                 gate_weight: float = 0.0, seed: int = 0,
+                 checkpoint_latent: bool = True):
         self.device = device
         self.thinking_id = int(thinking_id)
         self.eos_id = int(eos_id)
         self.no_ramp = bool(no_ramp)
         self.gate_weight = float(gate_weight)
+        # OOM fix (2026-07-02, default ON): activation-checkpoint every
+        # latent-thread forward — see _latent_model_call's docstring. Escape
+        # hatch for anyone who wants the old (unchecked, ~2x cheaper compute,
+        # ~16 GB heavier) behaviour back.
+        self.checkpoint_latent = bool(checkpoint_latent)
         self.data: dict[int, list[tuple]] = {}
         for n in rungs:
             recs = _load_rung(train_prefix, int(n), tok, max_len)
@@ -151,20 +241,30 @@ class LatentReasoningCotrain:
 
     def step(self, model, step: int, total_steps: int, n_examples: int):
         """Return (loss, rung): mean answer-span CE over n_examples at depth=rung
-        (R=rung latent steps). Toggles a clean latent thread for the duration."""
+        (R=rung latent steps).
+
+        The clean latent thread (WM off, FiLM bypass, per-block
+        activation-checkpointing off) is asserted PER model() CALL inside
+        `_run_latent_forward`, not once here for the whole step — required
+        for `checkpoint_latent=True` correctness (see that function's
+        docstring): an outer `with clean_latent_thread(...):` scoped to
+        just this method would have already exited (restoring the real
+        pretrain-config toggles) by the time the caller's combined
+        `.backward()` triggers checkpoint's recompute, making forward and
+        recompute silently diverge. Per-call re-assertion is exactly
+        equivalent when `checkpoint_latent=False` too (each of the (R+1)*
+        n_examples model() calls just re-applies/restores the same
+        no-op-when-already-clean toggles), so this is not a behaviour
+        change for the unchecked path.
+        """
         rung = self._pick_rung(step, total_steps)
-        # clean_latent_thread: WM off (no contamination), FiLM bypass (validated
-        # + faster at these tiny seqs), activation checkpointing off (the
-        # checkpoint backward RECOMPUTES the FLA kernel at the latent path's
-        # short/odd lengths → intermittent Blackwell "unspecified launch
-        # failure"; full rationale in the contextmanager's docstring).
-        with clean_latent_thread(model, film_bypass=True, no_activation_ckpt=True):
-            total = None
-            for _ in range(max(1, int(n_examples))):
-                c, s = self._next(rung)
-                l = _answer_span_latent_loss(model, c, s, self.eos_id, rung,
-                                             self.thinking_id, self.device,
-                                             gate_weight=self.gate_weight)
-                total = l if total is None else total + l
-            loss = total / max(1, int(n_examples))
+        total = None
+        for _ in range(max(1, int(n_examples))):
+            c, s = self._next(rung)
+            l = _answer_span_latent_loss(model, c, s, self.eos_id, rung,
+                                         self.thinking_id, self.device,
+                                         gate_weight=self.gate_weight,
+                                         checkpoint_latent=self.checkpoint_latent)
+            total = l if total is None else total + l
+        loss = total / max(1, int(n_examples))
         return loss, rung

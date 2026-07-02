@@ -33,6 +33,31 @@ class RMSNorm(nn.Module):
         return x * rms * self.weight
 
 
+def _plain_rms_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Non-learnable RMS normalization — same eps convention as
+    `RMSNorm.forward` (mean-square + eps, rsqrt) but with no learnable
+    weight. Used by `FeedbackProjection(src_norm="rms")` (2026-07-02 design
+    review FIX 2) to decouple FiLM's effective strength from the raw
+    magnitude drift of a deep-layer source state."""
+    rms = x.pow(2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
+    return x * rms
+
+
+def _rms_magnitude(x: torch.Tensor) -> torch.Tensor:
+    """Per-position RMS magnitude (not the reciprocal RMSNorm uses), computed
+    in fp32. Deliberately has NO internal eps: adding one inside the sqrt
+    breaks exact homogeneity (rms(c·x) == |c|·rms(x)) whenever eps isn't
+    negligible relative to x's squared magnitude — which it isn't for the
+    WM injection specifically, since W_proj/W_v's std=0.02 init gives
+    injections a much smaller natural scale than a typical residual stream.
+    Callers that divide by this must clamp the result themselves for
+    zero-protection (see `WorkingMemory(inj_norm="match_rms")`, 2026-07-02
+    design review FIX 3) — masked/no-match positions have `injection == 0`
+    exactly, so `_rms_magnitude` returns exactly 0 there and the caller's
+    clamp is what keeps the division finite."""
+    return x.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
+
+
 class GLU(nn.Module):
     """SwiGLU MLP — d_model -> d_ff -> d_model."""
 
@@ -306,12 +331,25 @@ class FeedbackProjection(nn.Module):
         normalization: per-batch z-score over (B, T) before the sigmoid,
         so the inputs to σ are roughly unit-variance regardless of the
         absolute scale of the surprise signal.
+
+    `src_norm` (2026-07-02 design review FIX 2, default "none" = the prior
+    behaviour, byte-identical): `state_above_lagged` is a raw deep-layer
+    residual state whose norm grows with depth and drifts over training —
+    coupling FiLM's effective strength to that norm drift and making
+    α·‖W‖ non-identifiable (is the modulation strong because α is large or
+    because the source norm happened to be large?). `src_norm="rms"`
+    applies a plain (non-learnable) RMS normalization to
+    `state_above_lagged` before it feeds W_scale/W_shift/W_fb, so α·‖W‖
+    alone determines the modulation strength. Applies to the SOURCE state
+    only (including the K-self-feed lagged source) — never to `x`, the
+    target this module modulates.
     """
 
     def __init__(self, d_model: int, mode: str,
                  per_channel_alpha: bool = False,
                  alpha_mode: str = "scalar",
-                 alpha_init: float = 0.0):
+                 alpha_init: float = 0.0,
+                 src_norm: str = "none"):
         super().__init__()
         self.mode = mode
         self.per_channel_alpha = per_channel_alpha
@@ -321,6 +359,9 @@ class FeedbackProjection(nn.Module):
                 f"(got {alpha_mode!r})"
             )
         self.alpha_mode = alpha_mode
+        if src_norm not in ("none", "rms"):
+            raise ValueError(f"src_norm must be 'none' or 'rms' (got {src_norm!r})")
+        self.src_norm = src_norm
         # IMPORTANT: keep W_fb / W_scale / W_shift at *normal* init so the
         # gradient on α is non-zero from the first step. Earlier bug: with
         # both α=0 AND W_*=0, gradient on α is zero and α never moves.
@@ -408,6 +449,14 @@ class FeedbackProjection(nn.Module):
                 surprise: torch.Tensor | None = None) -> torch.Tensor:
         if self.mode == "none" or state_above_lagged is None:
             return x
+        if self.src_norm == "rms":
+            # FIX 2: normalize the SOURCE only (never `x`) so the modulation
+            # strength is governed by α·‖W‖ alone, not by drift in the raw
+            # source-state norm. Local reassignment — does not mutate the
+            # caller's tensor, so e.g. the K-self-feed surprise signal
+            # (computed by the caller from the raw lagged states) is
+            # unaffected.
+            state_above_lagged = _plain_rms_normalize(state_above_lagged)
         if self.alpha_mode == "scalar":
             a = self.get_alpha()
         else:
@@ -425,12 +474,32 @@ class FeedbackProjection(nn.Module):
                 a = self.get_per_token_alpha(surprise)   # (B, T, 1)
         if self.mode == "additive":
             fb = self.W_fb(state_above_lagged)
-            return x + a * fb
+            out = x + a * fb
+            self._stash_mod_rms(x, out)
+            return out
         if self.mode == "film":
             scale = self.W_scale(state_above_lagged)
             shift = self.W_shift(state_above_lagged)
-            return x * (1.0 + a * scale) + a * shift
+            out = x * (1.0 + a * scale) + a * shift
+            self._stash_mod_rms(x, out)
+            return out
         return x
+
+    def _stash_mod_rms(self, x: torch.Tensor, out: torch.Tensor) -> None:
+        """Diagnostic (2026-07-02): effective modulation magnitude relative to
+        the residual stream — RMS(out − x) / RMS(x), stashed detached as a
+        0-dim GPU tensor (NO .item()/float() here: that would force a device
+        sync every forward; the log site converts at --log_every cadence).
+        The scalar α alone is NOT a utilization measure — the contribution is
+        α·‖W·h_src‖ and committed runs sit at α≈0.01–0.03 with large W (the
+        2026-07-02 forensics flagged exactly this confound) — this ratio is
+        the number that tracks FiLM's live effect. Under K-self-feed the last
+        pass's value wins, which is the loss-bearing pass.
+        """
+        with torch.no_grad():
+            num = (out - x).float().pow(2).mean().sqrt()
+            den = x.float().pow(2).mean().sqrt().clamp(min=1e-8)
+            self._last_mod_rms = (num / den).detach()
 
 
 class MultiSourceFiLMFeedbackMLP(nn.Module):
@@ -961,11 +1030,13 @@ class MultiScaleFeedbackProjection(nn.Module):
     """
 
     def __init__(self, d_model: int, mode: str,
-                 distances: tuple[int, ...] = (1,)):
+                 distances: tuple[int, ...] = (1,),
+                 src_norm: str = "none"):
         super().__init__()
         self.distances = distances
         self.projs = nn.ModuleList([
-            FeedbackProjection(d_model, mode) for _ in distances
+            FeedbackProjection(d_model, mode, src_norm=src_norm)
+            for _ in distances
         ])
 
     def forward(self, x: torch.Tensor,
@@ -1000,6 +1071,18 @@ class WorkingMemory(nn.Module):
     Gradient flows through values, queries, gate (via log-bias and value
     scaling), and W_proj — none of which start at zero, so the path can
     bootstrap.
+
+    `inj_norm` (2026-07-02 design review FIX 3, default "none" = the prior
+    behaviour, byte-identical): the read injection `W_proj(read)` has no
+    inherent relationship to the residual stream's magnitude, so
+    `read_alpha` has to simultaneously express "how much to mix" AND
+    "correct for whatever scale W_proj happens to produce" — two jobs
+    conflated in one scalar. `inj_norm="match_rms"` rescales the injection
+    per-position to match the LOCAL stream's RMS magnitude before it's
+    combined, so `read_alpha` becomes a pure mixing fraction. Applies to
+    the injection vector ONLY — never to the addressing keys/scores
+    (discrete-hash / soft-namekey / ctx-namekey all compute their match
+    upstream of this).
     """
 
     def __init__(
@@ -1012,6 +1095,7 @@ class WorkingMemory(nn.Module):
         read_alpha_init: float = 1.0,
         read_alpha_floor_start: float = 0.0,
         read_alpha_floor_warmup_steps: int = 0,
+        inj_norm: str = "none",
         decoupled_kv: bool = False,
         key_from_embedding: bool = False,
         key_window: int = 4,
@@ -1283,6 +1367,11 @@ class WorkingMemory(nn.Module):
         self.read_alpha_floor_warmup_steps = int(read_alpha_floor_warmup_steps)
         self.register_buffer("_fwd_count", torch.zeros((), dtype=torch.long),
                              persistent=False)
+        if inj_norm not in ("none", "match_rms"):
+            raise ValueError(
+                f"inj_norm must be 'none' or 'match_rms' (got {inj_norm!r})"
+            )
+        self.inj_norm = str(inj_norm)
 
         # Diagnostics: when _capture_read is set True (probe-only, default off
         # to avoid the B·T·K activation cost during training), forward stashes
@@ -2046,6 +2135,38 @@ class WorkingMemory(nn.Module):
 
         read = torch.einsum("btk,bkd->btd", attn, buf_v)          # (B, T, d_mem)
         injection = self.W_proj(read)                             # (B, T, d_model)
+        # FIX 3 (2026-07-02 design review): rescale the injection to match the
+        # LOCAL residual stream's RMS, so `read_alpha` below is a pure mixing
+        # fraction rather than also having to absorb whatever raw magnitude
+        # W_proj happens to produce. Applied here (before the stashes below)
+        # so `_last_injection`/`_last_injection_grad` — and the `wm(inj=...)`
+        # training diagnostic that reads `_last_injection` — report the
+        # POST-scaling magnitude when active. Clamp-safe: masked/no-match
+        # positions have `injection == 0` exactly (W_proj has no bias), so
+        # `_rms_magnitude(injection)` is exactly 0 there; the explicit
+        # `.clamp(min=1e-6)` on the denominator keeps the division finite
+        # and `0 * finite_scale == 0` (no NaN/Inf). `_rms_magnitude` itself
+        # has NO internal eps (see its docstring) so the scaling is exactly
+        # homogeneous — i.e. truly invariant to rescaling the WM buffer —
+        # for every position where the clamp doesn't engage.
+        if self.inj_norm == "match_rms":
+            # NaN fix (2026-07-02, bisected on the real 32L config): the scale
+            # must be (a) DETACHED — it is a magnitude measurement, not a
+            # gradient path; without the detach, autograd's sqrt-backward at
+            # exactly-zero injections (masked / no-match positions, which
+            # exist by construction) evaluates 0·inf = NaN and poisons the
+            # whole graph on the FIRST backward (pilot-B run 2: gnorm=nan at
+            # step 1 while the forward CE was finite) — and (b) RELATIVELY
+            # clamped: an absolute 1e-6 floor lets the scale reach ~1e7 at
+            # near-zero injections, amplifying their gradient by that factor
+            # (d out/d inj = scale even when scale is detached). Clamping the
+            # denominator at 0.1·h_rms bounds the amplification at 10×.
+            with torch.no_grad():
+                h_rms = _rms_magnitude(h)
+                inj_rms = _rms_magnitude(injection)
+                scale = (h_rms / inj_rms.clamp(min=0.1 * h_rms)
+                         ).to(injection.dtype)
+            injection = injection * scale
         # Stash per-position pre-mask injection. Two versions:
         #   `_last_injection_grad` — keeps the autograd graph, used by
         #     auxiliary training losses (e.g. Option-A future-emb-pred
@@ -2388,6 +2509,17 @@ class TinyLM(nn.Module):
                                               # step 0 (alpha_mode='scalar'
                                               # only; surprise_modulated path
                                               # is unaffected).
+        feedback_src_norm: str = "none",      # 2026-07-02 design review FIX 2:
+                                              # "none" (default, byte-identical
+                                              # to the prior behaviour) or "rms"
+                                              # — plain non-learnable RMS-norm
+                                              # applied to the FeedbackProjection
+                                              # SOURCE state (state_above_lagged,
+                                              # incl. the K-self-feed lagged
+                                              # source) before W_scale/W_shift/
+                                              # W_fb, decoupling FiLM strength
+                                              # from source-norm drift. See
+                                              # FeedbackProjection docstring.
         output_gate: bool = False,            # Learned per-position output gate.
                                               # When True, adds a gate_head
                                               # (d_model → 1) whose sigmoid
@@ -2409,6 +2541,20 @@ class TinyLM(nn.Module):
                                               # 0.0 = zero-init-residual boot.
         mem_read_alpha_floor_start: float = 0.0,   # PKM-style α-floor for WM
         mem_read_alpha_floor_warmup_steps: int = 0,  # addressing bootstrap.
+        mem_inj_norm: str = "none",           # 2026-07-02 design review FIX 3:
+                                              # "none" (default, byte-identical
+                                              # to the prior behaviour) or
+                                              # "match_rms" — rescale the WM
+                                              # read injection per-position to
+                                              # match the LOCAL residual
+                                              # stream's RMS magnitude, so
+                                              # read_alpha expresses a pure
+                                              # mixing fraction instead of an
+                                              # uncontrolled magnitude. Applies
+                                              # to the injection ONLY — never
+                                              # the addressing keys/scores
+                                              # (discrete/soft/ctx namekey).
+                                              # See WorkingMemory docstring.
         mem_decoupled_kv: bool = False,       # DKV-WM: decoupled key/value +
                                               # cosine addressing (reliable
                                               # semantic addressing).
@@ -2522,6 +2668,7 @@ class TinyLM(nn.Module):
         pkm_score_norm: str = "layer",
         pkm_value_init_std: float = 1.0,
         pkm_use_output_gate: bool = True,
+        pkm_out_alpha_init: float = 0.0,      # warm-start α (0.0 = legacy)
         # Phase 2 thinking fix (2026-05-26): force DeltaNet β=0 at think
         # positions so think tokens can read the recurrent state but never
         # write to it. Preserves long-range bindings across multi-think
@@ -2717,6 +2864,12 @@ class TinyLM(nn.Module):
             )
         self.feedback_alpha_mode = feedback_alpha_mode
         self.feedback_alpha_init = float(feedback_alpha_init)
+        if feedback_src_norm not in ("none", "rms"):
+            raise ValueError(
+                f"feedback_src_norm must be 'none' or 'rms' "
+                f"(got {feedback_src_norm!r})"
+            )
+        self.feedback_src_norm = str(feedback_src_norm)
         if (feedback_alpha_mode == "surprise_modulated"
                 and self.feedback_self_k < 2):
             raise ValueError(
@@ -2793,6 +2946,7 @@ class TinyLM(nn.Module):
                     per_channel_alpha=feedback_per_channel_alpha,
                     alpha_mode=feedback_alpha_mode,
                     alpha_init=self.feedback_alpha_init,
+                    src_norm=self.feedback_src_norm,
                 )
                 for t, _ in self.feedback_pairs
             })
@@ -2803,6 +2957,7 @@ class TinyLM(nn.Module):
                 MultiScaleFeedbackProjection(
                     d_model, mode=feedback_mode,
                     distances=self.feedback_distances,
+                    src_norm=self.feedback_src_norm,
                 )
                 for _ in range(n_layers)
             ])
@@ -2849,6 +3004,7 @@ class TinyLM(nn.Module):
                 read_alpha_init=float(mem_read_alpha_init),
                 read_alpha_floor_start=float(mem_read_alpha_floor_start),
                 read_alpha_floor_warmup_steps=int(mem_read_alpha_floor_warmup_steps),
+                inj_norm=str(mem_inj_norm),
                 decoupled_kv=bool(mem_decoupled_kv),
                 key_from_embedding=bool(mem_key_from_embedding),
                 key_window=int(mem_key_window),
@@ -2943,6 +3099,7 @@ class TinyLM(nn.Module):
                 score_norm=str(pkm_score_norm),
                 value_init_std=float(pkm_value_init_std),
                 use_output_gate=bool(pkm_use_output_gate),
+                out_alpha_init=float(pkm_out_alpha_init),
             )
 
     def _compute_think_index_emb(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -4148,6 +4305,21 @@ class TinyLM(nn.Module):
         attn = torch.where(all_masked, torch.zeros_like(attn), attn)
         read = torch.einsum("btk,bkd->btd", attn, buf_v)              # (B, 1, d_mem)
         injection = mem.W_proj(read)                                   # (B, 1, d_model)
+        # FIX 3 (2026-07-02 design review) — mirror WorkingMemory.forward's
+        # match_rms scaling here too, else this incremental-decode path would
+        # silently diverge from the training-time (and full-forward eval)
+        # injection magnitude whenever mem_inj_norm="match_rms" is active.
+        if mem.inj_norm == "match_rms":
+            # Same detached + relatively-clamped scale as WorkingMemory.forward
+            # (see the NaN-fix comment there); decode is no-grad anyway but the
+            # 10×-bounded relative clamp keeps the MAGNITUDE semantics
+            # identical between train and decode.
+            with torch.no_grad():
+                h_rms = _rms_magnitude(h_normed_new)
+                inj_rms = _rms_magnitude(injection)
+                scale = (h_rms / inj_rms.clamp(min=0.1 * h_rms)
+                         ).to(injection.dtype)
+            injection = injection * scale
         mem._last_injection = injection.detach()
 
         # Apply the read-injection α gate (matches WorkingMemory.forward) so

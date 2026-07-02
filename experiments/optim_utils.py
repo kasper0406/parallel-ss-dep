@@ -74,6 +74,32 @@ def _is_refinement_head(name: str) -> bool:
     return name.startswith("refinement_head.") or name == "refinement_head.alpha"
 
 
+_FEATURE_LR_PREFIXES = (
+    "sparse_feedback.", "xattn_feedback.", "xattn_all_module.",
+    "memory.", "latent_feedback_adapter.", "gate_head.",
+)
+
+
+def _is_feature_lr_param(name: str) -> bool:
+    """Feature-module params eligible for `--feature_lr_mult` (2026-07-02
+    recipe rule #3: "converged-base attach needs toll-payers per feature" —
+    a feature bolted onto a base trained at conservative LR needs its OWN
+    higher LR to escape cold-start, same motivation as `--pkm_value_lr_mult`
+    / `--embed_lr_mult`). Matches the sparse/cross-attn FiLM feedback,
+    WorkingMemory, the latent co-train adapter, and the thinking gate head.
+    PKM is matched too, EXCEPT the value tables (`pkm_layer.values.*`),
+    which already have their own dedicated `--pkm_value_lr_mult` path — the
+    two multipliers are mutually exclusive per-param so they never compound.
+    Deliberately narrower than `train_lm.py`'s `_FEATURE_PARAM_SUBSTRINGS`
+    freeze-trunk set (which also covers copy_head/gist/ctx_/future_gist/
+    think_adapter/refinement_head) — this only routes the modules named in
+    the recipe.
+    """
+    if name.startswith("pkm_layer.") and not _is_pkm_value(name):
+        return True
+    return any(name.startswith(prefix) for prefix in _FEATURE_LR_PREFIXES)
+
+
 def _wsd_lambda(total_steps: int, warmup_steps: int, decay_frac: float):
     """Warmup-Stable-Decay LR multiplier in [0, 1].
 
@@ -138,6 +164,7 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                     matrix_optimizer: str = "muon",
                     embed_lr_mult: float = 1.0,
                     embed_optimizer: str = "adam",
+                    feature_lr_mult: float = 1.0,
                     verbose: bool = True
                     ) -> tuple[list[torch.optim.Optimizer], list]:
     """Build optimizer(s) + LR schedulers. See module docstring.
@@ -190,6 +217,22 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
         Non-default embed treatment requires `--optimizer muon` (it splits the
         Muon-mode AdamW group); it is rejected otherwise rather than silently
         ignored, mirroring the matrix_optimizer guard.
+
+    `feature_lr_mult` (2026-07-02 recipe rule #3, "converged-base attach
+        needs toll-payers per feature"): LR multiplier applied to
+        FEATURE-module params (`_is_feature_lr_param`: sparse/xattn FiLM
+        feedback, WorkingMemory, PKM except its value tables, the latent
+        co-train adapter, the thinking gate head). Default 1.0 is
+        BYTE-IDENTICAL to the legacy shared-LR path (no extra groups
+        created; every param -> effective lr is unchanged). != 1.0 carves
+        those params into their own sub-group(s) at `lr * feature_lr_mult`
+        (AdamW side: alphas/biases/1D/embedding-like feature params) and, in
+        `--optimizer muon` mode, `lr_muon * feature_lr_mult` (Muon side: the
+        feature params that are plain 2D hidden matrices) — every non-feature
+        param is untouched. Requires `--optimizer muon` when
+        `matrix_optimizer == "fused_deltanet_ns"` is ALSO requested (the
+        per-head unit construction there does not thread a feature split;
+        use plain `matrix_optimizer="muon"` for a feature_lr_mult run).
     """
     if bf16_optim_state:
         from experiments.bf16_optim import BF16StateAdamW, BF16StateMuon
@@ -220,18 +263,29 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
             f"non-default embedding treatment (embed_lr_mult={embed_lr_mult}, "
             f"embed_optimizer={embed_optimizer!r}) requires --optimizer muon "
             f"(got {optimizer!r}).")
+    if (feature_lr_mult != 1.0 and optimizer == "muon"
+            and matrix_optimizer == "fused_deltanet_ns"):
+        raise ValueError(
+            "feature_lr_mult != 1.0 is not supported with "
+            "matrix_optimizer='fused_deltanet_ns' (its per-head unit "
+            "construction does not thread a feature split); use plain "
+            "matrix_optimizer='muon' for a feature_lr_mult run.")
+
+    _feature_lr_active = feature_lr_mult != 1.0
 
     if optimizer == "adamw":
         regular, alphas, pkm_values = [], [], []
+        feature_regular, feature_alphas = [], []
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
+            is_feat = _feature_lr_active and _is_feature_lr_param(name)
             if _is_pkm_value(name) and pkm_value_lr_mult != 1.0:
                 pkm_values.append(p)
             elif is_film_alpha(name):
-                alphas.append(p)
+                (feature_alphas if is_feat else alphas).append(p)
             else:
-                regular.append(p)
+                (feature_regular if is_feat else regular).append(p)
         groups = [{"params": regular, "weight_decay": wd}]
         if alphas:
             groups.append({"params": alphas, "weight_decay": alpha_wd})
@@ -245,6 +299,17 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                 print(f"  PKM-value LR boost: {len(pkm_values)} value tables "
                       f"get lr={lr * pkm_value_lr_mult:.2e} "
                       f"({pkm_value_lr_mult}× base lr={lr:.2e})")
+        if feature_regular:
+            groups.append({"params": feature_regular, "weight_decay": wd,
+                           "lr": lr * feature_lr_mult})
+        if feature_alphas:
+            groups.append({"params": feature_alphas, "weight_decay": alpha_wd,
+                           "lr": lr * feature_lr_mult})
+        if (feature_regular or feature_alphas) and verbose:
+            print(f"  feature LR mult: {len(feature_regular) + len(feature_alphas)} "
+                  f"feature-module params ({len(feature_regular)} regular + "
+                  f"{len(feature_alphas)} α) get lr={lr * feature_lr_mult:.2e} "
+                  f"({feature_lr_mult}× base lr={lr:.2e})")
         opts = [AdamWCls(groups, lr=lr, betas=(0.9, 0.95))]
         scheds = [_make_scheduler(opts[0], base_lr=lr, schedule=lr_schedule,
                                   steps=steps, warmup_steps=warmup_steps,
@@ -262,13 +327,22 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
     # ThinkAdapter (Phase B, 2026-05-26): both the 2D fc weights AND the
     # 1D α scalar route to AdamW — the adapter is a small specialized
     # head, not a general d×d hidden matrix Newton-Schulz should normalize.
+    # (think_adapter / refinement_head are NOT in the --feature_lr_mult set —
+    # only the modules named in `_is_feature_lr_param` are — so those two
+    # branches below stay unconditional adamw_regular, same as before.)
     muon_params, adamw_regular, adamw_alpha, adamw_pkm_values = [], [], [], []
     adamw_embed = []  # embed/lm_head split out only when embed_special
+    # --feature_lr_mult (2026-07-02 recipe rule #3) sub-groups: same routing
+    # as the corresponding non-feature bucket, just carved out to get their
+    # own (Muon or AdamW) lr = base_lr * feature_lr_mult. Empty when
+    # feature_lr_mult == 1.0 (default) → no extra groups, byte-identical.
+    muon_feature_params, adamw_feature_regular, adamw_feature_alpha = [], [], []
     seen = set()
     for name, p in model.named_parameters():
         if not p.requires_grad or id(p) in seen:
             continue
         seen.add(id(p))
+        is_feat = _feature_lr_active and _is_feature_lr_param(name)
         if _is_think_adapter(name):
             adamw_regular.append(p)
             continue
@@ -276,23 +350,25 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
             adamw_regular.append(p)
             continue
         if _is_latent_feedback_adapter(name):
-            adamw_regular.append(p)
+            (adamw_feature_regular if is_feat else adamw_regular).append(p)
             continue
         if _is_embedding_like(name) or p.ndim != 2:
             if _is_pkm_value(name) and pkm_value_lr_mult != 1.0:
                 adamw_pkm_values.append(p)
             elif is_film_alpha(name):
-                adamw_alpha.append(p)
+                (adamw_feature_alpha if is_feat else adamw_alpha).append(p)
             elif embed_special and _is_embedding_like(name) and not _is_pkm_value(name):
                 adamw_embed.append(p)
             else:
-                adamw_regular.append(p)
+                (adamw_feature_regular if is_feat else adamw_regular).append(p)
         else:
-            muon_params.append(p)
+            (muon_feature_params if is_feat else muon_params).append(p)
     if verbose:
-        _all_adamw = adamw_regular + adamw_alpha + adamw_pkm_values + adamw_embed
-        print(f"  optimizer split: {len(muon_params)} Muon params "
-              f"({sum(p.numel() for p in muon_params)/1e6:.1f}M), "
+        _all_adamw = (adamw_regular + adamw_alpha + adamw_pkm_values
+                      + adamw_embed + adamw_feature_regular + adamw_feature_alpha)
+        _all_muon = muon_params + muon_feature_params
+        print(f"  optimizer split: {len(_all_muon)} Muon params "
+              f"({sum(p.numel() for p in _all_muon)/1e6:.1f}M), "
               f"{len(_all_adamw)} AdamW params "
               f"({sum(p.numel() for p in _all_adamw)/1e6:.1f}M)")
     adamw_groups = [{"params": adamw_regular, "weight_decay": wd}]
@@ -318,6 +394,35 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
             print(f"  embed LR mult: {len(adamw_embed)} embed/lm_head params "
                   f"get AdamW lr={lr * embed_lr_mult:.2e} "
                   f"({embed_lr_mult}× base lr={lr:.2e})")
+    if adamw_feature_regular:
+        adamw_groups.append({"params": adamw_feature_regular,
+                             "weight_decay": wd, "lr": lr * feature_lr_mult})
+    if adamw_feature_alpha:
+        adamw_groups.append({"params": adamw_feature_alpha,
+                             "weight_decay": alpha_wd, "lr": lr * feature_lr_mult})
+    if (adamw_feature_regular or adamw_feature_alpha) and verbose:
+        print(f"  feature LR mult (AdamW side): "
+              f"{len(adamw_feature_regular) + len(adamw_feature_alpha)} "
+              f"feature-module params ({len(adamw_feature_regular)} regular + "
+              f"{len(adamw_feature_alpha)} α) get lr={lr * feature_lr_mult:.2e} "
+              f"({feature_lr_mult}× base lr={lr:.2e})")
+    # Muon-side feature group: same params matrix_opt would already handle
+    # (2D hidden matrices), just carved into their own group at
+    # lr_muon*feature_lr_mult. Empty muon_feature_params (default, or
+    # non-Muon-shaped feature params) -> plain flat `muon_params` list,
+    # byte-identical to the legacy construction.
+    if muon_feature_params:
+        _muon_param_groups = [
+            {"params": muon_params},
+            {"params": muon_feature_params, "lr": lr_muon * feature_lr_mult},
+        ]
+        if verbose:
+            print(f"  feature LR mult (Muon side): "
+                  f"{len(muon_feature_params)} feature-module 2D params get "
+                  f"lr={lr_muon * feature_lr_mult:.2e} "
+                  f"({feature_lr_mult}× base lr_muon={lr_muon:.2e})")
+    else:
+        _muon_param_groups = muon_params
     if optimizer == "muon":
         if matrix_optimizer == "fused_deltanet_ns":
             # Per-head Newton-Schulz on DeltaNet q/k/v/b + whole-matrix Muon
@@ -357,7 +462,7 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                       f"weight_decay={wd}"
                       + ("  [bf16 optimizer state]" if bf16_optim_state else ""))
         else:
-            matrix_opt = MuonCls(muon_params, lr=lr_muon, momentum=0.95,
+            matrix_opt = MuonCls(_muon_param_groups, lr=lr_muon, momentum=0.95,
                                  weight_decay=wd)
             if verbose:
                 print(f"  Muon weight_decay={wd}; AdamW(regular) "
@@ -365,7 +470,7 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                       + ("  [bf16 optimizer state]" if bf16_optim_state else ""))
     else:  # soap — Shampoo-in-Adam-eigenbasis on the same 2D matrix params.
         from experiments.soap import SOAP
-        matrix_opt = SOAP(muon_params, lr=lr_muon, betas=(0.95, 0.95),
+        matrix_opt = SOAP(_muon_param_groups, lr=lr_muon, betas=(0.95, 0.95),
                           weight_decay=wd, precondition_frequency=soap_precond_freq,
                           # vocab-sized dims excluded by max_precond_dim; our 2D
                           # hidden matrices are all <= max_precond_dim so both

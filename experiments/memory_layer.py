@@ -76,6 +76,13 @@ class PKMLayer(nn.Module):
                                             # multiplies PKM output. Lets
                                             # the model gradually trust
                                             # the table — mirrors FiLM α.
+        out_alpha_init: float = 0.0,         # Warm-start for α (2026-07-02,
+                                            # converged-base pre-warm probe):
+                                            # a POSITIVE init keeps the
+                                            # sign-preserving floor from
+                                            # flipping sign while αL noisy
+                                            # around 0 (the pilot-B pattern).
+                                            # 0.0 = legacy byte-identical.
     ):
         super().__init__()
         if v_dim_per_head is None:
@@ -157,7 +164,7 @@ class PKMLayer(nn.Module):
         # When False, PKM output is added unscaled (the v5-pkm behaviour).
         self.use_output_gate = bool(use_output_gate)
         if self.use_output_gate:
-            self.out_alpha = nn.Parameter(torch.zeros(1))
+            self.out_alpha = nn.Parameter(torch.full((1,), float(out_alpha_init)))
         # FIX 1B (added 2026-05-17 after v7 step-440 α-decay observation):
         # `alpha_floor` is a sign-preserving additive minimum magnitude that
         # the trainer sets per-step (annealed from `pkm_alpha_floor_start`
@@ -303,8 +310,24 @@ class PKMLayer(nn.Module):
         # contribution magnitude ≥ floor, ensuring value rows get
         # meaningful gradient even before α has grown. Sign defaults to +1
         # when α is essentially zero (the cold-start convention).
+        # `self.training` gate (2026-07-02 design review FIX 1, real bug):
+        # the floor is a TRAINING-ONLY bootstrap crutch — it must never fire
+        # during eval/VAL, else VAL includes a floor-forced random-value
+        # contribution that doesn't reflect the learned model (train/eval
+        # mismatch; this polluted Phase-1 arm B's VAL, SESSION_FINDINGS.md
+        # 2026-07-02). `alpha_floor` itself is set externally per-STEP by the
+        # trainer curriculum (not per-forward-call), so gating its
+        # application here doesn't disturb the warmup bookkeeping — eval
+        # forwards interleaved mid-training (e.g. the VAL-loss `model.eval()`
+        # window in train_lm.py) simply skip the floor for that forward and
+        # resume floor-application on the very next training-mode forward,
+        # with the curriculum's step-driven value unchanged. The `αeff`
+        # console/TB diagnostics in train_lm.py recompute αeff independently
+        # from `pkm.out_alpha` / `pkm.alpha_floor` (not from a value stashed
+        # by this forward), so they continue to report the training-time
+        # value regardless of the model's current train/eval mode.
         if self.use_output_gate:
-            if self.alpha_floor > 0.0:
+            if self.training and self.alpha_floor > 0.0:
                 α = self.out_alpha
                 sign = torch.where(
                     α.detach().abs() > 1e-3,

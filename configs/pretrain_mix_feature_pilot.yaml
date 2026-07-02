@@ -1,0 +1,171 @@
+# Feature-pilot mix (2026-07-02) — the ENGAGED-features iso-data A/B the repo
+# never had (SESSION_FINDINGS.md 2026-07-02 forensics: every prior negative
+# tested inert/absent mechanisms or used evals blind to the feature strata).
+#
+# Design: code-dominant core (v19_codeup proportions, anti-dilution lesson) +
+# ~25% recall-bearing streams that give WM/state the gradient it never had in
+# the negatives:
+#   - recall_diverse_train: scoreboard-format leak-free needle recall (the
+#     validated 0->100% recipe, RECALL_COTRAIN_PROBE.md), trimmed 0.50 -> 0.10.
+#   - natural_reuse_recall: NEW — WM copy/addressing supervision at NATURAL
+#     code identifier reuses >=256 tokens back (the 2-3.4-nat headroom stratum
+#     the depdist probe exposed; supervise recall where recurrence FAILS).
+#   - multibind / code_recall / agentic: the existing first-occurrence-masked
+#     recall streams (small weights).
+# BOTH pilot arms train on THIS SAME mix (iso-data); the lean arm simply
+# ignores the read masks.
+
+sources:
+
+  # ==== RECALL-BEARING (~25%) ====
+
+  - name: recall_diverse_train
+    jsonl_path: data/recall_diverse_train.jsonl
+    text_field: text
+    split: train
+    weight: 0.10
+    filter: always
+
+  # Single-field schema: text_field == answer_field == "text" so
+  # data_mix._build_read_mask's base offset is 0 and answer_char_span is an
+  # absolute offset (see configs/natural_reuse_recall_mini.yaml). NO
+  # mask_first_occurrence: the annotated span IS the far/hard occurrence.
+  - name: natural_reuse_recall
+    jsonl_path: data/natural_reuse_recall.jsonl
+    text_field: text
+    answer_field: text
+    answer_span_field: answer_char_span
+    split: train
+    weight: 0.08
+    filter: always
+    emit_read_mask: true
+
+  - name: multibind_recall_pretrain
+    jsonl_path: data/multibind_recall_pretrain.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.03
+    filter: always
+    emit_read_mask: true
+
+  - name: code_recall_train
+    jsonl_path: data/code_recall_train.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.02
+    filter: always
+    emit_read_mask: true
+    mask_first_occurrence: true
+
+  - name: agentic_recall_train
+    jsonl_path: data/agentic_recall_train.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.02
+    filter: always
+    emit_read_mask: true
+    mask_first_occurrence: true
+
+  # ==== Raw code (dominant core; v19 anti-dilution proportions) ====
+
+  - name: codeparrot
+    dataset_id: codeparrot/codeparrot-clean
+    text_field: content
+    split: train
+    weight: 0.28
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 200 }
+
+  - name: python_codes_25k
+    dataset_id: flytech/python-codes-25k
+    text_field: text
+    split: train
+    weight: 0.07
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  # ==== Problem-solving instruction code ====
+
+  - name: magicoder_oss
+    dataset_id: ise-uiuc/Magicoder-OSS-Instruct-75K
+    text_field: [problem, solution]
+    split: train
+    weight: 0.09
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  - name: code_exercises_jinaai
+    dataset_id: jinaai/code_exercises
+    text_field: [problem, solution]
+    split: train
+    weight: 0.02
+    fim_rate: 0.5
+    filter: always
+
+  - name: python_instr_18k_alpaca
+    dataset_id: iamtarun/python_code_instructions_18k_alpaca
+    text_field: [prompt, output]
+    split: train
+    weight: 0.05
+    filter: always
+
+  - name: codealpaca_20k
+    dataset_id: HuggingFaceH4/CodeAlpaca_20K
+    text_field: [prompt, completion]
+    split: train
+    weight: 0.04
+    filter: always
+
+  # ==== CVE / vulnerability + fix ====
+
+  - name: bigvul
+    dataset_id: bstee615/bigvul
+    text_builder: bigvul
+    split: train
+    weight: 0.06
+    filter: bigvul_vulnerable
+
+  - name: cybernative_vuln_dpo
+    dataset_id: CyberNative/Code_Vulnerability_Security_DPO
+    text_builder: cybernative_dpo
+    split: train
+    weight: 0.03
+    filter: always
+
+  # ==== Synthetic CS textbooks ====
+
+  - name: textbooks_lite_sciphi
+    dataset_id: SciPhi/textbooks-are-all-you-need-lite
+    text_field: completion
+    split: train
+    weight: 0.03
+    filter:
+      name: min_content_len
+      args: { min_chars: 400 }
+
+  - name: textbook_quality_programming
+    dataset_id: vikp/textbook_quality_programming
+    text_field: markdown
+    split: train
+    weight: 0.03
+    filter:
+      name: min_content_len
+      args: { min_chars: 400 }
+
+  # ==== Wikipedia (prose grounding) ====
+
+  - name: wikipedia_en
+    dataset_id: wikimedia/wikipedia
+    hf_extra: { name: "20231101.en" }
+    text_field: text
+    split: train
+    weight: 0.05
+    filter:
+      name: min_content_len
+      args: { min_chars: 500 }

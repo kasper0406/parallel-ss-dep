@@ -105,6 +105,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "freshly attached FiLM contributes from step 0 — useful "
                         "when grafting FiLM onto an inherited/competent trunk. "
                         "Ignored by the 'surprise_modulated' α path.")
+    p.add_argument("--feedback_src_norm", type=str, default="rms",
+                   choices=["none", "rms"],
+                   help="2026-07-02 design review FIX 2. Normalize "
+                        "FeedbackProjection's SOURCE state (state_above_lagged, "
+                        "including the K-self-feed lagged source) with a plain "
+                        "non-learnable RMS-norm before it feeds W_scale/W_shift/"
+                        "W_fb, decoupling FiLM's effective strength from the raw "
+                        "magnitude drift of a deep-layer state (grows with "
+                        "depth, drifts over training) so α·‖W‖ alone is "
+                        "identifiable. FIXED-BY-DEFAULT ('rms') for new runs — "
+                        "this is a correctness fix, not an experimental knob. "
+                        "'none' is kept as an escape hatch (and is what a "
+                        "pre-fix ckpt — cfg lacking this key — reconstructs as, "
+                        "so old checkpoints re-evaluate byte-identically).")
     p.add_argument("--output_gate", action="store_true",
                    help="Enable learned per-position output gate (Phase 23). "
                         "Adds a gate_head (d_model → 1) whose sigmoid output "
@@ -453,6 +467,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "normalised update is tolerant of high LR (Moonlight "
                         "ran at 6e-3 at 8M-token batches). AdamW LR for the "
                         "remaining params is taken from --lr.")
+    p.add_argument("--feature_lr_mult", type=float, default=1.0,
+                   help="LR multiplier for FEATURE-module params (sparse/"
+                        "xattn FiLM feedback, WorkingMemory, PKM except its "
+                        "value tables [which keep --pkm_value_lr_mult], the "
+                        "latent co-train adapter, the gate head) — 2026-07-02 "
+                        "recipe rule #3 ('converged-base attach needs "
+                        "toll-payers per feature'): a feature bolted onto a "
+                        "base trained at a conservative LR needs its own "
+                        "higher LR to escape cold-start. Default 1.0 is "
+                        "BYTE-IDENTICAL to the legacy shared-LR path (no "
+                        "extra optimizer groups). != 1.0 carves those params "
+                        "into their own group(s) at lr*mult (AdamW side) and, "
+                        "under --optimizer muon, lr_muon*mult (Muon side for "
+                        "the 2D feature matrices); every non-feature param is "
+                        "untouched. Incompatible with "
+                        "--matrix_optimizer fused_deltanet_ns. See "
+                        "experiments/optim_utils.py::_is_feature_lr_param.")
     p.add_argument("--lr_schedule", type=str, default="wsd",
                    choices=["cosine", "wsd"],
                    help="LR schedule. 'wsd' (default) = warmup-stable-decay: "
@@ -547,6 +578,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Anneal --mem_read_alpha_floor_start to 0 over this "
                         "many WM forwards. A few thousand is the validated "
                         "range. 0 disables the floor curriculum (default).")
+    p.add_argument("--mem_inj_norm", type=str, default="match_rms",
+                   choices=["none", "match_rms"],
+                   help="2026-07-02 design review FIX 3. Rescale the WM read "
+                        "injection (W_proj(read)) per-position to match the "
+                        "LOCAL residual stream's RMS magnitude before it's "
+                        "combined via read_alpha, so read_alpha expresses a "
+                        "pure mixing fraction instead of also having to "
+                        "absorb whatever raw magnitude W_proj happens to "
+                        "produce. Applies to the injection ONLY — never the "
+                        "addressing keys/scores (discrete/soft/ctx namekey). "
+                        "FIXED-BY-DEFAULT ('match_rms') for new runs — this "
+                        "is a correctness fix, not an experimental knob. "
+                        "'none' is kept as an escape hatch (and is what a "
+                        "pre-fix ckpt — cfg lacking this key — reconstructs "
+                        "as, so old checkpoints re-evaluate byte-identically).")
     # ---- v14 WM-recall plumbing (validated embedding-key + copy readout) -----
     # All default OFF → byte-identical to the legacy WM, so an in-flight run
     # (e.g. v12) that re-imports this file on autoresume is unaffected.
@@ -720,6 +766,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "— mirrors the FiLM α curriculum. v7 default on.")
     p.add_argument("--no_pkm_use_output_gate", dest="pkm_use_output_gate",
                    action="store_false")
+    p.add_argument("--pkm_out_alpha_init", type=float, default=0.0,
+                   help="Warm-start value for the PKM output-gate α (default "
+                        "0.0 = legacy zero-init). Converged-base pre-warm "
+                        "probe (2026-07-02): a POSITIVE init (e.g. 0.1) keeps "
+                        "the sign-preserving α-floor from flipping sign while "
+                        "αL is noisy around 0 (the pilot-B rejection pattern) "
+                        "and gives the value table real gradient from step 0.")
     p.add_argument("--pkm_epsilon_start", type=float, default=0.5,
                    help="FIX 2: starting ε for random-slot exploration. With "
                         "prob ε at training time, each top-k retrieval is "
@@ -1068,4 +1121,46 @@ def build_parser() -> argparse.ArgumentParser:
                         "higher and the Muon WD=0.1 was the brake, not a "
                         "true loss-flat ceiling. Pass --alpha_wd 0.1 to "
                         "reproduce the old behaviour.")
+    # --- Engagement kill-gates (2026-07-02 recipe rules, SESSION_FINDINGS.md
+    # "why don't the features help on code?" forensics). A feature run that
+    # ends inert is a wasted launch, not a negative result — these flags make
+    # that failure mode LOUD instead of silently shipping a null result.
+    p.add_argument("--engagement_check_step", type=int, default=0,
+                   help="Step at which to run the ONE-TIME engagement "
+                        "kill-gate: verify every enabled mechanism (PKM, "
+                        "FiLM, WM copy-head, latent-reasoning) has actually "
+                        "MOVED since init, not just that its module exists. "
+                        "0 (default) disables — zero-cost when off. Startup "
+                        "construction asserts (PKM/WM/FiLM/latent-reasoner "
+                        "object existence) run independently of this flag, "
+                        "whenever the corresponding feature flag is set.")
+    p.add_argument("--engagement_check_action", type=str, default="abort",
+                   choices=["abort", "warn"],
+                   help="What to do when --engagement_check_step finds an "
+                        "inert mechanism. 'abort' (default) raises SystemExit "
+                        "— on DDP, EVERY rank computes the same verdict from "
+                        "its own (in-sync) model state and aborts together, "
+                        "so the whole job dies instead of one rank hanging. "
+                        "'warn' prints a loud WARNING and continues.")
+    p.add_argument("--engage_pkm_alpha_min", type=float, default=0.02,
+                   help="PKM engagement threshold: |out_alpha| (the learned "
+                        "output-gate scalar) must reach at least this "
+                        "magnitude, OR the value-table row-norm-ratio must "
+                        "reach --engage_pkm_row_min. Reuses the pkm(αL=...) "
+                        "live diagnostic — not recomputed.")
+    p.add_argument("--engage_pkm_row_min", type=float, default=1.02,
+                   help="PKM engagement threshold: value-table mean row-norm "
+                        "/ expected-init-norm ratio must reach at least this "
+                        "(>1 means rows have grown from init — the table is "
+                        "actually learning). See --engage_pkm_alpha_min.")
+    p.add_argument("--engage_film_alpha_min", type=float, default=1e-3,
+                   help="FiLM engagement threshold: max |alpha| across all "
+                        "feedback pairs/layers must reach at least this.")
+    p.add_argument("--engage_copy_bias_delta_min", type=float, default=0.05,
+                   help="WM copy-head engagement threshold: the copy gate's "
+                        "bias must have moved at least this much from "
+                        "--copy_gate_bias_init, OR at least one cumulative "
+                        "match-fire must have been logged (a recall position "
+                        "with a matched binding, i.e. the copy gate could "
+                        "have fired there).")
     return p

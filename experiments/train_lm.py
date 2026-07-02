@@ -105,13 +105,30 @@ def _block_update_ratios(model, snapshot) -> list[float]:
 
 def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
                            doc_ids=None, gist_horizons=None, fwd_model=None,
-                           mem_read_mask=None):
+                           mem_read_mask=None, kd_teacher=None,
+                           kd_thinking_token_id=None, kd_logit_store=None):
     """Forward + LM loss for the non-thinking-token (pretrain) path.
 
     Returns (logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss,
-    gist_loss). Factored out of the step loop so gradient accumulation
-    can run it once per microbatch. Mirrors the inline forward +
-    gate/plain-loss branches exactly.
+    gist_loss, kd_loss). Factored out of the step loop so gradient
+    accumulation can run it once per microbatch. Mirrors the inline
+    forward + gate/plain-loss branches exactly.
+
+    KD has two mutually-exclusive sources:
+    * OFFLINE (`kd_logit_store` set): the teacher's TOP-K logits are read from a
+      `LogitStoreReader` cursor that advances in LOCKSTEP with the data iterator
+      (one `next_block(x.numel())` per microbatch). The store's `input_ids` are
+      asserted equal to the live `x` (the load-bearing alignment safety check),
+      then the student is gathered at the teacher's top-k ids and a top-k KL is
+      added. NO teacher in the loop.
+    * LIVE (`kd_teacher` set): see below.
+
+    When `kd_teacher` is set AND --distill_weight > 0, an extra frozen-teacher
+    forward (no_grad) over the SAME `x` produces teacher logits; the student
+    logits are sliced to the teacher vocab and a temperature-scaled KL is
+    returned as `kd_loss` (added to the total loss at the call site, scaled by
+    --distill_weight). kd_loss is a zero scalar when KD is off → byte-identical
+    backward to the pre-KD path.
 
     When `gist_horizons` is set and --gist_loss_weight > 0, the model
     computes the multi-horizon trunk gist loss INSIDE its forward and
@@ -211,7 +228,78 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
         )
         denom = valid.sum().clamp(min=1.0)
         gate_aux_loss = (bce * valid).sum() / denom
-    return logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss, gist_loss
+    # Logit-distillation (KD) from a frozen teacher. The teacher shares the
+    # SmolLM2 tokenizer so ids in `x` align; we slice the student logits to the
+    # teacher vocab BEFORE the KL so the extra/thinking slots are dropped (the
+    # load-bearing correctness detail). KD only on real (non-ignored) positions
+    # -- and, when `doc_ids` is available, only on positions whose TARGET is in
+    # the same document (see `_kd_valid_mask` / `_same_doc_target_mask` above).
+    kd_loss = torch.zeros((), device=logits.device)
+    if (kd_logit_store is not None
+            and getattr(args, "distill_weight", 0.0) > 0.0):
+        # OFFLINE KD: read the teacher's top-k for the NEXT x.numel() tokens of
+        # the precomputed stream. The cursor advances exactly once per call, so
+        # it stays locked to the data iterator (which is also advanced once per
+        # microbatch by the caller).
+        B, T = x.shape
+        n = B * T
+        t_ids, t_logits, t_input_ids = kd_logit_store.next_block(n)
+        dev = logits.device
+        t_ids = t_ids.to(dev).view(B, T, -1)                 # (B,T,k) int64
+        t_logits = t_logits.to(dev).view(B, T, -1)           # (B,T,k) fp16
+        t_input_ids = t_input_ids.to(dev).view(B, T)         # (B,T) int64
+        # ----- ALIGNMENT SAFETY (load-bearing) -----
+        # The store row order MUST equal the trainer's flattened token order.
+        # If it doesn't, KD would distil onto the WRONG positions — a silent,
+        # catastrophic corruption. Assert the stored input_ids match the live
+        # tokens for this block; fail loudly with the first mismatch otherwise.
+        if not torch.equal(t_input_ids, x.to(torch.int64)):
+            mism = (t_input_ids != x.to(torch.int64))
+            idx = int(mism.flatten().nonzero(as_tuple=False)[0].item())
+            bi, ti = idx // T, idx % T
+            raise RuntimeError(
+                "Offline-KD alignment FAILED: the teacher logit store is out of "
+                "sync with the training token stream (the #1 silent-corruption "
+                f"mode). First mismatch at flat index {idx} (batch {bi}, pos "
+                f"{ti}): store input_id={int(t_input_ids[bi, ti])} vs live "
+                f"x={int(x[bi, ti])}. The store and trainer must use the SAME "
+                "data_mix / seed / T / batch / num_workers / think_burst_prob. "
+                f"Store: {getattr(kd_logit_store, 'tokenizer_name', '?')} / "
+                f"{getattr(kd_logit_store, 'teacher_model', '?')}.")
+        valid_kd = _kd_valid_mask(y, doc_ids, kd_thinking_token_id)
+        kd_loss = _kd_loss_term_topk(logits, t_ids, t_logits,
+                                     valid_kd.float(), args.distill_temp)
+    elif kd_teacher is not None and getattr(args, "distill_weight", 0.0) > 0.0:
+        # The data stream may insert thinking_token_id (== base vocab size, i.e.
+        # one PAST the teacher's last valid id) into the INPUTS when
+        # --think_burst_prob>0. Clamp any such id down to a valid teacher id so
+        # the teacher's embedding lookup never indexes OOB (a CUDA assert). These
+        # positions are excluded from the KD loss by valid_kd below anyway, and
+        # for --think_burst_prob 0 (the A/B) no id exceeds the cap → x unchanged.
+        x_teacher = x
+        if kd_thinking_token_id is not None:
+            x_teacher = x.clamp(max=int(kd_thinking_token_id) - 1)
+        # Cross-document isolation (2026-07-01 fix): when the data stream
+        # carries doc_ids, forward the teacher PER-DOCUMENT (see
+        # `_kd_teacher_forward_doc_isolated`) instead of over the whole packed
+        # block, so the teacher's soft targets don't see context the student's
+        # cu_seqlens-reset DeltaNet state never had access to. `doc_ids is
+        # None` (non-data_mix streams) keeps the original single full-block
+        # forward — byte-identical to pre-fix behaviour.
+        if doc_ids is not None:
+            teacher_logits = _kd_teacher_forward_doc_isolated(
+                kd_teacher, x_teacher, doc_ids)                  # (B,T,Vt)
+        else:
+            with torch.no_grad():
+                t_out = kd_teacher(input_ids=x_teacher)
+                teacher_logits = getattr(t_out, "logits", t_out)  # (B,T,Vt)
+        V_t = teacher_logits.size(-1)
+        s = logits[..., :V_t]                                            # slice
+        valid_kd = _kd_valid_mask(y, doc_ids, kd_thinking_token_id)
+        kd_loss = _kd_loss_term(s, teacher_logits, valid_kd.float(),
+                                args.distill_temp)
+    return (logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss,
+            gist_loss, kd_loss)
 
 
 def _z_loss_term(logits, weight):
@@ -219,6 +307,195 @@ def _z_loss_term(logits, weight):
     if weight <= 0.0:
         return logits.new_zeros(())
     return weight * (torch.logsumexp(logits, dim=-1) ** 2).mean()
+
+
+def _kd_loss_term(student_logits, teacher_logits, valid_mask, temp):
+    """Hinton logit-distillation: T^2 * KL(teacher || student) over valid
+    (non-ignored) positions, mean-reduced.
+
+    `student_logits` must ALREADY be sliced to the teacher vocab (same last
+    dim as `teacher_logits`) — the load-bearing correctness detail that drops
+    the student's extra / thinking-token slots so the two vocabs align.
+
+    teacher_logits is the TARGET distribution. We use
+    F.kl_div(log_softmax(s/T), softmax(teacher/T), reduction='none').sum(-1)
+    which computes per-position KL(teacher || student); ×T² (Hinton) and mean
+    over valid positions. fp32 throughout for numerical stability.
+
+    valid_mask: (B, T) float in {0, 1}. Returns a scalar.
+    """
+    T = max(float(temp), 1e-6)
+    s_logp = F.log_softmax(student_logits.float() / T, dim=-1)        # (B,T,Vt)
+    t_p = F.softmax(teacher_logits.float() / T, dim=-1)               # (B,T,Vt)
+    kl = F.kl_div(s_logp, t_p, reduction="none").sum(dim=-1)         # (B, T)
+    denom = valid_mask.sum().clamp(min=1.0)
+    return (T * T) * (kl * valid_mask).sum() / denom
+
+
+def _kd_loss_term_topk(student_logits, teacher_ids, teacher_topk_logits,
+                       valid_mask, temp):
+    """OFFLINE-KD analog of `_kd_loss_term`: the teacher distribution is given
+    only as TOP-K (ids + raw logits) from disk, so the KL is computed over the
+    teacher's top-k SUPPORT instead of the full vocab.
+
+    - `student_logits`   (B, T, V): the student's FULL next-token logits.
+    - `teacher_ids`      (B, T, k): the teacher's top-k token ids (int).
+    - `teacher_topk_logits` (B, T, k): the teacher's RAW top-k logits.
+    - `valid_mask`       (B, T) float in {0,1}.
+
+    The student is GATHERED at the teacher's top-k ids, then both the teacher
+    top-k logits and the gathered-student logits are softmax-renormalised over
+    the k-subset (so they are proper distributions over the same support) at
+    temperature T; the per-position KL(teacher || student) is summed over k,
+    ×T² (Hinton), mean over valid positions. fp32 throughout.
+    """
+    Tmp = max(float(temp), 1e-6)
+    s_gather = torch.gather(student_logits.float(), -1,
+                            teacher_ids.long())                  # (B,T,k)
+    s_logp = F.log_softmax(s_gather / Tmp, dim=-1)               # renorm over k
+    t_p = F.softmax(teacher_topk_logits.float() / Tmp, dim=-1)   # renorm over k
+    kl = F.kl_div(s_logp, t_p, reduction="none").sum(dim=-1)     # (B, T)
+    denom = valid_mask.sum().clamp(min=1.0)
+    return (Tmp * Tmp) * (kl * valid_mask).sum() / denom
+
+
+# ---------------------------------------------------------------------------
+# KD doc-isolation (audited defect fix, 2026-07-01): the student forward is
+# cross-document-isolated (doc_ids -> cu_seqlens resets the DeltaNet
+# recurrent state at every in-block document boundary, see the "Cross-
+# document state isolation" AGENTS.md section), but a naive teacher forward
+# over the whole packed T=2048 block is NOT isolated — a full-attention HF
+# model conditions every position on the entire block, so its prediction for
+# the first tokens of doc N+1 sees doc N's content, which the student never
+# gets to see. That mismatch makes the "soft target" systematically easier
+# than what the student is actually being asked to match. The two helpers
+# below (a) reproduce the student's per-document isolation in the teacher
+# forward, and (b) mask out the one position per document boundary where even
+# a correctly-isolated teacher forward has nothing meaningful to predict (the
+# LAST token of a document predicts the FIRST token of the next, unrelated,
+# document — "meaningless" regardless of how the teacher forward is computed).
+
+def _same_doc_target_mask(doc_ids: torch.Tensor) -> torch.Tensor:
+    """Boolean (B, T) mask: True where the TARGET position is in the SAME
+    document as the source position `t` — i.e. where a KD signal at `t` is
+    meaningful. False exactly at each document's LAST token (its target is
+    the first token of the next document).
+
+    `doc_ids` is aligned with the INPUT stream `x` (data_mix.py:
+    `doc_ids[t]` is the id of `x[t]`), and the target `y[t]` is the token
+    that followed `x[t]` in the original packed chunk — i.e. the token whose
+    doc id is `doc_ids[t + 1]` (documents are packed contiguously with
+    monotonically non-decreasing ids per row, see MixedSourceStream.__iter__).
+    So `doc_ids[t] == doc_ids[t + 1]` is exactly "same doc as target".
+
+    The chunk's very last input position (t = T-1) predicts a token whose own
+    doc id was never carried through the (x, y, doc_ids) tuple returned by
+    the data stream (the source `chunk_docids` has T+1 entries; `doc_ids`
+    only keeps the first T, aligned with `x` — see data_mix.py's
+    `chunk_docids[:-1]`). We default that one column to True (same-doc): it's
+    1 of T positions per row, and defaulting it to "meaningless" would drop a
+    real KD signal far more often than it right about a boundary — no
+    downstream correctness invariant depends on this one column the way the
+    interior-boundary mask does.
+    """
+    same_interior = doc_ids[:, :-1] == doc_ids[:, 1:]           # (B, T-1)
+    last_col = torch.ones_like(doc_ids[:, :1], dtype=torch.bool)
+    return torch.cat([same_interior, last_col], dim=1)          # (B, T)
+
+
+def _kd_valid_mask(y: torch.Tensor, doc_ids: torch.Tensor | None,
+                   kd_thinking_token_id: int | None) -> torch.Tensor:
+    """Shared valid-position mask for BOTH the live-teacher and offline-store
+    KD branches: real targets (not -100), not a thinking-token target, and
+    (when doc_ids is available) not a target that crosses a document
+    boundary. `doc_ids is None` (non-data_mix streams / eval / MQAR) skips
+    the same-doc term entirely -> byte-identical to the pre-doc-isolation
+    mask.
+
+    NOTE for the offline logit-store path: the store's teacher logits were
+    (or, as of the parallel doc-isolation fix to the offline generators, will
+    be) themselves computed doc-isolated at generation time — but the SAME
+    "last token of a doc predicts the first token of an unrelated doc" issue
+    applies regardless of how the teacher forward was computed, so this mask
+    is applied there too. This function is the single shared convention both
+    the live and offline consumers must use.
+    """
+    valid_kd = (y != -100)
+    if kd_thinking_token_id is not None:
+        valid_kd = valid_kd & (y != int(kd_thinking_token_id))
+    if doc_ids is not None:
+        valid_kd = valid_kd & _same_doc_target_mask(doc_ids)
+    return valid_kd
+
+
+def _doc_segments(doc_ids: torch.Tensor) -> list[list[tuple[int, int]]]:
+    """Per row, the list of (start, length) contiguous same-document runs
+    covering [0, T) in order. `doc_ids` (B, T) is assumed non-decreasing
+    along T within a row (data_mix.py packs documents contiguously with
+    monotonically increasing per-row ids). CPU python loop — negligible next
+    to a teacher forward pass (T*B simple int comparisons, no GPU sync since
+    everything is pulled to CPU/list up front).
+    """
+    B, T = doc_ids.shape
+    rows = doc_ids.detach().to("cpu").tolist()
+    out = []
+    for row in rows:
+        segs = []
+        start = 0
+        for t in range(1, T):
+            if row[t] != row[t - 1]:
+                segs.append((start, t - start))
+                start = t
+        segs.append((start, T - start))
+        out.append(segs)
+    return out
+
+
+def _kd_teacher_forward_doc_isolated(kd_teacher, x_teacher: torch.Tensor,
+                                     doc_ids: torch.Tensor) -> torch.Tensor:
+    """Forward `kd_teacher` with cross-document state isolation, matching the
+    student's cu_seqlens doc reset (see the module-level comment above).
+
+    Splits each row into its contiguous per-document segments and forwards
+    every segment AS ITS OWN SEQUENCE starting at position 0 — i.e. exactly
+    the forward a fresh, single-document context would produce (this is what
+    makes the fix directly verifiable: it doesn't approximate "what a
+    doc-isolated forward would look like" via an attention-mask / position-id
+    trick, it just literally IS that forward). All segments in the microbatch
+    are batched together in one teacher call, right-padded to the batch's
+    longest segment: a causal decoder's logits at any REAL (non-pad) position
+    never depend on trailing pad tokens (upper-triangular causal attention
+    only looks backward, and RMSNorm/MLP are per-position), so right-padding
+    is lossless here and needs no attention_mask/position_ids plumbing —
+    verified empirically in test_kd_doc_isolation.py against a real
+    standalone per-segment forward.
+
+    Known cost/limitation (not fixed here, correctness-first): the padded
+    segment-batch has as many rows as there are TOTAL documents in the
+    microbatch, which can exceed the student batch size when documents are
+    short; for the pretrain data_mix corpora (documents are typically
+    hundreds+ of tokens, not single-digit) this stays a small multiple. If a
+    future data mix skews toward very short documents, chunk this into
+    several teacher calls to bound peak memory.
+    """
+    B, T = x_teacher.shape
+    segs_per_row = _doc_segments(doc_ids)
+    segs = [(b, s, l) for b, row_segs in enumerate(segs_per_row)
+            for (s, l) in row_segs]
+    L_max = max(l for _, _, l in segs)
+    n = len(segs)
+    seg_x = x_teacher.new_zeros((n, L_max))
+    for i, (b, s, l) in enumerate(segs):
+        seg_x[i, :l] = x_teacher[b, s:s + l]
+    with torch.no_grad():
+        t_out = kd_teacher(input_ids=seg_x,
+                           attention_mask=torch.ones_like(seg_x))
+        seg_logits = getattr(t_out, "logits", t_out)             # (n,Lmax,Vt)
+    Vt = seg_logits.size(-1)
+    teacher_logits = seg_logits.new_zeros((B, T, Vt))
+    for i, (b, s, l) in enumerate(segs):
+        teacher_logits[b, s:s + l] = seg_logits[i, :l]
+    return teacher_logits
 
 
 def _latent_reasoning_ramp(step: int, start_step: int, warmup_steps: int) -> float:
@@ -446,6 +723,90 @@ def main():
             "--enable_thinking_token currently supports the standard LM loss "
             "path only; disable aux losses for thinking experiments."
         )
+    # Logit-KD is implemented only on the non-thinking-queue pretrain path
+    # (the teacher forward + KL live in _nonthink_forward_loss). The think-queue
+    # path has a different loss structure; rather than silently no-op KD there,
+    # fail clearly.
+    _kd_live = bool(getattr(args, "distill_teacher_model", ""))
+    _kd_offline = bool(getattr(args, "distill_logits_dir", ""))
+    # LIVE and OFFLINE KD are mutually exclusive — they are two ways to obtain
+    # the same teacher distribution; running both is a config error.
+    if _kd_live and _kd_offline:
+        raise SystemExit(
+            "--distill_teacher_model (live teacher) and --distill_logits_dir "
+            "(offline precomputed top-k store) are mutually exclusive. Pick one."
+        )
+    _kd_on = ((_kd_live or _kd_offline)
+              and float(getattr(args, "distill_weight", 0.0)) > 0.0)
+    if _kd_on and args.enable_thinking_token:
+        raise SystemExit(
+            "--distill_teacher_model/--distill_logits_dir/--distill_weight "
+            "(logit-KD) is supported only on the non-thinking pretrain path; it "
+            "is mutually exclusive with --enable_thinking_token."
+        )
+    # OFFLINE KD is single-GPU only. The teacher store was generated against ONE
+    # deterministic stream (base_seed=args.seed), but each DDP rank streams a
+    # DISJOINT shard (base_seed = args.seed + ddp_rank*100003) while all ranks
+    # open the same single-seed store at cursor 0 — so rank>=1's live tokens can
+    # never match the store and the alignment assertion would abort mid-run.
+    # Fail at startup with the fix instead of wasting a launch.
+    if _kd_offline and is_ddp:
+        raise SystemExit(
+            "Offline KD (--distill_logits_dir) is single-GPU only: each DDP "
+            f"rank streams a disjoint data shard (base_seed+rank*100003) but the "
+            f"store is a single deterministic stream, so rank>=1 would desync "
+            f"and abort. You launched under torchrun with WORLD_SIZE="
+            f"{ddp_world_size}. Run offline KD without torchrun (single GPU), or "
+            "generate one per-rank store per rank's seed and load the matching "
+            "one — the latter is not yet implemented."
+        )
+    # OFFLINE KD requires num_workers in {0,1}. The teacher store was generated
+    # against the num_workers=0 flat token order (a single deterministic stream).
+    # Only worker counts 0 or 1 reproduce that order (worker 0 uses
+    # base_seed+17*0 == base_seed); num_workers>=2 round-robins DISJOINT
+    # per-worker sub-streams, so microbatch 2 (worker 1) desyncs and the
+    # alignment assert aborts 1-2 steps in — wasting a multi-day launch. The
+    # trainer default is num_workers=2, so fail loudly at startup instead.
+    if _kd_offline and int(getattr(args, "num_workers", 2)) not in (0, 1):
+        raise SystemExit(
+            "Offline KD (--distill_logits_dir) requires --num_workers 0 (or 1): "
+            "the store was generated at num_workers=0 and only 0/1 reproduce that "
+            f"flat token order. You passed --num_workers {args.num_workers}, which "
+            "would desync the alignment assert within a couple of steps. Re-run "
+            "with --num_workers 0."
+        )
+    # Offline KD requires NO think-burst insertion: the teacher store was built
+    # with bursts OFF (the teacher has no think token), so any burst the trainer
+    # inserts would shift the token stream and break lockstep alignment. The
+    # trainer default is --think_burst_prob 0.5, so force it to 0 here (with a
+    # loud warning) rather than relying on the user to remember the override.
+    if _kd_offline and float(getattr(args, "think_burst_prob", 0.0)) != 0.0:
+        print(
+            f"[offline-KD] WARNING: --think_burst_prob was "
+            f"{args.think_burst_prob} but offline KD requires think-burst "
+            "insertion OFF (the teacher store has no think tokens; bursts shift "
+            "the token stream and break store↔trainer alignment). Forcing "
+            "--think_burst_prob 0.0.",
+            flush=True,
+        )
+        args.think_burst_prob = 0.0
+    # LIVE KD has the same think-burst problem in a subtler form: bursts insert
+    # think ids into the INPUTS, which the teacher forward clamps to a stand-in
+    # real token (think_id-1). valid_kd masks only the burst positions
+    # themselves, NOT the post-burst positions whose teacher logits were
+    # conditioned on the corrupted context — so a default-flag launch
+    # (--think_burst_prob 0.5) silently distills against wrong targets.
+    # Mirror the offline-KD guard and force bursts off.
+    if _kd_live and float(getattr(args, "think_burst_prob", 0.0)) != 0.0:
+        print(
+            f"[live-KD] WARNING: --think_burst_prob was "
+            f"{args.think_burst_prob} but live KD requires think-burst "
+            "insertion OFF (the teacher sees a stand-in token at burst "
+            "positions, corrupting its context for every position after the "
+            "burst). Forcing --think_burst_prob 0.0.",
+            flush=True,
+        )
+        args.think_burst_prob = 0.0
 
     torch.manual_seed(args.seed)
     arch_label = args.arch if args.arch else f"layers={args.layers}"
@@ -468,11 +829,61 @@ def main():
                 f"failed to add/resolve thinking token {args.thinking_token!r}"
             )
     if args.data_mix:
-        # Mixed-corpus pretrain. Reserve one slot above the base tokenizer
-        # vocab for the think token; round model vocab up to multiple-of-64
-        # so embedding / lm_head dims are GPU-friendly.
-        thinking_token_id = int(tok.vocab_size)
-        model_vocab_size = ((int(tok.vocab_size) + 1 + 63) // 64) * 64
+        # Mixed-corpus pretrain. Reserve the FIRST id ABOVE every real token
+        # (base vocab AND any added special tokens) for the think token; round
+        # model vocab up to a multiple-of-64 so embedding / lm_head dims are
+        # GPU-friendly. Using max(vocab_size, len(tok)) is byte-identical for
+        # SmolLM2 (len == vocab_size == 49152) but is REQUIRED for tokenizers
+        # whose vocab_size slot is a real token — e.g. Qwen, where
+        # tok.vocab_size==151643 is "<|endoftext|>" (also the pad token); using
+        # it as the think id would alias a real token and make
+        # state_readonly_at_think / WM / the gate fire on every EOS/pad position.
+        if int(getattr(args, "keep_base_vocab", 0)) > 0:
+            # INHERITED-BASE continuation: keep the (tied) embedding at its
+            # original size so --load_ckpt restores embed/lm_head with ZERO
+            # shape-mismatch. The data_mix default below would round vocab up to
+            # round64(vocab+1) (e.g. 49152 -> 49216) to reserve an OUT-OF-RANGE
+            # think slot, which would size-mismatch the inherited 49152 rows.
+            # With --think_burst_prob 0 (+ --mem_always_read for WM) the discrete
+            # think token is never emitted into the stream, so alias it to an
+            # IN-RANGE id (EOS) and keep model_vocab == base vocab.
+            if float(getattr(args, "think_burst_prob", 0.0)) != 0.0:
+                raise SystemExit(
+                    "--keep_base_vocab requires --think_burst_prob 0 (an in-range "
+                    "think id + bursts would corrupt real tokens).")
+            model_vocab_size = int(args.keep_base_vocab)
+            thinking_token_id = (tok.eos_token_id
+                                 if tok.eos_token_id is not None
+                                 else model_vocab_size - 1)
+            if int(thinking_token_id) >= model_vocab_size:
+                thinking_token_id = model_vocab_size - 1
+            thinking_token_id = int(thinking_token_id)
+            # The EOS alias makes thinking_token_id == pad_token_id (SmolLM2
+            # eos = 0 = the pad fallback), which SILENTLY disables the aux
+            # losses guarded by `thinking_token_id != pad_token_id`
+            # (gate_calibration, latent_cotrain). A run combining
+            # --keep_base_vocab with those losses would train with the loss
+            # never engaging and no warning — fail loudly instead.
+            # (latent_reasoning_weight is NOT pad-guarded and runs fine under
+            # the alias — launch_phase1_ab_B.sh legitimately combines them.)
+            _think_losses = {
+                "--gate_calibration_weight":
+                    float(getattr(args, "gate_calibration_weight", 0.0)),
+                "--latent_cotrain_weight":
+                    float(getattr(args, "latent_cotrain_weight", 0.0)),
+            }
+            _on = [k for k, v in _think_losses.items() if v != 0.0]
+            if _on:
+                raise SystemExit(
+                    f"--keep_base_vocab aliases thinking_token_id to EOS, "
+                    f"which equals pad_token_id — the think-conditioned aux "
+                    f"losses you enabled ({', '.join(_on)}) would be silently "
+                    "skipped by their `thinking_token_id != pad_token_id` "
+                    "guards. Use the reserved out-of-range think slot (drop "
+                    "--keep_base_vocab) for these losses.")
+        else:
+            thinking_token_id = int(max(tok.vocab_size, len(tok)))
+            model_vocab_size = ((thinking_token_id + 1 + 63) // 64) * 64
     else:
         model_vocab_size = len(tok)
     print(f"  vocab size: base={tok.vocab_size}, model={model_vocab_size}"
@@ -511,7 +922,8 @@ def main():
             mask_eos_in_targets=bool(args.mask_eos_in_targets),
             emit_doc_ids=True,
         )
-        train_loader = DataLoader(train_ds, batch_size=args.batch, num_workers=2)
+        train_loader = DataLoader(train_ds, batch_size=args.batch,
+                                  num_workers=args.num_workers)
         val_loader = DataLoader(val_ds, batch_size=args.batch, num_workers=1)
     else:
         print(f"Loading dataset {args.dataset} (streaming) ...")
@@ -540,7 +952,7 @@ def main():
         val_ds = TokenisedStream(val_stream, tok, args.T,
                                  text_field=args.text_field)
         train_loader = DataLoader(train_ds, batch_size=args.batch,
-                                   num_workers=2)
+                                   num_workers=args.num_workers)
         val_loader = DataLoader(val_ds, batch_size=args.batch, num_workers=1)
 
     # 2. Model — see experiments/model_builder.py.
@@ -587,6 +999,58 @@ def main():
         feedback_desc = f"{args.feedback}"
     print(f"  params: {model.num_params() / 1e6:.1f}M  aux_dim={aux_dim}  "
           f"feedback={feedback_desc}")
+
+    # ---- Logit-KD teacher (frozen, eval, no grad). Loaded ONCE here; passed
+    # into _nonthink_forward_loss. Default OFF (empty id / weight 0) → kd_teacher
+    # stays None and the loss path is byte-identical to a non-KD run.
+    kd_teacher = None
+    if (bool(getattr(args, "distill_teacher_model", ""))
+            and float(getattr(args, "distill_weight", 0.0)) > 0.0):
+        from transformers import AutoModelForCausalLM
+        print(f"Loading KD teacher {args.distill_teacher_model} (bf16) ...")
+        kd_teacher = AutoModelForCausalLM.from_pretrained(
+            args.distill_teacher_model, torch_dtype=torch.bfloat16)
+        kd_teacher.to("cuda").eval()
+        for _p in kd_teacher.parameters():
+            _p.requires_grad_(False)
+        _tp = sum(p.numel() for p in kd_teacher.parameters()) / 1e6
+        print(f"  KD teacher: {_tp:.0f}M params, vocab="
+              f"{kd_teacher.get_output_embeddings().weight.shape[0]}, "
+              f"weight={args.distill_weight}, temp={args.distill_temp}")
+        # 2026-07-01 doc-isolation fix: when the batch carries doc_ids (any
+        # data_mix source), the live teacher forward now runs PER-DOCUMENT
+        # (`_kd_teacher_forward_doc_isolated`) so it never conditions a
+        # document's predictions on a preceding, unrelated document — matching
+        # the student's cu_seqlens state reset. Targets that straddle a
+        # document boundary are additionally excluded from the KD loss
+        # (`_kd_valid_mask`), for both this live path and the offline
+        # logit-store path. Streams without doc_ids are unaffected.
+        print("  KD live-teacher forward: CROSS-DOCUMENT ISOLATION active "
+              "(per-doc segment forwards + same-doc target masking whenever "
+              "the data stream emits doc_ids).")
+
+    # ---- OFFLINE logit-KD store (precomputed teacher top-k on disk). Opened
+    # ONCE; its cursor advances in lockstep with the data iterator inside
+    # _nonthink_forward_loss. Default OFF (empty dir / weight 0) → stays None and
+    # the loss path is byte-identical to a non-KD run.
+    kd_logit_store = None
+    if (bool(getattr(args, "distill_logits_dir", ""))
+            and float(getattr(args, "distill_weight", 0.0)) > 0.0):
+        from experiments.teacher_logits_io import LogitStoreReader
+        kd_logit_store = LogitStoreReader(args.distill_logits_dir)
+        print(f"Offline KD: opened logit store {args.distill_logits_dir}")
+        print(f"  teacher={kd_logit_store.teacher_model}  "
+              f"tokenizer={kd_logit_store.tokenizer_name}  "
+              f"k={kd_logit_store.k}  vocab={kd_logit_store.vocab_size}  "
+              f"tokens={len(kd_logit_store):,}  shards={len(kd_logit_store.shards)}")
+        print(f"  weight={args.distill_weight}, temp={args.distill_temp}")
+        # The store's teacher vocab must be <= the student vocab so the gather at
+        # the teacher's top-k ids is always in-range.
+        if kd_logit_store.vocab_size > model_vocab_size:
+            raise SystemExit(
+                f"offline-KD store vocab {kd_logit_store.vocab_size} exceeds the "
+                f"student model vocab {model_vocab_size} — top-k ids would be "
+                "out of range for the gather.")
 
     if args.aux_brackets:
         print("Computing bracket-deltas table for tokenizer ...")
@@ -1072,7 +1536,56 @@ def main():
         count = float(sum(term.numel() for term in loss_terms))
         return loss_sum, count, stats
 
+    # Freeze-trunk feature pre-warm (--freeze_trunk_steps N). A param is a
+    # "feature" iff its name contains any of these substrings; only features
+    # train during the window so a freshly attached FiLM/PKM/WM/gate/gist stack
+    # can adapt to an inherited (competent) trunk before the trunk is unfrozen.
+    _FEATURE_PARAM_SUBSTRINGS = (
+        "sparse_feedback", "feedback", "pkm_layer", "memory.",
+        "gate_head", "gist", "latent_feedback_adapter",
+        "retrieval_input_alpha", "future_gist", "ctx_",
+        # WM copy/pointer readout lives at top-level copy_head.* (not under
+        # memory.) — include it so the WM READOUT pre-warms too, not just the
+        # addresser (review caught this false-negative on 2026-06-22).
+        "copy_head", "pointer",
+    )
+
+    def _is_feature_param(name: str) -> bool:
+        return any(s in name for s in _FEATURE_PARAM_SUBSTRINGS)
+
+    _trunk_frozen = False  # tracks whether the trunk freeze is currently active
+    # Snapshot each param's ORIGINAL requires_grad so unfreeze restores the
+    # pre-freeze state rather than blanket-True (which would clobber intentional
+    # freezes like --mem_freeze_read_alpha that pin WM read-α at 0). During the
+    # freeze window we ONLY force non-feature (trunk) params off; feature params
+    # keep their original requires_grad (so a pinned WM read-α stays pinned).
+    _orig_requires_grad = {nm: p.requires_grad for nm, p in model.named_parameters()}
+
     for step in range(args.start_step + 1, args.steps + 1):
+        # Freeze-trunk window: for steps 1..N freeze every non-feature param;
+        # at the first step > N restore each param's ORIGINAL requires_grad once.
+        # Optimizer step is safe — Muon/AdamW skip params with grad=None.
+        if args.freeze_trunk_steps > 0:
+            if step <= args.freeze_trunk_steps:
+                if not _trunk_frozen:
+                    _n_froz = _n_feat = 0
+                    for _nm, _p in model.named_parameters():
+                        if _is_feature_param(_nm):
+                            _n_feat += 1  # leave feature params' requires_grad as-is
+                        else:
+                            _p.requires_grad_(False)
+                            _n_froz += 1
+                    _trunk_frozen = True
+                    print(f"[step {step}] freeze_trunk ENGAGED: froze {_n_froz} "
+                          f"trunk params (requires_grad=False); {_n_feat} feature "
+                          f"params keep their original requires_grad until step "
+                          f"{args.freeze_trunk_steps}", flush=True)
+            elif _trunk_frozen:
+                for _nm, _p in model.named_parameters():
+                    _p.requires_grad_(_orig_requires_grad.get(_nm, True))
+                _trunk_frozen = False
+                print(f"[step {step}] freeze_trunk RELEASED: restored original "
+                      f"requires_grad on all params; trunk now training", flush=True)
         try:
             batch = next(train_iter)
         except StopIteration:
@@ -1535,10 +2048,13 @@ def main():
                              else contextlib.nullcontext())
                 with _sync_ctx:
                     logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss, \
-                        gist_loss = _nonthink_forward_loss(
+                        gist_loss, kd_loss = _nonthink_forward_loss(
                             model, x, y, args, step, bracket_deltas,
                             doc_ids=doc_ids, gist_horizons=gist_horizons,
-                            fwd_model=ddp_model, mem_read_mask=mem_read_mask)
+                            fwd_model=ddp_model, mem_read_mask=mem_read_mask,
+                            kd_teacher=kd_teacher,
+                            kd_thinking_token_id=thinking_token_id,
+                            kd_logit_store=kd_logit_store)
                     # Snapshot the MAIN-forward gate NOW, before any aux loss
                     # (latent_cotrain / gate_calibration) runs an extra forward
                     # that clobbers model._last_gate(_logits) — the documented
@@ -1583,6 +2099,12 @@ def main():
                         loss = loss + args.gate_entropy_aux_weight * gate_aux_loss
                     if args.gist_loss_weight > 0.0:
                         loss = loss + args.gist_loss_weight * gist_loss
+                    # Logit-KD: add lambda * KL(teacher || student). kd_loss is a
+                    # zero scalar when KD is off (no live teacher AND no offline
+                    # store / weight 0) → no change to the loss or backward graph.
+                    if ((kd_teacher is not None or kd_logit_store is not None)
+                            and args.distill_weight > 0.0):
+                        loss = loss + args.distill_weight * kd_loss
                     # CTX-NAMEKEY addressing aux (learned WM addresser): train the
                     # ctx read attention to land on the binding the deterministic
                     # lexical code identifies as correct, ONLY at recall answer-
@@ -1756,6 +2278,9 @@ def main():
                     f"{scheduler.get_last_lr()[0]:>9.2e}")
             if args.gist_loss_weight > 0.0:
                 line += f"  gist={gist_loss.item():.4f}"
+            if ((kd_teacher is not None or kd_logit_store is not None)
+                    and args.distill_weight > 0.0):
+                line += f"  kd={kd_loss.item():.4f}"
             if getattr(args, "latent_cotrain_weight", 0.0) > 0.0 and \
                     _latent_cotrain_diag is not None:
                 _d, _n = _latent_cotrain_diag
@@ -1978,6 +2503,9 @@ def main():
                 tb.add_scalar("train/ppl", float(torch.tensor(tloss_avg).exp()), step)
                 tb.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
                 tb.add_scalar("train/tok_per_sec", tok_per_sec, step)
+                if ((kd_teacher is not None or kd_logit_store is not None)
+                        and args.distill_weight > 0.0):
+                    tb.add_scalar("train/kd_loss", float(kd_loss.item()), step)
                 if _blk_gnorms is not None:
                     for L, (g, u) in enumerate(zip(_blk_gnorms, _blk_uratios)):
                         tb.add_scalar(f"layer_grad_norm/L{L:02d}", g, step)
@@ -2273,6 +2801,8 @@ def main():
                 feedback_pairs=fb_pairs,
                 feedback_self_k=args.feedback_self_k,
                 feedback_alpha_mode=args.feedback_alpha_mode,
+                feedback_alpha_init=float(
+                    getattr(args, "feedback_alpha_init", 0.0)),
                 arch=args.arch, layers_spec=args.layers,
                 tokenizer=args.tokenizer,
                 thinking_token_id=thinking_token_id,
@@ -2331,6 +2861,17 @@ def main():
                 use_latent_feedback_adapter=bool(
                     getattr(args, "use_latent_feedback_adapter", False)),
                 retrieval_input_additive=False,
+                # Audited footgun fix (2026-07-01): d_ff and tie_embeddings were
+                # never persisted, so a --tie_embeddings ckpt silently
+                # reconstructed UNTIED on reload (eval_bracket_structure.py
+                # never passed the kwarg) and d_ff relied entirely on
+                # state-dict shape inference. d_ff already has a shape-infer
+                # fallback in eval_bracket_structure.build_model_from_ckpt for
+                # OLD ckpts that lack this key; the cfg value is now the
+                # PRIMARY source going forward. 0 means "not overridden" (the
+                # --d_ff CLI default), matching TinyLM's own 4*d_model default.
+                d_ff=int(getattr(args, "d_ff", 0)),
+                tie_embeddings=bool(getattr(args, "tie_embeddings", False)),
             )
             torch.save({"state_dict": model.state_dict(), "step": step,
                         "config": _save_cfg}, str(mid_path))
@@ -2484,6 +3025,8 @@ def main():
                 "feedback_xattn_form": args.feedback_xattn_form,
                 "feedback_self_k": args.feedback_self_k,
                 "feedback_alpha_mode": args.feedback_alpha_mode,
+                "feedback_alpha_init": float(
+                    getattr(args, "feedback_alpha_init", 0.0)),
                 "arch": args.arch, "layers_spec": args.layers,
                 "tokenizer": args.tokenizer,
                 "enable_thinking_token": bool(args.enable_thinking_token),
@@ -2515,6 +3058,10 @@ def main():
                 "use_latent_feedback_adapter": bool(
                     getattr(args, "use_latent_feedback_adapter", False)),
                 "retrieval_input_additive": False,
+                # Audited footgun fix (2026-07-01) — see the matching comment
+                # at the mid-eval save site above for the full rationale.
+                "d_ff": int(getattr(args, "d_ff", 0)),
+                "tie_embeddings": bool(getattr(args, "tie_embeddings", False)),
             },
         }
         pathlib.Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)

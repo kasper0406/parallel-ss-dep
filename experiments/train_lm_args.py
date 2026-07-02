@@ -87,6 +87,24 @@ def build_parser() -> argparse.ArgumentParser:
                         "delta of source-state norms (free signal from K=3 "
                         "self-feeding). Adds 3 learnable scalars per FiLM "
                         "target. Requires --feedback_self_k >= 2.")
+    p.add_argument("--freeze_trunk_steps", type=int, default=0,
+                   help="Freeze-trunk feature pre-warm window. For steps "
+                        "1..N (N = this value) every NON-feature param "
+                        "(requires_grad=False); only the freshly attached "
+                        "feature modules (FiLM/feedback, PKM, WM/memory, "
+                        "gate_head, gist/future_gist heads, latent feedback "
+                        "adapter, ctx-addresser, retrieval_input_alpha) keep "
+                        "training, letting them adapt to the inherited trunk. "
+                        "At the first step > N ALL params are unfrozen (once). "
+                        "Default 0 = no freezing ever (byte-identical).")
+    p.add_argument("--feedback_alpha_init", type=float, default=0.0,
+                   help="Init value for the scalar sparse-FiLM feedback α "
+                        "(alpha_mode='scalar' only). Default 0.0 = the legacy "
+                        "zeros-init (byte-identical). A positive value (e.g. "
+                        "0.1) warm-starts the FiLM feedback strength so a "
+                        "freshly attached FiLM contributes from step 0 — useful "
+                        "when grafting FiLM onto an inherited/competent trunk. "
+                        "Ignored by the 'surprise_modulated' α path.")
     p.add_argument("--output_gate", action="store_true",
                    help="Enable learned per-position output gate (Phase 23). "
                         "Adds a gate_head (d_model → 1) whose sigmoid output "
@@ -346,12 +364,47 @@ def build_parser() -> argparse.ArgumentParser:
                         "Linear-RNN architectures (DeltaNet, Mamba2, etc.) "
                         "have implicit position via state and do not need "
                         "this. Default 0 = no positional embedding.")
+    p.add_argument("--tie_embeddings", action="store_true",
+                   help="Share weights between the input embedding and the "
+                        "lm_head (TinyLM already supports it; this exposes it). "
+                        "Saves vocab*d_model params (~100M at 49k vocab / d=2048) "
+                        "and redirects that budget to the trunk. Default OFF "
+                        "(byte-identical to existing untied runs); recommended ON "
+                        "for the wide 1B config.")
     p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=2,
+                   help="DataLoader worker processes for the TRAIN loader. "
+                        "Default 2 (= the historical hardcoded value, so "
+                        "behaviour is unchanged). For offline-KD "
+                        "(--distill_logits_dir) you MUST pass --num_workers 0 "
+                        "(or 1): the teacher store is generated at num_workers=0 "
+                        "and only 0/1 reproduce that flat token order "
+                        "(MixedSourceStream seeds each worker as "
+                        "base_seed+17*worker_id; >=2 round-robins disjoint "
+                        "sub-streams and the alignment assertion aborts). The "
+                        "trainer rejects num_workers>=2 under --distill_logits_dir "
+                        "at startup.")
     p.add_argument("--steps", type=int, default=5000)
     p.add_argument("--d_model", type=int, default=576)
     p.add_argument("--n_heads", type=int, default=9)
     p.add_argument("--d_head", type=int, default=64)
     p.add_argument("--n_layers", type=int, default=30)
+    p.add_argument("--d_ff", type=int, default=0,
+                   help="MLP hidden dim. 0 = TinyLM default (mlp_mult x d_model). "
+                        "Set explicitly to match an inherited/linearized base whose "
+                        "FFN width is not a clean multiple of d_model (e.g. the "
+                        "SmolLM2-360M donor has d_ff=2560 at d_model=960).")
+    p.add_argument("--keep_base_vocab", type=int, default=0,
+                   help="Continuation from an INHERITED ckpt whose (tied) embedding "
+                        "must NOT be resized. When >0 (and --data_mix is set), force "
+                        "model_vocab_size to this value (the base vocab, e.g. 49152) "
+                        "instead of the data_mix default round64(vocab+1)=49216, so "
+                        "--load_ckpt restores embed/lm_head with ZERO shape-mismatch. "
+                        "The discrete think token is aliased to an IN-RANGE id (EOS) "
+                        "rather than the out-of-range vocab slot. Safe ONLY with "
+                        "--think_burst_prob 0 (the think token is never emitted into "
+                        "the stream — asserted). Default 0 = off (byte-identical "
+                        "legacy behavior).")
     p.add_argument("--lr", type=float, default=1.4e-3,
                    help="AdamW peak learning rate. Default 1.4e-3 — the "
                         "sqrt-batch-scaled v4 value (validated in the "
@@ -802,6 +855,35 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Weight on the z-loss regulariser "
                         "mean(logsumexp(logits)^2), which keeps output "
                         "logits from drifting. Default 1e-4; 0 disables.")
+    # --- Pretrain logit-distillation (KD) from a frozen HF teacher ---
+    # The teacher shares the SmolLM2 tokenizer so token ids align; the student
+    # logits are sliced to the teacher vocab (drops the extra/thinking slots)
+    # before the KL. All three default OFF so existing runs are byte-identical.
+    p.add_argument("--distill_teacher_model", type=str, default="",
+                   help="HF model id of a frozen teacher for logit-KD during "
+                        "pretrain (e.g. HuggingFaceTB/SmolLM2-1.7B). Must share "
+                        "the student tokenizer. Empty (default) = KD off.")
+    p.add_argument("--distill_weight", type=float, default=0.0,
+                   help="Weight lambda on the KD term added to the non-thinking "
+                        "CE loss. 0 (default) = KD off. KD fires only when both "
+                        "--distill_teacher_model is set and this is > 0.")
+    p.add_argument("--distill_temp", type=float, default=2.0,
+                   help="KD softmax temperature T. The KL is scaled by T^2 "
+                        "(Hinton). Default 2.0.")
+    # OFFLINE KD: read precomputed teacher TOP-K logits from a sharded store
+    # (built by experiments/gen_teacher_logits.py) instead of running a live
+    # teacher forward. Mutually exclusive with --distill_teacher_model. The KL
+    # is computed over the teacher's top-k support (student gathered at the
+    # stored ids), × --distill_weight, scaled by --distill_temp^2 (T^2). The
+    # store carries input_ids and the trainer asserts the live batch matches
+    # them per block (lockstep alignment safety). Default "" = offline KD off.
+    p.add_argument("--distill_logits_dir", type=str, default="",
+                   help="Directory of a precomputed sharded teacher top-k "
+                        "logit store (manifest.json + shard_*.safetensors). "
+                        "When set (and --distill_weight > 0) the trainer reads "
+                        "teacher logits from disk in lockstep with the data "
+                        "iterator — NO teacher in the loop. Mutually exclusive "
+                        "with --distill_teacher_model. Empty (default) = off.")
     # Trunk multi-horizon gist loss (v7, see experiments/gist_loss.py).
     p.add_argument("--gist_loss_weight", type=float, default=0.0,
                    help="Weight on the trunk multi-horizon gist loss: "

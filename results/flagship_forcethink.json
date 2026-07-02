@@ -1,0 +1,51 @@
+{
+  "config": {
+    "tasks": "data/flagship_recall.jsonl",
+    "ckpt": "checkpoints/pretrain_v12.pt",
+    "hf_model": "HuggingFaceTB/SmolLM2-360M",
+    "keys_per_task": 6,
+    "max_gen": 32,
+    "max_problems_per_bucket": 25,
+    "force_think": 8,
+    "arms": "ours_forcethink",
+    "shared_format": false,
+    "out_json": "results/flagship_forcethink.json"
+  },
+  "buckets": [
+    1024,
+    2048,
+    4096,
+    8192
+  ],
+  "results": {
+    "ours_forcethink": {
+      "per_bucket": {
+        "1024": [
+          53,
+          150
+        ],
+        "2048": [
+          13,
+          150
+        ],
+        "4096": [
+          0,
+          150
+        ],
+        "8192": [
+          0,
+          150
+        ]
+      },
+      "tok_len_mean": {
+        "1024": 1018.36,
+        "2048": 2043.08,
+        "4096": 4088.8,
+        "8192": 8185.76
+      },
+      "think_rate": 0.2,
+      "force_think": 8,
+      "secs": 209.85264658927917
+    }
+  }
+}

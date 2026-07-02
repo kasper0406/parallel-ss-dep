@@ -89,10 +89,9 @@ Both groups sit at **B = 262 k ≫ B_noise**, so both are in the saturated plate
 
 ### Empirical validation (short from-scratch sweep)
 
-A non-invasive watcher (`runs/noise_scale/watch_and_sweep.sh`) runs a 250-step from-scratch sweep on the real trunk (stripped of memory/PKM/latent/gist to isolate the optimizer-LR effect), reporting plain-LM VAL CE on a *fixed* held-out pool, the moment GPU 1 frees from the user's concurrent `embed_ab` run. Arms: {0.5×, 1×, 2×} LR @ 262 k and {1×, theory} LR @ 131 k. Expected from theory: VAL CE roughly **flat** across the LR bracket at 262 k with the optimum at/above 1× (saturation), and 131 k @ ~0.86× LR ≈ 131 k @ 1× ≈ 262 k (batch-robust).
+The script `experiments/lr_sweep_fromscratch.py` runs a 250-step from-scratch sweep on the real trunk (stripped of memory/PKM/latent/gist to isolate the optimizer-LR effect), reporting plain-LM VAL CE on a *fixed* held-out pool. The driver `runs/noise_scale/watch_and_sweep.sh` runs 5 arms: {0.5×, 1×, 2×} LR @ 262 k and {1×, theory} LR @ 131 k. Expected from theory: VAL CE roughly **flat** across the LR bracket at 262 k with the optimum at/above 1× (saturation), and 131 k @ ~0.86× LR ≈ 131 k @ 1× ≈ 262 k (batch-robust).
 
-> **STATUS: PENDING.** At analysis time GPU 1 was reclaimed by the user's `embed_ab_lr2` run (batch 12, ~75 min/arm); per "GPU 1 only / don't disturb others" the sweep was **not** run co-resident. Results will be appended to `runs/noise_scale/sweep.log` when the watcher fires. If it has not run by the time you read this, launch manually:
-> `bash runs/noise_scale/watch_and_sweep.sh` (waits for a free GPU 1, then runs ~35 min).
+> **STATUS: NOT RUN (pending a free GPU).** Throughout this analysis GPU 1 was occupied by the user's concurrent `embed_ab_lr2` run (batch 12, ~75 min/arm; its K=3 memory spiked to 24 GiB at step 201, so co-residency would have OOM'd it). Per "GPU 1 only / don't disturb others" the sweep was **not** run. The smoke confirmed the script is logically sound (it built the model, optimizer, data + val loaders, and forward, failing only at the co-resident OOM). **To run when GPU 1 is free:** `bash runs/noise_scale/watch_and_sweep.sh` (waits for >25 GiB free, then ~35 min; results → `runs/noise_scale/sweep.log`). The theory-only LR recommendation above stands without it.
 
 ---
 

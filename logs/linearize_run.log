@@ -1,0 +1,527 @@
+loading tokenizer HuggingFaceTB/SmolLM2-135M + donor HuggingFaceTB/SmolLM2-360M ...
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 3584.89it/s]
+building bare DeltaNet TinyLM + copying donor weights ...
+  COPIED 162 tensors (162 param-tensors in name-set)
+  LEFT RANDOM 288 param-tensors (DeltaNet attention sublayers)
+  copied (sample): embed.weight (<-embed_tokens, tied lm_head), blocks.0.attn_norm.weight, blocks.0.mlp_norm.weight, blocks.0.mlp.W_g.weight, ...
+  left-random (sample): blocks.0.attn.layer.q_proj.weight, blocks.0.attn.layer.k_proj.weight, blocks.0.attn.layer.v_proj.weight, blocks.0.attn.layer.b_proj.weight, ...
+  total model params: 402.0M
+[verify] zero-attn logit match vs donor: max|Δ|=0.0000e+00 mean|Δ|=0.0000e+00 (donor logit scale 3.092) argmax-agree=100.0%
+[verify] COPY EXACT (PASS)
+[init] HumanEval-solution CE (random DeltaNet attn) = 9.9023 (uniform=10.803, 9513 sol tokens)
+[stage2] trainable DeltaNet params: 118.8M across 288 tensors
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (19114 > 8192). Running this sequence through the model will result in indexing errors
+[stage2] step 0/20345 tok 0.0M rel_nmse 1.1026 lr 1.00e-04 4.9k tok/s
+[stage2] step 100/20345 tok 1.2M rel_nmse 0.8486 lr 1.60e-04 54.5k tok/s
+[stage2] step 200/20345 tok 2.5M rel_nmse 0.6474 lr 3.21e-04 57.5k tok/s
+[stage2] step 300/20345 tok 3.7M rel_nmse 0.5178 lr 5.41e-04 58.4k tok/s
+[stage2] step 400/20345 tok 4.9M rel_nmse 0.4370 lr 7.64e-04 58.8k tok/s
+[stage2] step 500/20345 tok 6.2M rel_nmse 0.3927 lr 9.32e-04 58.8k tok/s
+[stage2] step 600/20345 tok 7.4M rel_nmse 0.3637 lr 1.00e-03 59.0k tok/s
+[stage2] step 700/20345 tok 8.6M rel_nmse 0.3391 lr 1.00e-03 59.1k tok/s
+[stage2] step 800/20345 tok 9.8M rel_nmse 0.2946 lr 1.00e-03 59.1k tok/s
+[stage2] step 900/20345 tok 11.1M rel_nmse 0.3028 lr 9.99e-04 59.1k tok/s
+[stage2] step 1000/20345 tok 12.3M rel_nmse 0.3055 lr 9.99e-04 59.1k tok/s
+[stage2] step 1100/20345 tok 13.5M rel_nmse 0.2930 lr 9.98e-04 59.1k tok/s
+[stage2] step 1200/20345 tok 14.8M rel_nmse 0.2825 lr 9.98e-04 59.1k tok/s
+[stage2] step 1300/20345 tok 16.0M rel_nmse 0.2771 lr 9.97e-04 59.2k tok/s
+[stage2] step 1400/20345 tok 17.2M rel_nmse 0.2667 lr 9.96e-04 59.1k tok/s
+[stage2] step 1500/20345 tok 18.4M rel_nmse 0.2552 lr 9.95e-04 59.1k tok/s
+[stage2] step 1600/20345 tok 19.7M rel_nmse 0.2474 lr 9.94e-04 59.1k tok/s
+[stage2] step 1700/20345 tok 20.9M rel_nmse 0.2258 lr 9.93e-04 59.2k tok/s
+[stage2] step 1800/20345 tok 22.1M rel_nmse 0.2335 lr 9.91e-04 59.2k tok/s
+[stage2] step 1900/20345 tok 23.4M rel_nmse 0.2405 lr 9.90e-04 59.2k tok/s
+[stage2] step 2000/20345 tok 24.6M rel_nmse 0.2314 lr 9.88e-04 59.2k tok/s
+[stage2] step 2100/20345 tok 25.8M rel_nmse 0.2190 lr 9.86e-04 59.2k tok/s
+[stage2] step 2200/20345 tok 27.0M rel_nmse 0.2069 lr 9.84e-04 59.2k tok/s
+[stage2] step 2300/20345 tok 28.3M rel_nmse 0.2250 lr 9.82e-04 59.2k tok/s
+[stage2] step 2400/20345 tok 29.5M rel_nmse 0.2146 lr 9.80e-04 59.2k tok/s
+[stage2] step 2500/20345 tok 30.7M rel_nmse 0.2104 lr 9.78e-04 59.2k tok/s
+[stage2] step 2600/20345 tok 32.0M rel_nmse 0.2151 lr 9.75e-04 59.2k tok/s
+[stage2] step 2700/20345 tok 33.2M rel_nmse 0.1966 lr 9.73e-04 59.1k tok/s
+[stage2] step 2800/20345 tok 34.4M rel_nmse 0.1948 lr 9.70e-04 59.2k tok/s
+[stage2] step 2900/20345 tok 35.6M rel_nmse 0.2050 lr 9.67e-04 59.2k tok/s
+[stage2] step 3000/20345 tok 36.9M rel_nmse 0.1993 lr 9.64e-04 59.2k tok/s
+[stage2] step 3100/20345 tok 38.1M rel_nmse 0.1975 lr 9.61e-04 59.2k tok/s
+[stage2] step 3200/20345 tok 39.3M rel_nmse 0.1932 lr 9.58e-04 59.2k tok/s
+[stage2] step 3300/20345 tok 40.6M rel_nmse 0.1931 lr 9.55e-04 59.2k tok/s
+[stage2] step 3400/20345 tok 41.8M rel_nmse 0.1878 lr 9.52e-04 59.2k tok/s
+[stage2] step 3500/20345 tok 43.0M rel_nmse 0.1898 lr 9.48e-04 59.2k tok/s
+[stage2] step 3600/20345 tok 44.2M rel_nmse 0.1911 lr 9.45e-04 59.2k tok/s
+[stage2] step 3700/20345 tok 45.5M rel_nmse 0.1863 lr 9.41e-04 59.2k tok/s
+[stage2] step 3800/20345 tok 46.7M rel_nmse 0.1805 lr 9.37e-04 59.2k tok/s
+[stage2] step 3900/20345 tok 47.9M rel_nmse 0.1828 lr 9.33e-04 59.2k tok/s
+[stage2] step 4000/20345 tok 49.2M rel_nmse 0.1775 lr 9.29e-04 59.2k tok/s
+[stage2] *** HumanEval-solution CE @ 50M tok = 1.4425 ***
+[stage2] step 4100/20345 tok 50.4M rel_nmse 0.1794 lr 9.25e-04 58.8k tok/s
+[stage2] step 4200/20345 tok 51.6M rel_nmse 0.1740 lr 9.21e-04 58.8k tok/s
+[stage2] step 4300/20345 tok 52.9M rel_nmse 0.1757 lr 9.17e-04 58.8k tok/s
+[stage2] step 4400/20345 tok 54.1M rel_nmse 0.1689 lr 9.12e-04 58.9k tok/s
+[stage2] step 4500/20345 tok 55.3M rel_nmse 0.1714 lr 9.08e-04 58.9k tok/s
+[stage2] step 4600/20345 tok 56.5M rel_nmse 0.1793 lr 9.03e-04 58.9k tok/s
+[stage2] step 4700/20345 tok 57.8M rel_nmse 0.1655 lr 8.98e-04 58.9k tok/s
+[stage2] step 4800/20345 tok 59.0M rel_nmse 0.1543 lr 8.93e-04 58.9k tok/s
+[stage2] step 4900/20345 tok 60.2M rel_nmse 0.1660 lr 8.88e-04 58.9k tok/s
+[stage2] step 5000/20345 tok 61.5M rel_nmse 0.1675 lr 8.83e-04 58.9k tok/s
+[stage2] step 5100/20345 tok 62.7M rel_nmse 0.1639 lr 8.78e-04 58.9k tok/s
+[stage2] step 5200/20345 tok 63.9M rel_nmse 0.1640 lr 8.73e-04 58.9k tok/s
+[stage2] step 5300/20345 tok 65.1M rel_nmse 0.1616 lr 8.68e-04 58.9k tok/s
+[stage2] step 5400/20345 tok 66.4M rel_nmse 0.1604 lr 8.62e-04 58.9k tok/s
+[stage2] step 5500/20345 tok 67.6M rel_nmse 0.1515 lr 8.57e-04 58.9k tok/s
+[stage2] step 5600/20345 tok 68.8M rel_nmse 0.1591 lr 8.51e-04 59.0k tok/s
+[stage2] step 5700/20345 tok 70.1M rel_nmse 0.1574 lr 8.45e-04 59.0k tok/s
+[stage2] step 5800/20345 tok 71.3M rel_nmse 0.1566 lr 8.40e-04 59.0k tok/s
+[stage2] step 5900/20345 tok 72.5M rel_nmse 0.1547 lr 8.34e-04 59.0k tok/s
+[stage2] step 6000/20345 tok 73.7M rel_nmse 0.1567 lr 8.28e-04 59.0k tok/s
+[stage2] step 6100/20345 tok 75.0M rel_nmse 0.1522 lr 8.22e-04 59.0k tok/s
+[stage2] step 6200/20345 tok 76.2M rel_nmse 0.1523 lr 8.16e-04 59.0k tok/s
+[stage2] step 6300/20345 tok 77.4M rel_nmse 0.1513 lr 8.09e-04 59.0k tok/s
+[stage2] step 6400/20345 tok 78.7M rel_nmse 0.1490 lr 8.03e-04 59.0k tok/s
+[stage2] step 6500/20345 tok 79.9M rel_nmse 0.1461 lr 7.97e-04 59.0k tok/s
+[stage2] step 6600/20345 tok 81.1M rel_nmse 0.1515 lr 7.90e-04 59.0k tok/s
+[stage2] step 6700/20345 tok 82.3M rel_nmse 0.1500 lr 7.84e-04 59.0k tok/s
+[stage2] step 6800/20345 tok 83.6M rel_nmse 0.1482 lr 7.77e-04 59.0k tok/s
+[stage2] step 6900/20345 tok 84.8M rel_nmse 0.1481 lr 7.71e-04 59.0k tok/s
+[stage2] step 7000/20345 tok 86.0M rel_nmse 0.1462 lr 7.64e-04 59.0k tok/s
+[stage2] step 7100/20345 tok 87.3M rel_nmse 0.1463 lr 7.57e-04 59.0k tok/s
+[stage2] step 7200/20345 tok 88.5M rel_nmse 0.1463 lr 7.50e-04 59.0k tok/s
+[stage2] step 7300/20345 tok 89.7M rel_nmse 0.1438 lr 7.43e-04 59.0k tok/s
+[stage2] step 7400/20345 tok 90.9M rel_nmse 0.1399 lr 7.36e-04 59.0k tok/s
+[stage2] step 7500/20345 tok 92.2M rel_nmse 0.1428 lr 7.29e-04 59.0k tok/s
+[stage2] step 7600/20345 tok 93.4M rel_nmse 0.1374 lr 7.22e-04 59.0k tok/s
+[stage2] step 7700/20345 tok 94.6M rel_nmse 0.1453 lr 7.15e-04 59.1k tok/s
+[stage2] step 7800/20345 tok 95.9M rel_nmse 0.1412 lr 7.08e-04 59.1k tok/s
+[stage2] step 7900/20345 tok 97.1M rel_nmse 0.1408 lr 7.01e-04 59.0k tok/s
+[stage2] step 8000/20345 tok 98.3M rel_nmse 0.1399 lr 6.94e-04 59.1k tok/s
+[stage2] step 8100/20345 tok 99.5M rel_nmse 0.1342 lr 6.86e-04 59.1k tok/s
+[stage2] *** HumanEval-solution CE @ 100M tok = 1.1632 ***
+[stage2] step 8200/20345 tok 100.8M rel_nmse 0.1394 lr 6.79e-04 58.8k tok/s
+[stage2] step 8300/20345 tok 102.0M rel_nmse 0.1395 lr 6.71e-04 58.8k tok/s
+[stage2] step 8400/20345 tok 103.2M rel_nmse 0.1387 lr 6.64e-04 58.9k tok/s
+[stage2] step 8500/20345 tok 104.5M rel_nmse 0.1401 lr 6.56e-04 58.8k tok/s
+[stage2] step 8600/20345 tok 105.7M rel_nmse 0.1297 lr 6.49e-04 58.8k tok/s
+[stage2] step 8700/20345 tok 106.9M rel_nmse 0.1363 lr 6.41e-04 58.9k tok/s
+[stage2] step 8800/20345 tok 108.1M rel_nmse 0.1369 lr 6.34e-04 58.9k tok/s
+[stage2] step 8900/20345 tok 109.4M rel_nmse 0.1385 lr 6.26e-04 58.9k tok/s
+[stage2] step 9000/20345 tok 110.6M rel_nmse 0.1375 lr 6.18e-04 58.9k tok/s
+[stage2] step 9100/20345 tok 111.8M rel_nmse 0.1355 lr 6.11e-04 58.9k tok/s
+[stage2] step 9200/20345 tok 113.1M rel_nmse 0.1364 lr 6.03e-04 58.9k tok/s
+[stage2] step 9300/20345 tok 114.3M rel_nmse 0.1320 lr 5.95e-04 58.9k tok/s
+[stage2] step 9400/20345 tok 115.5M rel_nmse 0.1362 lr 5.87e-04 58.9k tok/s
+[stage2] step 9500/20345 tok 116.7M rel_nmse 0.1339 lr 5.79e-04 58.9k tok/s
+[stage2] step 9600/20345 tok 118.0M rel_nmse 0.1337 lr 5.72e-04 58.9k tok/s
+[stage2] step 9700/20345 tok 119.2M rel_nmse 0.1324 lr 5.64e-04 58.9k tok/s
+[stage2] step 9800/20345 tok 120.4M rel_nmse 0.1288 lr 5.56e-04 58.9k tok/s
+[stage2] step 9900/20345 tok 121.7M rel_nmse 0.0978 lr 5.48e-04 58.9k tok/s
+[stage2] step 10000/20345 tok 122.9M rel_nmse 0.1320 lr 5.40e-04 58.9k tok/s
+[stage2] step 10100/20345 tok 124.1M rel_nmse 0.1317 lr 5.32e-04 58.9k tok/s
+[stage2] step 10200/20345 tok 125.3M rel_nmse 0.1321 lr 5.24e-04 58.9k tok/s
+[stage2] step 10300/20345 tok 126.6M rel_nmse 0.1326 lr 5.16e-04 58.9k tok/s
+[stage2] step 10400/20345 tok 127.8M rel_nmse 0.1352 lr 5.08e-04 58.9k tok/s
+[stage2] step 10500/20345 tok 129.0M rel_nmse 0.1296 lr 5.01e-04 58.9k tok/s
+[stage2] step 10600/20345 tok 130.3M rel_nmse 0.1318 lr 4.93e-04 58.9k tok/s
+[stage2] step 10700/20345 tok 131.5M rel_nmse 0.1315 lr 4.85e-04 58.9k tok/s
+[stage2] step 10800/20345 tok 132.7M rel_nmse 0.1332 lr 4.77e-04 58.9k tok/s
+[stage2] step 10900/20345 tok 134.0M rel_nmse 0.1289 lr 4.69e-04 58.9k tok/s
+[stage2] step 11000/20345 tok 135.2M rel_nmse 0.1288 lr 4.61e-04 58.9k tok/s
+[stage2] step 11100/20345 tok 136.4M rel_nmse 0.1271 lr 4.53e-04 58.9k tok/s
+[stage2] step 11200/20345 tok 137.6M rel_nmse 0.1300 lr 4.45e-04 58.9k tok/s
+[stage2] step 11300/20345 tok 138.9M rel_nmse 0.1271 lr 4.37e-04 58.9k tok/s
+[stage2] step 11400/20345 tok 140.1M rel_nmse 0.1306 lr 4.30e-04 58.9k tok/s
+[stage2] step 11500/20345 tok 141.3M rel_nmse 0.1262 lr 4.22e-04 59.0k tok/s
+[stage2] step 11600/20345 tok 142.6M rel_nmse 0.1312 lr 4.14e-04 59.0k tok/s
+[stage2] step 11700/20345 tok 143.8M rel_nmse 0.1147 lr 4.06e-04 59.0k tok/s
+[stage2] step 11800/20345 tok 145.0M rel_nmse 0.1252 lr 3.98e-04 59.0k tok/s
+[stage2] step 11900/20345 tok 146.2M rel_nmse 0.1255 lr 3.91e-04 59.0k tok/s
+[stage2] step 12000/20345 tok 147.5M rel_nmse 0.1246 lr 3.83e-04 59.0k tok/s
+[stage2] step 12100/20345 tok 148.7M rel_nmse 0.1260 lr 3.75e-04 59.0k tok/s
+[stage2] step 12200/20345 tok 149.9M rel_nmse 0.1265 lr 3.68e-04 59.0k tok/s
+[stage2] *** HumanEval-solution CE @ 150M tok = 1.0400 ***
+[stage2] step 12300/20345 tok 151.2M rel_nmse 0.1253 lr 3.60e-04 58.8k tok/s
+[stage2] step 12400/20345 tok 152.4M rel_nmse 0.1304 lr 3.52e-04 58.8k tok/s
+[stage2] step 12500/20345 tok 153.6M rel_nmse 0.1200 lr 3.45e-04 58.8k tok/s
+[stage2] step 12600/20345 tok 154.8M rel_nmse 0.1252 lr 3.37e-04 58.8k tok/s
+[stage2] step 12700/20345 tok 156.1M rel_nmse 0.1243 lr 3.30e-04 58.8k tok/s
+[stage2] step 12800/20345 tok 157.3M rel_nmse 0.1237 lr 3.23e-04 58.8k tok/s
+[stage2] step 12900/20345 tok 158.5M rel_nmse 0.1253 lr 3.15e-04 58.8k tok/s
+[stage2] step 13000/20345 tok 159.8M rel_nmse 0.1195 lr 3.08e-04 58.8k tok/s
+[stage2] step 13100/20345 tok 161.0M rel_nmse 0.1231 lr 3.01e-04 58.9k tok/s
+[stage2] step 13200/20345 tok 162.2M rel_nmse 0.1271 lr 2.93e-04 58.9k tok/s
+[stage2] step 13300/20345 tok 163.4M rel_nmse 0.1212 lr 2.86e-04 58.9k tok/s
+[stage2] step 13400/20345 tok 164.7M rel_nmse 0.1266 lr 2.79e-04 58.9k tok/s
+[stage2] step 13500/20345 tok 165.9M rel_nmse 0.1225 lr 2.72e-04 58.9k tok/s
+[stage2] step 13600/20345 tok 167.1M rel_nmse 0.1244 lr 2.65e-04 58.9k tok/s
+[stage2] step 13700/20345 tok 168.4M rel_nmse 0.1255 lr 2.58e-04 58.9k tok/s
+[stage2] step 13800/20345 tok 169.6M rel_nmse 0.1137 lr 2.51e-04 58.9k tok/s
+[stage2] step 13900/20345 tok 170.8M rel_nmse 0.1234 lr 2.45e-04 58.9k tok/s
+[stage2] step 14000/20345 tok 172.0M rel_nmse 0.1244 lr 2.38e-04 58.9k tok/s
+[stage2] step 14100/20345 tok 173.3M rel_nmse 0.1370 lr 2.31e-04 58.9k tok/s
+[stage2] step 14200/20345 tok 174.5M rel_nmse 0.1213 lr 2.25e-04 58.9k tok/s
+[stage2] step 14300/20345 tok 175.7M rel_nmse 0.1193 lr 2.18e-04 58.9k tok/s
+[stage2] step 14400/20345 tok 177.0M rel_nmse 0.1235 lr 2.12e-04 58.9k tok/s
+[stage2] step 14500/20345 tok 178.2M rel_nmse 0.1216 lr 2.05e-04 58.9k tok/s
+[stage2] step 14600/20345 tok 179.4M rel_nmse 0.1240 lr 1.99e-04 58.9k tok/s
+[stage2] step 14700/20345 tok 180.6M rel_nmse 0.1221 lr 1.93e-04 58.9k tok/s
+[stage2] step 14800/20345 tok 181.9M rel_nmse 0.1198 lr 1.86e-04 58.9k tok/s
+[stage2] step 14900/20345 tok 183.1M rel_nmse 0.1224 lr 1.80e-04 58.9k tok/s
+[stage2] step 15000/20345 tok 184.3M rel_nmse 0.1052 lr 1.74e-04 58.9k tok/s
+[stage2] step 15100/20345 tok 185.6M rel_nmse 0.1213 lr 1.68e-04 58.9k tok/s
+[stage2] step 15200/20345 tok 186.8M rel_nmse 0.1215 lr 1.63e-04 58.9k tok/s
+[stage2] step 15300/20345 tok 188.0M rel_nmse 0.1214 lr 1.57e-04 58.9k tok/s
+[stage2] step 15400/20345 tok 189.2M rel_nmse 0.1194 lr 1.51e-04 58.9k tok/s
+[stage2] step 15500/20345 tok 190.5M rel_nmse 0.1201 lr 1.46e-04 58.9k tok/s
+[stage2] step 15600/20345 tok 191.7M rel_nmse 0.1181 lr 1.40e-04 58.9k tok/s
+[stage2] step 15700/20345 tok 192.9M rel_nmse 0.1234 lr 1.35e-04 58.9k tok/s
+[stage2] step 15800/20345 tok 194.2M rel_nmse 0.1046 lr 1.30e-04 58.9k tok/s
+[stage2] step 15900/20345 tok 195.4M rel_nmse 0.1215 lr 1.24e-04 58.9k tok/s
+[stage2] step 16000/20345 tok 196.6M rel_nmse 0.1199 lr 1.19e-04 58.9k tok/s
+[stage2] step 16100/20345 tok 197.8M rel_nmse 0.1192 lr 1.14e-04 58.9k tok/s
+[stage2] step 16200/20345 tok 199.1M rel_nmse 0.1177 lr 1.09e-04 58.9k tok/s
+[stage2] *** HumanEval-solution CE @ 200M tok = 1.0058 ***
+[stage2] step 16300/20345 tok 200.3M rel_nmse 0.1205 lr 1.05e-04 58.8k tok/s
+[stage2] step 16400/20345 tok 201.5M rel_nmse 0.1200 lr 9.98e-05 58.8k tok/s
+[stage2] step 16500/20345 tok 202.8M rel_nmse 0.1201 lr 9.52e-05 58.8k tok/s
+[stage2] step 16600/20345 tok 204.0M rel_nmse 0.1185 lr 9.07e-05 58.8k tok/s
+[stage2] step 16700/20345 tok 205.2M rel_nmse 0.1181 lr 8.63e-05 58.9k tok/s
+[stage2] step 16800/20345 tok 206.5M rel_nmse 0.1149 lr 8.21e-05 58.9k tok/s
+[stage2] step 16900/20345 tok 207.7M rel_nmse 0.1202 lr 7.79e-05 58.9k tok/s
+[stage2] step 17000/20345 tok 208.9M rel_nmse 0.1192 lr 7.38e-05 58.9k tok/s
+[stage2] step 17100/20345 tok 210.1M rel_nmse 0.1196 lr 6.98e-05 58.9k tok/s
+[stage2] step 17200/20345 tok 211.4M rel_nmse 0.1170 lr 6.60e-05 58.9k tok/s
+[stage2] step 17300/20345 tok 212.6M rel_nmse 0.1194 lr 6.22e-05 58.9k tok/s
+[stage2] step 17400/20345 tok 213.8M rel_nmse 0.1188 lr 5.86e-05 58.9k tok/s
+[stage2] step 17500/20345 tok 215.1M rel_nmse 0.1179 lr 5.51e-05 58.9k tok/s
+[stage2] step 17600/20345 tok 216.3M rel_nmse 0.1182 lr 5.17e-05 58.9k tok/s
+[stage2] step 17700/20345 tok 217.5M rel_nmse 0.1198 lr 4.84e-05 58.9k tok/s
+[stage2] step 17800/20345 tok 218.7M rel_nmse 0.1196 lr 4.52e-05 58.9k tok/s
+[stage2] step 17900/20345 tok 220.0M rel_nmse 0.1166 lr 4.22e-05 58.9k tok/s
+[stage2] step 18000/20345 tok 221.2M rel_nmse 0.1177 lr 3.92e-05 58.9k tok/s
+[stage2] step 18100/20345 tok 222.4M rel_nmse 0.1175 lr 3.64e-05 58.9k tok/s
+[stage2] step 18200/20345 tok 223.7M rel_nmse 0.1163 lr 3.37e-05 58.9k tok/s
+[stage2] step 18300/20345 tok 224.9M rel_nmse 0.1181 lr 3.11e-05 58.9k tok/s
+[stage2] step 18400/20345 tok 226.1M rel_nmse 0.1169 lr 2.86e-05 58.9k tok/s
+[stage2] step 18500/20345 tok 227.3M rel_nmse 0.1159 lr 2.63e-05 58.9k tok/s
+[stage2] step 18600/20345 tok 228.6M rel_nmse 0.1207 lr 2.40e-05 58.9k tok/s
+[stage2] step 18700/20345 tok 229.8M rel_nmse 0.1172 lr 2.19e-05 58.9k tok/s
+[stage2] step 18800/20345 tok 231.0M rel_nmse 0.1176 lr 1.99e-05 58.9k tok/s
+[stage2] step 18900/20345 tok 232.3M rel_nmse 0.1183 lr 1.81e-05 58.9k tok/s
+[stage2] step 19000/20345 tok 233.5M rel_nmse 0.1194 lr 1.63e-05 58.9k tok/s
+[stage2] step 19100/20345 tok 234.7M rel_nmse 0.1109 lr 1.47e-05 58.9k tok/s
+[stage2] step 19200/20345 tok 235.9M rel_nmse 0.1060 lr 1.32e-05 58.9k tok/s
+[stage2] step 19300/20345 tok 237.2M rel_nmse 0.1190 lr 1.18e-05 58.9k tok/s
+[stage2] step 19400/20345 tok 238.4M rel_nmse 0.1173 lr 1.06e-05 58.9k tok/s
+[stage2] step 19500/20345 tok 239.6M rel_nmse 0.1178 lr 9.47e-06 58.9k tok/s
+[stage2] step 19600/20345 tok 240.9M rel_nmse 0.1174 lr 8.48e-06 58.9k tok/s
+[stage2] step 19700/20345 tok 242.1M rel_nmse 0.1187 lr 7.60e-06 58.9k tok/s
+[stage2] step 19800/20345 tok 243.3M rel_nmse 0.1173 lr 6.86e-06 58.9k tok/s
+[stage2] step 19900/20345 tok 244.5M rel_nmse 0.1216 lr 6.24e-06 58.9k tok/s
+[stage2] step 20000/20345 tok 245.8M rel_nmse 0.1176 lr 5.74e-06 58.9k tok/s
+[stage2] step 20100/20345 tok 247.0M rel_nmse 0.1177 lr 5.37e-06 58.9k tok/s
+[stage2] step 20200/20345 tok 248.2M rel_nmse 0.1190 lr 5.13e-06 58.9k tok/s
+[stage2] step 20300/20345 tok 249.5M rel_nmse 0.1168 lr 5.01e-06 58.9k tok/s
+[stage2] *** HumanEval-solution CE @ 250M tok = 1.0052 ***
+[stage2] FINAL HumanEval-solution CE = 1.0052
+[stage3] step 0/29296 tok 0.0M kl 1.4501 ce 1.5844 lr 1.00e-05 2.1k tok/s
+[stage3] step 100/29296 tok 0.4M kl 0.9377 ce 1.7458 lr 1.11e-05 20.7k tok/s
+[stage3] step 200/29296 tok 0.8M kl 0.8067 ce 1.3829 lr 1.41e-05 21.6k tok/s
+[stage3] step 300/29296 tok 1.2M kl 0.7148 ce 1.6114 lr 1.91e-05 21.9k tok/s
+[stage3] step 400/29296 tok 1.6M kl 0.6710 ce 1.5578 lr 2.57e-05 22.1k tok/s
+[stage3] step 500/29296 tok 2.1M kl 0.6791 ce 1.5851 lr 3.36e-05 22.1k tok/s
+[stage3] step 600/29296 tok 2.5M kl 0.6887 ce 1.6336 lr 4.25e-05 22.2k tok/s
+[stage3] step 700/29296 tok 2.9M kl 0.6901 ce 1.6898 lr 5.20e-05 22.2k tok/s
+[stage3] step 800/29296 tok 3.3M kl 0.6845 ce 1.5982 lr 6.16e-05 22.3k tok/s
+[stage3] step 900/29296 tok 3.7M kl 0.6730 ce 1.5818 lr 7.10e-05 22.3k tok/s
+[stage3] step 1000/29296 tok 4.1M kl 0.6347 ce 1.5588 lr 7.96e-05 22.3k tok/s
+[stage3] step 1100/29296 tok 4.5M kl 0.6463 ce 1.5480 lr 8.70e-05 22.3k tok/s
+[stage3] step 1200/29296 tok 4.9M kl 0.6026 ce 1.2920 lr 9.30e-05 22.3k tok/s
+[stage3] step 1300/29296 tok 5.3M kl 0.6658 ce 1.5988 lr 9.73e-05 22.3k tok/s
+[stage3] step 1400/29296 tok 5.7M kl 0.6268 ce 1.6334 lr 9.96e-05 22.3k tok/s
+[stage3] step 1500/29296 tok 6.1M kl 0.6219 ce 1.3824 lr 1.00e-04 22.3k tok/s
+[stage3] step 1600/29296 tok 6.6M kl 0.6383 ce 1.5241 lr 1.00e-04 22.3k tok/s
+[stage3] step 1700/29296 tok 7.0M kl 0.2323 ce 1.1962 lr 1.00e-04 22.4k tok/s
+[stage3] step 1800/29296 tok 7.4M kl 0.6046 ce 1.5994 lr 1.00e-04 22.4k tok/s
+[stage3] step 1900/29296 tok 7.8M kl 0.6048 ce 1.5084 lr 9.99e-05 22.4k tok/s
+[stage3] step 2000/29296 tok 8.2M kl 0.5960 ce 1.6536 lr 9.99e-05 22.4k tok/s
+[stage3] step 2100/29296 tok 8.6M kl 0.5771 ce 1.4832 lr 9.99e-05 22.4k tok/s
+[stage3] step 2200/29296 tok 9.0M kl 0.5755 ce 1.6340 lr 9.98e-05 22.4k tok/s
+[stage3] step 2300/29296 tok 9.4M kl 0.5633 ce 1.6041 lr 9.98e-05 22.4k tok/s
+[stage3] step 2400/29296 tok 9.8M kl 0.5787 ce 1.4795 lr 9.97e-05 22.4k tok/s
+[stage3] step 2500/29296 tok 10.2M kl 0.5767 ce 1.3968 lr 9.97e-05 22.4k tok/s
+[stage3] step 2600/29296 tok 10.7M kl 0.5618 ce 1.2824 lr 9.96e-05 22.4k tok/s
+[stage3] step 2700/29296 tok 11.1M kl 0.5739 ce 1.5959 lr 9.95e-05 22.4k tok/s
+[stage3] step 2800/29296 tok 11.5M kl 0.6011 ce 1.5462 lr 9.94e-05 22.4k tok/s
+[stage3] step 2900/29296 tok 11.9M kl 0.5796 ce 1.5749 lr 9.93e-05 22.4k tok/s
+[stage3] step 3000/29296 tok 12.3M kl 0.5077 ce 1.5216 lr 9.93e-05 22.4k tok/s
+[stage3] step 3100/29296 tok 12.7M kl 0.5245 ce 1.2973 lr 9.92e-05 22.4k tok/s
+[stage3] step 3200/29296 tok 13.1M kl 0.5410 ce 1.5610 lr 9.90e-05 22.4k tok/s
+[stage3] step 3300/29296 tok 13.5M kl 0.5668 ce 1.5726 lr 9.89e-05 22.4k tok/s
+[stage3] step 3400/29296 tok 13.9M kl 0.5558 ce 1.5543 lr 9.88e-05 22.4k tok/s
+[stage3] step 3500/29296 tok 14.3M kl 0.5505 ce 1.5296 lr 9.87e-05 22.4k tok/s
+[stage3] step 3600/29296 tok 14.7M kl 0.5517 ce 1.5100 lr 9.86e-05 22.4k tok/s
+[stage3] step 3700/29296 tok 15.2M kl 0.5510 ce 1.4152 lr 9.84e-05 22.4k tok/s
+[stage3] step 3800/29296 tok 15.6M kl 0.5812 ce 1.4862 lr 9.83e-05 22.4k tok/s
+[stage3] step 3900/29296 tok 16.0M kl 0.5341 ce 1.6209 lr 9.81e-05 22.5k tok/s
+[stage3] step 4000/29296 tok 16.4M kl 0.5165 ce 1.5732 lr 9.80e-05 22.5k tok/s
+[stage3] step 4100/29296 tok 16.8M kl 0.5355 ce 1.5420 lr 9.78e-05 22.5k tok/s
+[stage3] step 4200/29296 tok 17.2M kl 0.4801 ce 1.2302 lr 9.76e-05 22.5k tok/s
+[stage3] step 4300/29296 tok 17.6M kl 0.5243 ce 1.4365 lr 9.75e-05 22.5k tok/s
+[stage3] step 4400/29296 tok 18.0M kl 0.5538 ce 1.4541 lr 9.73e-05 22.5k tok/s
+[stage3] step 4500/29296 tok 18.4M kl 0.5223 ce 1.4516 lr 9.71e-05 22.5k tok/s
+[stage3] step 4600/29296 tok 18.8M kl 0.5337 ce 1.5188 lr 9.69e-05 22.5k tok/s
+[stage3] step 4700/29296 tok 19.3M kl 0.5058 ce 1.5228 lr 9.67e-05 22.5k tok/s
+[stage3] step 4800/29296 tok 19.7M kl 0.5157 ce 1.4646 lr 9.65e-05 22.5k tok/s
+[stage3] step 4900/29296 tok 20.1M kl 0.5150 ce 1.5108 lr 9.63e-05 22.5k tok/s
+[stage3] step 5000/29296 tok 20.5M kl 0.5332 ce 1.4259 lr 9.61e-05 22.5k tok/s
+[stage3] step 5100/29296 tok 20.9M kl 0.5172 ce 1.5223 lr 9.59e-05 22.5k tok/s
+[stage3] step 5200/29296 tok 21.3M kl 0.5030 ce 1.5189 lr 9.56e-05 22.5k tok/s
+[stage3] step 5300/29296 tok 21.7M kl 0.5504 ce 1.5102 lr 9.54e-05 22.5k tok/s
+[stage3] step 5400/29296 tok 22.1M kl 0.5039 ce 1.4638 lr 9.52e-05 22.5k tok/s
+[stage3] step 5500/29296 tok 22.5M kl 0.4773 ce 1.3802 lr 9.49e-05 22.5k tok/s
+[stage3] step 5600/29296 tok 22.9M kl 0.5337 ce 1.3984 lr 9.47e-05 22.5k tok/s
+[stage3] step 5700/29296 tok 23.4M kl 0.5381 ce 1.5479 lr 9.44e-05 22.5k tok/s
+[stage3] step 5800/29296 tok 23.8M kl 0.4667 ce 1.4630 lr 9.42e-05 22.5k tok/s
+[stage3] step 5900/29296 tok 24.2M kl 0.5473 ce 1.4577 lr 9.39e-05 22.5k tok/s
+[stage3] step 6000/29296 tok 24.6M kl 0.5121 ce 1.5024 lr 9.36e-05 22.5k tok/s
+[stage3] step 6100/29296 tok 25.0M kl 0.4932 ce 1.4222 lr 9.33e-05 22.5k tok/s
+[stage3] step 6200/29296 tok 25.4M kl 0.4777 ce 1.4821 lr 9.31e-05 22.5k tok/s
+[stage3] step 6300/29296 tok 25.8M kl 0.5040 ce 1.5384 lr 9.28e-05 22.5k tok/s
+[stage3] step 6400/29296 tok 26.2M kl 0.4645 ce 1.4574 lr 9.25e-05 22.5k tok/s
+[stage3] step 6500/29296 tok 26.6M kl 0.4690 ce 1.5184 lr 9.22e-05 22.5k tok/s
+[stage3] step 6600/29296 tok 27.0M kl 0.4585 ce 1.5155 lr 9.19e-05 22.5k tok/s
+[stage3] step 6700/29296 tok 27.4M kl 0.5017 ce 1.4116 lr 9.16e-05 22.5k tok/s
+[stage3] step 6800/29296 tok 27.9M kl 0.4875 ce 1.4611 lr 9.12e-05 22.5k tok/s
+[stage3] step 6900/29296 tok 28.3M kl 0.4790 ce 1.5299 lr 9.09e-05 22.5k tok/s
+[stage3] step 7000/29296 tok 28.7M kl 0.4827 ce 1.4804 lr 9.06e-05 22.5k tok/s
+[stage3] step 7100/29296 tok 29.1M kl 0.4684 ce 1.4995 lr 9.03e-05 22.5k tok/s
+[stage3] step 7200/29296 tok 29.5M kl 0.4058 ce 1.0487 lr 8.99e-05 22.5k tok/s
+[stage3] step 7300/29296 tok 29.9M kl 0.4466 ce 1.3847 lr 8.96e-05 22.5k tok/s
+[stage3] step 7400/29296 tok 30.3M kl 0.4674 ce 1.3612 lr 8.92e-05 22.5k tok/s
+[stage3] step 7500/29296 tok 30.7M kl 0.4567 ce 1.1284 lr 8.89e-05 22.5k tok/s
+[stage3] step 7600/29296 tok 31.1M kl 0.4533 ce 1.5508 lr 8.85e-05 22.5k tok/s
+[stage3] step 7700/29296 tok 31.5M kl 0.4600 ce 1.4542 lr 8.82e-05 22.5k tok/s
+[stage3] step 7800/29296 tok 32.0M kl 0.5078 ce 1.5265 lr 8.78e-05 22.5k tok/s
+[stage3] step 7900/29296 tok 32.4M kl 0.4656 ce 1.4342 lr 8.74e-05 22.5k tok/s
+[stage3] step 8000/29296 tok 32.8M kl 0.4974 ce 1.4129 lr 8.71e-05 22.5k tok/s
+[stage3] step 8100/29296 tok 33.2M kl 0.4798 ce 1.5051 lr 8.67e-05 22.5k tok/s
+[stage3] step 8200/29296 tok 33.6M kl 0.4928 ce 1.4764 lr 8.63e-05 22.5k tok/s
+[stage3] step 8300/29296 tok 34.0M kl 0.4729 ce 1.5173 lr 8.59e-05 22.5k tok/s
+[stage3] step 8400/29296 tok 34.4M kl 0.4563 ce 1.5294 lr 8.55e-05 22.5k tok/s
+[stage3] step 8500/29296 tok 34.8M kl 0.4646 ce 1.3519 lr 8.51e-05 22.5k tok/s
+[stage3] step 8600/29296 tok 35.2M kl 0.3751 ce 1.0969 lr 8.47e-05 22.5k tok/s
+[stage3] step 8700/29296 tok 35.6M kl 0.4393 ce 1.4318 lr 8.43e-05 22.5k tok/s
+[stage3] step 8800/29296 tok 36.0M kl 0.4440 ce 1.4805 lr 8.39e-05 22.5k tok/s
+[stage3] step 8900/29296 tok 36.5M kl 0.4591 ce 1.3833 lr 8.35e-05 22.5k tok/s
+[stage3] step 9000/29296 tok 36.9M kl 0.4415 ce 1.4607 lr 8.31e-05 22.5k tok/s
+[stage3] step 9100/29296 tok 37.3M kl 0.4352 ce 1.4248 lr 8.26e-05 22.5k tok/s
+[stage3] step 9200/29296 tok 37.7M kl 0.4410 ce 1.4502 lr 8.22e-05 22.5k tok/s
+[stage3] step 9300/29296 tok 38.1M kl 0.4729 ce 1.4799 lr 8.18e-05 22.5k tok/s
+[stage3] step 9400/29296 tok 38.5M kl 0.5003 ce 1.5147 lr 8.13e-05 22.5k tok/s
+[stage3] step 9500/29296 tok 38.9M kl 0.4676 ce 1.4954 lr 8.09e-05 22.5k tok/s
+[stage3] step 9600/29296 tok 39.3M kl 0.4117 ce 1.3269 lr 8.04e-05 22.5k tok/s
+[stage3] step 9700/29296 tok 39.7M kl 0.4049 ce 1.3873 lr 8.00e-05 22.5k tok/s
+[stage3] step 9800/29296 tok 40.1M kl 0.4147 ce 1.4790 lr 7.95e-05 22.5k tok/s
+[stage3] step 9900/29296 tok 40.6M kl 0.4307 ce 1.5686 lr 7.91e-05 22.5k tok/s
+[stage3] step 10000/29296 tok 41.0M kl 0.4303 ce 1.3545 lr 7.86e-05 22.5k tok/s
+[stage3] step 10100/29296 tok 41.4M kl 0.4260 ce 1.1306 lr 7.82e-05 22.5k tok/s
+[stage3] step 10200/29296 tok 41.8M kl 0.4516 ce 1.4717 lr 7.77e-05 22.5k tok/s
+[stage3] step 10300/29296 tok 42.2M kl 0.3804 ce 1.1541 lr 7.72e-05 22.5k tok/s
+[stage3] step 10400/29296 tok 42.6M kl 0.4295 ce 1.5626 lr 7.68e-05 22.5k tok/s
+[stage3] step 10500/29296 tok 43.0M kl 0.4367 ce 1.5287 lr 7.63e-05 22.5k tok/s
+[stage3] step 10600/29296 tok 43.4M kl 0.4312 ce 1.4487 lr 7.58e-05 22.5k tok/s
+[stage3] step 10700/29296 tok 43.8M kl 0.4432 ce 1.4786 lr 7.53e-05 22.5k tok/s
+[stage3] step 10800/29296 tok 44.2M kl 0.4057 ce 1.4696 lr 7.48e-05 22.5k tok/s
+[stage3] step 10900/29296 tok 44.7M kl 0.4593 ce 1.4160 lr 7.43e-05 22.5k tok/s
+[stage3] step 11000/29296 tok 45.1M kl 0.4404 ce 1.3968 lr 7.38e-05 22.5k tok/s
+[stage3] step 11100/29296 tok 45.5M kl 0.4083 ce 1.3794 lr 7.34e-05 22.5k tok/s
+[stage3] step 11200/29296 tok 45.9M kl 0.4988 ce 1.2008 lr 7.29e-05 22.5k tok/s
+[stage3] step 11300/29296 tok 46.3M kl 0.3363 ce 0.9024 lr 7.24e-05 22.5k tok/s
+[stage3] step 11400/29296 tok 46.7M kl 0.3680 ce 1.0276 lr 7.18e-05 22.5k tok/s
+[stage3] step 11500/29296 tok 47.1M kl 0.4502 ce 1.4904 lr 7.13e-05 22.5k tok/s
+[stage3] step 11600/29296 tok 47.5M kl 0.4442 ce 1.5719 lr 7.08e-05 22.5k tok/s
+[stage3] step 11700/29296 tok 47.9M kl 0.4284 ce 1.4861 lr 7.03e-05 22.5k tok/s
+[stage3] step 11800/29296 tok 48.3M kl 0.4455 ce 1.3524 lr 6.98e-05 22.5k tok/s
+[stage3] step 11900/29296 tok 48.7M kl 0.4219 ce 1.4717 lr 6.93e-05 22.5k tok/s
+[stage3] step 12000/29296 tok 49.2M kl 0.4211 ce 1.3721 lr 6.88e-05 22.5k tok/s
+[stage3] step 12100/29296 tok 49.6M kl 0.4083 ce 1.5102 lr 6.82e-05 22.5k tok/s
+[stage3] step 12200/29296 tok 50.0M kl 0.4086 ce 1.4643 lr 6.77e-05 22.5k tok/s
+[stage3] *** HumanEval-solution CE @ 50M tok = 0.8011 ***
+[stage3] step 12300/29296 tok 50.4M kl 0.4037 ce 1.3439 lr 6.72e-05 22.4k tok/s
+[stage3] step 12400/29296 tok 50.8M kl 0.4071 ce 1.3066 lr 6.67e-05 22.4k tok/s
+[stage3] step 12500/29296 tok 51.2M kl 0.4202 ce 1.4143 lr 6.61e-05 22.4k tok/s
+[stage3] step 12600/29296 tok 51.6M kl 0.3871 ce 1.5028 lr 6.56e-05 22.4k tok/s
+[stage3] step 12700/29296 tok 52.0M kl 0.2852 ce 1.3696 lr 6.51e-05 22.4k tok/s
+[stage3] step 12800/29296 tok 52.4M kl 0.4294 ce 1.4053 lr 6.45e-05 22.4k tok/s
+[stage3] step 12900/29296 tok 52.8M kl 0.4202 ce 1.4116 lr 6.40e-05 22.4k tok/s
+[stage3] step 13000/29296 tok 53.3M kl 0.3201 ce 0.8660 lr 6.34e-05 22.4k tok/s
+[stage3] step 13100/29296 tok 53.7M kl 0.3946 ce 1.4189 lr 6.29e-05 22.4k tok/s
+[stage3] step 13200/29296 tok 54.1M kl 0.4106 ce 1.4532 lr 6.24e-05 22.4k tok/s
+[stage3] step 13300/29296 tok 54.5M kl 0.4037 ce 1.5152 lr 6.18e-05 22.4k tok/s
+[stage3] step 13400/29296 tok 54.9M kl 0.3660 ce 1.3845 lr 6.13e-05 22.4k tok/s
+[stage3] step 13500/29296 tok 55.3M kl 0.4268 ce 1.4137 lr 6.07e-05 22.4k tok/s
+[stage3] step 13600/29296 tok 55.7M kl 0.3968 ce 1.4029 lr 6.02e-05 22.4k tok/s
+[stage3] step 13700/29296 tok 56.1M kl 0.3513 ce 1.1764 lr 5.96e-05 22.4k tok/s
+[stage3] step 13800/29296 tok 56.5M kl 0.3973 ce 1.4006 lr 5.91e-05 22.4k tok/s
+[stage3] step 13900/29296 tok 56.9M kl 0.3949 ce 1.3891 lr 5.85e-05 22.4k tok/s
+[stage3] step 14000/29296 tok 57.3M kl 0.4058 ce 1.4189 lr 5.80e-05 22.4k tok/s
+[stage3] step 14100/29296 tok 57.8M kl 0.4413 ce 1.2339 lr 5.74e-05 22.4k tok/s
+[stage3] step 14200/29296 tok 58.2M kl 0.4046 ce 1.4704 lr 5.68e-05 22.4k tok/s
+[stage3] step 14300/29296 tok 58.6M kl 0.3364 ce 1.1047 lr 5.63e-05 22.4k tok/s
+[stage3] step 14400/29296 tok 59.0M kl 0.4057 ce 1.4495 lr 5.57e-05 22.4k tok/s
+[stage3] step 14500/29296 tok 59.4M kl 0.3845 ce 1.2904 lr 5.52e-05 22.4k tok/s
+[stage3] step 14600/29296 tok 59.8M kl 0.3824 ce 1.4240 lr 5.46e-05 22.4k tok/s
+[stage3] step 14700/29296 tok 60.2M kl 0.3443 ce 1.0560 lr 5.41e-05 22.4k tok/s
+[stage3] step 14800/29296 tok 60.6M kl 0.3998 ce 1.4720 lr 5.35e-05 22.4k tok/s
+[stage3] step 14900/29296 tok 61.0M kl 0.4196 ce 1.5187 lr 5.29e-05 22.4k tok/s
+[stage3] step 15000/29296 tok 61.4M kl 0.3873 ce 1.4665 lr 5.24e-05 22.4k tok/s
+[stage3] step 15100/29296 tok 61.9M kl 0.4064 ce 1.5707 lr 5.18e-05 22.4k tok/s
+[stage3] step 15200/29296 tok 62.3M kl 0.3441 ce 1.4174 lr 5.13e-05 22.4k tok/s
+[stage3] step 15300/29296 tok 62.7M kl 0.3960 ce 1.3357 lr 5.07e-05 22.4k tok/s
+[stage3] step 15400/29296 tok 63.1M kl 0.3997 ce 1.3746 lr 5.01e-05 22.4k tok/s
+[stage3] step 15500/29296 tok 63.5M kl 0.3989 ce 1.5216 lr 4.96e-05 22.4k tok/s
+[stage3] step 15600/29296 tok 63.9M kl 0.3739 ce 1.4039 lr 4.90e-05 22.4k tok/s
+[stage3] step 15700/29296 tok 64.3M kl 0.4195 ce 1.4208 lr 4.84e-05 22.4k tok/s
+[stage3] step 15800/29296 tok 64.7M kl 0.3718 ce 1.3959 lr 4.79e-05 22.4k tok/s
+[stage3] step 15900/29296 tok 65.1M kl 0.3998 ce 1.4522 lr 4.73e-05 22.4k tok/s
+[stage3] step 16000/29296 tok 65.5M kl 0.4155 ce 1.2513 lr 4.68e-05 22.4k tok/s
+[stage3] step 16100/29296 tok 65.9M kl 0.3910 ce 1.3958 lr 4.62e-05 22.4k tok/s
+[stage3] step 16200/29296 tok 66.4M kl 0.4099 ce 1.4109 lr 4.56e-05 22.4k tok/s
+[stage3] step 16300/29296 tok 66.8M kl 0.3965 ce 1.4374 lr 4.51e-05 22.4k tok/s
+[stage3] step 16400/29296 tok 67.2M kl 0.3898 ce 1.3344 lr 4.45e-05 22.4k tok/s
+[stage3] step 16500/29296 tok 67.6M kl 0.3960 ce 1.4178 lr 4.40e-05 22.4k tok/s
+[stage3] step 16600/29296 tok 68.0M kl 0.3734 ce 1.3548 lr 4.34e-05 22.4k tok/s
+[stage3] step 16700/29296 tok 68.4M kl 0.4059 ce 1.5039 lr 4.29e-05 22.4k tok/s
+[stage3] step 16800/29296 tok 68.8M kl 0.3910 ce 1.3814 lr 4.23e-05 22.4k tok/s
+[stage3] step 16900/29296 tok 69.2M kl 0.4022 ce 1.3851 lr 4.17e-05 22.4k tok/s
+[stage3] step 17000/29296 tok 69.6M kl 0.3658 ce 1.4024 lr 4.12e-05 22.4k tok/s
+[stage3] step 17100/29296 tok 70.0M kl 0.3363 ce 1.1509 lr 4.06e-05 22.4k tok/s
+[stage3] step 17200/29296 tok 70.5M kl 0.3761 ce 1.4537 lr 4.01e-05 22.4k tok/s
+[stage3] step 17300/29296 tok 70.9M kl 0.3028 ce 1.0884 lr 3.95e-05 22.4k tok/s
+[stage3] step 17400/29296 tok 71.3M kl 0.3882 ce 1.3284 lr 3.90e-05 22.4k tok/s
+[stage3] step 17500/29296 tok 71.7M kl 0.3997 ce 1.4148 lr 3.84e-05 22.4k tok/s
+[stage3] step 17600/29296 tok 72.1M kl 0.3807 ce 1.4323 lr 3.79e-05 22.4k tok/s
+[stage3] step 17700/29296 tok 72.5M kl 0.3362 ce 1.2939 lr 3.74e-05 22.4k tok/s
+[stage3] step 17800/29296 tok 72.9M kl 0.2986 ce 1.3115 lr 3.68e-05 22.4k tok/s
+[stage3] step 17900/29296 tok 73.3M kl 0.4197 ce 1.4136 lr 3.63e-05 22.4k tok/s
+[stage3] step 18000/29296 tok 73.7M kl 0.3763 ce 1.3275 lr 3.57e-05 22.4k tok/s
+[stage3] step 18100/29296 tok 74.1M kl 0.3380 ce 1.5573 lr 3.52e-05 22.4k tok/s
+[stage3] step 18200/29296 tok 74.6M kl 0.3677 ce 1.4404 lr 3.47e-05 22.4k tok/s
+[stage3] step 18300/29296 tok 75.0M kl 0.3827 ce 1.4721 lr 3.41e-05 22.4k tok/s
+[stage3] step 18400/29296 tok 75.4M kl 0.3762 ce 1.4234 lr 3.36e-05 22.4k tok/s
+[stage3] step 18500/29296 tok 75.8M kl 0.3414 ce 1.2812 lr 3.31e-05 22.4k tok/s
+[stage3] step 18600/29296 tok 76.2M kl 0.3510 ce 1.4492 lr 3.26e-05 22.4k tok/s
+[stage3] step 18700/29296 tok 76.6M kl 0.3582 ce 1.2964 lr 3.20e-05 22.4k tok/s
+[stage3] step 18800/29296 tok 77.0M kl 0.3772 ce 1.4127 lr 3.15e-05 22.4k tok/s
+[stage3] step 18900/29296 tok 77.4M kl 0.3655 ce 1.3386 lr 3.10e-05 22.4k tok/s
+[stage3] step 19000/29296 tok 77.8M kl 0.3589 ce 1.3234 lr 3.05e-05 22.4k tok/s
+[stage3] step 19100/29296 tok 78.2M kl 0.3579 ce 1.3964 lr 3.00e-05 22.4k tok/s
+[stage3] step 19200/29296 tok 78.6M kl 0.3707 ce 1.4353 lr 2.94e-05 22.4k tok/s
+[stage3] step 19300/29296 tok 79.1M kl 0.3504 ce 1.4249 lr 2.89e-05 22.4k tok/s
+[stage3] step 19400/29296 tok 79.5M kl 0.3826 ce 1.3728 lr 2.84e-05 22.4k tok/s
+[stage3] step 19500/29296 tok 79.9M kl 0.3482 ce 1.3596 lr 2.79e-05 22.4k tok/s
+[stage3] step 19600/29296 tok 80.3M kl 0.4150 ce 1.4210 lr 2.74e-05 22.4k tok/s
+[stage3] step 19700/29296 tok 80.7M kl 0.3571 ce 1.4212 lr 2.69e-05 22.4k tok/s
+[stage3] step 19800/29296 tok 81.1M kl 0.3394 ce 1.4322 lr 2.64e-05 22.4k tok/s
+[stage3] step 19900/29296 tok 81.5M kl 0.3782 ce 1.3911 lr 2.59e-05 22.4k tok/s
+[stage3] step 20000/29296 tok 81.9M kl 0.4878 ce 1.4192 lr 2.55e-05 22.4k tok/s
+[stage3] step 20100/29296 tok 82.3M kl 0.3639 ce 1.3353 lr 2.50e-05 22.4k tok/s
+[stage3] step 20200/29296 tok 82.7M kl 0.3534 ce 1.4662 lr 2.45e-05 22.4k tok/s
+[stage3] step 20300/29296 tok 83.2M kl 0.3433 ce 1.4244 lr 2.40e-05 22.4k tok/s
+[stage3] step 20400/29296 tok 83.6M kl 0.2961 ce 1.1114 lr 2.35e-05 22.4k tok/s
+[stage3] step 20500/29296 tok 84.0M kl 0.3683 ce 1.4452 lr 2.31e-05 22.4k tok/s
+[stage3] step 20600/29296 tok 84.4M kl 0.2725 ce 1.4290 lr 2.26e-05 22.4k tok/s
+[stage3] step 20700/29296 tok 84.8M kl 0.3454 ce 1.3241 lr 2.21e-05 22.4k tok/s
+[stage3] step 20800/29296 tok 85.2M kl 0.3042 ce 1.4321 lr 2.17e-05 22.4k tok/s
+[stage3] step 20900/29296 tok 85.6M kl 0.1470 ce 1.4674 lr 2.12e-05 22.4k tok/s
+[stage3] step 21000/29296 tok 86.0M kl 0.3415 ce 1.4167 lr 2.08e-05 22.4k tok/s
+[stage3] step 21100/29296 tok 86.4M kl 0.3695 ce 1.3832 lr 2.03e-05 22.4k tok/s
+[stage3] step 21200/29296 tok 86.8M kl 0.3658 ce 1.2254 lr 1.99e-05 22.4k tok/s
+[stage3] step 21300/29296 tok 87.2M kl 0.3735 ce 1.3371 lr 1.94e-05 22.4k tok/s
+[stage3] step 21400/29296 tok 87.7M kl 0.3696 ce 1.3795 lr 1.90e-05 22.4k tok/s
+[stage3] step 21500/29296 tok 88.1M kl 0.3569 ce 1.4018 lr 1.85e-05 22.4k tok/s
+[stage3] step 21600/29296 tok 88.5M kl 0.3132 ce 1.1574 lr 1.81e-05 22.4k tok/s
+[stage3] step 21700/29296 tok 88.9M kl 0.3715 ce 1.4662 lr 1.77e-05 22.4k tok/s
+[stage3] step 21800/29296 tok 89.3M kl 0.3460 ce 1.3925 lr 1.73e-05 22.4k tok/s
+[stage3] step 21900/29296 tok 89.7M kl 0.3209 ce 1.3753 lr 1.68e-05 22.4k tok/s
+[stage3] step 22000/29296 tok 90.1M kl 0.3605 ce 1.3954 lr 1.64e-05 22.4k tok/s
+[stage3] step 22100/29296 tok 90.5M kl 0.3267 ce 1.3499 lr 1.60e-05 22.4k tok/s
+[stage3] step 22200/29296 tok 90.9M kl 0.3333 ce 1.4555 lr 1.56e-05 22.4k tok/s
+[stage3] step 22300/29296 tok 91.3M kl 0.3712 ce 1.3730 lr 1.52e-05 22.4k tok/s
+[stage3] step 22400/29296 tok 91.8M kl 0.4070 ce 1.4540 lr 1.48e-05 22.4k tok/s
+[stage3] step 22500/29296 tok 92.2M kl 0.4228 ce 1.4872 lr 1.44e-05 22.4k tok/s
+[stage3] step 22600/29296 tok 92.6M kl 0.3367 ce 1.4457 lr 1.40e-05 22.4k tok/s
+[stage3] step 22700/29296 tok 93.0M kl 0.3569 ce 1.4302 lr 1.37e-05 22.4k tok/s
+[stage3] step 22800/29296 tok 93.4M kl 0.3365 ce 1.3701 lr 1.33e-05 22.4k tok/s
+[stage3] step 22900/29296 tok 93.8M kl 0.3470 ce 1.4176 lr 1.29e-05 22.4k tok/s
+[stage3] step 23000/29296 tok 94.2M kl 0.3413 ce 1.3634 lr 1.25e-05 22.4k tok/s
+[stage3] step 23100/29296 tok 94.6M kl 0.3561 ce 1.3004 lr 1.22e-05 22.5k tok/s
+[stage3] step 23200/29296 tok 95.0M kl 0.3785 ce 1.3928 lr 1.18e-05 22.4k tok/s
+[stage3] step 23300/29296 tok 95.4M kl 0.3558 ce 1.4134 lr 1.15e-05 22.4k tok/s
+[stage3] step 23400/29296 tok 95.9M kl 0.3616 ce 1.2807 lr 1.11e-05 22.4k tok/s
+[stage3] step 23500/29296 tok 96.3M kl 0.3469 ce 1.4029 lr 1.08e-05 22.4k tok/s
+[stage3] step 23600/29296 tok 96.7M kl 0.3358 ce 1.4019 lr 1.04e-05 22.5k tok/s
+[stage3] step 23700/29296 tok 97.1M kl 0.3555 ce 1.4165 lr 1.01e-05 22.4k tok/s
+[stage3] step 23800/29296 tok 97.5M kl 0.3609 ce 1.4176 lr 9.76e-06 22.5k tok/s
+[stage3] step 23900/29296 tok 97.9M kl 0.2819 ce 1.1100 lr 9.44e-06 22.5k tok/s
+[stage3] step 24000/29296 tok 98.3M kl 0.3609 ce 1.4463 lr 9.12e-06 22.5k tok/s
+[stage3] step 24100/29296 tok 98.7M kl 0.3432 ce 1.4203 lr 8.81e-06 22.5k tok/s
+[stage3] step 24200/29296 tok 99.1M kl 0.3461 ce 1.3581 lr 8.50e-06 22.5k tok/s
+[stage3] step 24300/29296 tok 99.5M kl 0.3309 ce 1.6097 lr 8.20e-06 22.5k tok/s
+[stage3] step 24400/29296 tok 99.9M kl 0.2953 ce 1.0427 lr 7.90e-06 22.5k tok/s
+[stage3] *** HumanEval-solution CE @ 100M tok = 0.7606 ***
+[stage3] step 24500/29296 tok 100.4M kl 0.3947 ce 1.4533 lr 7.61e-06 22.4k tok/s
+[stage3] step 24600/29296 tok 100.8M kl 0.3209 ce 1.4138 lr 7.32e-06 22.4k tok/s
+[stage3] step 24700/29296 tok 101.2M kl 0.3543 ce 1.3255 lr 7.04e-06 22.4k tok/s
+[stage3] step 24800/29296 tok 101.6M kl 0.3278 ce 1.3243 lr 6.77e-06 22.4k tok/s
+[stage3] step 24900/29296 tok 102.0M kl 0.3054 ce 1.3408 lr 6.50e-06 22.4k tok/s
+[stage3] step 25000/29296 tok 102.4M kl 0.3970 ce 1.4505 lr 6.23e-06 22.4k tok/s
+[stage3] step 25100/29296 tok 102.8M kl 0.3443 ce 1.5631 lr 5.97e-06 22.4k tok/s
+[stage3] step 25200/29296 tok 103.2M kl 0.3640 ce 1.3761 lr 5.72e-06 22.4k tok/s
+[stage3] step 25300/29296 tok 103.6M kl 0.3338 ce 1.3459 lr 5.47e-06 22.4k tok/s
+[stage3] step 25400/29296 tok 104.0M kl 0.2711 ce 1.1120 lr 5.23e-06 22.4k tok/s
+[stage3] step 25500/29296 tok 104.5M kl 0.3324 ce 1.4218 lr 4.99e-06 22.4k tok/s
+[stage3] step 25600/29296 tok 104.9M kl 0.2909 ce 1.2247 lr 4.76e-06 22.4k tok/s
+[stage3] step 25700/29296 tok 105.3M kl 0.3380 ce 1.4112 lr 4.54e-06 22.4k tok/s
+[stage3] step 25800/29296 tok 105.7M kl 0.3301 ce 1.3491 lr 4.32e-06 22.4k tok/s
+[stage3] step 25900/29296 tok 106.1M kl 0.3183 ce 1.3944 lr 4.11e-06 22.4k tok/s
+[stage3] step 26000/29296 tok 106.5M kl 0.3357 ce 1.4037 lr 3.90e-06 22.4k tok/s
+[stage3] step 26100/29296 tok 106.9M kl 0.3465 ce 1.3197 lr 3.70e-06 22.4k tok/s
+[stage3] step 26200/29296 tok 107.3M kl 0.3226 ce 1.3993 lr 3.50e-06 22.4k tok/s
+[stage3] step 26300/29296 tok 107.7M kl 0.3480 ce 1.3921 lr 3.31e-06 22.4k tok/s
+[stage3] step 26400/29296 tok 108.1M kl 0.3451 ce 1.2792 lr 3.13e-06 22.4k tok/s
+[stage3] step 26500/29296 tok 108.5M kl 0.3595 ce 1.3560 lr 2.95e-06 22.4k tok/s
+[stage3] step 26600/29296 tok 109.0M kl 0.3418 ce 1.4689 lr 2.78e-06 22.4k tok/s
+[stage3] step 26700/29296 tok 109.4M kl 0.3204 ce 1.4117 lr 2.62e-06 22.4k tok/s
+[stage3] step 26800/29296 tok 109.8M kl 0.3238 ce 1.4182 lr 2.46e-06 22.4k tok/s
+[stage3] step 26900/29296 tok 110.2M kl 0.3316 ce 1.3018 lr 2.31e-06 22.4k tok/s
+[stage3] step 27000/29296 tok 110.6M kl 0.3302 ce 1.4024 lr 2.16e-06 22.4k tok/s
+[stage3] step 27100/29296 tok 111.0M kl 0.3348 ce 1.3827 lr 2.02e-06 22.4k tok/s
+[stage3] step 27200/29296 tok 111.4M kl 0.3417 ce 1.3520 lr 1.88e-06 22.4k tok/s
+[stage3] step 27300/29296 tok 111.8M kl 0.3703 ce 1.3046 lr 1.75e-06 22.4k tok/s
+[stage3] step 27400/29296 tok 112.2M kl 0.3007 ce 1.1062 lr 1.63e-06 22.4k tok/s
+[stage3] step 27500/29296 tok 112.6M kl 0.3538 ce 1.3661 lr 1.52e-06 22.4k tok/s
+[stage3] step 27600/29296 tok 113.1M kl 0.3379 ce 1.4675 lr 1.41e-06 22.4k tok/s
+[stage3] step 27700/29296 tok 113.5M kl 0.3760 ce 1.3057 lr 1.30e-06 22.4k tok/s
+[stage3] step 27800/29296 tok 113.9M kl 0.3524 ce 1.3628 lr 1.21e-06 22.4k tok/s
+[stage3] step 27900/29296 tok 114.3M kl 0.3236 ce 1.3847 lr 1.11e-06 22.4k tok/s
+[stage3] step 28000/29296 tok 114.7M kl 0.2939 ce 1.1644 lr 1.03e-06 22.4k tok/s
+[stage3] step 28100/29296 tok 115.1M kl 0.3404 ce 1.3505 lr 9.51e-07 22.4k tok/s
+[stage3] step 28200/29296 tok 115.5M kl 0.3219 ce 1.4347 lr 8.79e-07 22.4k tok/s
+[stage3] step 28300/29296 tok 115.9M kl 0.3241 ce 1.3770 lr 8.13e-07 22.4k tok/s
+[stage3] step 28400/29296 tok 116.3M kl 0.3149 ce 1.6547 lr 7.53e-07 22.4k tok/s
+[stage3] step 28500/29296 tok 116.7M kl 0.3318 ce 1.4214 lr 7.00e-07 22.4k tok/s
+[stage3] step 28600/29296 tok 117.1M kl 0.3423 ce 1.3895 lr 6.53e-07 22.4k tok/s
+[stage3] step 28700/29296 tok 117.6M kl 0.3183 ce 1.4428 lr 6.12e-07 22.4k tok/s
+[stage3] step 28800/29296 tok 118.0M kl 0.3212 ce 1.3237 lr 5.77e-07 22.4k tok/s
+[stage3] step 28900/29296 tok 118.4M kl 0.3411 ce 1.2430 lr 5.49e-07 22.4k tok/s
+[stage3] step 29000/29296 tok 118.8M kl 0.3089 ce 1.4577 lr 5.27e-07 22.4k tok/s
+[stage3] step 29100/29296 tok 119.2M kl 0.3396 ce 1.4426 lr 5.12e-07 22.4k tok/s
+[stage3] step 29200/29296 tok 119.6M kl 0.3271 ce 1.4247 lr 5.03e-07 22.4k tok/s
+[stage3] *** HumanEval-solution CE @ 120M tok = 0.7587 ***
+[stage3] FINAL HumanEval-solution CE = 0.7587
+==== SUMMARY ====
+  SmolLM2-360M teacher (target) : 0.6142
+  our-from-scratch SFT (floor)  : 0.9716
+  (a) init random-attn          : 9.9023
+  (b) after layerwise transfer  : 1.0052
+  (c) after end-to-end distill  : 0.7587
+results json written

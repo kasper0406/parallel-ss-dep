@@ -27,7 +27,7 @@
   </style>
 
   <text x="430" y="34" text-anchor="middle" class="t ttl">Small Super-coder — model architecture</text>
-  <text x="430" y="54" text-anchor="middle" class="mut sub">DeltaNet linear-RNN backbone · shallow-wide trunk · sparse FiLM feedback · PKM + Working Memory · emit/think gate</text>
+  <text x="430" y="54" text-anchor="middle" class="mut sub">DeltaNet linear-RNN backbone · shallow-wide trunk · sparse FiLM feedback · PKM + Working Memory · emit/think gate + latent thinking</text>
 
   <!-- Input -->
   <rect x="330" y="74" width="200" height="34" rx="6" class="plain"/>
@@ -42,7 +42,7 @@
   <!-- Trunk -->
   <line x1="430" y1="170" x2="430" y2="190" class="flow" marker-end="url(#arrow)"/>
   <rect x="290" y="190" width="280" height="338" rx="8" class="core"/>
-  <text x="430" y="214" text-anchor="middle" class="t lbl">DeltaNet trunk &#183; 10 wide blocks (d=1280)</text>
+  <text x="430" y="214" text-anchor="middle" class="t lbl">DeltaNet trunk &#183; 10 wide blocks (d=896)</text>
 
   <!-- block rows -->
   <g>
@@ -94,8 +94,8 @@
   <path d="M 612 574 L 530 574" class="side" marker-end="url(#sidearrow)"/>
   <rect x="612" y="540" width="220" height="68" rx="8" class="mem"/>
   <text x="722" y="562" text-anchor="middle" class="t lbl">Working Memory</text>
-  <text x="722" y="579" text-anchor="middle" class="mut sub">write-gated bounded buffer of past</text>
-  <text x="722" y="595" text-anchor="middle" class="mut sub">hidden states &#183; soft-read @ think</text>
+  <text x="722" y="579" text-anchor="middle" class="mut sub">write-gated buffer &#183; learned name-span key</text>
+  <text x="722" y="595" text-anchor="middle" class="mut sub">copy/pointer readout @ recall positions</text>
 
   <!-- to heads -->
   <line x1="430" y1="582" x2="430" y2="618" class="flow" marker-end="url(#arrow)"/>
@@ -132,6 +132,6 @@
     <line x1="520" y1="8" x2="556" y2="8" class="fb"/>
     <text x="564" y="13" class="mut sub">FiLM feedback</text>
   </g>
-  <text x="430" y="806" text-anchor="middle" class="mut sub">Validated lifts: FiLM (&#8722;3&#8211;5% PPL) &#183; PKM (&#8722;5 HumanEval in ablation) &#183; WM (98% long-context recall).</text>
-  <text x="430" y="824" text-anchor="middle" class="mut sub">Execution-grounded GRPO (code-grader reward) is the post-pretrain capability lever. Thinking gate: active research.</text>
+  <text x="430" y="806" text-anchor="middle" class="mut sub">Validated lifts: FiLM (&#8722;3&#8211;5% PPL) &#183; PKM (&#8722;5 HumanEval in ablation) &#183; WM (first-occurrence recall 0.03&#8594;0.98 leak-free, co-trained).</text>
+  <text x="430" y="824" text-anchor="middle" class="mut sub">Execution-grounded GRPO (code-grader reward) is the post-pretrain capability lever. Latent thinking + gate: active research.</text>
 </svg>

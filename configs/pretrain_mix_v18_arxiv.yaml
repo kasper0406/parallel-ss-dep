@@ -1,0 +1,193 @@
+# Mixed-corpus pretrain v18 — v14 (validated WM-recall maskfix mix) + arXiv.
+#
+# WHY v18 EXISTS: add arXiv to broaden scientific/math knowledge + reasoning prose.
+#   User wants "as much / as new a cut of arXiv as possible"; license not a concern
+#   (personal prototype). Two arXiv streams chosen after probing HF (2026-06-18):
+#
+#   * arxiv_fulltext  = AlgorithmicResearchGroup/arxiv_s2orc_parsed
+#       Full extracted body text (S2ORC parse), broadest "≈all of arXiv" coverage
+#       that STILL STREAMS in our datasets lib. ~2024 cut. text field = `text`.
+#   * arxiv_abstracts = librarian-bots/arxiv-metadata-snapshot
+#       Title+abstract for ~all 2.7M papers, refreshed to ~Jun 2026 (the freshest
+#       cut available) — buys recency + coverage the full-text dump lacks.
+#
+#   WHY NOT RedPajama-1T-arxiv / peS2o / proof-pile-2 (the canonical full-text
+#   arXiv pretraining corpora): all are loading-SCRIPT datasets and the current
+#   `datasets` lib hard-refuses them ("Dataset scripts are no longer supported").
+#   Usable only via a parquet re-host or a pinned old `datasets` — deferred.
+#
+# WEIGHT BUDGET: arXiv kept a modest 0.08 total (0.06 full text + 0.02 abstracts)
+#   so the trunk stays CODE-dominant (this is a code model). Carved from wiki
+#   (0.10->0.04) and the two textbook streams (0.05->0.04 each); everything else —
+#   recall streams, code bulk, instruction code, CVE — is byte-identical to v14.
+#   Weights sum to 1.0 (data_mix renormalizes anyway).
+#
+# Base recipe + all caveats: see configs/pretrain_mix_v14_wmrecall_maskfix.yaml.
+
+sources:
+
+  # ==== RECALL streams (16% total — the WM gradient; unchanged from v14) =====
+
+  - name: multibind_recall_pretrain
+    jsonl_path: data/multibind_recall_pretrain.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.05
+    filter: always
+    emit_read_mask: true
+
+  - name: code_recall_train
+    jsonl_path: data/code_recall_train.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.05
+    filter: always
+    emit_read_mask: true
+    mask_first_occurrence: true
+
+  - name: agentic_recall_train
+    jsonl_path: data/agentic_recall_train.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.03
+    filter: always
+    emit_read_mask: true
+    mask_first_occurrence: true
+
+  - name: synthetic_memory
+    jsonl_path: data/synthetic_memory.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.03
+    filter: always
+
+  # ==== Raw code (the anti-forgetting bulk; unchanged) =====================
+
+  - name: codeparrot
+    dataset_id: codeparrot/codeparrot-clean
+    text_field: content
+    split: train
+    weight: 0.22
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 200 }
+
+  - name: python_codes_25k
+    dataset_id: flytech/python-codes-25k
+    text_field: text
+    split: train
+    weight: 0.08
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  # ==== Problem-solving instruction code (unchanged) =======================
+
+  - name: magicoder_oss
+    dataset_id: ise-uiuc/Magicoder-OSS-Instruct-75K
+    text_field: [problem, solution]
+    split: train
+    weight: 0.09
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  - name: code_exercises_jinaai
+    dataset_id: jinaai/code_exercises
+    text_field: [problem, solution]
+    split: train
+    weight: 0.02
+    fim_rate: 0.5
+    filter: always
+
+  - name: python_instr_18k_alpaca
+    dataset_id: iamtarun/python_code_instructions_18k_alpaca
+    text_field: [prompt, output]
+    split: train
+    weight: 0.06
+    filter: always
+
+  - name: codealpaca_20k
+    dataset_id: HuggingFaceH4/CodeAlpaca_20K
+    text_field: [prompt, completion]
+    split: train
+    weight: 0.05
+    filter: always
+
+  # ==== CVE / vulnerability + fix (unchanged) ==============================
+
+  - name: bigvul
+    dataset_id: bstee615/bigvul
+    text_builder: bigvul
+    split: train
+    weight: 0.08
+    filter: bigvul_vulnerable
+
+  - name: cybernative_vuln_dpo
+    dataset_id: CyberNative/Code_Vulnerability_Security_DPO
+    text_builder: cybernative_dpo
+    split: train
+    weight: 0.04
+    filter: always
+
+  # ==== Synthetic CS textbooks (trimmed 0.05->0.04 each to fund arXiv) ======
+
+  - name: textbooks_lite_sciphi
+    dataset_id: SciPhi/textbooks-are-all-you-need-lite
+    text_field: completion
+    split: train
+    weight: 0.04
+    filter:
+      name: min_content_len
+      args: { min_chars: 400 }
+
+  - name: textbook_quality_programming
+    dataset_id: vikp/textbook_quality_programming
+    text_field: markdown
+    split: train
+    weight: 0.04
+    filter:
+      name: min_content_len
+      args: { min_chars: 400 }
+
+  # ==== Wikipedia (trimmed 0.10->0.04 to fund arXiv) =======================
+
+  - name: wikipedia_en
+    dataset_id: wikimedia/wikipedia
+    hf_extra: { name: "20231101.en" }
+    text_field: text
+    split: train
+    weight: 0.04
+    filter:
+      name: min_content_len
+      args: { min_chars: 500 }
+
+  # ==== arXiv (NEW in v18) =================================================
+
+  # Full extracted paper body — broadest coverage that streams. ~2024 cut.
+  - name: arxiv_fulltext
+    dataset_id: AlgorithmicResearchGroup/arxiv_s2orc_parsed
+    text_field: text
+    split: train
+    weight: 0.06
+    filter:
+      name: min_content_len
+      args: { min_chars: 500 }
+
+  # Freshest cut (title+abstract → ~Jun 2026) for recency + near-total coverage.
+  # FILTER FIX (2026-06-18): min_content_len is structurally incompatible with a
+  #   LIST text_field here — _filter_min_content_len inspects ex["content"]/ex["text"],
+  #   but this dataset exposes only `title`/`abstract`, so the filter saw length 0 and
+  #   rejected 100% of examples (probe: 0/50 passed). Switched to `always`: abstracts
+  #   are naturally long (probed median ~1094 chars, none under 200) and _extract_text
+  #   already skips rows where both title+abstract are empty, so the length floor is
+  #   moot in practice. See data_mix._filter_min_content_len.
+  - name: arxiv_abstracts
+    dataset_id: librarian-bots/arxiv-metadata-snapshot
+    text_field: [title, abstract]
+    split: train
+    weight: 0.02
+    filter: always

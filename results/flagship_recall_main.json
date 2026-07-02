@@ -1,0 +1,107 @@
+{
+  "config": {
+    "tasks": "data/flagship_recall.jsonl",
+    "ckpt": "checkpoints/pretrain_v12.pt",
+    "hf_model": "HuggingFaceTB/SmolLM2-360M",
+    "keys_per_task": 6,
+    "max_gen": 32,
+    "max_problems_per_bucket": 0,
+    "force_think": 8,
+    "arms": "ours,control_full,control_window2048",
+    "shared_format": false,
+    "out_json": "results/flagship_recall_main.json"
+  },
+  "buckets": [
+    1024,
+    2048,
+    4096,
+    8192
+  ],
+  "results": {
+    "ours": {
+      "per_bucket": {
+        "1024": [
+          895,
+          900
+        ],
+        "2048": [
+          811,
+          900
+        ],
+        "4096": [
+          509,
+          900
+        ],
+        "8192": [
+          153,
+          900
+        ]
+      },
+      "tok_len_mean": {
+        "1024": 1018.0533333333333,
+        "2048": 2042.28,
+        "4096": 4089.62,
+        "8192": 8185.54
+      },
+      "think_rate": 0.00885321219317038,
+      "fmt": "prose",
+      "secs": 1083.968936920166
+    },
+    "control_full": {
+      "per_bucket": {
+        "1024": [
+          710,
+          900
+        ],
+        "2048": [
+          603,
+          900
+        ],
+        "4096": [
+          506,
+          900
+        ],
+        "8192": [
+          0,
+          900
+        ]
+      },
+      "tok_len_mean": {
+        "1024": 1007.0533333333333,
+        "2048": 2031.28,
+        "4096": 4078.62,
+        "8192": 8174.54
+      },
+      "n_overflow_8192": 0,
+      "secs": 852.0012309551239
+    },
+    "control_window2048": {
+      "per_bucket": {
+        "1024": [
+          710,
+          900
+        ],
+        "2048": [
+          603,
+          900
+        ],
+        "4096": [
+          0,
+          900
+        ],
+        "8192": [
+          0,
+          900
+        ]
+      },
+      "tok_len_mean": {
+        "1024": 1007.0533333333333,
+        "2048": 2031.28,
+        "4096": 2048.0,
+        "8192": 2048.0
+      },
+      "n_overflow_8192": 0,
+      "secs": 795.0039801597595
+    }
+  }
+}

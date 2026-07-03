@@ -293,7 +293,11 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
                 print(f"  α-WD split: {len(alphas)} FiLM α params get "
                       f"weight_decay={alpha_wd}")
         if pkm_values:
-            groups.append({"params": pkm_values, "weight_decay": wd,
+            # PKM values are a MEMORY TABLE, not weights: weight decay on them
+            # is forgetting-by-design (at value-lr 0.14 x wd 0.01 the table
+            # halves every ~500 steps wherever gradient thins — the measured
+            # post-epsilon erosion loop, 2026-07-03). No decay.
+            groups.append({"params": pkm_values, "weight_decay": 0.0,
                            "lr": lr * pkm_value_lr_mult})
             if verbose:
                 print(f"  PKM-value LR boost: {len(pkm_values)} value tables "
@@ -378,7 +382,8 @@ def build_optimizer(model: nn.Module, *, optimizer: str, lr: float,
             print(f"  α-WD split: {len(adamw_alpha)} FiLM α params get "
                   f"weight_decay={alpha_wd}")
     if adamw_pkm_values:
-        adamw_groups.append({"params": adamw_pkm_values, "weight_decay": wd,
+        # Memory table: no weight decay (see the adamw-mode comment above).
+        adamw_groups.append({"params": adamw_pkm_values, "weight_decay": 0.0,
                               "lr": lr * pkm_value_lr_mult})
         if verbose:
             print(f"  PKM-value LR boost: {len(adamw_pkm_values)} value "

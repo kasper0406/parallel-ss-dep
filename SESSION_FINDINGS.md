@@ -409,3 +409,69 @@ identifier-vs-other, with paired mechanism toggles:
 5. **Adopt dependency-distance-stratified CE as the standing feature dev
    signal** (the probe is now in-repo); stop deciding feature questions on
    HumanEval greedy or ≤512-token CE.
+
+---
+
+## 2026-07-03 — FEATURE-PILOT A/B verdict (iso-token, engaged features, 2×2500 steps on the linearized 32L base)
+
+The first engaged-features iso-data A/B (the experiment the repo never had).
+Arms: A = lean; B = FiLM+WM+PKM+gate+latent-aux, all engaged per the recipe
+(warm-starts + floors + aux stack). Same mix (code-dominant + 25% recall
+streams incl. the new natural-reuse supervision), same LR (6e-4/2e-3), same
+seed/steps/tokens (327M).
+
+### Results (B is a decisive NEGATIVE — but a diagnosable one)
+
+| metric | base | arm A (lean) | arm B (features) |
+|---|---|---|---|
+| HE-solution CE | 0.7585 | **0.7429** (improved!) | 0.9549 (+0.196) |
+| stratified natural-code CE (total) | — | **1.1687** | 1.5412 (+0.37, worse at EVERY stratum incl. far-reuse) |
+| leak-free 6-bind recall in-window (gen) | ~0 | **67–68%** | ~20–24% flat |
+| recall teacher-forced (full fwd, FiLM on) | — | (pending) | ~17–22% flat → NOT an eval artifact |
+| general VAL trajectory | — | falls 1.05→1.00 | drifts up 1.08→1.18 |
+| throughput | — | 27.9k tok/s | ~14k tok/s |
+
+- ENGAGEMENT itself succeeded (the step-1000 gate: FiLM differentiating pairs
+  to [0.001..0.055] w/ filmEff up to 6%; WM copy firing incl. on general text;
+  latent through R=5; PKM inert as predicted).
+- The MIX and LR are exonerated by arm A (it beat the base on code CE while
+  learning 67% recall — the recall streams + natural-reuse data are GOOD).
+- Within-B toggles: film_off +0.016 (FiLM carries real function), pkm_off
+  ±0.000 (inert), wm_on slightly negative.
+
+### Post-mortem (the unifying diagnosis)
+
+**Forced-contribution floors on a converged base are sabotage, not tolls** —
+the same lesson as arm-C's PKM floor, spread thinner: WM's read-alpha floor
+injected ~15%-RMS noise at EVERY position for 800 steps; PKM's sign-flipping
+floor injected ±0.1–0.3 noise at L16; the latent aux fed full-trunk gradients
+from maximally-OOD ptr10dict; the gate trained the LM loss at ~0.8× weight.
+The trunk spent the run fighting noise instead of learning: worse code CE,
+worse recall, worse everywhere. The validated alternative was already in hand:
+the frozen-trunk PRE-WARM (PKM probe: αL 0.10→0.27 w/ VAL recovering;
+unfreeze-survival probe: α holds 0.27, value rows GROW once unfrozen).
+
+### Also found: two missing-wiring gaps in the generation path
+
+1. **`prefill`/`forward_step` NEVER apply FiLM** (deliberate bypass) — a
+   FiLM-trained ckpt generates as a different function than it trained as
+   (B's flat generated recall was partly this, though the tf-recall shows the
+   capability regression is real too). The designed deployment mode (K=3
+   self-feed trains for K=1 lag-1-in-time inference) was never wired.
+2. **WM copy head cannot fire at inference** (only on data-provided masks)
+   despite having an input-driven trigger (the match-existence gate).
+Both being fixed (2026-07-03) + an incremental-vs-full FiLM equivalence test.
+
+### The B′ recipe (all fixes, unified two-phase design)
+
+- **Phase-0** (`launch_feature_prewarm_phase0.sh`, ~600 frozen-trunk steps):
+  pre-warm PKM+WM+FiLM with NO floors — features must become genuinely useful
+  before the trunk ever trains with them.
+- **Phase-1 B′** (`launch_feature_pilot_Bprime.sh`, 2500 steps): joint
+  training, no floors anywhere, NO latent aux on the trunk (adapter-only
+  post-hoc — the validated base-preserving mode), gate floor 1.0 (full LM
+  gradient, entropy-aux-only gate training).
+- **Success gate vs A**: HE-CE within ~0.03 of 0.7429, stratified total
+  within ~0.03, recall ≥ A, engagement green incl. PKM.
+- If B′ passes → full run (same two-phase shape). If B′ lags → leave-one-out
+  arms (4 × 2500 steps) to isolate which feature carries the residual tax.

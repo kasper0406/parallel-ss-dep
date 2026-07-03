@@ -3265,15 +3265,91 @@ class TinyLM(nn.Module):
         p_final = (1-g)·softmax(lm) + g·p_copy, so the downstream
         cross-entropy (which re-applies log_softmax) is exact:
         softmax(log p_final) == p_final. Only fires when use_copy_head AND
-        mem_read_mask has True positions AND the WM stashed its read attention —
-        otherwise returns lm_logits unchanged (byte-identical)."""
-        if (not getattr(self, "use_copy_head", False)
-                or mem_read_mask is None or not self.use_memory):
-            return lm_logits
-        mask = mem_read_mask.bool()
-        if not bool(mask.any()):
+        the WM stashed its read attention — otherwise returns lm_logits
+        unchanged (byte-identical).
+
+        `mem_read_mask` is data-provided by the recall streams at
+        TRAINING (the answer-span positions the copy head is supervised
+        on as POSITIVES). No caller threads a mask at GENERATION
+        (2026-07-03 pilot post-mortem, GAP 2: the copy head — despite
+        having its own input-driven trigger, the match-existence gate
+        `me` from `mem_copy_require_match` — silently never fired). With
+        `mem.always_read` (the WM already injects at every position when
+        no mask is given — see `WorkingMemory.forward`), the fix is
+        symmetric: apply the SAME mixing wherever `me` (match-
+        existence) is True — NOT literally every position; see the
+        in-line comment below for why a blanket all-True mask corrupts
+        the multi-token-copy answer-offset — and leave every `me == 0`
+        position exactly as the plain LM would have produced it.
+
+        The maskless branch fires in TRAINING forwards too (the
+        self-calibrating-gate design, owner-approved 2026-07-03): on
+        plain-CE batches with no data mask, `me`-positions where copying
+        would hurt the loss push the copy gate DOWN (negatives), while
+        the masked recall batches keep supplying supervised positives.
+        `model._copy_inference_off = True` is the explicit escape hatch
+        (mirrors `_film_bypass`) for anyone who wants the literal old
+        mask-only semantics back, e.g. an A/B ablation — it disables the
+        maskless path in training and eval alike.
+
+        Byte-compat: models without `always_read`, models whose WM has
+        no match-existence signal (`_last_match_exists is None`), and
+        callers that pass an explicit `mem_read_mask` are completely
+        unaffected — this only changes the `mem_read_mask is None`
+        branch, and only where `me` exists."""
+        if not getattr(self, "use_copy_head", False) or not self.use_memory:
             return lm_logits
         mem = self.memory
+        if mem_read_mask is None:
+            if (not getattr(mem, "always_read", False)
+                    or getattr(self, "_copy_inference_off", False)):
+                return lm_logits
+            # Scope the "apply everywhere" mask to the match-existence
+            # signal itself, NOT a blanket all-True mask. Two reasons:
+            # (1) it's exactly the intended semantics anyway (`me == 0`
+            # positions must end up unchanged, so there's no reason to
+            # even touch them); (2) `offset = self._contiguous_run_index
+            # (mask)` below assumes `mask` marks CONTIGUOUS multi-token
+            # answer-spans (offset 0, 1, 2, ... within each run) so a
+            # multi-digit value's answer tokens each copy the right
+            # digit of the source span. A blanket all-True mask turns
+            # the ENTIRE sequence into one giant "run" — offsets grow
+            # unbounded across unrelated positions instead of resetting
+            # at each real match, corrupting `src_pos` (verified by a
+            # failing test during development: an isolated match at one
+            # position picked up a large stale offset and copied the
+            # wrong source token). Masking by `me` keeps each
+            # consecutive run of genuine matches its own 0-indexed span,
+            # which is the correct multi-token-copy semantics whether
+            # the run is length 1 (an isolated match) or longer (a
+            # multi-token value under sustained match).
+            #
+            # When there is no match signal at all (`_last_match_exists`
+            # is None: legacy dot-product / cosine addressing, where no
+            # match-existence machinery exists), the maskless path is a
+            # NO-OP — the alternative (a blanket all-True mask) is the
+            # corrupted-offset case above PLUS the copy fires ungated by
+            # `me` everywhere, which is exactly the "garbage copy"
+            # failure mode `mem_copy_require_match` exists to prevent.
+            # "Apply where `me` fires, exact no-op elsewhere" — no `me`,
+            # no application.
+            #
+            # This same maskless branch fires in TRAINING forwards that
+            # don't thread a data mask (the self-calibrating-gate design,
+            # approved 2026-07-03): plain-CE batches supply NEGATIVES at
+            # `me`-positions where copying would hurt (gradient pushes g
+            # down via the mixed logits), while masked recall batches
+            # keep supplying the supervised positives — the copy gate
+            # calibrates itself against both. `_copy_inference_off`
+            # disables the maskless path in training and eval alike.
+            me_scope = getattr(mem, "_last_match_exists", None)
+            if me_scope is None:
+                return lm_logits
+            mask = me_scope.bool()
+        else:
+            mask = mem_read_mask.bool()
+        if not bool(mask.any()):
+            return lm_logits
         attn = getattr(mem, "_last_read_attn_grad", None)     # (B, T, K) w/ grad
         top_idx = getattr(mem, "_last_top_idx_buf", None)     # (B, K) src positions
         if attn is None or top_idx is None:
@@ -3875,14 +3951,25 @@ class TinyLM(nn.Module):
     #       Total tokens processed so far (= position of the NEXT token
     #       when forward_step is called).
     #
-    #   lagged_sources: dict[int, Tensor (B, 1, d_model)] | None
-    #       For FiLM (--feedback_pairs with K-self-feed): the previous
-    #       step's source-layer outputs, used as FiLM input for THIS
-    #       step's target layer (matches `decode_step_film` semantics —
-    #       at convergence of K-self-feed, the pass-2 lagged source
-    #       state is the right deploy-time input).
-    #       None when _film_bypass=True (the default at decode for the
-    #       v7 ckpt family, since generators set bypass=True).
+    #   lagged_sources: dict[int, Tensor (B, feedback_lag, d_model)] | None
+    #       For FiLM (--feedback_pairs, any feedback_self_k): a
+    #       constant-length ring buffer per source layer holding the
+    #       last `feedback_lag` steps' ALREADY-COMPUTED (self-
+    #       referential, not a recomputed vanilla pass) source-layer
+    #       hidden, oldest first. `[:, :1]` is always exactly `lag`
+    #       steps behind "now" — the same t-lag relationship
+    #       `_shift_right_by_k` implements in the full-sequence forward.
+    #       This realizes the K-self-feed training's designed deploy
+    #       mode: after the K-1 no_grad self-feed passes converge FiLM
+    #       inputs to (approximately) a fixed point during training, a
+    #       single causal walk through time — each new token's FiLM
+    #       source being the actual previous token's own hidden — closes
+    #       the same fixed point at 1x decode cost (no repeated passes
+    #       over the growing sequence). Populated whenever
+    #       `feedback_pairs` is set and `_film_bypass=False`; None when
+    #       `_film_bypass=True` (the explicit escape hatch / ablation
+    #       toggle — bypass ALWAYS wins, matching the "plain block loop"
+    #       branch of the full forward).
     #
     #   wm_buf: dict with growing tensors
     #       'gate':  (B, t_cur)        per-position write-gate sigmoid
@@ -3903,10 +3990,20 @@ class TinyLM(nn.Module):
     #   - feedback_xattn (cross-layer attention) — v7 uses FiLM, not xattn;
     #     the deployed generators set _film_bypass=True so even FiLM is
     #     bypassed. xattn forward_step raises NotImplementedError.
-    #   - K-self-feed at decode time: ALWAYS run K=1 (`_film_bypass=True`
-    #     is the convention shipped in eval_humaneval / train_rl_grader;
-    #     when bypass is True, no FiLM is applied either, mirroring the
-    #     full forward's "plain block loop" branch).
+    #   - K-self-feed at decode time: ALWAYS run K=1-lagged (never the
+    #     multi-pass self-feed training uses — see the `lagged_sources`
+    #     docstring above for why a single causal walk through time
+    #     realizes the same fixed point). `_film_bypass=True` (still the
+    #     convention several existing generators — eval_humaneval,
+    #     train_rl_grader — set as a blanket decode-speedup) skips FiLM
+    #     entirely, mirroring the full forward's "plain block loop"
+    #     branch; this is intentionally the explicit ablation escape
+    #     hatch (2026-07-03 fix), NOT the default. A checkpoint trained
+    #     with `--feedback film` should be generated from with
+    #     `_film_bypass` left at its default `False` so FiLM is actually
+    #     applied — callers that want the bypass ablation (or the old
+    #     "ignore FiLM for speed" behaviour on a lean/no-FiLM ckpt, where
+    #     it's a genuine no-op either way) must opt in explicitly.
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -3986,10 +4083,12 @@ class TinyLM(nn.Module):
                               and not self.feedback_xattn_pairs)
 
         h = x
+        lag = max(1, int(self.feedback_lag))
         if use_film_at_decode:
             # Pass 1: vanilla, collect source layer outputs (no cache —
             # pass-1 state isn't used downstream, only the source-layer
-            # outputs matter for the FiLM lag).
+            # outputs matter for the FiLM lag). Mirrors forward()'s
+            # "Standard 2-pass sparse FiLM" pass 1 exactly.
             h1 = x
             pass1_at_sources: dict = {}
             for L, blk in enumerate(self.blocks):
@@ -3998,7 +4097,24 @@ class TinyLM(nn.Module):
                 h1 = self._maybe_pkm(h1, L)
                 if L in source_layers:
                     pass1_at_sources[L] = h1
-            # Pass 2: FiLM at targets, populate the real cache.
+            # Pass 2: FiLM at targets (lagged from pass 1), populate the
+            # real cache. Also capture, INLINE, each source layer's last
+            # `feedback_lag` post-pkm positions — this seeds
+            # `lagged_sources` for the first forward_step call.
+            #
+            # forward_step's own convention (see below) is
+            # SELF-referential: each new decode step's FiLM input is the
+            # PREVIOUS step's actually-computed (already FiLM'd) hidden,
+            # never a separately-recomputed vanilla pass — exactly the
+            # "single forward at 1x decode cost" AGENTS.md promises for
+            # the deployed K-self-feed-trained stack. A second full
+            # forward used to be run here just to re-derive this seed
+            # value (2x prompt-processing cost, and it silently dropped
+            # `think_mask` — a correctness bug whenever
+            # state_readonly_at_think / use_think_adapter are active,
+            # since the recomputation then diverged from the real
+            # cache-populating pass above). Capturing inline avoids both
+            # problems and removes the redundant forward entirely.
             for L, blk in enumerate(self.blocks):
                 if L in self.sparse_target_to_source and self.feedback_position == "pre":
                     src = self.sparse_target_to_source[L]
@@ -4013,41 +4129,20 @@ class TinyLM(nn.Module):
                         pass1_at_sources[src], self.feedback_lag)
                     h = self.sparse_feedback[str(L)](h, state_above_lagged)
                 h = self._maybe_pkm(h, L)
-            # Lagged source for the NEXT decode step: the LAST position of
-            # pass-2's source-layer output (since pass-2 is what training
-            # actually computed; pass-1 only feeds FiLM). Match
-            # decode_step_film semantics.
-            #
-            # Subtle: decode_step_film actually caches PASS-2's source
-            # output for the NEXT step's FiLM input (it's a proxy for
-            # the true pass-1 lagged input). We mirror that.
-            for L in source_layers:
-                lagged_sources[L] = h.new_zeros(B, 1, h.shape[-1])
-            # Walk pass-2 again? No — `pass1_at_sources` already has them
-            # to lag from. But for the NEXT decode step we want pass-2's
-            # output at the last prompt position. Recompute by saving
-            # pass-2 source outputs:
-            # → do it in-line above. Repeating that here cleanly:
-            pass2_at_sources: dict = {}
-            h_p2 = x
-            for L, blk in enumerate(self.blocks):
-                if L in self.sparse_target_to_source and self.feedback_position == "pre":
-                    src = self.sparse_target_to_source[L]
-                    state_above_lagged = _shift_right_by_k(
-                        pass1_at_sources[src], self.feedback_lag)
-                    h_p2 = self.sparse_feedback[str(L)](h_p2, state_above_lagged)
-                # NOTE: this is a wasteful 2nd full forward; for now this
-                # branch is mainly correctness fallback. Production usage
-                # has _film_bypass=True so we never hit this code.
-                h_p2 = blk(h_p2, input_ids=input_ids)
-                if L in self.sparse_target_to_source and self.feedback_position == "post":
-                    src = self.sparse_target_to_source[L]
-                    state_above_lagged = _shift_right_by_k(
-                        pass1_at_sources[src], self.feedback_lag)
-                    h_p2 = self.sparse_feedback[str(L)](h_p2, state_above_lagged)
-                h_p2 = self._maybe_pkm(h_p2, L)
                 if L in source_layers:
-                    lagged_sources[L] = h_p2[:, -1:].clone()
+                    # Keep the last `lag` positions (oldest first) so
+                    # forward_step's very first read — the oldest slot,
+                    # `[:, :1]` — is exactly the same t-lag value
+                    # `_shift_right_by_k(..., lag)` would have produced
+                    # one more step into a (hypothetical) full-sequence
+                    # forward. Zero-pad the front if the prompt itself
+                    # is shorter than the lag (mirrors
+                    # `_shift_right_by_k`'s zero-fill for t < lag).
+                    if T_prompt >= lag:
+                        lagged_sources[L] = h[:, -lag:].clone()
+                    else:
+                        pad = h.new_zeros(B, lag - T_prompt, h.shape[-1])
+                        lagged_sources[L] = torch.cat([pad, h.clone()], dim=1)
         else:
             # Plain block loop (= _film_bypass branch). The single,
             # primary code path for the v7 generator.
@@ -4246,11 +4341,18 @@ class TinyLM(nn.Module):
 
         Semantics match WorkingMemory.forward but for a single read
         position: topk over the entire current buffer's write-gates,
-        then soft-attention with causal+pad masking.
+        then soft-attention with causal+pad masking. Includes the
+        `always_read` branch (2026-07-03): with `mem.always_read` and no
+        explicit mask, the injection is ADDED at every step — matching
+        the full forward — instead of only at think tokens. Guarded to
+        the legacy addressing this function faithfully implements (see
+        the in-line comment); decoupled/discrete/namekey configs keep
+        the old think-only behaviour until their addressing is ported.
 
-        Cheap-skip: if the read is masked out (the default-think-mask
-        case: input_ids_new != thinking_token_id, AND read_mask_new is
-        None or 0), we return h_normed_new unchanged — no read compute.
+        If the read is masked out (non-always_read, non-think position,
+        no explicit mask), h_normed_new is returned unchanged (the
+        injection is still computed for the `_last_injection` stash —
+        see the NOTE below — but contributes zero).
         """
         import math
         mem = self.memory
@@ -4265,8 +4367,44 @@ class TinyLM(nn.Module):
         # `WorkingMemory.forward` also stashes the injection PRE-mask,
         # so we must too. The mask only gates whether the injection is
         # ADDED back to h.
+        #
+        # 2026-07-03 fix (third missing-wiring gap of the pilot post-
+        # mortem family): mirror `WorkingMemory.forward`'s `always_read`
+        # branch. Previously this maskless path ONLY activated at think
+        # tokens, so a `mem_always_read=True` model — whose full forward
+        # injects the WM read at EVERY position — had its WM silently
+        # dead throughout incremental decode (no think tokens are ever
+        # generated by the non-thinking configs, so `inj_mask` was all
+        # zero at every step). Non-always_read models keep the exact
+        # think-token semantics below.
+        #
+        # GUARDED to addressing schemes this function actually
+        # implements. The scoring below is the LEGACY dot-product path
+        # (q·buf_v · 1/sqrt(d) + log g) ONLY — none of the
+        # decoupled_kv / discrete_key / soft_namekey / ctx_namekey
+        # branches of `WorkingMemory.forward` exist here (no W_k in the
+        # buffer, no cosine+tau, no name-span key carry). For those
+        # configs an always-on step-read would inject a DIFFERENTLY-
+        # ADDRESSED (wrong-scoring) read at every position of a trained
+        # ckpt — actively worse than the dead-zero it replaces — so they
+        # keep the old behaviour until their addressing is ported
+        # (open follow-up: needs buffered keys + an incremental
+        # name-span-carry state in the cache). This same infidelity
+        # already existed for think-token reads on those configs
+        # (pre-existing, low-exposure); the guard just avoids widening
+        # it from "think tokens only" to "every position".
+        _wm_step_addressing_faithful = not (
+            getattr(mem, "decoupled_kv", False)
+            or getattr(mem, "discrete_key", False)
+            or getattr(mem, "soft_namekey", False)
+            or getattr(mem, "ctx_namekey", False))
         if read_mask_new is None:
-            inj_mask = (input_ids_new == mem.thinking_token_id).to(h_normed_new.dtype)
+            if (getattr(mem, "always_read", False)
+                    and _wm_step_addressing_faithful):
+                inj_mask = torch.ones((B, 1), dtype=h_normed_new.dtype,
+                                      device=device)
+            else:
+                inj_mask = (input_ids_new == mem.thinking_token_id).to(h_normed_new.dtype)
         else:
             inj_mask = read_mask_new.to(h_normed_new.dtype)
 
@@ -4429,17 +4567,28 @@ class TinyLM(nn.Module):
             for L, blk in enumerate(self.blocks):
                 if L in self.sparse_target_to_source and self.feedback_position == "pre":
                     src = self.sparse_target_to_source[L]
-                    h = self.sparse_feedback[str(L)](
-                        h, cache["lagged_sources"][src])
+                    # Oldest slot of the ring buffer == exactly `lag`
+                    # steps behind "now" — the lag-1 semantics (or
+                    # lag-k, generalized). See the matching comment in
+                    # `prefill` for why this is self-referential (uses
+                    # the model's own prior output, not a recomputed
+                    # vanilla pass).
+                    state_above_lagged = cache["lagged_sources"][src][:, :1]
+                    h = self.sparse_feedback[str(L)](h, state_above_lagged)
                 h = self._step_block(blk, h, past=fla_cache, layer_idx=L,
                                     think_mask=step_think_mask)
                 if L in self.sparse_target_to_source and self.feedback_position == "post":
                     src = self.sparse_target_to_source[L]
-                    h = self.sparse_feedback[str(L)](
-                        h, cache["lagged_sources"][src])
+                    state_above_lagged = cache["lagged_sources"][src][:, :1]
+                    h = self.sparse_feedback[str(L)](h, state_above_lagged)
                 h = self._maybe_pkm(h, L)
                 if L in source_layers:
-                    new_lagged[L] = h.clone()
+                    # Drop the oldest slot, append this step's freshly
+                    # computed hidden — keeps a constant-length
+                    # (B, lag, d) ring buffer across arbitrarily many
+                    # forward_step calls.
+                    new_lagged[L] = torch.cat(
+                        [cache["lagged_sources"][L][:, 1:], h.clone()], dim=1)
             cache["lagged_sources"] = new_lagged
         else:
             h = x

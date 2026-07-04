@@ -1530,6 +1530,8 @@ def main():
             device="cuda", max_len=int(args.latent_reasoning_max_len),
             no_ramp=bool(args.latent_reasoning_no_ramp),
             gate_weight=float(getattr(args, "latent_reasoning_gate_weight", 0.0)),
+            perhop_weight=float(getattr(args, "latent_reasoning_perhop_weight",
+                                        1.0)),
             seed=int(args.seed))
         _lr_aux_every = int(getattr(args, "latent_reasoning_aux_every", 1))
         if _lr_aux_every > 8:
@@ -1539,6 +1541,7 @@ def main():
                   "spikier/higher-variance gradient for the wall-clock win; "
                   "keep it <= 8 unless you've checked stability.")
         print(f"Latent-reasoning co-train ON: weight={args.latent_reasoning_weight} "
+              f"perhop_weight={_latent_reasoner.perhop_weight} "
               f"rungs={_latent_reasoner.rungs} "
               f"n/step={args.latent_reasoning_n} "
               f"aux_every={_lr_aux_every} "
@@ -2514,7 +2517,9 @@ def main():
                         loss = loss + (n_micro * args.latent_reasoning_weight
                                        * _lr_ramp * _lr_every_mult) * _lr_loss
                         _latent_reasoning_diag = (float(_lr_loss.detach()),
-                                                  int(_lr_rung), float(_lr_ramp))
+                                                  int(_lr_rung), float(_lr_ramp),
+                                                  float(_latent_reasoner.last_ans),
+                                                  float(_latent_reasoner.last_perhop))
                         # Engagement kill-gate counters (recipe rule #1): the
                         # reason loss ACTUALLY ran this step — count it and
                         # track whether it stayed finite (a NaN/inf reason
@@ -2636,8 +2641,9 @@ def main():
                 line += f"  latent(Δlogp={_d:+.3f},n={_n})"
             if _latent_reasoner is not None and \
                     _latent_reasoning_diag is not None:
-                _rl, _rr, _rmp = _latent_reasoning_diag
-                line += f"  reason(loss={_rl:.3f},R={_rr},ramp={_rmp:.2f})"
+                _rl, _rr, _rmp, _ra, _rh = _latent_reasoning_diag
+                line += (f"  reason(loss={_rl:.3f},ans={_ra:.3f},hop={_rh:.3f},"
+                         f"R={_rr},ramp={_rmp:.2f})")
             if getattr(args, "gate_calibration_weight", 0.0) > 0.0 and \
                     _gate_calib_diag is not None:
                 _t1, _sg, _gd, _gn = _gate_calib_diag
@@ -2992,10 +2998,12 @@ def main():
                     tb.add_scalar("latent_cotrain/delta_logp", _d, step)
                 if (_latent_reasoner is not None
                         and _latent_reasoning_diag is not None):
-                    _rl, _rr, _rmp = _latent_reasoning_diag
+                    _rl, _rr, _rmp, _ra, _rh = _latent_reasoning_diag
                     tb.add_scalar("latent_reasoning/loss", _rl, step)
                     tb.add_scalar("latent_reasoning/rung", _rr, step)
                     tb.add_scalar("latent_reasoning/weight_ramp", _rmp, step)
+                    tb.add_scalar("latent_reasoning/answer_ce", _ra, step)
+                    tb.add_scalar("latent_reasoning/perhop_ce", _rh, step)
                 if args.enable_thinking_token and think_stats_window:
                     tb.add_scalar("think/rate", think_rate, step)
                     tb.add_scalar("think/explore_rate", explore_rate, step)

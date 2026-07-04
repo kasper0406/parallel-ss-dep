@@ -1022,6 +1022,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "at the last). Fixes 'capability baked but gate never "
                         "fires it' (avg_steps≈0.77 vs target n). 0 = capability "
                         "only.")
+    p.add_argument("--latent_reasoning_perhop_weight", type=float, default=1.0,
+                   help="Weight on the DENSE per-hop CE that decodes latent "
+                        "step j -> the j-th intermediate f^j(s) from the "
+                        "record's `intermediates` field (the exec-trace "
+                        "program: per-step supervision fixes latent credit "
+                        "assignment). Total aux = answer_ce + this*mean_perhop. "
+                        "DEFAULT 1.0 (per-hop IS the program). 0.0 = the old "
+                        "answer-only behaviour (the escape hatch — N0/N1 ran at "
+                        "the equivalent of 0.0). Non-zero enforces the "
+                        "single-token-intermediate data contract at load "
+                        "(skip+count violators, error if <50%% of a rung is "
+                        "usable).")
     p.add_argument("--latent_reasoning_start_step", type=int, default=0,
                    help="Step at which the latent-reasoning co-train begins "
                         "firing (default 0 = from scratch). Use to start it on a "

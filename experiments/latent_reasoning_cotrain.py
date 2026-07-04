@@ -129,8 +129,9 @@ def _latent_model_call(model, ids, embeds, return_hidden, use_checkpoint,
 
 def _answer_span_latent_loss(model, comment_ids, sol_ids, eos_id, R,
                              thinking_id, device, gate_weight=0.0,
-                             checkpoint_latent=True):
-    """Answer-span CE after an R-step latent ponder burst (one example).
+                             checkpoint_latent=True, inter_ids=None,
+                             perhop_weight=0.0, return_components=False):
+    """Answer-span CE (+ optional per-hop CE) after an R-step latent burst.
 
     Self-contained twin of latent_sft.latent_sft_loss, but robust to the
     pretrain forward's return arity: with the gist loss active, training-mode
@@ -152,6 +153,26 @@ def _answer_span_latent_loss(model, comment_ids, sol_ids, eos_id, R,
     re-running the same kernels twice, which `use_reentrant=False` handles
     deterministically via RNG-state save/restore for anything stochastic,
     e.g. PKM's epsilon-greedy slot replacement).
+
+    ``inter_ids`` / ``perhop_weight`` (2026-07-04, the exec-trace program):
+    DENSE per-step supervision that mirrors
+    ``latent_arith_real.latent_perhop_loss`` EXACTLY. Think slot j (1-indexed)
+    sits at absolute position ``P + j - 1``; the logits AT that position
+    (SAME output head as the answer span — ``model.forward``'s
+    ``out_norm -> lm_head``, read as ``logits[:, P+j-1, :]`` with NO causal
+    shift) decode the j-th intermediate ``f^j(s) = inter_ids[j-1]``. The last
+    slot (j=R) predicts the answer, exactly the position the answer-span shift
+    decodes ``sol[0]`` from — the two conventions agree. Only ``j <=
+    min(R, len(inter_ids))`` (rungs whose R exceeds the available
+    intermediates supervise what exists). The trailing answer span is causally
+    masked out of these positions, so ``logits[:, P:P+n_hops, :]`` here equal
+    ``latent_perhop_loss``'s own forward over ``[comment, think_1..think_R]``
+    (pinned in test_latent_reasoning_perhop.py). ``perhop_weight == 0.0`` (with
+    ``return_components=False``) is byte-identical to the answer-only path
+    (N0/N1 ran at the equivalent of 0.0). Total = answer_ce (+ gate)
+    ``+ perhop_weight * perhop_ce``. ``return_components`` returns
+    ``(total, answer_ce, perhop_ce)`` (both grad-connected) for separate
+    logging / gradient-isolation tests.
     """
     base_ids = torch.tensor([comment_ids], dtype=torch.long, device=device)
     cur_ids = base_ids
@@ -178,9 +199,27 @@ def _answer_span_latent_loss(model, comment_ids, sol_ids, eos_id, R,
     shift_labels = full_ids[:, 1:].clone()
     start = P + int(R) - 1                            # supervise sol[0]..eos only
     shift_labels[:, :start] = -100
-    loss = F.cross_entropy(
+    ans_ce = F.cross_entropy(
         shift_logits.reshape(-1, shift_logits.shape[-1]),
         shift_labels.reshape(-1), ignore_index=-100)
+    loss = ans_ce
+    # Per-hop supervision: decode think slot j (position P+j-1) -> inter[j-1].
+    # UNSHIFTED logits at the think-slot positions, exactly like
+    # latent_arith_real.latent_perhop_loss. Only computed when it actually
+    # affects the loss (perhop_weight != 0) OR the caller wants the component
+    # for logging (return_components) — so the perhop_weight=0 /
+    # return_components=False path is byte-identical (no extra graph nodes).
+    n_hops = min(int(R), len(inter_ids)) if inter_ids is not None else 0
+    if n_hops > 0 and (perhop_weight != 0.0 or return_components):
+        slot_logits = logits[:, P:P + n_hops, :]          # (1, n_hops, V)
+        itgt = torch.tensor([list(inter_ids[:n_hops])], dtype=torch.long,
+                            device=device)
+        perhop_ce = F.cross_entropy(
+            slot_logits.reshape(-1, slot_logits.shape[-1]), itgt.reshape(-1))
+    else:
+        perhop_ce = torch.zeros((), device=logits.device, dtype=loss.dtype)
+    if perhop_weight != 0.0 and n_hops > 0:
+        loss = loss + float(perhop_weight) * perhop_ce
     if gate_weight > 0.0 and getattr(model, "_last_gate_logits", None) is not None:
         gate_logits = model._last_gate_logits             # (1, T) pre-sigmoid emit
         dec = list(range(P - 1, P + int(R)))              # R+1 decision positions
@@ -189,6 +228,8 @@ def _answer_span_latent_loss(model, comment_ids, sol_ids, eos_id, R,
         tgt[-1] = 1.0                                      # EMIT at the last
         gate_loss = F.binary_cross_entropy_with_logits(gl, tgt)
         loss = loss + float(gate_weight) * gate_loss
+    if return_components:
+        return loss, ans_ce, perhop_ce
     return loss
 
 
@@ -242,7 +283,8 @@ def _right_pad_solutions(sols: list, eos_id: int, pad_id: int, device
 
 def _answer_span_latent_loss_batched(model, examples, eos_id, R, thinking_id,
                                      device, gate_weight=0.0,
-                                     checkpoint_latent=True, pad_id=0):
+                                     checkpoint_latent=True, pad_id=0,
+                                     perhop_weight=0.0, return_components=False):
     """Batched twin of `_answer_span_latent_loss`: ONE growing latent thread
     of batch size n = len(examples) instead of n sequential B=1 threads, for
     the shared rung R every example in a `step()` call already uses. Returns
@@ -301,8 +343,13 @@ def _answer_span_latent_loss_batched(model, examples, eos_id, R, thinking_id,
     implemented (out of the requested scope; flag as a follow-up if needed).
     """
     n = len(examples)
-    prompts = [list(c) for c, _ in examples]
-    sols = [list(s) for _, s in examples]
+    # Arity-tolerant: examples may be (comment, sol) 2-tuples (answer-only /
+    # existing tests) or (comment, sol, inter_ids) 3-tuples (per-hop). The
+    # per-hop targets are None/[] for 2-tuples => the perhop term is inert.
+    prompts = [list(ex[0]) for ex in examples]
+    sols = [list(ex[1]) for ex in examples]
+    inters = [(list(ex[2]) if len(ex) > 2 and ex[2] is not None else [])
+              for ex in examples]
     base_ids, doc_prompt, P_max = _left_pad_prompts(prompts, int(pad_id), device)
     cur_ids = base_ids
     cur_emb = model.embed(base_ids)
@@ -343,7 +390,33 @@ def _answer_span_latent_loss_batched(model, examples, eos_id, R, thinking_id,
         shift_labels.reshape(-1), ignore_index=-100, reduction="none"
     ).reshape(n, -1)
     valid = (shift_labels != -100)
-    per_example = ce.sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+    ans_per_row = ce.sum(dim=1) / valid.sum(dim=1).clamp_min(1)   # (n,)
+    per_example = ans_per_row
+    # Per-hop supervision (same convention as the single-example path): think
+    # slot j (1-indexed) is at the UNIFORM (left-pad => shared) absolute
+    # position P_max+j-1; its UNSHIFTED logits decode inter j = f^j(s). Targets
+    # are per-row (n, R) with -100 for rows/steps lacking an intermediate
+    # (rungs whose R exceeds a row's available intermediates use what exists).
+    # Per-row-mean over that row's valid steps, then example-mean — matching
+    # the answer term's per-example semantics so batched == mean-of-sequential.
+    perhop_mean = torch.zeros((), device=logits.device, dtype=per_example.dtype)
+    n_hops = [min(int(R), len(it)) for it in inters]
+    if (perhop_weight != 0.0 or return_components) and any(h > 0 for h in n_hops):
+        itgt = torch.full((n, int(R)), -100, dtype=torch.long, device=device)
+        for i, it in enumerate(inters):
+            h = n_hops[i]
+            if h > 0:
+                itgt[i, :h] = torch.tensor(it[:h], dtype=torch.long,
+                                           device=device)
+        slot_logits = logits[:, P_max:P_max + int(R), :]          # (n, R, V)
+        ph = F.cross_entropy(
+            slot_logits.reshape(-1, slot_logits.shape[-1]), itgt.reshape(-1),
+            ignore_index=-100, reduction="none").reshape(n, int(R))
+        ph_valid = (itgt != -100)
+        per_row_perhop = ph.sum(dim=1) / ph_valid.sum(dim=1).clamp_min(1)  # (n,)
+        perhop_mean = per_row_perhop.mean()
+        if perhop_weight != 0.0:
+            per_example = per_example + float(perhop_weight) * per_row_perhop
     if gate_weight > 0.0 and getattr(model, "_last_gate_logits", None) is not None:
         gate_logits = model._last_gate_logits              # (n, T) pre-sigmoid
         dec = list(range(P_max - 1, P_max + int(R)))        # R+1 decisions
@@ -352,14 +425,37 @@ def _answer_span_latent_loss_batched(model, examples, eos_id, R, thinking_id,
         tgt[:, -1] = 1.0                                    # EMIT at the last
         gate_ce = F.binary_cross_entropy_with_logits(gl, tgt, reduction="none")
         per_example = per_example + float(gate_weight) * gate_ce.mean(dim=1)
-    return per_example.mean()
+    total = per_example.mean()
+    if return_components:
+        return total, ans_per_row.mean(), perhop_mean
+    return total
 
 
-def _load_rung(prefix: str, n: int, tok, max_len: int) -> list[tuple]:
-    """Pointer-chase records → (comment_ids, answer_ids). Mirrors
-    latent_arith_real._load_rung (answer rendered as `def solve(): return <ans>`)."""
+def _load_rung(prefix: str, n: int, tok, max_len: int,
+               require_single_token_inter: bool = False) -> list[tuple]:
+    """Pointer-chase / exec-trace records → (comment_ids, answer_ids,
+    inter_ids). Mirrors latent_arith_real._load_rung (answer rendered as
+    `def solve(): return <ans>`), additionally tokenising each element of the
+    record's `intermediates` field into a single-token id (the j-th
+    intermediate f^j(s)) for the per-hop supervision.
+
+    `require_single_token_inter` (set True by LatentReasoningCotrain whenever
+    `perhop_weight != 0`) enforces the v1 exec-trace data contract: every
+    intermediate must be a single token AND at least one must be present.
+    Examples violating it are SKIPPED and counted, and a rung with < 50 %
+    usable examples raises loudly (bad data — regenerate with single-token
+    values, or run answer-only via `--latent_reasoning_perhop_weight 0`).
+
+    `require_single_token_inter=False` (the answer-only / escape-hatch default,
+    and every pre-per-hop caller) keeps the OLD example set byte-for-byte:
+    every length-passing record is returned, inter_ids best-effort (`[]` when
+    absent or multi-token, and never consulted since perhop_weight is 0). The
+    (comment, answer) content, count, and order are identical to the old
+    2-tuple loader — only the tuple arity grew, which the sampling (index into
+    self.data) and loss helpers (arity-tolerant) are indifferent to."""
     out = []
     path = f"{prefix}_n{n}.jsonl"
+    total = 0                       # length-passing records considered
     for line in open(path):
         if not line.strip():
             continue
@@ -367,8 +463,34 @@ def _load_rung(prefix: str, n: int, tok, max_len: int) -> list[tuple]:
         pfx = r["prompt"] + "\ndef solve():\n    return "
         c = tok.encode(pfx, add_special_tokens=False)
         s = tok.encode(str(r["answer"]), add_special_tokens=False)
-        if len(c) + len(s) + n + 2 <= max_len:
-            out.append((c, s))
+        if len(c) + len(s) + n + 2 > max_len:
+            continue
+        total += 1
+        inter_ids = []
+        multitoken = False
+        for v in r.get("intermediates", []):
+            enc = tok.encode(str(v), add_special_tokens=False)
+            if len(enc) != 1:
+                multitoken = True
+                break
+            inter_ids.append(int(enc[0]))
+        if require_single_token_inter:
+            if multitoken or len(inter_ids) == 0:
+                continue            # skip-and-count (via total - len(out))
+            out.append((c, s, inter_ids))
+        else:
+            out.append((c, s, [] if multitoken else inter_ids))
+    if require_single_token_inter and total > 0:
+        usable = len(out)
+        if usable < 0.5 * total:
+            raise ValueError(
+                f"latent-reasoning per-hop: rung n={n} at {path} has only "
+                f"{usable}/{total} ({100.0 * usable / total:.0f}%) examples "
+                f"with usable single-token intermediates (need >= 50%). "
+                f"Multi-token or missing intermediates violate the v1 "
+                f"exec-trace data contract — regenerate with single-token "
+                f"(small-int) values, or set --latent_reasoning_perhop_weight "
+                f"0 for the answer-only escape hatch.")
     return out
 
 
@@ -382,12 +504,27 @@ class LatentReasoningCotrain:
                  eos_id: int, device, max_len: int = 256, no_ramp: bool = False,
                  gate_weight: float = 0.0, seed: int = 0,
                  checkpoint_latent: bool = True, batch_examples: bool = True,
-                 pad_id: int = 0):
+                 pad_id: int = 0, perhop_weight: float = 0.0):
         self.device = device
         self.thinking_id = int(thinking_id)
         self.eos_id = int(eos_id)
         self.no_ramp = bool(no_ramp)
         self.gate_weight = float(gate_weight)
+        # Per-hop supervision weight (2026-07-04, the exec-trace program).
+        # DENSE per-step CE that decodes latent step j -> intermediate j =
+        # f^j(s), the mechanism the "per-step credit assignment fixes latent"
+        # hypothesis rests on. Total aux = answer_ce + perhop_weight *
+        # mean_perhop_ce. The CLASS default is 0.0 (answer-only = the exact
+        # N0/N1 behaviour + backwards-compat for every existing caller/test);
+        # the PRODUCT default is 1.0 via train_lm.py's
+        # --latent_reasoning_perhop_weight ("per-hop IS the program"). Non-zero
+        # weight also switches _load_rung into single-token-contract-enforcing
+        # mode (skip+count violators, error < 50% usable).
+        self.perhop_weight = float(perhop_weight)
+        # Last-step component diagnostics (set by step(), read by train_lm.py
+        # for the reason(ans=..,hop=..) log line + TB scalars).
+        self.last_ans = 0.0
+        self.last_perhop = 0.0
         # OOM fix (2026-07-02, default ON): activation-checkpoint every
         # latent-thread forward — see _latent_model_call's docstring. Escape
         # hatch for anyone who wants the old (unchecked, ~2x cheaper compute,
@@ -409,8 +546,10 @@ class LatentReasoningCotrain:
         self.batch_examples = bool(batch_examples)
         self.pad_id = int(pad_id)
         self.data: dict[int, list[tuple]] = {}
+        _require_inter = self.perhop_weight != 0.0
         for n in rungs:
-            recs = _load_rung(train_prefix, int(n), tok, max_len)
+            recs = _load_rung(train_prefix, int(n), tok, max_len,
+                              require_single_token_inter=_require_inter)
             if recs:
                 self.data[int(n)] = recs
         self.rungs = sorted(self.data.keys())
@@ -475,18 +614,36 @@ class LatentReasoningCotrain:
         rung = self._pick_rung(step, total_steps)
         n = max(1, int(n_examples))
         examples = [self._next(rung) for _ in range(n)]
+        # return_components=True so we can log the answer / per-hop CE
+        # separately (reason(ans=..,hop=..)); it forces the per-hop CE to be
+        # COMPUTED for logging even at perhop_weight=0, but never ADDED to the
+        # loss there — so the perhop_weight=0 loss/gradient stays byte-
+        # identical to the answer-only path (the escape hatch).
         if self.batch_examples:
-            loss = _answer_span_latent_loss_batched(
+            loss, ans, hop = _answer_span_latent_loss_batched(
                 model, examples, self.eos_id, rung, self.thinking_id,
                 self.device, gate_weight=self.gate_weight,
-                checkpoint_latent=self.checkpoint_latent, pad_id=self.pad_id)
+                checkpoint_latent=self.checkpoint_latent, pad_id=self.pad_id,
+                perhop_weight=self.perhop_weight, return_components=True)
+            self.last_ans = float(ans.detach())
+            self.last_perhop = float(hop.detach())
             return loss, rung
         total = None
-        for c, s in examples:
-            l = _answer_span_latent_loss(model, c, s, self.eos_id, rung,
-                                         self.thinking_id, self.device,
-                                         gate_weight=self.gate_weight,
-                                         checkpoint_latent=self.checkpoint_latent)
+        ans_sum = 0.0
+        hop_sum = 0.0
+        for ex in examples:
+            c, s = ex[0], ex[1]
+            inter = ex[2] if len(ex) > 2 else None
+            l, a, h = _answer_span_latent_loss(
+                model, c, s, self.eos_id, rung, self.thinking_id, self.device,
+                gate_weight=self.gate_weight,
+                checkpoint_latent=self.checkpoint_latent,
+                inter_ids=inter, perhop_weight=self.perhop_weight,
+                return_components=True)
             total = l if total is None else total + l
+            ans_sum += float(a.detach())
+            hop_sum += float(h.detach())
         loss = total / n
+        self.last_ans = ans_sum / n
+        self.last_perhop = hop_sum / n
         return loss, rung

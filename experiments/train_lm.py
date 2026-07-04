@@ -515,6 +515,28 @@ def _latent_reasoning_ramp(step: int, start_step: int, warmup_steps: int) -> flo
     return min(1.0, max(0.0, (step - start_step) / warmup_steps))
 
 
+def _latent_reasoning_aux_every_gate(step: int, start_step: int, every: int
+                                     ) -> tuple[bool, float]:
+    """Whether the latent-reasoning aux fires THIS step, and the weight
+    multiplier to apply when it does (`--latent_reasoning_aux_every`, K).
+
+    Fires on step indices `start_step, start_step + K, start_step + 2K, ...`
+    at weight multiplier K, so the EXPECTED per-step gradient contribution —
+    averaged over any K-step window — is identical to firing every step at
+    multiplier 1. This is pure variance-for-wall-clock trade (the aux's
+    growing-thread forwards, even batched into one, are still the dominant
+    per-step cost at ~25% GPU utilization in the sequential path this
+    replaces), not a change to what's being optimised. `every <= 1` fires
+    every step at multiplier 1 — byte-identical to the pre-aux_every
+    behaviour. Steps before `start_step` never fire (multiplier is then
+    irrelevant to the caller, returned as 1.0 for a defined value).
+    """
+    if step < start_step:
+        return False, 1.0
+    k = max(1, int(every))
+    return ((step - start_step) % k == 0), float(k)
+
+
 # _pkm_diversity_loss REMOVED 2026-06-18 (--pkm_diversity_weight dropped):
 # it was an inert NO-OP — it operated on the STASHED *detached* slot indices +
 # weights, so it had zero autograd path to any parameter (measured 0% gradient
@@ -1509,9 +1531,18 @@ def main():
             no_ramp=bool(args.latent_reasoning_no_ramp),
             gate_weight=float(getattr(args, "latent_reasoning_gate_weight", 0.0)),
             seed=int(args.seed))
+        _lr_aux_every = int(getattr(args, "latent_reasoning_aux_every", 1))
+        if _lr_aux_every > 8:
+            print(f"[latent-reasoning] WARNING: --latent_reasoning_aux_every="
+                  f"{_lr_aux_every} > 8 — firing this rarely (at "
+                  f"{_lr_aux_every}x weight when it does) trades a much "
+                  "spikier/higher-variance gradient for the wall-clock win; "
+                  "keep it <= 8 unless you've checked stability.")
         print(f"Latent-reasoning co-train ON: weight={args.latent_reasoning_weight} "
               f"rungs={_latent_reasoner.rungs} "
               f"n/step={args.latent_reasoning_n} "
+              f"aux_every={_lr_aux_every} "
+              f"batch_examples={_latent_reasoner.batch_examples} "
               f"(examples/rung: "
               f"{ {n: len(_latent_reasoner.data[n]) for n in _latent_reasoner.rungs} })")
     # Engagement kill-gate, part 2b: STARTUP construction assert (recipe rule
@@ -2456,9 +2487,17 @@ def main():
                     # gradient matches --latent_reasoning_weight after /n_micro.
                     _lr_start = int(getattr(
                         args, "latent_reasoning_start_step", 0))
+                    # --latent_reasoning_aux_every K (2026-07-04, default 1 =
+                    # every step, byte-identical): fire only every K-th
+                    # optimizer step, at K x the weight — same expected
+                    # gradient (see _latent_reasoning_aux_every_gate), fewer
+                    # stalls from the aux's growing-thread forwards.
+                    _lr_fire, _lr_every_mult = _latent_reasoning_aux_every_gate(
+                        step, _lr_start,
+                        int(getattr(args, "latent_reasoning_aux_every", 1)))
                     if (_latent_reasoner is not None
                             and _is_last_micro
-                            and step >= _lr_start):
+                            and _lr_fire):
                         # Linear 0->1 weight ramp over the warmup window after
                         # the start step — keeps the aux gradient negligible
                         # while PKM bootstraps (the v12-destabilization fix).
@@ -2473,13 +2512,20 @@ def main():
                             model, step - _lr_start, args.steps - _lr_start,
                             int(args.latent_reasoning_n))
                         loss = loss + (n_micro * args.latent_reasoning_weight
-                                       * _lr_ramp) * _lr_loss
+                                       * _lr_ramp * _lr_every_mult) * _lr_loss
                         _latent_reasoning_diag = (float(_lr_loss.detach()),
                                                   int(_lr_rung), float(_lr_ramp))
                         # Engagement kill-gate counters (recipe rule #1): the
                         # reason loss ACTUALLY ran this step — count it and
                         # track whether it stayed finite (a NaN/inf reason
                         # loss would silently corrupt the trunk gradient).
+                        # NOTE: with aux_every=K this increments only 1 step in
+                        # K, so fire_count by --engagement_check_step is ~1/K
+                        # of the every-step rate — the engagement check only
+                        # requires fire_count > 0 past the ramp window, so this
+                        # is a non-issue unless K approaches the distance from
+                        # ramp-end to the check step (warned about separately
+                        # at K > 8 startup).
                         _latent_reason_fire_count += 1
                         _latent_reason_all_finite = (
                             _latent_reason_all_finite

@@ -16,6 +16,23 @@ Clean latent thread: WorkingMemory is toggled OFF and FiLM bypassed ONLY during
 the latent forwards (WM injects at think positions and contaminates the fed-back
 hidden — the documented blocker; the validated run used --no_memory + _film_bypass).
 The main general-data forward is untouched.
+
+BATCHED growing-thread (2026-07-04, the "aux 2x cheaper" fix). The original
+mechanism ran its n examples/step SEQUENTIALLY as n independent B=1 growing
+threads — measured at ~25% GPU utilization (kernel-launch/latency-bound, not
+compute-bound), ~5.6s of every 10.4s step in the running N1 config. Since all n
+examples of a `step()` call already share the SAME rung R (`_pick_rung` is
+called once per step, not once per example), they can run as ONE batched
+growing thread of batch size n instead — see `_answer_span_latent_loss_batched`
+for the full design (LEFT-pad + doc_ids state-isolation is the load-bearing
+part: pad tokens WRITE to a linear-RNN's recurrent state, unlike causal-
+attention padding, so naive left-padding would silently corrupt the real
+prompt's starting state). `LatentReasoningCotrain(batch_examples=True)`
+(default) uses the batched path; `batch_examples=False` is the escape hatch
+that reproduces the exact old sequential behaviour (same example sampling
+order either way — only how they're processed differs), kept for A/B
+comparison against the running N1 if ever needed. Equivalence (loss + grads,
+batched == mean-of-sequential) pinned in test_latent_reasoning_batched.py.
 """
 from __future__ import annotations
 
@@ -28,11 +45,20 @@ from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from experiments.thinking import clean_latent_thread
 
 
-def _run_latent_forward(model, ids, embeds, return_hidden):
+def _run_latent_forward(model, ids, embeds, return_hidden, doc_ids=None):
     """Free function (not a closure) so torch.utils.checkpoint's
     non-reentrant recompute can re-invoke it cleanly — mirrors
     experiments/model.py::_run_block, which notes closures over `self`
     cause occasional issues with the non-reentrant checkpoint path.
+
+    `doc_ids` (n, T) | None: threaded straight to `TinyLM.forward`'s existing
+    cross-document-isolation kwarg (model.py::_build_cu_seqlens). None (the
+    default, and always the value used by the single-example
+    `_answer_span_latent_loss` path) is byte-identical to the pre-batching
+    behaviour. The batched growing-thread (`_answer_span_latent_loss_batched`)
+    passes a real mask marking each row's left-pad prefix as a separate
+    "document" from its real content, so the recurrent state resets to zero
+    exactly at the pad/real boundary — see that function's docstring.
 
     Re-asserts `clean_latent_thread` on EVERY invocation (not just once for
     the whole `step()` call) — this is load-bearing, not cosmetic. Found
@@ -55,10 +81,12 @@ def _run_latent_forward(model, ids, embeds, return_hidden):
     state, independent of what the outer `with` block has since restored.
     """
     with clean_latent_thread(model, film_bypass=True, no_activation_ckpt=True):
-        return model(ids, inputs_embeds=embeds, return_hidden=return_hidden)
+        return model(ids, inputs_embeds=embeds, return_hidden=return_hidden,
+                     doc_ids=doc_ids)
 
 
-def _latent_model_call(model, ids, embeds, return_hidden, use_checkpoint):
+def _latent_model_call(model, ids, embeds, return_hidden, use_checkpoint,
+                       doc_ids=None):
     """One latent-thread forward, optionally activation-checkpointed.
 
     ROOT CAUSE (2026-07-02 OOM postmortem): `clean_latent_thread(...,
@@ -95,8 +123,8 @@ def _latent_model_call(model, ids, embeds, return_hidden, use_checkpoint):
     """
     if use_checkpoint and torch.is_grad_enabled():
         return _torch_checkpoint(_run_latent_forward, model, ids, embeds,
-                                 return_hidden, use_reentrant=False)
-    return _run_latent_forward(model, ids, embeds, return_hidden)
+                                 return_hidden, doc_ids, use_reentrant=False)
+    return _run_latent_forward(model, ids, embeds, return_hidden, doc_ids)
 
 
 def _answer_span_latent_loss(model, comment_ids, sol_ids, eos_id, R,
@@ -164,6 +192,169 @@ def _answer_span_latent_loss(model, comment_ids, sol_ids, eos_id, R,
     return loss
 
 
+def _left_pad_prompts(prompts: list, pad_id: int, device
+                      ) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Left-pad a batch of variable-length prompt token-id lists to a common
+    length, and build the (n, P_max) `doc_ids` marking the pad prefix (0) vs.
+    the real content (1) — the DeltaNet state-isolation boundary the batched
+    growing-thread relies on (see `_answer_span_latent_loss_batched`).
+
+    LEFT-pad (not right-pad) is the key choice: it keeps every row's real
+    content ending at the same absolute position (P_max - 1) throughout the
+    whole growing thread (padding is only ever at the very front, and every
+    later append is a single shared column for every row), so the thread's
+    `h[:, -1:, :]` read is correct for every row at every step with no
+    per-row gather — exactly the single-example code's indexing, unchanged.
+    """
+    n = len(prompts)
+    P_max = max(len(p) for p in prompts)
+    ids = torch.full((n, P_max), int(pad_id), dtype=torch.long, device=device)
+    doc_ids = torch.zeros((n, P_max), dtype=torch.long, device=device)
+    for i, p in enumerate(prompts):
+        pad_len = P_max - len(p)
+        if p:
+            ids[i, pad_len:] = torch.tensor(p, dtype=torch.long, device=device)
+        doc_ids[i, pad_len:] = 1
+    return ids, doc_ids, P_max
+
+
+def _right_pad_solutions(sols: list, eos_id: int, pad_id: int, device
+                         ) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Right-pad `sol_ids + [eos_id]` per example to a common length.
+
+    Returns `(ids (n, S_max), lens (n,), S_max)` — `lens` is each row's REAL
+    length (including eos), used to mask the loss beyond that row's own
+    content. Right-padding here (unlike the prompt) needs no state isolation:
+    this trailing region only ever follows the positions being supervised, so
+    causal order alone keeps pad content from influencing any loss-bearing
+    position — the per-row loss mask (built from `lens`) is enough.
+    """
+    n = len(sols)
+    with_eos = [list(s) + [int(eos_id)] for s in sols]
+    lens = torch.tensor([len(s) for s in with_eos], dtype=torch.long,
+                        device=device)
+    S_max = int(lens.max().item())
+    ids = torch.full((n, S_max), int(pad_id), dtype=torch.long, device=device)
+    for i, s in enumerate(with_eos):
+        ids[i, :len(s)] = torch.tensor(s, dtype=torch.long, device=device)
+    return ids, lens, S_max
+
+
+def _answer_span_latent_loss_batched(model, examples, eos_id, R, thinking_id,
+                                     device, gate_weight=0.0,
+                                     checkpoint_latent=True, pad_id=0):
+    """Batched twin of `_answer_span_latent_loss`: ONE growing latent thread
+    of batch size n = len(examples) instead of n sequential B=1 threads, for
+    the shared rung R every example in a `step()` call already uses. Returns
+    the SAME quantity as
+    ``mean(_answer_span_latent_loss(model, *ex, ..., R) for ex in examples)``
+    — equivalence (loss + gradients) pinned in
+    test_latent_reasoning_batched.py — at roughly 1/n the wall-clock of n
+    sequential B=1 forwards (the fix for the ~25%-GPU-utilization stall the
+    sequential growing-thread caused: n=4 B=1 forwards are latency/kernel-
+    launch-bound, not compute-bound, so batching amortizes that overhead).
+
+    PADDING DESIGN (the load-bearing correctness point): a pad token WRITES
+    to a linear-RNN's (DeltaNet's) recurrent state before the real prompt
+    starts — unlike causal-attention padding, which is free as long as it's
+    masked. Two things make this batched thread exact:
+      1. LEFT-pad each prompt (`_left_pad_prompts`) so every row's real
+         content ends at the same absolute position — the thread's
+         `h[:, -1:, :]` read (every latent step) stays correct with no
+         per-row gather.
+      2. Mark the left-pad prefix as a separate "document" (doc_id 0) from
+         the real content (doc_id 1) using the EXISTING cross-document
+         isolation machinery (`doc_ids` -> model.py::_build_cu_seqlens ->
+         FLA's packed `cu_seqlens` kernels, validated 2026-05-14 for packing
+         multiple documents per pretrain row). This HARD-resets the
+         recurrent state to zero exactly at the pad/real boundary,
+         independent of whether the model was built with
+         `--state_readonly_at_think` — the currently-running N1 process was
+         NOT (checked directly against its live cmdline), so leaning on that
+         flag's β=0 forcing instead would have been silently inert for it.
+         `doc_ids` isolation has no such prerequisite: it works purely via
+         the packed-sequence kernel path, always.
+    The trailing (right-padded) solution region needs no isolation — see
+    `_right_pad_solutions`.
+
+    The per-example CE is computed with a PER-ROW mean (not a single
+    batch-flattened mean) before averaging over examples — solution lengths
+    differ per example, and a flattened `reduction="mean"` would silently
+    token-weight the average (longer solutions counting more), whereas
+    `LatentReasoningCotrain.step()`'s sequential path weights every example
+    equally (`total / n_examples`, each term itself a per-example mean CE).
+
+    MEASURED TRADE-OFF (`experiments/bench_latent_reasoning_batched.py`, real
+    32L x 960d config matching the running N1 process): 3.2-3.5x wall-clock
+    speedup (exceeds the ~2x target) at the cost of a real, not-negligible
+    memory increase — peak allocated goes from ~6.0-6.4 GiB (sequential) to
+    ~11.4-11.9 GiB (batched) for the aux ALONE at n=4, R=8 (both the absolute
+    worst case, all prompts near --latent_reasoning_max_len 512, and the
+    typical real-corpus rung-8 length spread, ~400-460 tok). This exceeds the
+    informal "~12GB combined" prior target on paper, but still leaves >15 GiB
+    of headroom on the 32GB card at the currently-observed ~7.5GB combined
+    N1 usage — no OOM risk on this hardware. If memory margin ever gets
+    tight (e.g. a wider trunk, or running concurrently with something else),
+    the mitigation is lowering `--latent_reasoning_n` (this function's cost
+    scales with n, same as the sequential path's did, just with a much
+    better constant) — sub-batching within this function was NOT
+    implemented (out of the requested scope; flag as a follow-up if needed).
+    """
+    n = len(examples)
+    prompts = [list(c) for c, _ in examples]
+    sols = [list(s) for _, s in examples]
+    base_ids, doc_prompt, P_max = _left_pad_prompts(prompts, int(pad_id), device)
+    cur_ids = base_ids
+    cur_emb = model.embed(base_ids)
+    cur_doc = doc_prompt
+    think_tok = torch.full((n, 1), int(thinking_id), dtype=torch.long,
+                           device=device)
+    think_doc = torch.ones((n, 1), dtype=torch.long, device=device)
+    for _ in range(int(R)):
+        out = _latent_model_call(model, cur_ids, cur_emb, True,
+                                 checkpoint_latent, doc_ids=cur_doc)
+        h = out[1]                                   # hidden = index 1 always
+        z = h[:, -1:, :].to(cur_emb.dtype)
+        z = model.apply_latent_feedback_adapter(z).to(cur_emb.dtype)
+        cur_ids = torch.cat([cur_ids, think_tok], dim=1)
+        cur_emb = torch.cat([cur_emb, z], dim=1)
+        cur_doc = torch.cat([cur_doc, think_doc], dim=1)
+    sol_t, sol_lens, S_max = _right_pad_solutions(sols, eos_id, int(pad_id),
+                                                  device)
+    full_ids = torch.cat([cur_ids, sol_t], dim=1)
+    full_emb = torch.cat([cur_emb, model.embed(sol_t)], dim=1)
+    full_doc = torch.cat(
+        [cur_doc, torch.ones((n, S_max), dtype=torch.long, device=device)],
+        dim=1)
+    out = _latent_model_call(model, full_ids, full_emb, False,
+                             checkpoint_latent, doc_ids=full_doc)
+    logits = out[0] if isinstance(out, tuple) else out
+    shift_logits = logits[:, :-1, :]
+    shift_labels = full_ids[:, 1:].clone()
+    start = P_max + int(R) - 1                        # uniform across rows
+    shift_labels[:, :start] = -100
+    col = torch.arange(shift_labels.shape[1], device=device).unsqueeze(0)
+    end = (start + sol_lens).unsqueeze(1)              # (n, 1) per-row end
+    shift_labels = torch.where(col >= end,
+                               torch.full_like(shift_labels, -100),
+                               shift_labels)
+    ce = F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.shape[-1]),
+        shift_labels.reshape(-1), ignore_index=-100, reduction="none"
+    ).reshape(n, -1)
+    valid = (shift_labels != -100)
+    per_example = ce.sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+    if gate_weight > 0.0 and getattr(model, "_last_gate_logits", None) is not None:
+        gate_logits = model._last_gate_logits              # (n, T) pre-sigmoid
+        dec = list(range(P_max - 1, P_max + int(R)))        # R+1 decisions
+        gl = gate_logits[:, dec]
+        tgt = torch.zeros_like(gl)
+        tgt[:, -1] = 1.0                                    # EMIT at the last
+        gate_ce = F.binary_cross_entropy_with_logits(gl, tgt, reduction="none")
+        per_example = per_example + float(gate_weight) * gate_ce.mean(dim=1)
+    return per_example.mean()
+
+
 def _load_rung(prefix: str, n: int, tok, max_len: int) -> list[tuple]:
     """Pointer-chase records → (comment_ids, answer_ids). Mirrors
     latent_arith_real._load_rung (answer rendered as `def solve(): return <ans>`)."""
@@ -190,7 +381,8 @@ class LatentReasoningCotrain:
     def __init__(self, train_prefix: str, rungs, tok, thinking_id: int,
                  eos_id: int, device, max_len: int = 256, no_ramp: bool = False,
                  gate_weight: float = 0.0, seed: int = 0,
-                 checkpoint_latent: bool = True):
+                 checkpoint_latent: bool = True, batch_examples: bool = True,
+                 pad_id: int = 0):
         self.device = device
         self.thinking_id = int(thinking_id)
         self.eos_id = int(eos_id)
@@ -201,6 +393,21 @@ class LatentReasoningCotrain:
         # hatch for anyone who wants the old (unchecked, ~2x cheaper compute,
         # ~16 GB heavier) behaviour back.
         self.checkpoint_latent = bool(checkpoint_latent)
+        # Batched growing-thread (2026-07-04, default ON): process the step's
+        # n_examples as ONE batch-n thread instead of n sequential B=1
+        # threads — see _answer_span_latent_loss_batched's docstring for the
+        # full design (left-pad + doc_ids state isolation). `pad_id` is a
+        # purely-internal filler id for the batched path's left/right pad
+        # positions — its exact value never matters for correctness (the
+        # doc_ids isolation discards the pad-prefix's effect on state
+        # entirely, and pad-id != thinking_id is all that's required to keep
+        # it from being mistaken for a real think token by other think_mask
+        # consumers) — 0 is safe regardless of the tokenizer's real pad
+        # convention. `batch_examples=False` is the escape hatch reproducing
+        # the exact old sequential behaviour (same example sampling order
+        # either way — see `step()`).
+        self.batch_examples = bool(batch_examples)
+        self.pad_id = int(pad_id)
         self.data: dict[int, list[tuple]] = {}
         for n in rungs:
             recs = _load_rung(train_prefix, int(n), tok, max_len)
@@ -256,15 +463,30 @@ class LatentReasoningCotrain:
         n_examples model() calls just re-applies/restores the same
         no-op-when-already-clean toggles), so this is not a behaviour
         change for the unchecked path.
+
+        `batch_examples` (default True, set in `__init__`) runs the
+        n_examples as ONE batched growing thread
+        (`_answer_span_latent_loss_batched`) instead of n sequential B=1
+        threads — the ~2x step-time fix. Example SAMPLING is identical
+        either way (drawn here, before branching) so the escape hatch
+        (`batch_examples=False`) is a true A/B: only how the same examples
+        are processed differs, not which examples are used.
         """
         rung = self._pick_rung(step, total_steps)
+        n = max(1, int(n_examples))
+        examples = [self._next(rung) for _ in range(n)]
+        if self.batch_examples:
+            loss = _answer_span_latent_loss_batched(
+                model, examples, self.eos_id, rung, self.thinking_id,
+                self.device, gate_weight=self.gate_weight,
+                checkpoint_latent=self.checkpoint_latent, pad_id=self.pad_id)
+            return loss, rung
         total = None
-        for _ in range(max(1, int(n_examples))):
-            c, s = self._next(rung)
+        for c, s in examples:
             l = _answer_span_latent_loss(model, c, s, self.eos_id, rung,
                                          self.thinking_id, self.device,
                                          gate_weight=self.gate_weight,
                                          checkpoint_latent=self.checkpoint_latent)
             total = l if total is None else total + l
-        loss = total / max(1, int(n_examples))
+        loss = total / n
         return loss, rung

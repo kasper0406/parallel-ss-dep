@@ -1034,6 +1034,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "the old path). Set to the PKM α-floor window (e.g. 3000) "
                         "so the aux gradient stays negligible while PKM bootstraps "
                         "— the v12-destabilization safety knob.")
+    p.add_argument("--latent_reasoning_aux_every", type=int, default=1,
+                   help="Fire the latent-reasoning aux only every K-th "
+                        "optimizer step, at K x the weight (same expected "
+                        "gradient, fewer stalls — the aux's n growing-thread "
+                        "forwards are the main step-time cost even after "
+                        "batching them into one). Default 1 = fire every "
+                        "step (current/byte-identical behaviour). K>~8 is "
+                        "warned about at startup (gradient variance from "
+                        "the coarser, spikier schedule).")
     # --- Gate-calibration aux loss (latent "think only where helpful") ---
     # Trains the OUTPUT GATE (not the trunk) toward firing think exactly where
     # a latent think actually raises logp(true_next). Uses the shared latent

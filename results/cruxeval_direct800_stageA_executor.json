@@ -1,0 +1,7219 @@
+{
+  "ckpt": "checkpoints/stageA_executor.pt",
+  "n": 800,
+  "seed": 0,
+  "arms": [
+    "direct"
+  ],
+  "latent_adapter": false,
+  "aggregate": {
+    "direct": {
+      "n": 800,
+      "acc": 0.08125,
+      "parse_rate": 0.935
+    }
+  },
+  "per_record": [
+    {
+      "id": "sample_54",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f('happy"
+      }
+    },
+    {
+      "id": "sample_608",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_205",
+      "direct": {
+        "pred": "assert f(\"##fiu##nk#he###wumun##\") ==",
+        "correct": 0,
+        "parsed": 0,
+        "text": "\nassert f(\"##fiu##nk#he###wumun##\") == \nassert f(\"##fiu##nk#he###wumun##\") == \nassert f(\"##fiu##nk#he###wumun##\") == \nassert f(\""
+      }
+    },
+    {
+      "id": "sample_313",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('ur"
+      }
+    },
+    {
+      "id": "sample_141",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_706",
+      "direct": {
+        "pred": "assert f(\"ab\", \"xy\") ==",
+        "correct": 0,
+        "parsed": 0,
+        "text": "\nassert f(\"ab\", \"xy\") == \nassert f(\"ab\", \"xy\") == \nassert f(\"ab\", \"xy\") == \nassert f(\"ab\", \"xy\") == \nassert f(\"ab\", \"xy\") == \nassert f(\"ab\", \"xy\")"
+      }
+    },
+    {
+      "id": "sample_447",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(\"\\t"
+      }
+    },
+    {
+      "id": "sample_56",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_563",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f('j"
+      }
+    },
+    {
+      "id": "sample_530",
+      "direct": {
+        "pred": "'@@@ff'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " '@@@ff'\nassert f(\"@@"
+      }
+    },
+    {
+      "id": "sample_375",
+      "direct": {
+        "pred": "iz",
+        "correct": 0,
+        "parsed": 0,
+        "text": "iz\nassert f('sierizam', 'iz') == 'iz'\nassert f('sierizam', 'iz') == 'iz'\nassert f('sierizam', 'iz') == 'iz'\nassert f('sierizam', 'iz') == 'iz"
+      }
+    },
+    {
+      "id": "sample_459",
+      "direct": {
+        "pred": "{'b': 'vzjmc', 'f': 'ae', '0': '0'}",
+        "correct": 0,
+        "parsed": 1,
+        "text": " {'b': 'vzjmc', 'f': 'ae', '0': '0'}\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_420",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_67",
+      "direct": {
+        "pred": "8",
+        "correct": 0,
+        "parsed": 1,
+        "text": "8\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_214",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('present"
+      }
+    },
+    {
+      "id": "sample_715",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('ab"
+      }
+    },
+    {
+      "id": "sample_786",
+      "direct": {
+        "pred": "19kefp7",
+        "correct": 0,
+        "parsed": 0,
+        "text": "19kefp7\nassert f('19kefp7', '1') == 19kefp7\nassert f('19kefp7', '1') == 19kefp7\nassert f('19kefp7', '1') == 19kefp"
+      }
+    },
+    {
+      "id": "sample_34",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_473",
+      "direct": {
+        "pred": "'scedvtvotkwqfoqn'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'scedvtvotkwqfoqn'\nassert f('s"
+      }
+    },
+    {
+      "id": "sample_791",
+      "direct": {
+        "pred": "8999",
+        "correct": 0,
+        "parsed": 1,
+        "text": "8999\nassert f(8"
+      }
+    },
+    {
+      "id": "sample_357",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('cre"
+      }
+    },
+    {
+      "id": "sample_104",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"ab"
+      }
+    },
+    {
+      "id": "sample_232",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('f"
+      }
+    },
+    {
+      "id": "sample_396",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f({1"
+      }
+    },
+    {
+      "id": "sample_536",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f('C"
+      }
+    },
+    {
+      "id": "sample_69",
+      "direct": {
+        "pred": "56",
+        "correct": 0,
+        "parsed": 1,
+        "text": "56\nassert f({'8"
+      }
+    },
+    {
+      "id": "sample_518",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('the"
+      }
+    },
+    {
+      "id": "sample_304",
+      "direct": {
+        "pred": "23",
+        "correct": 0,
+        "parsed": 1,
+        "text": "23\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_615",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([-1"
+      }
+    },
+    {
+      "id": "sample_336",
+      "direct": {
+        "pred": "234dsfssdfs333324314",
+        "correct": 0,
+        "parsed": 0,
+        "text": "234dsfssdfs333324314\nassert f('234dsfssdfs333324314', 's') == 234dsfssdfs333324314\nassert f('23"
+      }
+    },
+    {
+      "id": "sample_322",
+      "direct": {
+        "pred": "['lsi', 's', 't', 'd']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['lsi', 's', 't', 'd']\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_793",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_87",
+      "direct": {
+        "pred": "9 - 1 + 1 + 2 + 3 + 1 + 2",
+        "correct": 0,
+        "parsed": 0,
+        "text": "9 - 1 + 1 + 2 + 3 + 1 + 2\n\ndef f(nums):\n    nums.reverse()\n    return ''.join(map(str, nums))\nassert f([-1, 9, 3, 1, -2]) == 9 -"
+      }
+    },
+    {
+      "id": "sample_635",
+      "direct": {
+        "pred": "True",
+        "correct": 0,
+        "parsed": 1,
+        "text": " True\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_474",
+      "direct": {
+        "pred": "' 8'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ' 8'\nassert f('#"
+      }
+    },
+    {
+      "id": "sample_96",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('l"
+      }
+    },
+    {
+      "id": "sample_789",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('a"
+      }
+    },
+    {
+      "id": "sample_579",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('a"
+      }
+    },
+    {
+      "id": "sample_578",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f({'R"
+      }
+    },
+    {
+      "id": "sample_370",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('  "
+      }
+    },
+    {
+      "id": "sample_760",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(dict"
+      }
+    },
+    {
+      "id": "sample_237",
+      "direct": {
+        "pred": "'uuzlwaqiaj'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'uuzlwaqiaj'\nassert f('uz"
+      }
+    },
+    {
+      "id": "sample_552",
+      "direct": {
+        "pred": "15.0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "15.0\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_278",
+      "direct": {
+        "pred": "1000000000000000000000000000000000000000000000000000000000000000",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "id": "sample_658",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_57",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f('x"
+      }
+    },
+    {
+      "id": "sample_72",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_52",
+      "direct": {
+        "pred": "7279",
+        "correct": 0,
+        "parsed": 1,
+        "text": "7279\nassert f(\"se"
+      }
+    },
+    {
+      "id": "sample_352",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f([-1"
+      }
+    },
+    {
+      "id": "sample_181",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(\"q"
+      }
+    },
+    {
+      "id": "sample_296",
+      "direct": {
+        "pred": "\"https://www.ekapusta.com/image/url\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"https://www.ekapusta.com/image/url\"\nassert f(\"https"
+      }
+    },
+    {
+      "id": "sample_512",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_631",
+      "direct": {
+        "pred": "19",
+        "correct": 0,
+        "parsed": 1,
+        "text": "19\nassert f('a"
+      }
+    },
+    {
+      "id": "sample_94",
+      "direct": {
+        "pred": "{'w': 5, 'wi': 10, 'w': 3}",
+        "correct": 1,
+        "parsed": 1,
+        "text": " {'w': 5, 'wi': 10, 'w': 3}\nassert f({'w"
+      }
+    },
+    {
+      "id": "sample_646",
+      "direct": {
+        "pred": "'aBc, ,SzY'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'aBc, ,SzY'\nassert f('a"
+      }
+    },
+    {
+      "id": "sample_622",
+      "direct": {
+        "pred": "'galgu'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'galgu'\nassert f('gal"
+      }
+    },
+    {
+      "id": "sample_508",
+      "direct": {
+        "pred": "'ertubwi'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'ertubwi'\nassert f('ert"
+      }
+    },
+    {
+      "id": "sample_568",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('b"
+      }
+    },
+    {
+      "id": "sample_708",
+      "direct": {
+        "pred": "'jcmfxv'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'jcmfxv'\nassert f('   "
+      }
+    },
+    {
+      "id": "sample_35",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(\" B"
+      }
+    },
+    {
+      "id": "sample_349",
+      "direct": {
+        "pred": "555",
+        "correct": 0,
+        "parsed": 1,
+        "text": "555\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_781",
+      "direct": {
+        "pred": "6",
+        "correct": 0,
+        "parsed": 1,
+        "text": "6\nassert f('sh"
+      }
+    },
+    {
+      "id": "sample_661",
+      "direct": {
+        "pred": "'elrtsSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS",
+        "correct": 0,
+        "parsed": 0,
+        "text": " 'elrtsSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS"
+      }
+    },
+    {
+      "id": "sample_217",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('Str"
+      }
+    },
+    {
+      "id": "sample_517",
+      "direct": {
+        "pred": "'Sz'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Sz'\nassert f('S"
+      }
+    },
+    {
+      "id": "sample_388",
+      "direct": {
+        "pred": "28",
+        "correct": 0,
+        "parsed": 1,
+        "text": "28\nassert f(\"2"
+      }
+    },
+    {
+      "id": "sample_514",
+      "direct": {
+        "pred": "'stew-corn-beans-in soup-.-'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'stew-corn-beans-in soup-.-'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_393",
+      "direct": {
+        "pred": "'scala'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'scala'\nassert f('python"
+      }
+    },
+    {
+      "id": "sample_621",
+      "direct": {
+        "pred": "134556",
+        "correct": 0,
+        "parsed": 1,
+        "text": "134556\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_337",
+      "direct": {
+        "pred": "56",
+        "correct": 0,
+        "parsed": 1,
+        "text": "56\nassert f(\"5"
+      }
+    },
+    {
+      "id": "sample_321",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f({'desc"
+      }
+    },
+    {
+      "id": "sample_92",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('w"
+      }
+    },
+    {
+      "id": "sample_555",
+      "direct": {
+        "pred": "\"odes\\tcode\\twell\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"odes\\tcode\\twell\"\n\ndef test_"
+      }
+    },
+    {
+      "id": "sample_30",
+      "direct": {
+        "pred": "[\"a\", \"b\", \"c\"]",
+        "correct": 1,
+        "parsed": 1,
+        "text": " [\"a\", \"b\", \"c\"]\nassert f([\"a"
+      }
+    },
+    {
+      "id": "sample_136",
+      "direct": {
+        "pred": "\"a\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n",
+        "correct": 0,
+        "parsed": 0,
+        "text": " \"a\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n"
+      }
+    },
+    {
+      "id": "sample_702",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_612",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_263",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([\"gl"
+      }
+    },
+    {
+      "id": "sample_742",
+      "direct": {
+        "pred": "0",
+        "correct": 1,
+        "parsed": 1,
+        "text": "0\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_651",
+      "direct": {
+        "pred": "'E WEAK E WEAK E WEAK E WEAK E'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'E WEAK E WEAK E WEAK E WEAK E'\nassert f('E"
+      }
+    },
+    {
+      "id": "sample_385",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_139",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_492",
+      "direct": {
+        "pred": "'abbkebaniuwurzvr'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'abbkebaniuwurzvr'\nassert f('ab"
+      }
+    },
+    {
+      "id": "sample_345",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f('m"
+      }
+    },
+    {
+      "id": "sample_503",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f({1"
+      }
+    },
+    {
+      "id": "sample_592",
+      "direct": {
+        "pred": "11",
+        "correct": 0,
+        "parsed": 1,
+        "text": "11\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_176",
+      "direct": {
+        "pred": "'some text'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'some text'\nassert f('some"
+      }
+    },
+    {
+      "id": "sample_709",
+      "direct": {
+        "pred": "'a love a'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'a love a'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_421",
+      "direct": {
+        "pred": "\"try.\"",
+        "correct": 1,
+        "parsed": 1,
+        "text": " \"try.\"\nassert f(\"try"
+      }
+    },
+    {
+      "id": "sample_796",
+      "direct": {
+        "pred": "'fnu'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'fnu'\nassert f('fn"
+      }
+    },
+    {
+      "id": "sample_81",
+      "direct": {
+        "pred": "23",
+        "correct": 0,
+        "parsed": 1,
+        "text": "23\nassert f({\"B"
+      }
+    },
+    {
+      "id": "sample_549",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([[1"
+      }
+    },
+    {
+      "id": "sample_637",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('0"
+      }
+    },
+    {
+      "id": "sample_437",
+      "direct": {
+        "pred": "{'john', 'doe', 'the'}",
+        "correct": 0,
+        "parsed": 1,
+        "text": " {'john', 'doe', 'the'}\nassert f(['j"
+      }
+    },
+    {
+      "id": "sample_354",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('{"
+      }
+    },
+    {
+      "id": "sample_371",
+      "direct": {
+        "pred": "11",
+        "correct": 0,
+        "parsed": 1,
+        "text": "11\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_485",
+      "direct": {
+        "pred": "'gsd avdropj'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'gsd avdropj'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_521",
+      "direct": {
+        "pred": "93",
+        "correct": 0,
+        "parsed": 1,
+        "text": "93\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_325",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f(\"abc"
+      }
+    },
+    {
+      "id": "sample_151",
+      "direct": {
+        "pred": "7.00000000000000000000000000000000000000000000000000000000000000",
+        "correct": 0,
+        "parsed": 1,
+        "text": "7.00000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "id": "sample_466",
+      "direct": {
+        "pred": "'-----\\t\\n\\tth\\n-----'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " '-----\\t\\n\\tth\\n-----'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_442",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_392",
+      "direct": {
+        "pred": "'ALL UPPERCASE'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'ALL UPPERCASE'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_61",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('0"
+      }
+    },
+    {
+      "id": "sample_353",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_167",
+      "direct": {
+        "pred": "'aaXXXXbbXXXXccXXXXde'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'aaXXXXbbXXXXccXXXXde'\nassert f('aa"
+      }
+    },
+    {
+      "id": "sample_500",
+      "direct": {
+        "pred": "'dsj osq w'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'dsj osq w'\nassert f('ds"
+      }
+    },
+    {
+      "id": "sample_410",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_261",
+      "direct": {
+        "pred": "2, f(nums, 516)",
+        "correct": 0,
+        "parsed": 0,
+        "text": "2, f(nums, 516)\n\ndef f(nums, target):\n    lows, higgs = [], []\n    for i in nums:\n        if i < target:\n            lows.append(i)\n        else:\n            higgs.append(i)\n    lows.clear()\n   "
+      }
+    },
+    {
+      "id": "sample_769",
+      "direct": {
+        "pred": "'a?riu'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'a?riu'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_527",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_413",
+      "direct": {
+        "pred": "'jbucwc'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'jbucwc'\nassert f('j"
+      }
+    },
+    {
+      "id": "sample_448",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('u"
+      }
+    },
+    {
+      "id": "sample_787",
+      "direct": {
+        "pred": "'xzd'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'xzd'\nassert f('x"
+      }
+    },
+    {
+      "id": "sample_415",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f(((8"
+      }
+    },
+    {
+      "id": "sample_431",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(1"
+      }
+    },
+    {
+      "id": "sample_239",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('0"
+      }
+    },
+    {
+      "id": "sample_301",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_445",
+      "direct": {
+        "pred": "\"carrot, banana, and strawberry\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"carrot, banana, and strawberry\"\nassert f(\"car"
+      }
+    },
+    {
+      "id": "sample_382",
+      "direct": {
+        "pred": "\"QltufRwrepny\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"QltufRwrepny\"\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_674",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('q"
+      }
+    },
+    {
+      "id": "sample_251",
+      "direct": {
+        "pred": "\"Marie.Nelson.Oscar\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"Marie.Nelson.Oscar\"\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_273",
+      "direct": {
+        "pred": "'NETNET'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'NETNET'\nassert f('."
+      }
+    },
+    {
+      "id": "sample_653",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(\"c"
+      }
+    },
+    {
+      "id": "sample_572",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f({1"
+      }
+    },
+    {
+      "id": "sample_295",
+      "direct": {
+        "pred": "['apple', 'pear', 'banana', 'orange']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['apple', 'pear', 'banana', 'orange']\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_293",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('D"
+      }
+    },
+    {
+      "id": "sample_137",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_272",
+      "direct": {
+        "pred": "[2, 4, 6, 8, 0]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [2, 4, 6, 8, 0]\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_407",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_524",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef test_"
+      }
+    },
+    {
+      "id": "sample_45",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('za"
+      }
+    },
+    {
+      "id": "sample_89",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('o"
+      }
+    },
+    {
+      "id": "sample_629",
+      "direct": {
+        "pred": "'catNG'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'catNG'\nassert f('cat"
+      }
+    },
+    {
+      "id": "sample_783",
+      "direct": {
+        "pred": "0",
+        "correct": 1,
+        "parsed": 1,
+        "text": "0\nassert f(\"managed"
+      }
+    },
+    {
+      "id": "sample_180",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_632",
+      "direct": {
+        "pred": "100",
+        "correct": 0,
+        "parsed": 1,
+        "text": "100\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_316",
+      "direct": {
+        "pred": "'i am your father'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'i am your father'\nassert f('i"
+      }
+    },
+    {
+      "id": "sample_238",
+      "direct": {
+        "pred": "100",
+        "correct": 0,
+        "parsed": 1,
+        "text": "100\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_243",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('abc"
+      }
+    },
+    {
+      "id": "sample_738",
+      "direct": {
+        "pred": "\"x.r\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"x.r\"\nassert f(\"x"
+      }
+    },
+    {
+      "id": "sample_270",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\n\ndef test_"
+      }
+    },
+    {
+      "id": "sample_668",
+      "direct": {
+        "pred": "'hmyforyear'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'hmyforyear'\nassert f('hello"
+      }
+    },
+    {
+      "id": "sample_147",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_576",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_797",
+      "direct": {
+        "pred": "\\",
+        "correct": 0,
+        "parsed": 0,
+        "text": " \\\n    [(1, 2), (2, 3)]\n\ndef f(dct):\n    lst = []\n    for key, value in sorted(dct.items()):\n        lst.append((key, value))\n    return lst\nassert f({'a': 1, 'b': "
+      }
+    },
+    {
+      "id": "sample_114",
+      "direct": {
+        "pred": "[\"a-.-.b\"]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [\"a-.-.b\"]\nassert f(\"a"
+      }
+    },
+    {
+      "id": "sample_705",
+      "direct": {
+        "pred": "['Sydney', 'Melbourne', 'Hong Kong', 'Boston', 'Istanbul', 'Somewhere ']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['Sydney', 'Melbourne', 'Hong Kong', 'Boston', 'Istanbul', 'Somewhere ']\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_283",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f({'Iron"
+      }
+    },
+    {
+      "id": "sample_152",
+      "direct": {
+        "pred": "20",
+        "correct": 1,
+        "parsed": 1,
+        "text": "20\nassert f(''."
+      }
+    },
+    {
+      "id": "sample_230",
+      "direct": {
+        "pred": "102x0zoq",
+        "correct": 0,
+        "parsed": 0,
+        "text": "102x0zoq\nassert f('102x0zoq') == 102x0zoq\nassert f('102x0zoq') == 102x0zoq\nassert f('102x0zoq') == 1"
+      }
+    },
+    {
+      "id": "sample_664",
+      "direct": {
+        "pred": "35",
+        "correct": 0,
+        "parsed": 1,
+        "text": "35\nassert f({\"3"
+      }
+    },
+    {
+      "id": "sample_377",
+      "direct": {
+        "pred": "\"BYE\\nNO\\nWAY\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"BYE\\nNO\\nWAY\"\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_219",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"Hello"
+      }
+    },
+    {
+      "id": "sample_614",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('z"
+      }
+    },
+    {
+      "id": "sample_108",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(0"
+      }
+    },
+    {
+      "id": "sample_144",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_109",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_636",
+      "direct": {
+        "pred": "{'A3': 'A1', 'A2': 'A2'}",
+        "correct": 0,
+        "parsed": 1,
+        "text": " {'A3': 'A1', 'A2': 'A2'}\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_29",
+      "direct": {
+        "pred": "314",
+        "correct": 0,
+        "parsed": 1,
+        "text": "314\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_78",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f('m"
+      }
+    },
+    {
+      "id": "sample_129",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\nassert f('ON"
+      }
+    },
+    {
+      "id": "sample_107",
+      "direct": {
+        "pred": "\"UAJHQ\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"UAJHQ\"\nassert f(\"u"
+      }
+    },
+    {
+      "id": "sample_381",
+      "direct": {
+        "pred": "19",
+        "correct": 0,
+        "parsed": 1,
+        "text": "19\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_128",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f('M"
+      }
+    },
+    {
+      "id": "sample_160",
+      "direct": {
+        "pred": "38381",
+        "correct": 0,
+        "parsed": 1,
+        "text": "38381\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_699",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"some"
+      }
+    },
+    {
+      "id": "sample_765",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_417",
+      "direct": {
+        "pred": "8",
+        "correct": 0,
+        "parsed": 1,
+        "text": "8\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_584",
+      "direct": {
+        "pred": "5123807309875480094949830",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5123807309875480094949830\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_733",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('a"
+      }
+    },
+    {
+      "id": "sample_315",
+      "direct": {
+        "pred": "'czywZ'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'czywZ'\nassert f('c"
+      }
+    },
+    {
+      "id": "sample_368",
+      "direct": {
+        "pred": "4327",
+        "correct": 0,
+        "parsed": 1,
+        "text": "4327\nassert f('4"
+      }
+    },
+    {
+      "id": "sample_6",
+      "direct": {
+        "pred": "52",
+        "correct": 0,
+        "parsed": 1,
+        "text": "52\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_605",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_124",
+      "direct": {
+        "pred": "'i like you'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'i like you'\nassert f('i"
+      }
+    },
+    {
+      "id": "sample_339",
+      "direct": {
+        "pred": "2",
+        "correct": 1,
+        "parsed": 1,
+        "text": "2\nassert f([-1"
+      }
+    },
+    {
+      "id": "sample_11",
+      "direct": {
+        "pred": "{'foo': ['bar', 'bar']}",
+        "correct": 0,
+        "parsed": 1,
+        "text": " {'foo': ['bar', 'bar']}\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_403",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('h"
+      }
+    },
+    {
+      "id": "sample_657",
+      "direct": {
+        "pred": "\"dheggasdha\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"dheggasdha\"\nassert f(\"d"
+      }
+    },
+    {
+      "id": "sample_426",
+      "direct": {
+        "pred": "[1, 2, 3, 8, 5]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [1, 2, 3, 8, 5]\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_116",
+      "direct": {
+        "pred": "200",
+        "correct": 0,
+        "parsed": 1,
+        "text": "200\nassert f({},"
+      }
+    },
+    {
+      "id": "sample_768",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('ab"
+      }
+    },
+    {
+      "id": "sample_751",
+      "direct": {
+        "pred": "\"wwhttpp\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"wwhttpp\"\nassert f(\"aa"
+      }
+    },
+    {
+      "id": "sample_732",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\n\ndef process_"
+      }
+    },
+    {
+      "id": "sample_794",
+      "direct": {
+        "pred": "\"\\\\%$ normal chars qwet42\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"\\\\%$ normal chars qwet42\"\nassert f(\"\\\""
+      }
+    },
+    {
+      "id": "sample_236",
+      "direct": {
+        "pred": "'ac89wg'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'ac89wg'\nassert f(['a"
+      }
+    },
+    {
+      "id": "sample_48",
+      "direct": {
+        "pred": "\"\"",
+        "correct": 1,
+        "parsed": 1,
+        "text": " \"\"\nassert f([\"a"
+      }
+    },
+    {
+      "id": "sample_486",
+      "direct": {
+        "pred": "15",
+        "correct": 0,
+        "parsed": 1,
+        "text": "15\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_210",
+      "direct": {
+        "pred": "100",
+        "correct": 0,
+        "parsed": 1,
+        "text": "100\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_211",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(\"ab"
+      }
+    },
+    {
+      "id": "sample_291",
+      "direct": {
+        "pred": "{'a': 2, 'b': 2}",
+        "correct": 0,
+        "parsed": 1,
+        "text": " {'a': 2, 'b': 2}\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_395",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_99",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('aa"
+      }
+    },
+    {
+      "id": "sample_361",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f(\"#!"
+      }
+    },
+    {
+      "id": "sample_314",
+      "direct": {
+        "pred": "105",
+        "correct": 0,
+        "parsed": 1,
+        "text": "105\nassert f('2"
+      }
+    },
+    {
+      "id": "sample_159",
+      "direct": {
+        "pred": "'rtiGM'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'rtiGM'\nassert f('RT"
+      }
+    },
+    {
+      "id": "sample_182",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_356",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_260",
+      "direct": {
+        "pred": "6",
+        "correct": 0,
+        "parsed": 1,
+        "text": "6\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_543",
+      "direct": {
+        "pred": "'MUNAB'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'MUNAB'\nassert f(',"
+      }
+    },
+    {
+      "id": "sample_86",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(['s"
+      }
+    },
+    {
+      "id": "sample_528",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('p"
+      }
+    },
+    {
+      "id": "sample_529",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_753",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f({0"
+      }
+    },
+    {
+      "id": "sample_687",
+      "direct": {
+        "pred": "'Rug nzufE'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Rug nzufE'\nassert f('R"
+      }
+    },
+    {
+      "id": "sample_292",
+      "direct": {
+        "pred": "5f83u23saa",
+        "correct": 0,
+        "parsed": 0,
+        "text": "5f83u23saa\n\ndef f(text):\n    return ''.join(c for c in text if c.isalpha())\nassert f('abc123') == 'abc123'\n\ndef f(text):\n    return ''.join(c for c in"
+      }
+    },
+    {
+      "id": "sample_531",
+      "direct": {
+        "pred": "\"Ibaskdjgblw\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"Ibaskdjgblw\"\nassert f(\"I"
+      }
+    },
+    {
+      "id": "sample_28",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_665",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f(\"abc"
+      }
+    },
+    {
+      "id": "sample_558",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([3"
+      }
+    },
+    {
+      "id": "sample_276",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_200",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('j"
+      }
+    },
+    {
+      "id": "sample_233",
+      "direct": {
+        "pred": "1 + 2 + 3",
+        "correct": 0,
+        "parsed": 0,
+        "text": "1 + 2 + 3\n\ndef f(xs):\n    return xs.pop(0)\nassert f([1, 2, 3]) == 1 + 2 + 3\n\ndef f(xs):\n    return xs.pop(0)\nassert f([1,"
+      }
+    },
+    {
+      "id": "sample_49",
+      "direct": {
+        "pred": "816",
+        "correct": 0,
+        "parsed": 1,
+        "text": "816\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_88",
+      "direct": {
+        "pred": "\"hellohello\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"hellohello\"\nassert f(\"hello"
+      }
+    },
+    {
+      "id": "sample_166",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f({1"
+      }
+    },
+    {
+      "id": "sample_140",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('Hi"
+      }
+    },
+    {
+      "id": "sample_681",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_26",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(\"q"
+      }
+    },
+    {
+      "id": "sample_570",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([2"
+      }
+    },
+    {
+      "id": "sample_484",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_535",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(1"
+      }
+    },
+    {
+      "id": "sample_158",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_519",
+      "direct": {
+        "pred": "42",
+        "correct": 0,
+        "parsed": 1,
+        "text": "42\n\ndef test_"
+      }
+    },
+    {
+      "id": "sample_8",
+      "direct": {
+        "pred": "'Upp'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Upp'\nassert f('U"
+      }
+    },
+    {
+      "id": "sample_5",
+      "direct": {
+        "pred": "2, f('DSUWeqExTQdCMGpqur', 'a', 'x')",
+        "correct": 0,
+        "parsed": 0,
+        "text": "2, f('DSUWeqExTQdCMGpqur', 'a', 'x')\nassert f('DSUWeqExTQdCMGpqur', 'a', 'x') == 2, f('DSUWeqExTQdCMG"
+      }
+    },
+    {
+      "id": "sample_307",
+      "direct": {
+        "pred": "'pxcznyf'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'pxcznyf'\nassert f('p"
+      }
+    },
+    {
+      "id": "sample_780",
+      "direct": {
+        "pred": "301",
+        "correct": 0,
+        "parsed": 1,
+        "text": "301\nassert f([2"
+      }
+    },
+    {
+      "id": "sample_595",
+      "direct": {
+        "pred": "'qdhstudentamxupuihbuztn'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'qdhstudentamxupuihbuztn'\nassert f('q"
+      }
+    },
+    {
+      "id": "sample_25",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f({\"l"
+      }
+    },
+    {
+      "id": "sample_750",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f({},"
+      }
+    },
+    {
+      "id": "sample_117",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(\"2"
+      }
+    },
+    {
+      "id": "sample_471",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f('o"
+      }
+    },
+    {
+      "id": "sample_463",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_156",
+      "direct": {
+        "pred": "'tqym'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'tqym'\nassert f('t"
+      }
+    },
+    {
+      "id": "sample_470",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(4"
+      }
+    },
+    {
+      "id": "sample_511",
+      "direct": {
+        "pred": "{'ca': 'cx'}",
+        "correct": 0,
+        "parsed": 1,
+        "text": " {'ca': 'cx'}\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_90",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_673",
+      "direct": {
+        "pred": "\"C\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"C\"\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_38",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_178",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_412",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f(3"
+      }
+    },
+    {
+      "id": "sample_449",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('2"
+      }
+    },
+    {
+      "id": "sample_363",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([2"
+      }
+    },
+    {
+      "id": "sample_499",
+      "direct": {
+        "pred": "'mag'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'mag'\nassert f('mag"
+      }
+    },
+    {
+      "id": "sample_221",
+      "direct": {
+        "pred": "'bpxa24fc5.'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'bpxa24fc5.'\nassert f('bp"
+      }
+    },
+    {
+      "id": "sample_735",
+      "direct": {
+        "pred": "'A B'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'A B'\nassert f('("
+      }
+    },
+    {
+      "id": "sample_125",
+      "direct": {
+        "pred": "123",
+        "correct": 0,
+        "parsed": 1,
+        "text": "123\nassert f('\""
+      }
+    },
+    {
+      "id": "sample_423",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_598",
+      "direct": {
+        "pred": "'abc'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'abc'\nassert f('abc"
+      }
+    },
+    {
+      "id": "sample_123",
+      "direct": {
+        "pred": "[1, 2, 3, 5, 8, 6, 1, 2, 3, 5, 8]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [1, 2, 3, 5, 8, 6, 1, 2, 3, 5, 8]\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_491",
+      "direct": {
+        "pred": "4, f(xs)",
+        "correct": 0,
+        "parsed": 0,
+        "text": "4, f(xs)\n\ndef f(xs):\n    return xs[0] + xs[1]\nassert f([4, 8, 8, 5]) == 4, f(xs)\n\ndef f(xs):\n    return xs[0] + xs[1"
+      }
+    },
+    {
+      "id": "sample_685",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_571",
+      "direct": {
+        "pred": "4",
+        "correct": 0,
+        "parsed": 1,
+        "text": "4\nassert f(r"
+      }
+    },
+    {
+      "id": "sample_401",
+      "direct": {
+        "pred": "'mathematics example'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'mathematics example'\nassert f('mat"
+      }
+    },
+    {
+      "id": "sample_146",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\nassert f(1"
+      }
+    },
+    {
+      "id": "sample_682",
+      "direct": {
+        "pred": "'hypernimovichyp'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'hypernimovichyp'\nassert f('hyper"
+      }
+    },
+    {
+      "id": "sample_548",
+      "direct": {
+        "pred": "'spider.ed'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'spider.ed'\nassert f('sp"
+      }
+    },
+    {
+      "id": "sample_743",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('dog"
+      }
+    },
+    {
+      "id": "sample_386",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('mid"
+      }
+    },
+    {
+      "id": "sample_262",
+      "direct": {
+        "pred": "4",
+        "correct": 0,
+        "parsed": 1,
+        "text": "4\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_562",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('V"
+      }
+    },
+    {
+      "id": "sample_602",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_155",
+      "direct": {
+        "pred": "\"dskjs hjcdjnxhjicnn\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"dskjs hjcdjnxhjicnn\"\nassert f(\"ds"
+      }
+    },
+    {
+      "id": "sample_134",
+      "direct": {
+        "pred": "1000000000000000000000000000000000000000000000000000000000000000",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "id": "sample_252",
+      "direct": {
+        "pred": "'\\\\foo'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " '\\\\foo'\nassert f('\\\\"
+      }
+    },
+    {
+      "id": "sample_302",
+      "direct": {
+        "pred": "'wdeejjjzsjsjjsxjjneddaddddddefsfd'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'wdeejjjzsjsjjsxjjneddaddddddefsfd'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_757",
+      "direct": {
+        "pred": "'a1a8n2'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'a1a8n2'\n\ndef f2"
+      }
+    },
+    {
+      "id": "sample_130",
+      "direct": {
+        "pred": "'l=6, h=6, o=9'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'l=6, h=6, o=9'\nassert f({'l"
+      }
+    },
+    {
+      "id": "sample_259",
+      "direct": {
+        "pred": "'String matching is a big part of RexEx library.'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'String matching is a big part of RexEx library.'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_402",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f(1"
+      }
+    },
+    {
+      "id": "sample_639",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"x"
+      }
+    },
+    {
+      "id": "sample_788",
+      "direct": {
+        "pred": "'hello.txt'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'hello.txt'\nassert f('hello"
+      }
+    },
+    {
+      "id": "sample_10",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('a"
+      }
+    },
+    {
+      "id": "sample_662",
+      "direct": {
+        "pred": "['Dusty', 'Joe', 'Pete']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['Dusty', 'Joe', 'Pete']\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_198",
+      "direct": {
+        "pred": "'cfjm'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'cfjm'\nassert f('t"
+      }
+    },
+    {
+      "id": "sample_792",
+      "direct": {
+        "pred": "{'a': 'b', 'c': 'd'}",
+        "correct": 0,
+        "parsed": 1,
+        "text": " {'a': 'b', 'c': 'd'}\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_213",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"("
+      }
+    },
+    {
+      "id": "sample_274",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_638",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('ab"
+      }
+    },
+    {
+      "id": "sample_758",
+      "direct": {
+        "pred": "0",
+        "correct": 1,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_451",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('pn"
+      }
+    },
+    {
+      "id": "sample_541",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f(' \\"
+      }
+    },
+    {
+      "id": "sample_660",
+      "direct": {
+        "pred": "15",
+        "correct": 0,
+        "parsed": 1,
+        "text": "15\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_577",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([(1"
+      }
+    },
+    {
+      "id": "sample_17",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(\"There"
+      }
+    },
+    {
+      "id": "sample_257",
+      "direct": {
+        "pred": "['Hello World\\n\"I am String\"']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['Hello World\\n\"I am String\"']\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_271",
+      "direct": {
+        "pred": "'uufhl'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'uufhl'\nassert f('u"
+      }
+    },
+    {
+      "id": "sample_522",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_258",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_591",
+      "direct": {
+        "pred": "assert f([6, 3, 0, 7, 4, 8, 9, 0, 0, 0]) ==",
+        "correct": 0,
+        "parsed": 0,
+        "text": "\nassert f([6, 3, 0, 7, 4, 8, 9, 0, 0, 0]) == \nassert f([6, 3, 0, 7, 4, 8, 9, 0, 0"
+      }
+    },
+    {
+      "id": "sample_235",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_440",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_723",
+      "direct": {
+        "pred": "['dga', 'nqdk', 'qcha', 'kl']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['dga', 'nqdk', 'qcha', 'kl']\nassert f('d"
+      }
+    },
+    {
+      "id": "sample_550",
+      "direct": {
+        "pred": "16",
+        "correct": 0,
+        "parsed": 1,
+        "text": "16\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_378",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f(dict"
+      }
+    },
+    {
+      "id": "sample_7",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_590",
+      "direct": {
+        "pred": "25000",
+        "correct": 0,
+        "parsed": 1,
+        "text": "25000\nassert f(\"2"
+      }
+    },
+    {
+      "id": "sample_303",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f('m"
+      }
+    },
+    {
+      "id": "sample_479",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_115",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('os"
+      }
+    },
+    {
+      "id": "sample_306",
+      "direct": {
+        "pred": "12",
+        "correct": 0,
+        "parsed": 1,
+        "text": "12\nassert f([0"
+      }
+    },
+    {
+      "id": "sample_489",
+      "direct": {
+        "pred": "'coscifysu'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'coscifysu'\nassert f('c"
+      }
+    },
+    {
+      "id": "sample_264",
+      "direct": {
+        "pred": "\"A\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"A\"\nassert f(\"a"
+      }
+    },
+    {
+      "id": "sample_390",
+      "direct": {
+        "pred": "0",
+        "correct": 1,
+        "parsed": 1,
+        "text": "0\nassert f(\" \\"
+      }
+    },
+    {
+      "id": "sample_391",
+      "direct": {
+        "pred": "['r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '",
+        "correct": 0,
+        "parsed": 0,
+        "text": " ['r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '9', 'r', '"
+      }
+    },
+    {
+      "id": "sample_240",
+      "direct": {
+        "pred": "3.121",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3.121\nassert f(3"
+      }
+    },
+    {
+      "id": "sample_477",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('|"
+      }
+    },
+    {
+      "id": "sample_439",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('c"
+      }
+    },
+    {
+      "id": "sample_666",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f({ "
+      }
+    },
+    {
+      "id": "sample_398",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f({'2"
+      }
+    },
+    {
+      "id": "sample_619",
+      "direct": {
+        "pred": "'rock paper scissors'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'rock paper scissors'\nassert f('  "
+      }
+    },
+    {
+      "id": "sample_464",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_502",
+      "direct": {
+        "pred": "* 3",
+        "correct": 0,
+        "parsed": 0,
+        "text": " * 3\nassert f('John Doe') ==  * 3\nassert f('Jane Smith') ==  * 3\nassert f('John Doe') ==  * 3\nassert f('Jane Smith') ==  * 3\nassert f('Jane Smith') ==  * "
+      }
+    },
+    {
+      "id": "sample_268",
+      "direct": {
+        "pred": "'h k k k'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'h k k k'\nassert f('h"
+      }
+    },
+    {
+      "id": "sample_764",
+      "direct": {
+        "pred": "\"some test string\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"some test string\"\nassert f(\"some"
+      }
+    },
+    {
+      "id": "sample_164",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_600",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_659",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(['y"
+      }
+    },
+    {
+      "id": "sample_384",
+      "direct": {
+        "pred": "'Ta'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Ta'\nassert f('as"
+      }
+    },
+    {
+      "id": "sample_369",
+      "direct": {
+        "pred": "\"tuple\"",
+        "correct": 1,
+        "parsed": 1,
+        "text": " \"tuple\"\nassert f(\" "
+      }
+    },
+    {
+      "id": "sample_312",
+      "direct": {
+        "pred": "True",
+        "correct": 0,
+        "parsed": 1,
+        "text": " True\nassert f('7"
+      }
+    },
+    {
+      "id": "sample_663",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([],"
+      }
+    },
+    {
+      "id": "sample_355",
+      "direct": {
+        "pred": "123x",
+        "correct": 0,
+        "parsed": 0,
+        "text": "123x\nassert f('123x John z', 'x') == 123x\nassert f('123x John z', 'x') == 123x\nassert f('123x John z', 'x') == 123x"
+      }
+    },
+    {
+      "id": "sample_331",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('abc"
+      }
+    },
+    {
+      "id": "sample_255",
+      "direct": {
+        "pred": "'no asw'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'no asw'\nassert f('no"
+      }
+    },
+    {
+      "id": "sample_599",
+      "direct": {
+        "pred": "[\"a\", \"b\", \"c\", \"a\", \"b\", \"c\"]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [\"a\", \"b\", \"c\", \"a\", \"b\", \"c\"]\nassert f([\"a"
+      }
+    },
+    {
+      "id": "sample_472",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_726",
+      "direct": {
+        "pred": "2, f(\"jcle oq wsnibktxpiozyxmopqkfnrfjds\")",
+        "correct": 0,
+        "parsed": 0,
+        "text": "2, f(\"jcle oq wsnibktxpiozyxmopqkfnrfjds\")\nassert f(\"jcle oq wsnibktxpiozyxmopqkfnrfjds\") == 3, f(\"jcle oq wsn"
+      }
+    },
+    {
+      "id": "sample_372",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(['v"
+      }
+    },
+    {
+      "id": "sample_326",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f('This"
+      }
+    },
+    {
+      "id": "sample_207",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_784",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('write"
+      }
+    },
+    {
+      "id": "sample_647",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('/al"
+      }
+    },
+    {
+      "id": "sample_741",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f([6"
+      }
+    },
+    {
+      "id": "sample_305",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f('hello"
+      }
+    },
+    {
+      "id": "sample_344",
+      "direct": {
+        "pred": "6",
+        "correct": 0,
+        "parsed": 1,
+        "text": "6\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_712",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('A"
+      }
+    },
+    {
+      "id": "sample_279",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_185",
+      "direct": {
+        "pred": "16",
+        "correct": 0,
+        "parsed": 1,
+        "text": "16\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_644",
+      "direct": {
+        "pred": "6, f(6, 1)",
+        "correct": 0,
+        "parsed": 0,
+        "text": "6, f(6, 1)\nassert f([1, 2, 3], 3) == 1, f(1, 2)\nassert f([1, 2, 3], 3) == 1, f(1, 2)\nassert f"
+      }
+    },
+    {
+      "id": "sample_580",
+      "direct": {
+        "pred": "['r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', '",
+        "correct": 0,
+        "parsed": 0,
+        "text": " ['r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', '"
+      }
+    },
+    {
+      "id": "sample_389",
+      "direct": {
+        "pred": "15",
+        "correct": 0,
+        "parsed": 1,
+        "text": "15\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_53",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"UR"
+      }
+    },
+    {
+      "id": "sample_74",
+      "direct": {
+        "pred": "99",
+        "correct": 0,
+        "parsed": 1,
+        "text": "99\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_538",
+      "direct": {
+        "pred": "0574",
+        "correct": 0,
+        "parsed": 0,
+        "text": "0574\nassert f('0574', 10) == 0574\nassert f('0574', 11) == 0574\nassert f('0574', 12) == 0574\nassert f"
+      }
+    },
+    {
+      "id": "sample_110",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(\" "
+      }
+    },
+    {
+      "id": "sample_443",
+      "direct": {
+        "pred": "\"lorem ipsum\"",
+        "correct": 1,
+        "parsed": 1,
+        "text": " \"lorem ipsum\"\nassert f(\"l"
+      }
+    },
+    {
+      "id": "sample_328",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_679",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('hello"
+      }
+    },
+    {
+      "id": "sample_678",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(\"hello"
+      }
+    },
+    {
+      "id": "sample_588",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(['1"
+      }
+    },
+    {
+      "id": "sample_507",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('car"
+      }
+    },
+    {
+      "id": "sample_60",
+      "direct": {
+        "pred": "'raruwa'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'raruwa'\nassert f('rar"
+      }
+    },
+    {
+      "id": "sample_611",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_346",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('docs"
+      }
+    },
+    {
+      "id": "sample_509",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\nassert f(5"
+      }
+    },
+    {
+      "id": "sample_269",
+      "direct": {
+        "pred": "9",
+        "correct": 0,
+        "parsed": 1,
+        "text": "9\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_525",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f({'TEXT"
+      }
+    },
+    {
+      "id": "sample_475",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_554",
+      "direct": {
+        "pred": "9999",
+        "correct": 0,
+        "parsed": 1,
+        "text": "9999\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_432",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(-5"
+      }
+    },
+    {
+      "id": "sample_183",
+      "direct": {
+        "pred": "[\"echo\", \"hello\", \"! nice!\"]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [\"echo\", \"hello\", \"! nice!\"]\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_98",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('SO"
+      }
+    },
+    {
+      "id": "sample_772",
+      "direct": {
+        "pred": "'serjgpoDFdbcA.'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'serjgpoDFdbcA.'\nassert f('ser"
+      }
+    },
+    {
+      "id": "sample_566",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"tow"
+      }
+    },
+    {
+      "id": "sample_609",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f({},"
+      }
+    },
+    {
+      "id": "sample_532",
+      "direct": {
+        "pred": "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_112",
+      "direct": {
+        "pred": "'YXEI TLLBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEB",
+        "correct": 0,
+        "parsed": 0,
+        "text": " 'YXEI TLLBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEBIGRHEB"
+      }
+    },
+    {
+      "id": "sample_450",
+      "direct": {
+        "pred": "'K zBK'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'K zBK'\nassert f('K"
+      }
+    },
+    {
+      "id": "sample_42",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_216",
+      "direct": {
+        "pred": "2",
+        "correct": 1,
+        "parsed": 1,
+        "text": "2\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_725",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(\"m"
+      }
+    },
+    {
+      "id": "sample_347",
+      "direct": {
+        "pred": "'hzcw'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'hzcw'\nassert f('h"
+      }
+    },
+    {
+      "id": "sample_586",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"break"
+      }
+    },
+    {
+      "id": "sample_299",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('sta"
+      }
+    },
+    {
+      "id": "sample_250",
+      "direct": {
+        "pred": "'wlace A'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'wlace A'\nassert f('wl"
+      }
+    },
+    {
+      "id": "sample_229",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f({'9"
+      }
+    },
+    {
+      "id": "sample_438",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_650",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('abc"
+      }
+    },
+    {
+      "id": "sample_284",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('best"
+      }
+    },
+    {
+      "id": "sample_201",
+      "direct": {
+        "pred": "4yrw 251-//4 6p",
+        "correct": 0,
+        "parsed": 0,
+        "text": "4yrw 251-//4 6p\nassert f('4yrw 251-//4 6p') == 4yrw 251-//4 6p\nassert f('4yrw 251-//4 6p')"
+      }
+    },
+    {
+      "id": "sample_416",
+      "direct": {
+        "pred": "'jysrhfm ojwesf xgwwdyr dlrul ymba bpq'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'jysrhfm ojwesf xgwwdyr dlrul ymba bpq'\nassert f('j"
+      }
+    },
+    {
+      "id": "sample_778",
+      "direct": {
+        "pred": "'mjsqwiso'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'mjsqwiso'\nassert f('m"
+      }
+    },
+    {
+      "id": "sample_197",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(1"
+      }
+    },
+    {
+      "id": "sample_31",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('Po"
+      }
+    },
+    {
+      "id": "sample_113",
+      "direct": {
+        "pred": "987yhNSHAshd  # noqa: E501",
+        "correct": 0,
+        "parsed": 0,
+        "text": "987yhNSHAshd  # noqa: E501\n\ndef f(line):\n    count = 0\n    a = []\n    for i in range(len(line)):\n        count += 1\n        if count%2==0:\n            a.append(line[i"
+      }
+    },
+    {
+      "id": "sample_476",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"boot"
+      }
+    },
+    {
+      "id": "sample_782",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"a"
+      }
+    },
+    {
+      "id": "sample_43",
+      "direct": {
+        "pred": "6",
+        "correct": 0,
+        "parsed": 1,
+        "text": "6\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_701",
+      "direct": {
+        "pred": "31849 pass!",
+        "correct": 0,
+        "parsed": 0,
+        "text": "31849 pass!\nassert f('31849 let it!31849 pass!', ('3','1','8',' ','1','9','2','d')) == 31849 pass!\nassert f('31849 let it"
+      }
+    },
+    {
+      "id": "sample_44",
+      "direct": {
+        "pred": "'noh'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'noh'\nassert f('n"
+      }
+    },
+    {
+      "id": "sample_510",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_460",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\nassert f('GEN"
+      }
+    },
+    {
+      "id": "sample_289",
+      "direct": {
+        "pred": "148",
+        "correct": 0,
+        "parsed": 1,
+        "text": "148\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_320",
+      "direct": {
+        "pred": "'USaR'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'USaR'\nassert f('US"
+      }
+    },
+    {
+      "id": "sample_756",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_494",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_351",
+      "direct": {
+        "pred": "'a_B3'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'a_B3'\nassert f('a"
+      }
+    },
+    {
+      "id": "sample_376",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(\"two"
+      }
+    },
+    {
+      "id": "sample_171",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_422",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_19",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_526",
+      "direct": {
+        "pred": "'ekrpg'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'ekrpg'\nassert f('ek"
+      }
+    },
+    {
+      "id": "sample_254",
+      "direct": {
+        "pred": "'upper case'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'upper case'\nassert f('lower"
+      }
+    },
+    {
+      "id": "sample_618",
+      "direct": {
+        "pred": "9",
+        "correct": 0,
+        "parsed": 1,
+        "text": "9\nassert f('9"
+      }
+    },
+    {
+      "id": "sample_544",
+      "direct": {
+        "pred": "\"  tab tabulates\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"  tab tabulates\"\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_559",
+      "direct": {
+        "pred": "1.0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1.0\nassert f(\"first"
+      }
+    },
+    {
+      "id": "sample_677",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('I"
+      }
+    },
+    {
+      "id": "sample_175",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f('\\n"
+      }
+    },
+    {
+      "id": "sample_749",
+      "direct": {
+        "pred": "'l\\n'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'l\\n'\nassert f('l"
+      }
+    },
+    {
+      "id": "sample_594",
+      "direct": {
+        "pred": "504",
+        "correct": 0,
+        "parsed": 1,
+        "text": "504\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_242",
+      "direct": {
+        "pred": "\"udhv zcvi nhtnfyd :erwuyawa pun\"",
+        "correct": 1,
+        "parsed": 1,
+        "text": " \"udhv zcvi nhtnfyd :erwuyawa pun\"\nassert f(\"ud"
+      }
+    },
+    {
+      "id": "sample_246",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f(\"3"
+      }
+    },
+    {
+      "id": "sample_575",
+      "direct": {
+        "pred": "13",
+        "correct": 0,
+        "parsed": 1,
+        "text": "13\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_50",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(['a"
+      }
+    },
+    {
+      "id": "sample_55",
+      "direct": {
+        "pred": "17",
+        "correct": 0,
+        "parsed": 1,
+        "text": "17\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_212",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_693",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f(\"sa"
+      }
+    },
+    {
+      "id": "sample_168",
+      "direct": {
+        "pred": "4",
+        "correct": 0,
+        "parsed": 1,
+        "text": "4\nassert f('sp"
+      }
+    },
+    {
+      "id": "sample_206",
+      "direct": {
+        "pred": "'hello world!'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'hello world!'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_154",
+      "direct": {
+        "pred": "'Hello   There'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Hello   There'\nassert f('Hello"
+      }
+    },
+    {
+      "id": "sample_36",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('a"
+      }
+    },
+    {
+      "id": "sample_373",
+      "direct": {
+        "pred": "100",
+        "correct": 0,
+        "parsed": 1,
+        "text": "100\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_267",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('s"
+      }
+    },
+    {
+      "id": "sample_469",
+      "direct": {
+        "pred": "'sduyai'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'sduyai'\nassert f('s"
+      }
+    },
+    {
+      "id": "sample_604",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f(\"Hello"
+      }
+    },
+    {
+      "id": "sample_24",
+      "direct": {
+        "pred": "47",
+        "correct": 0,
+        "parsed": 1,
+        "text": "47\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_641",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('dummy"
+      }
+    },
+    {
+      "id": "sample_374",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f([ '"
+      }
+    },
+    {
+      "id": "sample_734",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_496",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f('ef"
+      }
+    },
+    {
+      "id": "sample_775",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_66",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('happy"
+      }
+    },
+    {
+      "id": "sample_280",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('0"
+      }
+    },
+    {
+      "id": "sample_202",
+      "direct": {
+        "pred": "15",
+        "correct": 0,
+        "parsed": 1,
+        "text": "15\nassert f([2"
+      }
+    },
+    {
+      "id": "sample_648",
+      "direct": {
+        "pred": "23",
+        "correct": 0,
+        "parsed": 1,
+        "text": "23\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_148",
+      "direct": {
+        "pred": "'2m 12 tfiqr'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " '2m 12 tfiqr'\nassert f('2"
+      }
+    },
+    {
+      "id": "sample_777",
+      "direct": {
+        "pred": "assert f([\"avc  a .d e\", \"avc  a .d e\", \"avc  a .d e\", \"avc  a .d e\", \"avc  a .d e\", \"avc  a .d e\", \"avc  a .d",
+        "correct": 0,
+        "parsed": 0,
+        "text": "\nassert f([\"avc  a .d e\", \"avc  a .d e\", \"avc  a .d e\", \"avc  a .d e\", \"avc  a .d e\", \"avc  a .d e\", \"avc  a .d"
+      }
+    },
+    {
+      "id": "sample_76",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_513",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([0"
+      }
+    },
+    {
+      "id": "sample_454",
+      "direct": {
+        "pred": "{'a': 2, 'b': 0, 'c': {}}",
+        "correct": 0,
+        "parsed": 1,
+        "text": " {'a': 2, 'b': 0, 'c': {}}\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_688",
+      "direct": {
+        "pred": "[1, 2, 3, 0, 8, 9]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [1, 2, 3, 0, 8, 9]\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_18",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f([5"
+      }
+    },
+    {
+      "id": "sample_567",
+      "direct": {
+        "pred": "['one', 'two', 'three', 'four']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['one', 'two', 'three', 'four']\nassert f('one"
+      }
+    },
+    {
+      "id": "sample_399",
+      "direct": {
+        "pred": "'va-va-va-va'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'va-va-va-va'\nassert f('av"
+      }
+    },
+    {
+      "id": "sample_683",
+      "direct": {
+        "pred": "{'disface': 9, 'cam': 7, 'mforce': 5}",
+        "correct": 1,
+        "parsed": 1,
+        "text": " {'disface': 9, 'cam': 7, 'mforce': 5}\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_551",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_569",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_704",
+      "direct": {
+        "pred": "99",
+        "correct": 0,
+        "parsed": 1,
+        "text": "99\nassert f('.',"
+      }
+    },
+    {
+      "id": "sample_404",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_172",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_170",
+      "direct": {
+        "pred": "2",
+        "correct": 1,
+        "parsed": 1,
+        "text": "2\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_642",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f(\" "
+      }
+    },
+    {
+      "id": "sample_77",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('h"
+      }
+    },
+    {
+      "id": "sample_696",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f('wd"
+      }
+    },
+    {
+      "id": "sample_4",
+      "direct": {
+        "pred": "'  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' +",
+        "correct": 0,
+        "parsed": 0,
+        "text": " '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' + '  ' +"
+      }
+    },
+    {
+      "id": "sample_654",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('aph"
+      }
+    },
+    {
+      "id": "sample_300",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_686",
+      "direct": {
+        "pred": "23",
+        "correct": 0,
+        "parsed": 1,
+        "text": "23\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_106",
+      "direct": {
+        "pred": "18",
+        "correct": 0,
+        "parsed": 1,
+        "text": "18\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_695",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f({1"
+      }
+    },
+    {
+      "id": "sample_275",
+      "direct": {
+        "pred": "{\"-1\": \"a\", 0: \"b\", 1: \"c\"}",
+        "correct": 0,
+        "parsed": 1,
+        "text": " {\"-1\": \"a\", 0: \"b\", 1: \"c\"}\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_495",
+      "direct": {
+        "pred": "('a1234', '\u00e5r')",
+        "correct": 1,
+        "parsed": 1,
+        "text": " ('a1234', '\u00e5r')\nassert f('a"
+      }
+    },
+    {
+      "id": "sample_190",
+      "direct": {
+        "pred": "980j",
+        "correct": 0,
+        "parsed": 1,
+        "text": "980j\nassert f('9"
+      }
+    },
+    {
+      "id": "sample_222",
+      "direct": {
+        "pred": "0aabbaa0b",
+        "correct": 0,
+        "parsed": 0,
+        "text": "0aabbaa0b\nassert f('0aabbaa0b', 'a') == 0aabbaa0b\nassert f('0aabbaa0b', 'b') == 0aabbaa0b\nassert f('0aabbaa"
+      }
+    },
+    {
+      "id": "sample_728",
+      "direct": {
+        "pred": "'ru'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'ru'\nassert f('ru"
+      }
+    },
+    {
+      "id": "sample_234",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('w"
+      }
+    },
+    {
+      "id": "sample_462",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('ld"
+      }
+    },
+    {
+      "id": "sample_329",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('j"
+      }
+    },
+    {
+      "id": "sample_364",
+      "direct": {
+        "pred": "assert f([0, 3, 0, 1], lambda x: x < 2) ==",
+        "correct": 0,
+        "parsed": 0,
+        "text": "\nassert f([0, 3, 0, 1], lambda x: x < 2) == \nassert f([0, 3, 0, 1], lambda x: x < 2) == \nassert f([0, 3, 0, 1"
+      }
+    },
+    {
+      "id": "sample_253",
+      "direct": {
+        "pred": "'kumwfv'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'kumwfv'\nassert f('k"
+      }
+    },
+    {
+      "id": "sample_335",
+      "direct": {
+        "pred": "'sjbqmw'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'sjbqmw'\nassert f('s"
+      }
+    },
+    {
+      "id": "sample_311",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('B"
+      }
+    },
+    {
+      "id": "sample_359",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(['d"
+      }
+    },
+    {
+      "id": "sample_383",
+      "direct": {
+        "pred": "'ellod!p.nkyp.exa.bi.y.hain'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'ellod!p.nkyp.exa.bi.y.hain'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_433",
+      "direct": {
+        "pred": "\"Dmreh,Sspp,T,G ,.tB,Vxk,Cct\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"Dmreh,Sspp,T,G ,.tB,Vxk,Cct\"\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_630",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_434",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('ee"
+      }
+    },
+    {
+      "id": "sample_465",
+      "direct": {
+        "pred": "['north', 'south']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['north', 'south']\nassert f(['w"
+      }
+    },
+    {
+      "id": "sample_290",
+      "direct": {
+        "pred": "'abixaaely'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'abixaaely'\nassert f('ab"
+      }
+    },
+    {
+      "id": "sample_480",
+      "direct": {
+        "pred": "'miasti'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'miasti'\nassert f('',"
+      }
+    },
+    {
+      "id": "sample_187",
+      "direct": {
+        "pred": "27",
+        "correct": 0,
+        "parsed": 1,
+        "text": "27\nassert f({2"
+      }
+    },
+    {
+      "id": "sample_546",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('[CHAR"
+      }
+    },
+    {
+      "id": "sample_285",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"This"
+      }
+    },
+    {
+      "id": "sample_132",
+      "direct": {
+        "pred": "'abcd'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'abcd'\nassert f('abc"
+      }
+    },
+    {
+      "id": "sample_348",
+      "direct": {
+        "pred": "563",
+        "correct": 0,
+        "parsed": 1,
+        "text": "563\nassert f({5"
+      }
+    },
+    {
+      "id": "sample_105",
+      "direct": {
+        "pred": "\"PermissioN is GRANTED\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"PermissioN is GRANTED\"\nassert f(\"This"
+      }
+    },
+    {
+      "id": "sample_20",
+      "direct": {
+        "pred": "'was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was",
+        "correct": 0,
+        "parsed": 0,
+        "text": " 'was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was,was"
+      }
+    },
+    {
+      "id": "sample_21",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_9",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('#"
+      }
+    },
+    {
+      "id": "sample_762",
+      "direct": {
+        "pred": "'thisAndcPanel'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'thisAndcPanel'\nassert f('this"
+      }
+    },
+    {
+      "id": "sample_785",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(2"
+      }
+    },
+    {
+      "id": "sample_79",
+      "direct": {
+        "pred": "'1,2,3,4'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " '1,2,3,4'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_716",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_58",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_177",
+      "direct": {
+        "pred": "'Hey dude this is this @#'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Hey dude this is this @#'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_330",
+      "direct": {
+        "pred": "12",
+        "correct": 0,
+        "parsed": 1,
+        "text": "12\nassert f('m"
+      }
+    },
+    {
+      "id": "sample_539",
+      "direct": {
+        "pred": "assert f(['a', 'b', 'c']) == 'abbcc'",
+        "correct": 0,
+        "parsed": 0,
+        "text": "\nassert f(['a', 'b', 'c']) == 'abbcc'\nassert f(['a', 'b', 'c', 'd']) == 'abbccd'\nassert f(['a', 'b', 'c', 'd', 'e']) == 'abbccd"
+      }
+    },
+    {
+      "id": "sample_418",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"qq"
+      }
+    },
+    {
+      "id": "sample_607",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('C"
+      }
+    },
+    {
+      "id": "sample_334",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('0"
+      }
+    },
+    {
+      "id": "sample_68",
+      "direct": {
+        "pred": "'omeunhwpvr.dq'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'omeunhwpvr.dq'\nassert f('ome"
+      }
+    },
+    {
+      "id": "sample_131",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f(\"a"
+      }
+    },
+    {
+      "id": "sample_441",
+      "direct": {
+        "pred": "23",
+        "correct": 0,
+        "parsed": 1,
+        "text": "23\nassert f({3"
+      }
+    },
+    {
+      "id": "sample_669",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(\"f"
+      }
+    },
+    {
+      "id": "sample_405",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([6"
+      }
+    },
+    {
+      "id": "sample_409",
+      "direct": {
+        "pred": "'querist u'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'querist u'\nassert f('quer"
+      }
+    },
+    {
+      "id": "sample_231",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_467",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f({1"
+      }
+    },
+    {
+      "id": "sample_680",
+      "direct": {
+        "pred": "32r71g72ug94=(823658*!@324\")",
+        "correct": 0,
+        "parsed": 0,
+        "text": "32r71g72ug94=(823658*!@324\")\nassert f(\"we@32r71g72ug94=(823658*!@324\") == 32r71g"
+      }
+    },
+    {
+      "id": "sample_634",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('ab"
+      }
+    },
+    {
+      "id": "sample_83",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('qq"
+      }
+    },
+    {
+      "id": "sample_406",
+      "direct": {
+        "pred": "'Josh'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Josh'\nassert f('J"
+      }
+    },
+    {
+      "id": "sample_697",
+      "direct": {
+        "pred": "(\"not\", \"it\", \"\")",
+        "correct": 0,
+        "parsed": 1,
+        "text": " (\"not\", \"it\", \"\")\nassert f(\"not"
+      }
+    },
+    {
+      "id": "sample_102",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(['a"
+      }
+    },
+    {
+      "id": "sample_186",
+      "direct": {
+        "pred": "'pvtso'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'pvtso'\nassert f('pv"
+      }
+    },
+    {
+      "id": "sample_286",
+      "direct": {
+        "pred": "11",
+        "correct": 0,
+        "parsed": 1,
+        "text": "11\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_309",
+      "direct": {
+        "pred": "'faqofosaxf'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'faqofosaxf'\nassert f('fa"
+      }
+    },
+    {
+      "id": "sample_203",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f({'a"
+      }
+    },
+    {
+      "id": "sample_121",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('0"
+      }
+    },
+    {
+      "id": "sample_737",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([0"
+      }
+    },
+    {
+      "id": "sample_100",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f({'1"
+      }
+    },
+    {
+      "id": "sample_2",
+      "direct": {
+        "pred": "'hfdeqto'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'hfdeqto'\nassert f('h"
+      }
+    },
+    {
+      "id": "sample_752",
+      "direct": {
+        "pred": "8",
+        "correct": 0,
+        "parsed": 1,
+        "text": "8\nassert f('abc"
+      }
+    },
+    {
+      "id": "sample_218",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f('ab"
+      }
+    },
+    {
+      "id": "sample_3",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('b"
+      }
+    },
+    {
+      "id": "sample_763",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f('2"
+      }
+    },
+    {
+      "id": "sample_427",
+      "direct": {
+        "pred": "'s a a b s a a'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 's a a b s a a'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_690",
+      "direct": {
+        "pred": "800",
+        "correct": 0,
+        "parsed": 1,
+        "text": "800\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_15",
+      "direct": {
+        "pred": "\"HNKGU\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"HNKGU\"\nassert f(\"z"
+      }
+    },
+    {
+      "id": "sample_694",
+      "direct": {
+        "pred": "3, f(dict(e=1, d=2, c=3))",
+        "correct": 0,
+        "parsed": 0,
+        "text": "3, f(dict(e=1, d=2, c=3))\nassert f(dict(e=1, d=2, c=3, f=4)) == 3, f(dict(e=1, d=2, c=3, f=4))"
+      }
+    },
+    {
+      "id": "sample_85",
+      "direct": {
+        "pred": "3.5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3.5\nassert f(1"
+      }
+    },
+    {
+      "id": "sample_192",
+      "direct": {
+        "pred": "'!klcd!ma:ri'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " '!klcd!ma:ri'\nassert f('!"
+      }
+    },
+    {
+      "id": "sample_425",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('CL"
+      }
+    },
+    {
+      "id": "sample_51",
+      "direct": {
+        "pred": "19",
+        "correct": 0,
+        "parsed": 1,
+        "text": "19\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_613",
+      "direct": {
+        "pred": "'eat'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'eat'\nassert f('race"
+      }
+    },
+    {
+      "id": "sample_319",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('a"
+      }
+    },
+    {
+      "id": "sample_740",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_506",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(2"
+      }
+    },
+    {
+      "id": "sample_692",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_0",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_670",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(['1"
+      }
+    },
+    {
+      "id": "sample_540",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_457",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_161",
+      "direct": {
+        "pred": "'kdifk rinpx'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'kdifk rinpx'\nassert f('d"
+      }
+    },
+    {
+      "id": "sample_795",
+      "direct": {
+        "pred": "'Fu,ux zfujijabji pfu.'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Fu,ux zfujijabji pfu.'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_65",
+      "direct": {
+        "pred": "24",
+        "correct": 0,
+        "parsed": 1,
+        "text": "24\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_456",
+      "direct": {
+        "pred": "\"Join us in Hungary\"",
+        "correct": 1,
+        "parsed": 1,
+        "text": " \"Join us in Hungary\"\nassert f(\"Join"
+      }
+    },
+    {
+      "id": "sample_169",
+      "direct": {
+        "pred": "'taole'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'taole'\nassert f('ta"
+      }
+    },
+    {
+      "id": "sample_47",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('bb"
+      }
+    },
+    {
+      "id": "sample_428",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_411",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('Hello"
+      }
+    },
+    {
+      "id": "sample_32",
+      "direct": {
+        "pred": "'l*volume'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'l*volume'\nassert f('volume"
+      }
+    },
+    {
+      "id": "sample_759",
+      "direct": {
+        "pred": "7",
+        "correct": 0,
+        "parsed": 1,
+        "text": "7\nassert f('eg"
+      }
+    },
+    {
+      "id": "sample_387",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_731",
+      "direct": {
+        "pred": "'Chris requires a ride to the airport on Friday.'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Chris requires a ride to the airport on Friday.'\nassert f('Chris"
+      }
+    },
+    {
+      "id": "sample_228",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('L"
+      }
+    },
+    {
+      "id": "sample_767",
+      "direct": {
+        "pred": "\"dkhqw whi fwi bbn 41\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"dkhqw whi fwi bbn 41\"\nassert f(\"d"
+      }
+    },
+    {
+      "id": "sample_163",
+      "direct": {
+        "pred": "7",
+        "correct": 0,
+        "parsed": 1,
+        "text": "7\nassert f('w"
+      }
+    },
+    {
+      "id": "sample_342",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"---"
+      }
+    },
+    {
+      "id": "sample_196",
+      "direct": {
+        "pred": "398",
+        "correct": 0,
+        "parsed": 1,
+        "text": "398\nassert f(\"3"
+      }
+    },
+    {
+      "id": "sample_745",
+      "direct": {
+        "pred": "1234567890123456789012345678901234567890123456789012345678901234",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1234567890123456789012345678901234567890123456789012345678901234"
+      }
+    },
+    {
+      "id": "sample_691",
+      "direct": {
+        "pred": "'cyt'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'cyt'\nassert f('r"
+      }
+    },
+    {
+      "id": "sample_424",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f('\""
+      }
+    },
+    {
+      "id": "sample_585",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(';"
+      }
+    },
+    {
+      "id": "sample_774",
+      "direct": {
+        "pred": "23",
+        "correct": 0,
+        "parsed": 1,
+        "text": "23\nassert f(2"
+      }
+    },
+    {
+      "id": "sample_135",
+      "direct": {
+        "pred": "['Moscow', 'Kazakhstan']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['Moscow', 'Kazakhstan']\n\ndef f():"
+      }
+    },
+    {
+      "id": "sample_606",
+      "direct": {
+        "pred": "'ruam'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'ruam'\nassert f('ru"
+      }
+    },
+    {
+      "id": "sample_713",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('one"
+      }
+    },
+    {
+      "id": "sample_360",
+      "direct": {
+        "pred": "'g'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'g'\nassert f('ab"
+      }
+    },
+    {
+      "id": "sample_493",
+      "direct": {
+        "pred": "{'-4': '4', '-1': '2', '-3': '-3'}",
+        "correct": 0,
+        "parsed": 1,
+        "text": " {'-4': '4', '-1': '2', '-3': '-3'}\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_245",
+      "direct": {
+        "pred": "['all_uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'upp",
+        "correct": 0,
+        "parsed": 0,
+        "text": " ['all_uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'uppercased', 'upp"
+      }
+    },
+    {
+      "id": "sample_138",
+      "direct": {
+        "pred": "'tflb omn rtt'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'tflb omn rtt'\nassert f('t"
+      }
+    },
+    {
+      "id": "sample_287",
+      "direct": {
+        "pred": "'pinneale'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'pinneale'\nassert f('P"
+      }
+    },
+    {
+      "id": "sample_744",
+      "direct": {
+        "pred": "'wdlpwd'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'wdlpwd'\nassert f('j"
+      }
+    },
+    {
+      "id": "sample_652",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_667",
+      "direct": {
+        "pred": "f'C7<C7>C7<C7>C7<C7>C7<C7>C7<C7>C7<C7>C7<C7>C7<C7>C7<C7>C7<C7>C7",
+        "correct": 0,
+        "parsed": 0,
+        "text": " f'C7<C7>C7<C7>C7<C7>C7<C7>C7<C7>C7<C7>C7<C7>C7<C7>C7<C7>C7<C7>C7"
+      }
+    },
+    {
+      "id": "sample_80",
+      "direct": {
+        "pred": "'ab'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'ab'\nassert f('ab"
+      }
+    },
+    {
+      "id": "sample_468",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('un"
+      }
+    },
+    {
+      "id": "sample_12",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('If"
+      }
+    },
+    {
+      "id": "sample_574",
+      "direct": {
+        "pred": "assert f(['George', 'Michael', 'George', 'Costanza', 'Pete']) ==",
+        "correct": 0,
+        "parsed": 0,
+        "text": "\nassert f(['George', 'Michael', 'George', 'Costanza', 'Pete']) == \nassert f(['George', 'Michael', 'George', 'Costanza', 'Pete', 'Pete']) == \nassert f(['George', 'Michael', 'George', 'Costanza',"
+      }
+    },
+    {
+      "id": "sample_157",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f(\"ab"
+      }
+    },
+    {
+      "id": "sample_596",
+      "direct": {
+        "pred": "9",
+        "correct": 0,
+        "parsed": 1,
+        "text": "9\nassert f(['8"
+      }
+    },
+    {
+      "id": "sample_397",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(['x"
+      }
+    },
+    {
+      "id": "sample_675",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_318",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('2"
+      }
+    },
+    {
+      "id": "sample_748",
+      "direct": {
+        "pred": "123, f('d')",
+        "correct": 0,
+        "parsed": 0,
+        "text": "123, f('d')\nassert f({'a': 123, 'b': 456, 'c': 789}) == 123, f('d')\nassert f({'a': 123, 'b': 456,"
+      }
+    },
+    {
+      "id": "sample_582",
+      "direct": {
+        "pred": "7",
+        "correct": 0,
+        "parsed": 1,
+        "text": "7\nassert f(7"
+      }
+    },
+    {
+      "id": "sample_419",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('mm"
+      }
+    },
+    {
+      "id": "sample_482",
+      "direct": {
+        "pred": "'Because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'",
+        "correct": 0,
+        "parsed": 0,
+        "text": " 'Because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'s because it\\'"
+      }
+    },
+    {
+      "id": "sample_13",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(['John"
+      }
+    },
+    {
+      "id": "sample_179",
+      "direct": {
+        "pred": "7, f(nums)",
+        "correct": 0,
+        "parsed": 0,
+        "text": "7, f(nums)\n\ndef f(nums):\n    # Pass in a copy to avoid modifying nums\n    nums = nums[:]\n    count = len(nums)\n    for i in range(-count+1, 0):\n        nums.insert(0, nums[i])\n    return nums\nassert"
+      }
+    },
+    {
+      "id": "sample_452",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_120",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_779",
+      "direct": {
+        "pred": "1.0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1.0\nassert f('python"
+      }
+    },
+    {
+      "id": "sample_542",
+      "direct": {
+        "pred": "['ab', 'cd']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['ab', 'cd']\nassert f('ab"
+      }
+    },
+    {
+      "id": "sample_350",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f({'a"
+      }
+    },
+    {
+      "id": "sample_165",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('="
+      }
+    },
+    {
+      "id": "sample_162",
+      "direct": {
+        "pred": "'Ss f.Swift'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Ss f.Swift'\nassert f('abc"
+      }
+    },
+    {
+      "id": "sample_59",
+      "direct": {
+        "pred": "'hi'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'hi'\nassert f('hi"
+      }
+    },
+    {
+      "id": "sample_717",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(\"tim"
+      }
+    },
+    {
+      "id": "sample_173",
+      "direct": {
+        "pred": "4",
+        "correct": 0,
+        "parsed": 1,
+        "text": "4\nassert f([5"
+      }
+    },
+    {
+      "id": "sample_583",
+      "direct": {
+        "pred": "\"t\\nza\\n\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"t\\nza\\n\"\nassert f(\"t"
+      }
+    },
+    {
+      "id": "sample_481",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_367",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\nassert f([6"
+      }
+    },
+    {
+      "id": "sample_623",
+      "direct": {
+        "pred": "'hi!~'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'hi!~'\nassert f('hi"
+      }
+    },
+    {
+      "id": "sample_204",
+      "direct": {
+        "pred": "assert f(\"master. \") ==",
+        "correct": 0,
+        "parsed": 0,
+        "text": "\nassert f(\"master. \") == \nassert f(\"master. \") == \nassert f(\"master. \") == \nassert f(\"master. \") == \nassert f(\"master. \") == \nassert f(\"master. \") == \nassert f(\"master. \") == \n"
+      }
+    },
+    {
+      "id": "sample_746",
+      "direct": {
+        "pred": "{'pinc.uk': '1234567890'}",
+        "correct": 0,
+        "parsed": 1,
+        "text": " {'pinc.uk': '1234567890'}\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_624",
+      "direct": {
+        "pred": "'xllomnpc'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'xllomnpc'\nassert f('x"
+      }
+    },
+    {
+      "id": "sample_710",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_40",
+      "direct": {
+        "pred": "\"the cow goes moo\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"the cow goes moo\"\nassert f(\"the"
+      }
+    },
+    {
+      "id": "sample_478",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f('me"
+      }
+    },
+    {
+      "id": "sample_515",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_628",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_184",
+      "direct": {
+        "pred": "12",
+        "correct": 0,
+        "parsed": 1,
+        "text": "12\nassert f([3"
+      }
+    },
+    {
+      "id": "sample_446",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_358",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('b"
+      }
+    },
+    {
+      "id": "sample_724",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(\"0"
+      }
+    },
+    {
+      "id": "sample_73",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_226",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_71",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f({1"
+      }
+    },
+    {
+      "id": "sample_698",
+      "direct": {
+        "pred": "1)",
+        "correct": 0,
+        "parsed": 0,
+        "text": "1)\n\ndef f(text):\n    return ''.join(x for x in text if x != ')')\nassert f(('(((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((("
+      }
+    },
+    {
+      "id": "sample_761",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_435",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_557",
+      "direct": {
+        "pred": "'xxxarmmarxx'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'xxxarmmarxx'\nassert f('xxx"
+      }
+    },
+    {
+      "id": "sample_23",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('new"
+      }
+    },
+    {
+      "id": "sample_62",
+      "direct": {
+        "pred": "(\"eat\", \"ing\", \"na\", \"coke\", \"zebra\")",
+        "correct": 0,
+        "parsed": 1,
+        "text": " (\"eat\", \"ing\", \"na\", \"coke\", \"zebra\")\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_215",
+      "direct": {
+        "pred": "f(') ')",
+        "correct": 0,
+        "parsed": 0,
+        "text": " f(') ')\nassert f('(') == f('(')\nassert f('(') == f('(')\nassert f('(') == f('(')\nassert f('(') == f('(')\nassert f('(') == f('(')\nassert f('('"
+      }
+    },
+    {
+      "id": "sample_490",
+      "direct": {
+        "pred": "'i\\n\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r",
+        "correct": 0,
+        "parsed": 0,
+        "text": " 'i\\n\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r\\r"
+      }
+    },
+    {
+      "id": "sample_126",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f('k"
+      }
+    },
+    {
+      "id": "sample_189",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"{{"
+      }
+    },
+    {
+      "id": "sample_199",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('mn"
+      }
+    },
+    {
+      "id": "sample_22",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f(0"
+      }
+    },
+    {
+      "id": "sample_643",
+      "direct": {
+        "pred": "'damdrodm'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'damdrodm'\nassert f('dam"
+      }
+    },
+    {
+      "id": "sample_37",
+      "direct": {
+        "pred": "123",
+        "correct": 0,
+        "parsed": 1,
+        "text": "123\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_671",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"ew"
+      }
+    },
+    {
+      "id": "sample_379",
+      "direct": {
+        "pred": "0",
+        "correct": 1,
+        "parsed": 1,
+        "text": "0\nassert f([0"
+      }
+    },
+    {
+      "id": "sample_711",
+      "direct": {
+        "pred": "'apples\\n\\t\\npears\\n\\t\\nbananas'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'apples\\n\\t\\npears\\n\\t\\nbananas'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_689",
+      "direct": {
+        "pred": "24",
+        "correct": 0,
+        "parsed": 1,
+        "text": "24\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_122",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('N"
+      }
+    },
+    {
+      "id": "sample_707",
+      "direct": {
+        "pred": "'undbs'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'undbs'\nassert f('und"
+      }
+    },
+    {
+      "id": "sample_620",
+      "direct": {
+        "pred": "\"ndqohi lert\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"ndqohi lert\"\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_703",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('v"
+      }
+    },
+    {
+      "id": "sample_721",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_27",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('fl"
+      }
+    },
+    {
+      "id": "sample_771",
+      "direct": {
+        "pred": "7",
+        "correct": 0,
+        "parsed": 1,
+        "text": "7\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_798",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('@"
+      }
+    },
+    {
+      "id": "sample_547",
+      "direct": {
+        "pred": "\"hello, world!\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"hello, world!\"\nassert f(\"hello"
+      }
+    },
+    {
+      "id": "sample_649",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"\\n"
+      }
+    },
+    {
+      "id": "sample_587",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([0"
+      }
+    },
+    {
+      "id": "sample_46",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(['many"
+      }
+    },
+    {
+      "id": "sample_224",
+      "direct": {
+        "pred": "123",
+        "correct": 0,
+        "parsed": 1,
+        "text": "123\nassert f(['2"
+      }
+    },
+    {
+      "id": "sample_149",
+      "direct": {
+        "pred": "132323",
+        "correct": 0,
+        "parsed": 1,
+        "text": "132323\nassert f((3"
+      }
+    },
+    {
+      "id": "sample_766",
+      "direct": {
+        "pred": "117",
+        "correct": 0,
+        "parsed": 1,
+        "text": "117\nassert f(['0"
+      }
+    },
+    {
+      "id": "sample_754",
+      "direct": {
+        "pred": "['1', '2', '2', '44', '0', '7', '20257']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['1', '2', '2', '44', '0', '7', '20257']\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_436",
+      "direct": {
+        "pred": "7616111111111111111111111111111111111111111111111111111111111111",
+        "correct": 0,
+        "parsed": 1,
+        "text": "7616111111111111111111111111111111111111111111111111111111111111"
+      }
+    },
+    {
+      "id": "sample_719",
+      "direct": {
+        "pred": "\"if (x) {y = 1;} else {z = 1;}\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"if (x) {y = 1;} else {z = 1;}\"\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_174",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_380",
+      "direct": {
+        "pred": "'xxjarczx'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'xxjarczx'\nassert f('xx"
+      }
+    },
+    {
+      "id": "sample_225",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"5"
+      }
+    },
+    {
+      "id": "sample_119",
+      "direct": {
+        "pred": "\"vsnlygltaw\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"vsnlygltaw\"\nassert f(\"v"
+      }
+    },
+    {
+      "id": "sample_277",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_16",
+      "direct": {
+        "pred": "'zejrohajow'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'zejrohajow'\nassert f('ze"
+      }
+    },
+    {
+      "id": "sample_248",
+      "direct": {
+        "pred": "666",
+        "correct": 0,
+        "parsed": 1,
+        "text": "666\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_194",
+      "direct": {
+        "pred": "[[5, 6, 2, 3], [1, 9, 5, 6]]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [[5, 6, 2, 3], [1, 9, 5, 6]]\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_343",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_645",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_714",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f([-2"
+      }
+    },
+    {
+      "id": "sample_498",
+      "direct": {
+        "pred": "2, f(nums, 2, 3)",
+        "correct": 0,
+        "parsed": 0,
+        "text": "2, f(nums, 2, 3)\n\ndef f(nums, idx, added):\n    nums[idx:idx] = (added,)\n    return nums\nassert f([2, 2, 2, 3, 3], 2, 3) == 2"
+      }
+    },
+    {
+      "id": "sample_118",
+      "direct": {
+        "pred": "'zbzqm'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'zbzqm'\nassert f('z"
+      }
+    },
+    {
+      "id": "sample_770",
+      "direct": {
+        "pred": "78",
+        "correct": 0,
+        "parsed": 1,
+        "text": "78\nassert f('$"
+      }
+    },
+    {
+      "id": "sample_332",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_84",
+      "direct": {
+        "pred": "\"nwv mef ofme bdryl\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"nwv mef ofme bdryl\"\nassert f(\"n"
+      }
+    },
+    {
+      "id": "sample_365",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('x"
+      }
+    },
+    {
+      "id": "sample_656",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(['a"
+      }
+    },
+    {
+      "id": "sample_676",
+      "direct": {
+        "pred": "100",
+        "correct": 0,
+        "parsed": 1,
+        "text": "100\nassert f('a"
+      }
+    },
+    {
+      "id": "sample_504",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_461",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_281",
+      "direct": {
+        "pred": "assert f({1: 2, 3: 4, 5: 6, 'message': 'qrTHo'}, 8, 2) ==",
+        "correct": 0,
+        "parsed": 0,
+        "text": "\nassert f({1: 2, 3: 4, 5: 6, 'message': 'qrTHo'}, 8, 2) == \nassert f({1: 2, 3: 4, 5: 6, 'message': 'q"
+      }
+    },
+    {
+      "id": "sample_593",
+      "direct": {
+        "pred": "14",
+        "correct": 0,
+        "parsed": 1,
+        "text": "14\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_429",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_603",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f('osc"
+      }
+    },
+    {
+      "id": "sample_220",
+      "direct": {
+        "pred": "\"abcdefg\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"abcdefg\"\nassert f(\"abc"
+      }
+    },
+    {
+      "id": "sample_241",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('ED"
+      }
+    },
+    {
+      "id": "sample_534",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('h"
+      }
+    },
+    {
+      "id": "sample_282",
+      "direct": {
+        "pred": "2",
+        "correct": 1,
+        "parsed": 1,
+        "text": "2\nassert f('x"
+      }
+    },
+    {
+      "id": "sample_537",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('ab"
+      }
+    },
+    {
+      "id": "sample_400",
+      "direct": {
+        "pred": "'I am hungry! eat food.'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'I am hungry! eat food.'\nassert f('I"
+      }
+    },
+    {
+      "id": "sample_718",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f('This"
+      }
+    },
+    {
+      "id": "sample_729",
+      "direct": {
+        "pred": "6",
+        "correct": 0,
+        "parsed": 1,
+        "text": "6\nassert f('abc"
+      }
+    },
+    {
+      "id": "sample_39",
+      "direct": {
+        "pred": "6",
+        "correct": 0,
+        "parsed": 1,
+        "text": "6\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_153",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('friends"
+      }
+    },
+    {
+      "id": "sample_133",
+      "direct": {
+        "pred": "9",
+        "correct": 0,
+        "parsed": 1,
+        "text": "9\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_91",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_70",
+      "direct": {
+        "pred": "1000000000000000000000000000000000000000000000000000000000000000",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "id": "sample_487",
+      "direct": {
+        "pred": "4",
+        "correct": 0,
+        "parsed": 1,
+        "text": "4\nassert f({ "
+      }
+    },
+    {
+      "id": "sample_755",
+      "direct": {
+        "pred": "'ph>t#A#BiEcDefW#ON#iiNCU'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'ph>t#A#BiEcDefW#ON#iiNCU'\nassert f('###"
+      }
+    },
+    {
+      "id": "sample_672",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_627",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f([('"
+      }
+    },
+    {
+      "id": "sample_33",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\nassert f([5"
+      }
+    },
+    {
+      "id": "sample_191",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('H"
+      }
+    },
+    {
+      "id": "sample_193",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('1"
+      }
+    },
+    {
+      "id": "sample_188",
+      "direct": {
+        "pred": "[\"a\", \"b\", \"car\", \"d\"]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [\"a\", \"b\", \"car\", \"d\"]\nassert f([\"a"
+      }
+    },
+    {
+      "id": "sample_297",
+      "direct": {
+        "pred": "'Half Life'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Half Life'\nassert f(6"
+      }
+    },
+    {
+      "id": "sample_247",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('str"
+      }
+    },
+    {
+      "id": "sample_589",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_324",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_799",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('eq"
+      }
+    },
+    {
+      "id": "sample_610",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_730",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\nassert f(\"w"
+      }
+    },
+    {
+      "id": "sample_455",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('?"
+      }
+    },
+    {
+      "id": "sample_294",
+      "direct": {
+        "pred": "2xz&5H3*1a@#a*1hris",
+        "correct": 0,
+        "parsed": 0,
+        "text": "2xz&5H3*1a@#a*1hris\nassert f(\"x\", \"$\", \"2xz&5H3*1a@#a*1hris\") == 2xz&5H3*1a@#a*1hris\n"
+      }
+    },
+    {
+      "id": "sample_601",
+      "direct": {
+        "pred": "30",
+        "correct": 0,
+        "parsed": 1,
+        "text": "30\nassert f('c"
+      }
+    },
+    {
+      "id": "sample_739",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('q"
+      }
+    },
+    {
+      "id": "sample_617",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\">>"
+      }
+    },
+    {
+      "id": "sample_208",
+      "direct": {
+        "pred": "['123', 'cat', 'd dee']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['123', 'cat', 'd dee']\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_553",
+      "direct": {
+        "pred": "439m2670hlsw",
+        "correct": 0,
+        "parsed": 0,
+        "text": "439m2670hlsw\nassert f('439m2670hlsw', 2) == 439m2670hlsw\nassert f('439m2670hlsw', 1) == 439m"
+      }
+    },
+    {
+      "id": "sample_340",
+      "direct": {
+        "pred": "'EJIkxHtDpV G'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'EJIkxHtDpV G'\nassert f('E"
+      }
+    },
+    {
+      "id": "sample_560",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\nassert f(\"5"
+      }
+    },
+    {
+      "id": "sample_127",
+      "direct": {
+        "pred": "14",
+        "correct": 0,
+        "parsed": 1,
+        "text": "14\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_298",
+      "direct": {
+        "pred": "'dgcvb gvf vf vb vavd'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'dgcvb gvf vf vb vavd'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_564",
+      "direct": {
+        "pred": "4223",
+        "correct": 0,
+        "parsed": 1,
+        "text": "4223\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_308",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([\"Hello"
+      }
+    },
+    {
+      "id": "sample_111",
+      "direct": {
+        "pred": "100, f(marks)",
+        "correct": 0,
+        "parsed": 0,
+        "text": "100, f(marks)\n```\n\nThe `f` function takes a dictionary `marks` as input and iterates through its values. It calculates the highest and lowest values for each key and returns the highest and lowest values as a tuple. The `assert` statements ensure that the function raises an"
+      }
+    },
+    {
+      "id": "sample_501",
+      "direct": {
+        "pred": "'qpfi jzm'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'qpfi jzm'\nassert f('q"
+      }
+    },
+    {
+      "id": "sample_520",
+      "direct": {
+        "pred": "6",
+        "correct": 1,
+        "parsed": 1,
+        "text": "6\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_327",
+      "direct": {
+        "pred": "7",
+        "correct": 0,
+        "parsed": 1,
+        "text": "7\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_82",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('C"
+      }
+    },
+    {
+      "id": "sample_93",
+      "direct": {
+        "pred": "7",
+        "correct": 0,
+        "parsed": 1,
+        "text": "7\nassert f('q"
+      }
+    },
+    {
+      "id": "sample_458",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('mm"
+      }
+    },
+    {
+      "id": "sample_556",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('\\n"
+      }
+    },
+    {
+      "id": "sample_145",
+      "direct": {
+        "pred": "1.25",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1.25\nassert f(1"
+      }
+    },
+    {
+      "id": "sample_244",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('',"
+      }
+    },
+    {
+      "id": "sample_227",
+      "direct": {
+        "pred": "'Manolo'",
+        "correct": 1,
+        "parsed": 1,
+        "text": " 'Manolo'\nassert f('Man"
+      }
+    },
+    {
+      "id": "sample_581",
+      "direct": {
+        "pred": "'aXoXo'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'aXoXo'\nassert f('abc"
+      }
+    },
+    {
+      "id": "sample_195",
+      "direct": {
+        "pred": "'ilfdoirwirmtoibacs'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'ilfdoirwirmtoibacs'\nassert f('il"
+      }
+    },
+    {
+      "id": "sample_64",
+      "direct": {
+        "pred": "7",
+        "correct": 0,
+        "parsed": 1,
+        "text": "7\nassert f(\"7"
+      }
+    },
+    {
+      "id": "sample_720",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_333",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f([3"
+      }
+    },
+    {
+      "id": "sample_249",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_341",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f({1"
+      }
+    },
+    {
+      "id": "sample_505",
+      "direct": {
+        "pred": "4",
+        "correct": 0,
+        "parsed": 1,
+        "text": "4\nassert f('--4"
+      }
+    },
+    {
+      "id": "sample_626",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('ab"
+      }
+    },
+    {
+      "id": "sample_1",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f((1"
+      }
+    },
+    {
+      "id": "sample_640",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\nassert f(\"3"
+      }
+    },
+    {
+      "id": "sample_684",
+      "direct": {
+        "pred": "9833",
+        "correct": 0,
+        "parsed": 1,
+        "text": "9833\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_727",
+      "direct": {
+        "pred": "['ix', 'dxh', 'snegi', 'wiubvu']",
+        "correct": 0,
+        "parsed": 1,
+        "text": " ['ix', 'dxh', 'snegi', 'wiubvu']\nassert f(['ix"
+      }
+    },
+    {
+      "id": "sample_408",
+      "direct": {
+        "pred": "4",
+        "correct": 0,
+        "parsed": 1,
+        "text": "4\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_736",
+      "direct": {
+        "pred": "'pi\\tch\\n'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'pi\\tch\\n'\nassert f('pi"
+      }
+    },
+    {
+      "id": "sample_95",
+      "direct": {
+        "pred": "{'A': 'fr', 'B': 'fr', 'C': 'fr', 'D': 'fr', 'E': 'fr', 'G': 'fr', 'H': 'fr', 'I': 'fr', 'J': 'fr', 'K': 'fr', 'L': '",
+        "correct": 0,
+        "parsed": 0,
+        "text": " {'A': 'fr', 'B': 'fr', 'C': 'fr', 'D': 'fr', 'E': 'fr', 'G': 'fr', 'H': 'fr', 'I': 'fr', 'J': 'fr', 'K': 'fr', 'L': '"
+      }
+    },
+    {
+      "id": "sample_14",
+      "direct": {
+        "pred": "'OOP'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'OOP'\nassert f('  "
+      }
+    },
+    {
+      "id": "sample_561",
+      "direct": {
+        "pred": "7",
+        "correct": 1,
+        "parsed": 1,
+        "text": "7\nassert f('7"
+      }
+    },
+    {
+      "id": "sample_63",
+      "direct": {
+        "pred": "'ndbtdabdahesyehu'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'ndbtdabdahesyehu'\nassert f('nd"
+      }
+    },
+    {
+      "id": "sample_266",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_533",
+      "direct": {
+        "pred": "0",
+        "correct": 1,
+        "parsed": 1,
+        "text": "0\nassert f('b"
+      }
+    },
+    {
+      "id": "sample_453",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('w"
+      }
+    },
+    {
+      "id": "sample_790",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f({'i"
+      }
+    },
+    {
+      "id": "sample_565",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"q"
+      }
+    },
+    {
+      "id": "sample_209",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('hy"
+      }
+    },
+    {
+      "id": "sample_655",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('r"
+      }
+    },
+    {
+      "id": "sample_625",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(\"b"
+      }
+    },
+    {
+      "id": "sample_323",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f('nc"
+      }
+    },
+    {
+      "id": "sample_444",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_362",
+      "direct": {
+        "pred": "'wuzugzu'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'wuzugzu'\nassert f('w"
+      }
+    },
+    {
+      "id": "sample_103",
+      "direct": {
+        "pred": "123",
+        "correct": 0,
+        "parsed": 1,
+        "text": "123\nassert f('abc"
+      }
+    },
+    {
+      "id": "sample_573",
+      "direct": {
+        "pred": "\"Vipra via\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"Vipra via\"\nassert f(\"V"
+      }
+    },
+    {
+      "id": "sample_483",
+      "direct": {
+        "pred": "'a'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'a'\nassert f('a"
+      }
+    },
+    {
+      "id": "sample_338",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_700",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f(\"Where"
+      }
+    },
+    {
+      "id": "sample_75",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f_"
+      }
+    },
+    {
+      "id": "sample_747",
+      "direct": {
+        "pred": "42.42",
+        "correct": 0,
+        "parsed": 1,
+        "text": "42.42\nassert f(\"1"
+      }
+    },
+    {
+      "id": "sample_101",
+      "direct": {
+        "pred": "[ 4, 1, 0]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [ 4, 1, 0]\nassert f([ -"
+      }
+    },
+    {
+      "id": "sample_317",
+      "direct": {
+        "pred": "'vup a zwwo oihee amuwuuw!'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'vup a zwwo oihee amuwuuw!'\nassert f(' v"
+      }
+    },
+    {
+      "id": "sample_150",
+      "direct": {
+        "pred": "[2, 4, -4]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [2, 4, -4]\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_616",
+      "direct": {
+        "pred": "'y\\ny\\ny'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'y\\ny\\ny'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_722",
+      "direct": {
+        "pred": "'Pppdlw'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Pppdlw'\nassert f('P"
+      }
+    },
+    {
+      "id": "sample_545",
+      "direct": {
+        "pred": "[8, -4, 8, -1, 2, 8, -9]",
+        "correct": 0,
+        "parsed": 1,
+        "text": " [8, -4, 8, -1, 2, 8, -9]\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_256",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f('dor"
+      }
+    },
+    {
+      "id": "sample_633",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([5"
+      }
+    },
+    {
+      "id": "sample_97",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_773",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_143",
+      "direct": {
+        "pred": "1",
+        "correct": 1,
+        "parsed": 1,
+        "text": "1\nassert f(\"da"
+      }
+    },
+    {
+      "id": "sample_288",
+      "direct": {
+        "pred": "555",
+        "correct": 0,
+        "parsed": 1,
+        "text": "555\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_142",
+      "direct": {
+        "pred": "1",
+        "correct": 0,
+        "parsed": 1,
+        "text": "1\nassert f('y"
+      }
+    },
+    {
+      "id": "sample_516",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_223",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f([1"
+      }
+    },
+    {
+      "id": "sample_597",
+      "direct": {
+        "pred": "\"JAAFSOFJA1\"",
+        "correct": 0,
+        "parsed": 1,
+        "text": " \"JAAFSOFJA1\"\nassert f(\"J"
+      }
+    },
+    {
+      "id": "sample_366",
+      "direct": {
+        "pred": "'Hello, World!!_ Hi'",
+        "correct": 0,
+        "parsed": 1,
+        "text": " 'Hello, World!!_ Hi'\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_488",
+      "direct": {
+        "pred": "651h",
+        "correct": 0,
+        "parsed": 0,
+        "text": "651h\nassert f('tezmgvn 651h', '7') == 651h\nassert f('tezmgvn 651h', '8') == 651h\nassert f('tezmgvn 651h',"
+      }
+    },
+    {
+      "id": "sample_310",
+      "direct": {
+        "pred": "10",
+        "correct": 0,
+        "parsed": 1,
+        "text": "10\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_414",
+      "direct": {
+        "pred": "{'X': ['X'], 'Y': ['y']}",
+        "correct": 0,
+        "parsed": 1,
+        "text": " {'X': ['X'], 'Y': ['y']}\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_497",
+      "direct": {
+        "pred": "44",
+        "correct": 0,
+        "parsed": 1,
+        "text": "44\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_523",
+      "direct": {
+        "pred": "'   '",
+        "correct": 0,
+        "parsed": 1,
+        "text": " '   '\nassert f('  "
+      }
+    },
+    {
+      "id": "sample_265",
+      "direct": {
+        "pred": "3",
+        "correct": 0,
+        "parsed": 1,
+        "text": "3\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_41",
+      "direct": {
+        "pred": "92",
+        "correct": 0,
+        "parsed": 1,
+        "text": "92\n\ndef f("
+      }
+    },
+    {
+      "id": "sample_430",
+      "direct": {
+        "pred": "5",
+        "correct": 0,
+        "parsed": 1,
+        "text": "5\nassert f([5"
+      }
+    },
+    {
+      "id": "sample_776",
+      "direct": {
+        "pred": "0",
+        "correct": 0,
+        "parsed": 1,
+        "text": "0\nassert f({'a"
+      }
+    },
+    {
+      "id": "sample_394",
+      "direct": {
+        "pred": "2",
+        "correct": 0,
+        "parsed": 1,
+        "text": "2\nassert f(\"2"
+      }
+    }
+  ],
+  "runtime_s": 168.92633652687073
+}

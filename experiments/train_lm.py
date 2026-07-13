@@ -1532,6 +1532,8 @@ def main():
             gate_weight=float(getattr(args, "latent_reasoning_gate_weight", 0.0)),
             perhop_weight=float(getattr(args, "latent_reasoning_perhop_weight",
                                         1.0)),
+            trace_mode=bool(getattr(args, "latent_reasoning_trace_mode",
+                                    False)),
             seed=int(args.seed))
         _lr_aux_every = int(getattr(args, "latent_reasoning_aux_every", 1))
         if _lr_aux_every > 8:
@@ -1542,6 +1544,7 @@ def main():
                   "keep it <= 8 unless you've checked stability.")
         print(f"Latent-reasoning co-train ON: weight={args.latent_reasoning_weight} "
               f"perhop_weight={_latent_reasoner.perhop_weight} "
+              f"trace_mode={_latent_reasoner.trace_mode} "
               f"rungs={_latent_reasoner.rungs} "
               f"n/step={args.latent_reasoning_n} "
               f"aux_every={_lr_aux_every} "
@@ -2642,8 +2645,13 @@ def main():
             if _latent_reasoner is not None and \
                     _latent_reasoning_diag is not None:
                 _rl, _rr, _rmp, _ra, _rh = _latent_reasoning_diag
+                # In trace_mode R is the effective latent depth s_eff; append the
+                # rung K so both are visible (additive — off = byte-identical).
                 line += (f"  reason(loss={_rl:.3f},ans={_ra:.3f},hop={_rh:.3f},"
-                         f"R={_rr},ramp={_rmp:.2f})")
+                         f"R={_rr},ramp={_rmp:.2f}")
+                if getattr(_latent_reasoner, "trace_mode", False):
+                    line += f",K={getattr(_latent_reasoner, 'last_K', -1)}"
+                line += ")"
             if getattr(args, "gate_calibration_weight", 0.0) > 0.0 and \
                     _gate_calib_diag is not None:
                 _t1, _sg, _gd, _gn = _gate_calib_diag

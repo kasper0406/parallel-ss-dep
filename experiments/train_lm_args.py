@@ -1055,6 +1055,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "step (current/byte-identical behaviour). K>~8 is "
                         "warned about at startup (gradient variance from "
                         "the coarser, spikier schedule).")
+    p.add_argument("--latent_reasoning_trace_mode", action="store_true",
+                   help="Stage-B (Coconut text->latent replacement, "
+                        "EXEC_TRACE_LATENT_PLAN.md): read the ORIGINAL "
+                        "exec-trace schema (--latent_reasoning_train_prefix, "
+                        "e.g. data/exec_trace_train) and gradually replace the "
+                        "first `s` text-trace steps with `s` latent slots. s "
+                        "ramps 0->8 over the first 55%% of the run then "
+                        "consolidates (uniform); rung K uniform; s_eff=min(s,K). "
+                        "Loss = CE on the remaining text+final + per-hop CE "
+                        "decoding each latent slot to its intermediate. Default "
+                        "off = the ordinary depth-matched path (byte-identical).")
     # --- Gate-calibration aux loss (latent "think only where helpful") ---
     # Trains the OUTPUT GATE (not the trunk) toward firing think exactly where
     # a latent think actually raises logp(true_next). Uses the shared latent

@@ -494,22 +494,148 @@ def _load_rung(prefix: str, n: int, tok, max_len: int,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Stage-B (Coconut text->latent replacement) helpers — EXEC_TRACE_LATENT_PLAN.md
+# "Staged addendum". Default-off; the ordinary latent-reasoning path above is
+# byte-identical when trace_mode is not set.
+# ---------------------------------------------------------------------------
+
+def _trace_render_parts(record) -> tuple[str, list, str]:
+    """(prompt_str, step_lines, final_line) for the Stage-A text rendering of
+    an ORIGINAL exec-trace record. Verified byte-identical to
+    data/exec_trace_text_train.jsonl's flattened `text` field (same generator):
+        prompt = record["prompt"].rstrip() + "\\n# trace:\\n"
+        step j = "# step {j}: {tracked_var} = {intermediates[j-1]}\\n"  (j=1..K)
+        final  = "# final: {answer}\\n"
+    """
+    var = record["tracked_var"]
+    inter = list(record["intermediates"])
+    K = len(inter)
+    prompt = record["prompt"].rstrip() + "\n# trace:\n"
+    step_lines = [f"# step {j}: {var} = {inter[j - 1]}\n"
+                  for j in range(1, K + 1)]
+    final_line = f"# final: {record['answer']}\n"
+    return prompt, step_lines, final_line
+
+
+def _render_trace_text(record) -> str:
+    """Full s=0 Stage-A text (prompt + every text step line + final line)."""
+    prompt, step_lines, final_line = _trace_render_parts(record)
+    return prompt + "".join(step_lines) + final_line
+
+
+def _trace_stage_smax(step: int, total_steps: int, max_stage: int = 8,
+                      ramp_frac: float = 0.55):
+    """Curriculum frontier `s_max` (how many leading text-trace steps are
+    replaced by latent slots) at this training step. Ramp phase (first
+    `ramp_frac` of the run): s_max grows 0 -> max_stage linearly (rounded).
+    Consolidation (the rest): returns None (caller then samples s uniformly
+    over 0..max_stage). Pure -> unit-testable without a model."""
+    if total_steps <= 0:
+        return 0
+    ramp_end = max(1.0, ramp_frac * total_steps)
+    if step >= ramp_end:
+        return None
+    return max(0, min(max_stage, int(round(max_stage * step / ramp_end))))
+
+
+def _load_rung_trace(prefix: str, n: int, tok, max_len: int,
+                     require_single_token_inter: bool = True) -> list[dict]:
+    """Stage-B loader: reads the ORIGINAL exec-trace schema
+    (`<prefix>_n{n}.jsonl`, fields prompt/answer/intermediates/rung/tracked_var)
+    and pre-tokenizes, per record, the Stage-A `prompt_ids` AND every
+    curriculum suffix variant `sol_ids_by_s[s]` for s in 0..K — the trace text
+    with the FIRST `s` step lines removed (those become latent slots), tokenized
+    as ONE string so within-suffix BPE merges are natural and the s>0 suffix
+    starts at a fresh token boundary (matching how the model generates it at
+    eval). `sol_ids_by_s[0]` is the full text trace; `sol_ids_by_s[K]` is the
+    final line alone (fully-latent trace).
+
+    `inter_ids` are the single-token ids of the intermediates (per-hop latent
+    targets), with the SAME single-token data contract + >=50%-usable guard as
+    `_load_rung(require_single_token_inter=True)`. Length filter (spec):
+    len(prompt_ids) + len(sol_ids_by_s[0]) + K + 2 <= max_len (the s=0 suffix is
+    the longest, so bounding it bounds every stage; +K latent slots + margin)."""
+    out = []
+    path = f"{prefix}_n{n}.jsonl"
+    total = 0
+    for line in open(path):
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        inter_vals = list(r.get("intermediates", []))
+        K = len(inter_vals)
+        prompt, step_lines, final_line = _trace_render_parts(r)
+        prompt_ids = tok.encode(prompt, add_special_tokens=False)
+        sol_ids_by_s = {
+            s: tok.encode("".join(step_lines[s:]) + final_line,
+                          add_special_tokens=False)
+            for s in range(0, K + 1)
+        }
+        if len(prompt_ids) + len(sol_ids_by_s[0]) + K + 2 > max_len:
+            continue
+        total += 1
+        inter_ids = []
+        multitoken = False
+        for v in inter_vals:
+            enc = tok.encode(str(v), add_special_tokens=False)
+            if len(enc) != 1:
+                multitoken = True
+                break
+            inter_ids.append(int(enc[0]))
+        if require_single_token_inter:
+            if multitoken or len(inter_ids) == 0:
+                continue            # skip-and-count (via total - len(out))
+        elif multitoken:
+            inter_ids = []
+        out.append({"prompt_ids": prompt_ids, "sol_ids_by_s": sol_ids_by_s,
+                    "inter_ids": inter_ids, "K": K})
+    if require_single_token_inter and total > 0:
+        usable = len(out)
+        if usable < 0.5 * total:
+            raise ValueError(
+                f"latent-reasoning trace-mode: rung n={n} at {path} has only "
+                f"{usable}/{total} ({100.0 * usable / total:.0f}%) examples "
+                f"with usable single-token intermediates (need >= 50%). "
+                f"Regenerate with single-token (small-int) values, or set "
+                f"--latent_reasoning_perhop_weight 0.")
+    return out
+
+
 class LatentReasoningCotrain:
     """Holds the depth-bound reasoning corpus and emits one answer-span latent
     loss per call, with a depth curriculum (ramp 1->max over 60% of steps, then
     uniform consolidation). Does NOT call backward — the caller adds the returned
-    loss to the total and backprops with the rest of the step."""
+    loss to the total and backprops with the rest of the step.
+
+    `trace_mode` (default False, byte-identical when off) switches to the
+    Stage-B Coconut text->latent curriculum: each step replaces the first
+    `s` text-trace steps with `s` latent slots (s ramped 0->8 then consolidated,
+    rung K sampled uniformly, s_eff = min(s, K)); the loss rides
+    `_answer_span_latent_loss_batched` UNCHANGED with R=s_eff, solution =
+    remaining trace text + final line, per-hop targets = intermediates[:s_eff].
+    See `_load_rung_trace` / `_pick_stage`."""
 
     def __init__(self, train_prefix: str, rungs, tok, thinking_id: int,
                  eos_id: int, device, max_len: int = 256, no_ramp: bool = False,
                  gate_weight: float = 0.0, seed: int = 0,
                  checkpoint_latent: bool = True, batch_examples: bool = True,
-                 pad_id: int = 0, perhop_weight: float = 0.0):
+                 pad_id: int = 0, perhop_weight: float = 0.0,
+                 trace_mode: bool = False):
         self.device = device
         self.thinking_id = int(thinking_id)
         self.eos_id = int(eos_id)
         self.no_ramp = bool(no_ramp)
         self.gate_weight = float(gate_weight)
+        # Stage-B Coconut text->latent curriculum (default off = byte-identical
+        # to the ordinary latent-reasoning path). See the class docstring /
+        # `_load_rung_trace` / `_pick_stage`. `max_stage`/`ramp_frac` are the
+        # validated 0->8-over-first-55% recipe.
+        self.trace_mode = bool(trace_mode)
+        self.max_stage = 8
+        self.ramp_frac = 0.55
+        self.last_K = 0          # rung of the last trace step (for logging)
+        self.last_s_eff = 0      # latent depth of the last trace step
         # Per-hop supervision weight (2026-07-04, the exec-trace program).
         # DENSE per-step CE that decodes latent step j -> intermediate j =
         # f^j(s), the mechanism the "per-step credit assignment fixes latent"
@@ -545,11 +671,15 @@ class LatentReasoningCotrain:
         # either way — see `step()`).
         self.batch_examples = bool(batch_examples)
         self.pad_id = int(pad_id)
-        self.data: dict[int, list[tuple]] = {}
+        self.data: dict[int, list] = {}
         _require_inter = self.perhop_weight != 0.0
         for n in rungs:
-            recs = _load_rung(train_prefix, int(n), tok, max_len,
-                              require_single_token_inter=_require_inter)
+            if self.trace_mode:
+                recs = _load_rung_trace(train_prefix, int(n), tok, max_len,
+                                        require_single_token_inter=_require_inter)
+            else:
+                recs = _load_rung(train_prefix, int(n), tok, max_len,
+                                  require_single_token_inter=_require_inter)
             if recs:
                 self.data[int(n)] = recs
         self.rungs = sorted(self.data.keys())
@@ -585,6 +715,77 @@ class LatentReasoningCotrain:
         return choices[int(torch.randint(0, len(choices), (1,),
                                          generator=self.g).item())]
 
+    def _pick_stage(self, step: int, total_steps: int) -> int:
+        """Stage-B curriculum: pick `s` (number of leading text-trace steps to
+        replace with latent slots) for this step. Ramp phase: sample near the
+        frontier s_max with probs ~ (0.7, 0.2, 0.1) over {s_max, s_max-1,
+        s_max-2} (clamped >=0, deduped, renormalized). Consolidation: uniform
+        over {0..max_stage}."""
+        s_max = _trace_stage_smax(step, total_steps, self.max_stage,
+                                  self.ramp_frac)
+        if s_max is None:
+            return int(torch.randint(0, self.max_stage + 1, (1,),
+                                     generator=self.g).item())
+        cands = []
+        seen = set()
+        for off, pr in ((0, 0.7), (1, 0.2), (2, 0.1)):
+            c = max(0, s_max - off)
+            if c in seen:
+                continue
+            seen.add(c)
+            cands.append((c, pr))
+        tot = sum(p for _, p in cands)
+        rdraw = float(torch.rand(1, generator=self.g).item()) * tot
+        acc = 0.0
+        for c, p in cands:
+            acc += p
+            if rdraw <= acc:
+                return c
+        return cands[-1][0]
+
+    def _trace_step(self, model, step: int, total_steps: int, n_examples: int):
+        """Stage-B step: rung K uniform, stage s from the curriculum, s_eff =
+        min(s, K) shared across the batch. Rides `_answer_span_latent_loss_
+        batched` UNCHANGED with R=s_eff, solution = the s_eff-suffix trace text
+        + final line, per-hop targets = intermediates[:s_eff]."""
+        rung = self.rungs[int(torch.randint(0, len(self.rungs), (1,),
+                                            generator=self.g).item())]
+        n = max(1, int(n_examples))
+        recs = [self._next(rung) for _ in range(n)]
+        s = self._pick_stage(step, total_steps)
+        K = int(rung)
+        s_eff = min(int(s), K)
+        self.last_K = K
+        self.last_s_eff = s_eff
+        examples = [(r["prompt_ids"], r["sol_ids_by_s"][s_eff],
+                     r["inter_ids"][:s_eff]) for r in recs]
+        if self.batch_examples:
+            loss, ans, hop = _answer_span_latent_loss_batched(
+                model, examples, self.eos_id, s_eff, self.thinking_id,
+                self.device, gate_weight=self.gate_weight,
+                checkpoint_latent=self.checkpoint_latent, pad_id=self.pad_id,
+                perhop_weight=self.perhop_weight, return_components=True)
+            self.last_ans = float(ans.detach())
+            self.last_perhop = float(hop.detach())
+            return loss, s_eff
+        total = None
+        ans_sum = 0.0
+        hop_sum = 0.0
+        for c, sol, inter in examples:
+            l, a, h = _answer_span_latent_loss(
+                model, c, sol, self.eos_id, s_eff, self.thinking_id,
+                self.device, gate_weight=self.gate_weight,
+                checkpoint_latent=self.checkpoint_latent,
+                inter_ids=inter, perhop_weight=self.perhop_weight,
+                return_components=True)
+            total = l if total is None else total + l
+            ans_sum += float(a.detach())
+            hop_sum += float(h.detach())
+        loss = total / n
+        self.last_ans = ans_sum / n
+        self.last_perhop = hop_sum / n
+        return loss, s_eff
+
     def step(self, model, step: int, total_steps: int, n_examples: int):
         """Return (loss, rung): mean answer-span CE over n_examples at depth=rung
         (R=rung latent steps).
@@ -610,7 +811,13 @@ class LatentReasoningCotrain:
         either way (drawn here, before branching) so the escape hatch
         (`batch_examples=False`) is a true A/B: only how the same examples
         are processed differs, not which examples are used.
+
+        In `trace_mode` this delegates to `_trace_step` (the Stage-B Coconut
+        text->latent curriculum); the body below is the ordinary
+        latent-reasoning path, unchanged.
         """
+        if self.trace_mode:
+            return self._trace_step(model, step, total_steps, n_examples)
         rung = self._pick_rung(step, total_steps)
         n = max(1, int(n_examples))
         examples = [self._next(rung) for _ in range(n)]

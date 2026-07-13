@@ -351,7 +351,7 @@ rownorm dualizer −12.84%); SOAP / Sketchy-Shampoo (Pareto-dominated by Muon at
 - `THESIS.md` / `README.md` — project framing + headline results.
 - `SESSION_FINDINGS.md` — chronological empirical log (tail = freshest).
 - `HANDOFF.md` — session-to-session handoff notes; append at end of each session.
-- `MILESTONE_ARCH.md`, `THINKING_LATENT_2026_05_28.md`,
+- `THINKING_LATENT_2026_05_28.md`,
   `THINKING_HUMANEVAL_2026_06_06.md`, `WHY_THINKING_MARGINAL_ON_CODE.md`,
   `DELTANET_PRECONDITIONER*.md`, `STATEFUL_CHUNKING_PROPOSAL.md`,
   `EXEC_PRETRAIN_PROPOSAL.md` — mechanism/probe deep-dives.

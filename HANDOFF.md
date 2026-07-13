@@ -141,3 +141,33 @@ To beat the robust ~14/164, pick a real investment:
   #84 (data-regen build spec), #52 (re-measure latent results with the fixed harness).
 - Ready-to-run: `launch_sft_v12.sh`, `launch_sft_phasec_clean.sh` (+ the clean distill
   `data/distill_v7_phase1_clean.jsonl`).
+
+## 2026-07-13 — Stage B verdict, meta-TTT unparked, ideation fleet, idle-work package
+
+- **Stage B (Coconut text→latent) NOT KILLED**: latent(R=K) 0.63/0.63/0.59 @K4-6
+  (direct 0.12), per-hop 0.844 @K4 (eval had a units bug — fixed + re-measured),
+  depth-true signature. ~6-hop horizon diagnosed as curriculum exposure →
+  **depth-fix arm** (depth-weighted consolidation) trained + eval nearly done:
+  K7 0.497→0.613 (clears bar), K8 0.333→0.453. Ckpts stageB_latent_trace.pt /
+  stageB_depthfix.pt. CRUXEval-O: mechanism does NOT transfer; direct-answer
+  internalization +53% rel (z=2.58 n=800; token-confound control training on
+  GPU1 → results/cruxeval_direct800_*.json + runs/cruxattr_token_control*).
+- **Literature verdict** (LITERATURE_LATENT_EXEC_2026_07_13.md): claimable =
+  interpreter-supervised latent steps + staging cell + depth-true + bounded-state
+  framing; Stage A alone = CWM mini-replication. Paper draft:
+  PAPER_LATENT_EXECUTION_DRAFT.md ([PENDING] blocks for depth-fix + control).
+- **Meta-TTT unparked as main bet** (META_TTT_PLAN_2026_07_13.md): P0 episode
+  corpus + 3-arm eval built (data/repo_episodes); P1 training wiring being built
+  (agent, meta_ttt_train.py); zero-train baselines need a free GPU.
+- **Ideation fleet**: IDEAS_2026_07_13.md + ideas_2026_07_13/ (10 verbatim lens
+  reports). Tier-0 queued: State Algebra + exposure-bias probes (scripts being
+  built), two-GPU manual-allreduce validation, cascade cost number.
+- **Idle package done**: AGENTS.md consolidated (368 lines + AGENTS_HISTORY.md),
+  13 dead files pruned (CLEANUP_INVENTORY_2026_07_13.md), EdgeBench-mini
+  (experiments/edgebench_mini/, 64 tests, GPU discrimination gate pending),
+  repair corpus (gen_repair_triples.py, 20.6k verified triples), PyTorch DDP fix
+  runtime-validated — PR ALREADY OPEN as pytorch/pytorch#187732 (awaiting review;
+  nudge comment ready at ~/ml/pytorch/PR_COMMENT_runtime_validation.md; do NOT
+  push the stale local branch).
+- Anneal corpora downloading (opc-annealing, finemath-4plus) for the Tier-1
+  KD-through-anneal campaign.

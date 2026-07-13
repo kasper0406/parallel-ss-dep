@@ -140,13 +140,27 @@ def latent_greedy_answer(model, prompt_ids: list[int], R: int, thinking_id: int,
     return tok.decode(gen_ids, skip_special_tokens=False)
 
 
+def encode_inter_token_ids(tok, inter_vals: list) -> list:
+    """Intermediate VALUES -> single TOKEN IDS (the training loader's encoding;
+    `None` for multi-token values, which are then skipped in the read). The
+    original harness compared the argmax token id against the RAW int value —
+    units that can never match, reading structurally 0.000 (bug caught
+    2026-07-13 on the first Stage-B eval; answer_exact arms were unaffected)."""
+    out = []
+    for v in inter_vals:
+        enc = tok.encode(str(v), add_special_tokens=False)
+        out.append(int(enc[0]) if len(enc) == 1 else None)
+    return out
+
+
 @torch.no_grad()
 def latent_perhop_reads(model, prompt_ids: list[int], R: int, thinking_id: int,
                         inter: list[int], device) -> list[int]:
     """Argmax-decode each latent slot j (1..R) at absolute position P+j-1 through
-    out_norm->lm_head and compare to intermediates[j-1]. Returns the per-hop
-    correctness list over j=1..min(R, len(inter)) (the unshifted-logit
-    convention, exactly `_answer_span_latent_loss`'s per-hop read)."""
+    out_norm->lm_head and compare to intermediates[j-1] AS A TOKEN ID (encode
+    via `encode_inter_token_ids` first). Returns the per-hop correctness list
+    over j=1..min(R, len(inter)) (the unshifted-logit convention, exactly
+    `_answer_span_latent_loss`'s per-hop read)."""
     P = len(prompt_ids)
     cur_ids, cur_emb = grow_latent_thread(model, prompt_ids, R, thinking_id,
                                           device)
@@ -155,7 +169,7 @@ def latent_perhop_reads(model, prompt_ids: list[int], R: int, thinking_id: int,
     logits = out[0] if isinstance(out, tuple) else out
     correct = []
     for j in range(1, R + 1):
-        if (j - 1) < len(inter):
+        if (j - 1) < len(inter) and inter[j - 1] is not None:
             pred = int(logits[0, P + j - 1, :].argmax().item())
             correct.append(int(pred == inter[j - 1]))
     return correct
@@ -187,8 +201,8 @@ def eval_record(model, tok, eos_id: int, thinking_id: int, rec: dict, K: int,
         return int(pred is not None and pred == answer), pred, txt
 
     rk_correct, rk_pred, rk_txt = _latent_answer(K, 24)
-    perhop = latent_perhop_reads(model, prompt_ids, K, thinking_id, inter,
-                                 device)
+    perhop = latent_perhop_reads(model, prompt_ids, K, thinking_id,
+                                 encode_inter_token_ids(tok, inter), device)
     r1_correct, _r1_pred, _r1_txt = _latent_answer(1, max_gen_trace)
     rkp4_correct, _rp_pred, _rp_txt = _latent_answer(K + 4, 24)
 

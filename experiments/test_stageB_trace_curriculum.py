@@ -551,3 +551,30 @@ def test_batched_trace_step_runs_and_grads(tmp_path):
     assert 0 <= R <= r.last_K
     loss.backward()
     assert m.latent_feedback_adapter.proj.weight.grad is not None
+
+
+# =========================================================================== #
+# H2. Per-hop read units (regression: 2026-07-13 first Stage-B eval read
+# structurally 0.000 because the argmax TOKEN ID was compared to the RAW int
+# value — encode_inter_token_ids pins the conversion).
+# =========================================================================== #
+
+def test_encode_inter_token_ids_units():
+    from experiments.eval_exec_trace_latent_trace import encode_inter_token_ids
+
+    class _FakeTok:
+        def encode(self, s, add_special_tokens=False):
+            # single digit -> one id offset by 100; multi-char -> two ids
+            return [100 + int(s)] if len(s) == 1 else [1, 2]
+
+    ids = encode_inter_token_ids(_FakeTok(), [4, 7, 12])
+    assert ids == [104, 107, None]      # raw values NEVER compared directly
+
+
+def test_latent_perhop_reads_skips_none_entries():
+    """None (multi-token) intermediates are skipped, not scored as wrong."""
+    import experiments.eval_exec_trace_latent_trace as ev
+    m = _tiny_cpu_model(seed=4)
+    got = ev.latent_perhop_reads(m, [7, 8, 9, 10], 3, THINK_ID,
+                                 [5, None, 6], "cpu")
+    assert len(got) == 2                # the None slot contributes no entry

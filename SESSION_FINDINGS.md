@@ -537,3 +537,19 @@ paid off). Eval `eval_exec_trace_text.py` (runs/stageA_executor_eval.json):
 exist in token machinery before anything could compress it. Stage B (Coconut
 gradual text→latent replacement) was pre-registered as "unlocked only if A
 passes" — A passed; Stage B spec in EXEC_TRACE_LATENT_PLAN.md.
+
+## 2026-07-13 — Stage B (Coconut text->latent): NOT killed; latent carries ~6 hops of real program state
+
+Full FT from stageA_executor.pt, curriculum s 0->8 over 55% then uniform,
+per-hop weight 1.0, 340M tok. See EXEC_TRACE_LATENT_PLAN.md "Stage-B RESULT"
+for the full table. Headlines: latent(R=K) answer 0.63/0.63/0.59 at K=4/5/6
+(direct 0.12; text ceiling 0.73-0.83 on this ckpt) with the R=1/R=K+4
+depth-true signature; per-hop decode 0.844 @K=4 (N1' 0.11) after fixing a
+units bug in the eval harness (token id vs raw int — the harness read 0.000
+structurally; regression-tested); ~6-hop latent horizon with a hop-7+ cliff,
+diagnosed as curriculum under-exposure of deep slots (fix arm: depth-weighted
+consolidation sampling); HE-CE 0.7491 (guard pass). The prior-plateau escape
+during training (hop CE 2.30-flat in N1' -> 0.43-0.89 here) is the durable
+methodology finding: latent compression becomes learnable once the function
+pre-exists in token space (Scratchpad->Coconut staging), per-hop supervision
+alone was NOT sufficient (N1').

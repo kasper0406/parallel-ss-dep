@@ -126,3 +126,45 @@ inject R=K latent slots after `# trace:\n`, then greedy-decode; parse
   K=4–8 (i.e. answer_exact ≥ ~0.55) — K steps of computation without K×~12
   tokens of scratchpad.
 - **Code guard**: HE-CE ≤ 0.755 (within ~0.02 of Stage-A's 0.7343).
+
+## Stage-B RESULT (2026-07-13) — NOT KILLED; mechanism validated; depth-limited
+
+Run: `launch_stageB_latent_trace.sh` (2,600 steps / ~340M tok, full FT from
+stageA_executor.pt). Training: per-hop CE broke the N1' digit-prior plateau
+(~2.30 flat for N1's entire run) at step ~750 as the ramp deepened, falling
+monotonically to ~0.43-0.89 in consolidation. Final VAL ppl 2.30 (trunk held).
+Eval: `runs/stageB_latent_trace_eval.json` (+ `stageB_perhop_remeasure.json`).
+
+Pre-registered lines:
+- **KILL line: NOT tripped** — latent(R=K) beats same-ckpt direct by
+  +50.7/+51.7/+45.7/+36.3/+19.7pp at K=4..8.
+- **Mechanism gate: PASS** — per-hop decode 0.844 @K=4 (bar 0.50; N1' was
+  0.11). NOTE: the harness as FIRST run read 0.000 — a units bug (argmax
+  token id compared to raw int); fixed + regression-tested, re-measured.
+- **Success bar (>=0.55 @K4-8): PARTIAL** — 0.63/0.63/0.59 at K=4/5/6 pass;
+  K=7 0.497, K=8 0.333 fail.
+- **Code guard: PASS** — HE-CE 0.7491 (bar 0.755; Stage-A 0.7343).
+
+Depth signature is genuine sequential computation: R=1 collapses (~0.05-0.20)
+AND R=K+4 collapses (~0.22) — only R=K works, replicating the synthetic
+pointer-chase signature on real traces.
+
+**The limiting mechanism — a ~6-hop latent horizon.** Per-step decode acc has
+the SAME profile at every K incl. lengen K=9-12: hops 1-5 at 0.78-0.96, hop 6
+~0.60, hop 7+ cliff (<=0.28 -> 0.00). Likely a TRAINING-EXPOSURE artifact, not
+a wall: slots 7-8 get gradient only from (K>=7 rung) x (s>=7 stage) draws — a
+tiny fraction of aux steps — while slots 1-5 train in every s>=1 draw.
+Next arm: depth-weighted stage sampling in consolidation (+ possibly c=2
+slots/step, higher aux weight; hop CE was still falling at run end).
+
+Length-gen: latent lift collapses past the horizon (+4.7/+3.7/+3.0 at
+K=9/10/12) — consistent with the horizon (answer needs the LAST hop).
+Text-trace on the B ckpt also degraded at lengen (0.12-0.21), and heldout text
+answer fell ~0.95 -> 0.73-0.83 vs Stage A — a real but bounded text-skill cost.
+
+Open anomaly: K=2 latent answer 0.14 (vs 0.59-0.63 at K=3-6) despite 0.925
+per-hop — answer EMISSION fails at the shallowest rung; inspect transcripts.
+
+**Bottom line: first working latent compression of a real computation in this
+project.** The staged path (teach in tokens, then compress) is what made the
+difference vs N1' — same data, same aux machinery, opposite outcome.

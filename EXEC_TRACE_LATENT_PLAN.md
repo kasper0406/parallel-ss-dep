@@ -63,3 +63,66 @@ validated recipe.
   competence preserved by construction in stage 1.
 - The parked sibling bet (meta-TTT repo-adaptive coder) shares this
   substrate; revisit after N3.
+
+---
+
+## Results (2026-07-04..11) — see SESSION_FINDINGS.md for the full arc
+
+- **N0**: pipeline sanity on state-track passed, but silently trained rungs
+  [2,3] only — `--latent_reasoning_max_len` default 256 dropped K≥4 examples.
+  LESSON: always pass `--latent_reasoning_max_len 512` for exec traces.
+- **N1**: FAIL — but a methodology bug (loss was answer-only; `intermediates`
+  never consumed). Not evidence against per-hop. Fixed in fc6a833.
+- **N1′** (per-hop wired, full fine-tune, 350M tok): **REAL FAIL on the
+  kill-line** (runs/n3_killtest_N1prime.json). All arms ≈ 9–13% at every K,
+  lift −2.3..+2.3pp (needed ≥5pp @K≥4), per-hop acc 9–14% ≈ digit prior
+  (hop CE plateau ~2.2 ≈ ln 10). The latents learned the VALUE PRIOR, not the
+  simulation. Diagnosis (3 stacked): inverted capability gradient (base can't
+  do the task in text either), skipped Scratchpad→Coconut staging, and the
+  marginal-stats attractor under CE.
+
+## Staged addendum — Stage A (text) → Stage B (latent compression)
+
+**Stage A — text-scratchpad executor: DECISIVE PASS (2026-07-11).**
+Format: prompt + `# trace:\n` + `# step j: x = v` lines + `# final: N`, as a
+0.15 mix stream over the pilot mix ×0.85, full FT from feature_pilot_A.
+Heldout K=2–8: trace step-acc 0.96–0.99, answer-with-trace 0.94–0.97 vs
+direct 0.12–0.16 → **+80–84pp causal lift**; base control 0%; **HE-CE 0.7343
+(better than arm A's 0.7429)**. Length-gen: partial (step-acc 0.79/0.73/0.60
+at K=9/10/12, answers collapse — stops at trained max depth).
+Ckpt: `checkpoints/stageA_executor.pt`. Eval: `eval_exec_trace_text.py`.
+
+**Stage B — Coconut-style gradual text→latent replacement (pre-registered
+2026-07-13, launching now).**
+
+Mechanism: curriculum stage `s` replaces the FIRST `s` text-trace steps with
+`s` latent (hidden-feedback) steps:
+`prompt + "# trace:\n" + [s latent slots] + remaining text step lines
+(original numbering kept) + "# final: N"`.
+Loss = CE on the remaining text + final (teacher-forced) + per-hop CE decoding
+latent slot j → intermediates[j−1] (the N1′ machinery, unchanged convention:
+slot j at P_max+j−1, unshifted). At s = K the trace is fully latent.
+Implementation rides `_answer_span_latent_loss_batched` as-is: R=s, "solution"
+= remaining trace text + final line, per-hop targets = intermediates[:s].
+
+Training: full fine-tune from `stageA_executor.pt` (Stage-A lesson: full
+plasticity), fresh LatentFeedbackAdapter, background = the Stage-A mix
+(×0.85 pilot + 0.15 exec-text stream stays as the anchor keeping the text
+executor alive). Curriculum: s_max ramps 0→8 over the first ~55% of steps,
+sampling s ∈ {s_max, s_max−1, s_max−2} (30% on the earlier stages); then
+consolidation with s ~ uniform{0..min(K,8)} (the validated
+ramp-then-consolidate recipe). Rows in one aux step share the rung K (existing
+`_pick_rung`), s_row = min(s, K). Single GPU (DDP+latent incompatibility).
+
+Pre-registered lines (eval = latent twin of `eval_exec_trace_text.py`:
+inject R=K latent slots after `# trace:\n`, then greedy-decode; parse
+`# final: N`):
+- **KILL**: full-latent answer_exact fails to beat the same-ckpt DIRECT
+  (no-trace) baseline by ≥5pp at K≥4 on heldout → latent cannot absorb what
+  text demonstrably carries in this model; write up and close the latent arc.
+- **Mechanism gate**: per-hop decode acc at latent slots ≥50% at K=4
+  (vs N1′'s 11% = prior-matching).
+- **Success bar (the real prize)**: retain ≥50% of the Stage-A text lift at
+  K=4–8 (i.e. answer_exact ≥ ~0.55) — K steps of computation without K×~12
+  tokens of scratchpad.
+- **Code guard**: HE-CE ≤ 0.755 (within ~0.02 of Stage-A's 0.7343).

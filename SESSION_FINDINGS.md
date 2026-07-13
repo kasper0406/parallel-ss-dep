@@ -475,3 +475,65 @@ Both being fixed (2026-07-03) + an incremental-vs-full FiLM equivalence test.
   within ~0.03, recall ≥ A, engagement green incl. PKM.
 - If B′ passes → full run (same two-phase shape). If B′ lags → leave-one-out
   arms (4 × 2500 steps) to isolate which feature carries the residual tax.
+
+## 2026-07-04..11 — Exec-trace "neural interpreter": latent-first FAILS twice, staged text-first PASSES decisively
+
+The program (EXEC_TRACE_LATENT_PLAN.md): teach the model to SIMULATE program
+execution — per-step ground truth is free (sys.settrace) and infinite. Data:
+`gen_exec_traces.py`, 30,100 validated examples K=2–8 (+ length-gen K=9/10/12),
+synthetic-but-real Python (arith/branches/list/dict mutation on a tracked var),
+single-token intermediate values.
+
+### N1 (latent, answer-only) — FAIL, but a METHODOLOGY BUG, not a result
+`latent_reasoning_cotrain` never consumed the `intermediates` field: the loss
+was answer-only. So N1 merely replicated the already-known answer-only negative
+(project_depth_via_iteration) — the per-hop hypothesis was never tested.
+Caught post-run; per-hop supervision wired in fc6a833 (slot j at position
+P_max+j−1, unshifted logits decode intermediates[j−1]; 44 tests).
+
+### N1′ (latent, per-hop wired) — REAL FAIL on the pre-registered kill-line
+Full run (2,671 steps / 350M tok, full fine-tune from feature_pilot_A on the
+pilot mix + latent aux). Kill-test (`eval_exec_trace_latent.py`,
+runs/n3_killtest_N1prime.json): all four arms statistically indistinguishable
+at every K — no_think 8.7–13.0%, latent(R=K) 8.0–11.3%, lift −2.3..+2.3pp
+(kill-line required ≥5pp at K≥4). Per-hop decode acc 9–14% ≈ the marginal
+distribution of intermediate values: hop-loss plateaued at ~2.2 ≈ ln(10)
+(digits are ~uniform) — the latent slots learned the PRIOR over values, never
+the simulation. Structural floor held exactly (no-think byte-identical to A).
+
+### Why latent-first fails (the three stacked issues)
+1. **Inverted capability gradient**: the base cannot do the task in TEXT
+   either (direct answer ≈ 9–14% ≈ prior over digits). Latent training asks
+   the model to invent the executor function AND its compressed encoding
+   simultaneously, with gradient only through R fragile bottleneck vectors.
+2. **Skipped staging**: the literature path (Scratchpad/Nye → Coconut) teaches
+   the function in native token machinery FIRST, then compresses. We had
+   jumped straight to the compressed form.
+3. **Marginal-stats attractor**: under CE, matching the value prior is a deep
+   local optimum reachable without simulation; nothing forces per-step state.
+
+### Stage A (text-scratchpad executor) — DECISIVE PASS (2026-07-11)
+Same programs rendered as text traces (`# step j: x = v` lines then
+`# final: N`), trained as a plain 0.15-weight mix stream on top of the pilot
+mix ×0.85 (`configs/pretrain_mix_stageA_executor.yaml`), full fine-tune from
+feature_pilot_A, 2,120 steps. Survived a GPU-falling-off-the-bus mid-run
+(resumed from the step-382 periodic ckpt — the launch rule that mandates them
+paid off). Eval `eval_exec_trace_text.py` (runs/stageA_executor_eval.json):
+
+| K (heldout, n=300/rung) | trace step-acc | answer w/ trace | answer direct | lift |
+|---|---|---|---|---|
+| 2–8 | 0.963–0.988 | 0.937–0.970 | 0.117–0.160 | **+80–84pp** |
+
+- Pre-registered verdict PASS (bar was ≥0.5 state-acc @K=4 → 0.988; ≥5pp lift
+  at K≥4 → 80–84pp). Base-model control: 0% format compliance (clean null).
+- **HE-CE 0.7343 — BETTER than arm A's 0.7429.** The executor training
+  improved code capability; best code ckpt in the repo to date
+  (`checkpoints/stageA_executor.pt`).
+- Length-gen: step-acc degrades gracefully past trained depth (0.79/0.73/0.60
+  at K=9/10/12) but answers collapse — the model stops at ~8 steps (trained
+  max) and reads off the wrong line. Curriculum artifact, not a wall.
+
+**Conclusion: the staged path is vindicated.** The executor function had to
+exist in token machinery before anything could compress it. Stage B (Coconut
+gradual text→latent replacement) was pre-registered as "unlocked only if A
+passes" — A passed; Stage B spec in EXEC_TRACE_LATENT_PLAN.md.

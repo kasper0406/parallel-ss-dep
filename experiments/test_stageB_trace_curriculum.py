@@ -578,3 +578,78 @@ def test_latent_perhop_reads_skips_none_entries():
     got = ev.latent_perhop_reads(m, [7, 8, 9, 10], 3, THINK_ID,
                                  [5, None, 6], "cpu")
     assert len(got) == 2                # the None slot contributes no entry
+
+
+# =========================================================================== #
+# I. Depth-weighted sampling (the hop-7+ cliff fix arm, 2026-07-13).
+# =========================================================================== #
+
+def _mk_trace_jsonl(tmp_path, rungs=(2, 8)):
+    import json as _json
+    for K in rungs:
+        recs = []
+        for i in range(4):
+            inter = [(i + j) % 10 for j in range(K)]
+            lines = "\n".join(f"x = {v}" for v in inter)
+            recs.append({"prompt": f"prog {i}\n{lines}\n", "answer": inter[-1],
+                         "intermediates": inter, "rung": K,
+                         "tracked_var": "x"})
+        p = tmp_path / f"tr_n{K}.jsonl"
+        p.write_text("\n".join(_json.dumps(r) for r in recs) + "\n")
+    return str(tmp_path / "tr")
+
+
+class _CharTok:
+    """Every value 0..9 is a single token (id 30+v)."""
+    def encode(self, s, add_special_tokens=False):
+        if len(s) == 1 and s.isdigit():
+            return [30 + int(s)]
+        return [ord(c) % 29 for c in s]
+
+
+def _mk_cotrain(tmp_path, **kw):
+    prefix = _mk_trace_jsonl(tmp_path)
+    return LatentReasoningCotrain(
+        train_prefix=prefix, rungs=[2, 8], tok=_CharTok(), thinking_id=THINK_ID,
+        eos_id=EOS_ID, device="cpu", max_len=512, perhop_weight=1.0,
+        trace_mode=True, **kw)
+
+
+def test_depth_weighted_stage_distribution(tmp_path):
+    """Consolidation P(s) ~ (1+s): s=8 drawn ~9x as often as s=0."""
+    c = _mk_cotrain(tmp_path, depth_weighted=True, no_ramp=True, seed=0)
+    draws = [c._pick_stage(step=10, total_steps=100) for _ in range(4000)]
+    n8 = draws.count(8)
+    n0 = draws.count(0)
+    # expected 9:1; allow generous sampling noise
+    assert n8 > 4 * max(1, n0), (n8, n0)
+    assert min(draws) == 0 and max(draws) == 8
+
+
+def test_depth_weighted_rung_distribution(tmp_path):
+    """Rung P(K) ~ K over [2, 8]: K=8 drawn ~4x as often as K=2."""
+    c = _mk_cotrain(tmp_path, depth_weighted=True, no_ramp=True, seed=0)
+    ks = []
+    for _ in range(2000):
+        if c.depth_weighted:
+            w = torch.tensor([float(r) for r in c.rungs])
+            ks.append(c.rungs[int(torch.multinomial(w, 1,
+                                                    generator=c.g).item())])
+    r = ks.count(8) / max(1, ks.count(2))
+    assert 2.5 < r < 6.5, r                     # expected 4.0
+
+
+def test_no_ramp_skips_ramp_in_trace_mode(tmp_path):
+    """no_ramp=True: even at step 0 the stage draw is consolidation (can draw
+    the full range), not the ramp frontier s_max=0."""
+    c = _mk_cotrain(tmp_path, no_ramp=True, seed=0)
+    draws = {c._pick_stage(step=0, total_steps=1000) for _ in range(300)}
+    assert max(draws) == 8                      # ramp would pin ALL draws to 0
+
+
+def test_default_uniform_unchanged(tmp_path):
+    """depth_weighted absent: consolidation stays uniform (regression)."""
+    c = _mk_cotrain(tmp_path, no_ramp=True, seed=0)
+    draws = [c._pick_stage(step=10, total_steps=100) for _ in range(4000)]
+    counts = [draws.count(s) for s in range(9)]
+    assert min(counts) > 0.5 * (4000 / 9), counts

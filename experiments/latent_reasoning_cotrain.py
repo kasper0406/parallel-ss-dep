@@ -621,7 +621,7 @@ class LatentReasoningCotrain:
                  gate_weight: float = 0.0, seed: int = 0,
                  checkpoint_latent: bool = True, batch_examples: bool = True,
                  pad_id: int = 0, perhop_weight: float = 0.0,
-                 trace_mode: bool = False):
+                 trace_mode: bool = False, depth_weighted: bool = False):
         self.device = device
         self.thinking_id = int(thinking_id)
         self.eos_id = int(eos_id)
@@ -632,6 +632,11 @@ class LatentReasoningCotrain:
         # `_load_rung_trace` / `_pick_stage`. `max_stage`/`ramp_frac` are the
         # validated 0->8-over-first-55% recipe.
         self.trace_mode = bool(trace_mode)
+        # Depth-weighted curriculum sampling (2026-07-13, the hop-7+ cliff fix
+        # arm): consolidation P(s) ~ (1+s) and rung P(K) ~ K, so the deep slots
+        # (gradient only from deep-stage x deep-rung draws) stop being starved.
+        # Default off = the original Stage-B recipe.
+        self.depth_weighted = bool(depth_weighted)
         self.max_stage = 8
         self.ramp_frac = 0.55
         self.last_K = 0          # rung of the last trace step (for logging)
@@ -720,10 +725,17 @@ class LatentReasoningCotrain:
         replace with latent slots) for this step. Ramp phase: sample near the
         frontier s_max with probs ~ (0.7, 0.2, 0.1) over {s_max, s_max-1,
         s_max-2} (clamped >=0, deduped, renormalized). Consolidation: uniform
-        over {0..max_stage}."""
-        s_max = _trace_stage_smax(step, total_steps, self.max_stage,
-                                  self.ramp_frac)
+        over {0..max_stage}, or P(s) ~ (1+s) when `depth_weighted` (the
+        hop-7+ cliff fix: deep slots get gradient only from deep stages x deep
+        rungs — the uniform draw starves them). `no_ramp` skips the ramp
+        entirely (continuation runs)."""
+        s_max = (None if self.no_ramp else
+                 _trace_stage_smax(step, total_steps, self.max_stage,
+                                   self.ramp_frac))
         if s_max is None:
+            if self.depth_weighted:
+                w = torch.arange(1, self.max_stage + 2, dtype=torch.float)
+                return int(torch.multinomial(w, 1, generator=self.g).item())
             return int(torch.randint(0, self.max_stage + 1, (1,),
                                      generator=self.g).item())
         cands = []
@@ -744,12 +756,18 @@ class LatentReasoningCotrain:
         return cands[-1][0]
 
     def _trace_step(self, model, step: int, total_steps: int, n_examples: int):
-        """Stage-B step: rung K uniform, stage s from the curriculum, s_eff =
-        min(s, K) shared across the batch. Rides `_answer_span_latent_loss_
-        batched` UNCHANGED with R=s_eff, solution = the s_eff-suffix trace text
-        + final line, per-hop targets = intermediates[:s_eff]."""
-        rung = self.rungs[int(torch.randint(0, len(self.rungs), (1,),
-                                            generator=self.g).item())]
+        """Stage-B step: rung K uniform (P(K) ~ K when `depth_weighted`),
+        stage s from the curriculum, s_eff = min(s, K) shared across the batch.
+        Rides `_answer_span_latent_loss_batched` UNCHANGED with R=s_eff,
+        solution = the s_eff-suffix trace text + final line, per-hop targets =
+        intermediates[:s_eff]."""
+        if self.depth_weighted:
+            w = torch.tensor([float(r) for r in self.rungs])
+            rung = self.rungs[int(torch.multinomial(w, 1,
+                                                    generator=self.g).item())]
+        else:
+            rung = self.rungs[int(torch.randint(0, len(self.rungs), (1,),
+                                                generator=self.g).item())]
         n = max(1, int(n_examples))
         recs = [self._next(rung) for _ in range(n)]
         s = self._pick_stage(step, total_steps)

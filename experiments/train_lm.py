@@ -1534,6 +1534,9 @@ def main():
                                         1.0)),
             trace_mode=bool(getattr(args, "latent_reasoning_trace_mode",
                                     False)),
+            depth_weighted=bool(getattr(args,
+                                        "latent_reasoning_depth_weighted",
+                                        False)),
             seed=int(args.seed))
         _lr_aux_every = int(getattr(args, "latent_reasoning_aux_every", 1))
         if _lr_aux_every > 8:

@@ -1066,6 +1066,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "Loss = CE on the remaining text+final + per-hop CE "
                         "decoding each latent slot to its intermediate. Default "
                         "off = the ordinary depth-matched path (byte-identical).")
+    p.add_argument("--latent_reasoning_depth_weighted", action="store_true",
+                   help="Stage-B hop-7+ cliff fix arm (2026-07-13): "
+                        "depth-weighted curriculum sampling — consolidation "
+                        "P(s) ~ (1+s) and rung P(K) ~ K, so deep latent slots "
+                        "(which only receive gradient from deep-stage x "
+                        "deep-rung draws) stop being starved. Default off = "
+                        "the original uniform Stage-B recipe.")
     # --- Gate-calibration aux loss (latent "think only where helpful") ---
     # Trains the OUTPUT GATE (not the trunk) toward firing think exactly where
     # a latent think actually raises logp(true_next). Uses the shared latent

@@ -25,15 +25,15 @@ mkdir -p runs checkpoints
 
 ARM=${ARM:?set ARM=control or ARM=anneal}
 case "$ARM" in
-  control) MIX=configs/pretrain_mix_feature_pilot.yaml ;;
-  anneal)  MIX=configs/anneal_mix_v1.yaml ;;
+  control) MIX=${MIX:-configs/pretrain_mix_feature_pilot.yaml} ;;
+  anneal)  MIX=${MIX:-configs/anneal_mix_v1.yaml} ;;
   *) echo "ARM must be 'control' or 'anneal', got '$ARM'" >&2; exit 1 ;;
 esac
 
 GPU=${GPU:-1}
 STEPS=${STEPS:-2300}          # x131,072 tok/step ~= 301M tokens
 SEED=${SEED:-0}
-TAG=microanneal_${ARM}
+TAG=${TAG:-microanneal_${ARM}}
 
 CUDA_VISIBLE_DEVICES=$GPU nohup .venv/bin/python -u experiments/train_lm.py \
   --arch deltanet --d_model 960 --n_layers 32 --n_heads 15 --d_head 64 --d_ff 2560 --tie_embeddings \

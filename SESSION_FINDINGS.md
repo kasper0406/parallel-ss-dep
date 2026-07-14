@@ -553,3 +553,25 @@ during training (hop CE 2.30-flat in N1' -> 0.43-0.89 here) is the durable
 methodology finding: latent compression becomes learnable once the function
 pre-exists in token space (Scratchpad->Coconut staging), per-hop supervision
 alone was NOT sufficient (N1').
+
+## 2026-07-14 — Meta-TTT parked (P1′ valid kill); attribution control resolves the internalization claim
+
+- **Meta-TTT P1′ (instrument-fixed retry): VALID KILL → PARKED per registration.**
+  6k episodes, engagement guard passed (no memorization); held-out
+  lift(shuffled−real) +0.073/+0.174 still BELOW the untrained incidental bar
+  (+0.138/+0.246); meta-training dulled the incidental structure signal while
+  improving the no-context path. Revisit-suspect if ever: truncated BPTT (grad
+  only through the final ~4k ingestion tokens). Adaptivity pillar falls back
+  to state-cartridges/self-study + LoRA-sleep. META_TTT_PLAN_2026_07_13.md.
+- **CRUXEval attribution control (token-matched, trace-free): Stage-A's gain
+  = pure tokens** (control 0.0775–0.0838 brackets stageA 0.0813); **Stage-B
+  keeps a significant paired edge** over the matched control (0.1050 vs
+  0.0838; McNemar 37-vs-20 on identical problems, z=2.25, p≈0.02). Claim
+  survives as: the exec+latent package (components not separable) improves
+  direct real-code output prediction beyond generic exposure; single-seed.
+  Paper §4.7 updated; one [PENDING] (K=2 anomaly) remains.
+- Ops: token-sentinel FIM regression on lean 49152-vocab ckpts fixed via
+  --fim_legacy_strings (lineage-comparability replay mode); EdgeBench-mini
+  discrimination gate FAIL (all ckpts 0.0 — below action-protocol floor;
+  needs few-shot protocol prompt or protocol-SFT before it's a usable dev
+  signal); Tier-1 microanneal A/B control arm launched.

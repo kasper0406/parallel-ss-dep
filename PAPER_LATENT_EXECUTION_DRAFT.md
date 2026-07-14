@@ -520,12 +520,22 @@ stageB_latent_trace}.json`.**
 Base → Stage B is 0.0688 → 0.1050 (z=2.58; we confirm z≈2.57 with a pooled
 two-proportion test). The suggestive reading is that *internalizing execution*
 improves zero-scaffold output prediction even where the explicit mechanism does
-not transfer. **The confound:** Stage A + Stage B expose the model to more code
-training tokens than the base, so the direct-answer gain could reflect extra
-code exposure rather than internalized execution. A matched-token no-trace
-fine-tune control is in flight. **[PENDING: attribution control — matched-token,
-trace-free fine-tune; report whether the 0.0688→0.1050 direct-answer gain
-survives.]**
+not transfer. **The confound, resolved by a matched-token control:** we
+continued the base on the same code mix *without* any trace/latent training to
+token counts matched to each stage
+(`results/cruxeval_direct800_cruxattr_token_control_step*.json`,
+`results/cruxeval_direct800_control600M.json`). The control fully explains
+Stage A's gain (control 0.0775/0.0838 at 250M/300M extra tokens brackets Stage
+A's 0.0813 at +277M) — the *text-trace stage adds no measurable direct-answer
+transfer beyond generic code exposure*. At Stage B's matched token count
+(~600M) the control reaches 0.0838 and plateaus (flat from 300M→600M), while
+Stage B sits at 0.1050: a +2.1pp edge that an unpaired test leaves ambiguous
+(z≈1.45) but the paired McNemar test on the identical 800 problems confirms
+(Stage-B-only-correct 37 vs control-only-correct 20, z=2.25, p≈0.02). We
+attribute the surviving edge to the Stage-B training package as a whole (the
+exec-trace stream + latent-compression co-training); these arms cannot
+separate the two components, and the result is single-seed — both caveats
+stand.
 
 ---
 

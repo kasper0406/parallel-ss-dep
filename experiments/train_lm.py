@@ -107,13 +107,25 @@ def _block_update_ratios(model, snapshot) -> list[float]:
 def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
                            doc_ids=None, gist_horizons=None, fwd_model=None,
                            mem_read_mask=None, kd_teacher=None,
-                           kd_thinking_token_id=None, kd_logit_store=None):
+                           kd_thinking_token_id=None, kd_logit_store=None,
+                           triage_cfg=None, triage_ref_reader=None,
+                           source_ids=None):
     """Forward + LM loss for the non-thinking-token (pretrain) path.
 
     Returns (logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss,
-    gist_loss, kd_loss). Factored out of the step loop so gradient
+    gist_loss, kd_loss, triage_stats). Factored out of the step loop so gradient
     accumulation can run it once per microbatch. Mirrors the inline
     forward + gate/plain-loss branches exactly.
+
+    TOKEN TRIAGE (Rho-1 selective loss, `--token_triage`; `experiments/
+    token_triage.py`). When `triage_cfg` is set, every token's per-token CE is
+    re-weighted by an excess-loss route (KD-route full CE, EASY-route low CE,
+    DROP-route zero CE) and, when a KD store is present, the KD term is
+    RESTRICTED to the KD-route tokens. The reference (excess-loss denominator)
+    comes from `triage_ref_reader` (a precomputed per-token ref-CE cache, mode b)
+    if given, else derived from the SAME offline KD store block the KD term uses
+    (mode a — the zero-extra-infra path). `triage_stats` is None when off, else a
+    dict {stats, per_source} for the log. Byte-identical when `triage_cfg=None`.
 
     KD has two mutually-exclusive sources:
     * OFFLINE (`kd_logit_store` set): the teacher's TOP-K logits are read from a
@@ -180,6 +192,52 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
     ce_per_token = F.cross_entropy(
         logits.reshape(-1, V), y.reshape(-1), reduction="none",
     ).reshape(y.shape)                                                   # (B, T)
+
+    # ---- Token triage (Rho-1 selective loss). Compute the per-token route
+    # weights + KD mask BEFORE the LM loss so the loss can be weighted. When the
+    # reference is derived from the KD store (mode a) we read the store block
+    # HERE (once) and hand it to the KD branch below via `_triage_kd_block` so
+    # the cursor advances exactly once per microbatch (lockstep contract). Off
+    # (triage_cfg is None) → triage_res stays None, everything byte-identical.
+    triage_res = None
+    triage_stats = None
+    _triage_kd_block = None
+    if triage_cfg is not None:
+        from experiments.token_triage import compute_triage_mask
+        B, T = x.shape
+        n = B * T
+        dev = logits.device
+        if triage_ref_reader is not None:
+            # Mode b: precomputed per-token reference CE (e.g. SmolLM2-scored).
+            rc_ce, rc_ids = triage_ref_reader.next_block(n)
+            rc_ids = rc_ids.to(dev).view(B, T)
+            _assert_store_alignment(rc_ids, x, store=triage_ref_reader)
+            ref_arg = rc_ce.to(dev).float().view(B, T)
+            triage_res = compute_triage_mask(
+                ce_per_token.detach(), ref_arg, y, triage_cfg,
+                source_ids=source_ids)
+        elif kd_logit_store is not None:
+            # Mode a: derive reference CE from the teacher top-k store — the
+            # SAME block the KD term consumes (no extra infra, no double read).
+            t_ids, t_logits, t_input_ids = kd_logit_store.next_block(n)
+            t_ids = t_ids.to(dev).view(B, T, -1)
+            t_logits = t_logits.to(dev).view(B, T, -1)
+            t_input_ids = t_input_ids.to(dev).view(B, T)
+            _assert_store_alignment(t_input_ids, x, store=kd_logit_store)
+            _triage_kd_block = (t_ids, t_logits)
+            triage_res = compute_triage_mask(
+                ce_per_token.detach(), (t_ids, t_logits), y, triage_cfg,
+                source_ids=source_ids)
+        else:
+            raise RuntimeError(
+                "--token_triage needs a reference: set --triage_ref_ce_dir "
+                "(precomputed ref-CE cache) or --distill_logits_dir (derive from "
+                "the teacher top-k store).")
+        triage_stats = {"stats": triage_res.stats,
+                        "per_source": triage_res.per_source}
+    # Per-token CE weight (constant, no grad): DROP→0, EASY→w_easy, KD→1.
+    _tri_w = triage_res.ce_weights if triage_res is not None else None
+
     if args.output_gate:
         g = model._last_gate                                             # (B, T)
         if args.gate_warmup_steps > 0:
@@ -199,12 +257,20 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
         ponder_gate = g if getattr(args, "gate_ponder_raw", False) else g_eff
         gate_terms = g_eff * ce_per_token + (1.0 - ponder_gate) * args.gate_lambda
         valid = (y != -100).float()
-        denom = valid.sum().clamp(min=1.0)
-        lm_loss = (gate_terms * valid).sum() / denom
+        if _tri_w is not None:
+            wv = valid * _tri_w
+            lm_loss = (gate_terms * wv).sum() / wv.sum().clamp(min=1.0)
+        else:
+            denom = valid.sum().clamp(min=1.0)
+            lm_loss = (gate_terms * valid).sum() / denom
     else:
         valid = (y != -100).float()
-        denom = valid.sum().clamp(min=1.0)
-        lm_loss = (ce_per_token * valid).sum() / denom
+        if _tri_w is not None:
+            wv = valid * _tri_w
+            lm_loss = (ce_per_token * wv).sum() / wv.sum().clamp(min=1.0)
+        else:
+            denom = valid.sum().clamp(min=1.0)
+            lm_loss = (ce_per_token * valid).sum() / denom
     # Entropy-grounded gate target (CE-reduction self-reward, cheap form).
     gate_aux_loss = torch.zeros((), device=logits.device)
     if args.output_gate and args.gate_entropy_aux_weight > 0.0:
@@ -241,35 +307,41 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
         # OFFLINE KD: read the teacher's top-k for the NEXT x.numel() tokens of
         # the precomputed stream. The cursor advances exactly once per call, so
         # it stays locked to the data iterator (which is also advanced once per
-        # microbatch by the caller).
+        # microbatch by the caller). When token-triage already read this block
+        # (mode a) we REUSE it (_triage_kd_block) so the cursor is not
+        # double-advanced — the alignment was asserted at the triage read.
         B, T = x.shape
         n = B * T
-        t_ids, t_logits, t_input_ids = kd_logit_store.next_block(n)
         dev = logits.device
-        t_ids = t_ids.to(dev).view(B, T, -1)                 # (B,T,k) int64
-        t_logits = t_logits.to(dev).view(B, T, -1)           # (B,T,k) fp16
-        t_input_ids = t_input_ids.to(dev).view(B, T)         # (B,T) int64
-        # ----- ALIGNMENT SAFETY (load-bearing) -----
-        # The store row order MUST equal the trainer's flattened token order.
-        # If it doesn't, KD would distil onto the WRONG positions — a silent,
-        # catastrophic corruption. Assert the stored input_ids match the live
-        # tokens for this block; fail loudly with the first mismatch otherwise.
-        if not torch.equal(t_input_ids, x.to(torch.int64)):
-            mism = (t_input_ids != x.to(torch.int64))
-            idx = int(mism.flatten().nonzero(as_tuple=False)[0].item())
-            bi, ti = idx // T, idx % T
-            raise RuntimeError(
-                "Offline-KD alignment FAILED: the teacher logit store is out of "
-                "sync with the training token stream (the #1 silent-corruption "
-                f"mode). First mismatch at flat index {idx} (batch {bi}, pos "
-                f"{ti}): store input_id={int(t_input_ids[bi, ti])} vs live "
-                f"x={int(x[bi, ti])}. The store and trainer must use the SAME "
-                "data_mix / seed / T / batch / num_workers / think_burst_prob. "
-                f"Store: {getattr(kd_logit_store, 'tokenizer_name', '?')} / "
-                f"{getattr(kd_logit_store, 'teacher_model', '?')}.")
+        if _triage_kd_block is not None:
+            t_ids, t_logits = _triage_kd_block
+        else:
+            t_ids, t_logits, t_input_ids = kd_logit_store.next_block(n)
+            t_ids = t_ids.to(dev).view(B, T, -1)             # (B,T,k) int64
+            t_logits = t_logits.to(dev).view(B, T, -1)       # (B,T,k) fp16
+            t_input_ids = t_input_ids.to(dev).view(B, T)     # (B,T) int64
+            # ----- ALIGNMENT SAFETY (load-bearing) ----- silent-corruption #1
+            _assert_store_alignment(t_input_ids, x, store=kd_logit_store)
         valid_kd = _kd_valid_mask(y, doc_ids, kd_thinking_token_id)
-        kd_loss = _kd_loss_term_topk(logits, t_ids, t_logits,
-                                     valid_kd.float(), args.distill_temp)
+        # Token triage restricts KD to the KD-route tokens (teacher-confident,
+        # student-wrong): valid_kd &= kd_mask. Off → unchanged.
+        if triage_res is not None:
+            valid_kd = valid_kd & triage_res.kd_mask.bool()
+        if getattr(args, "kd_objective", "legacy") == "decoupled":
+            # LFM2-style tempered decoupled top-K objective — lives in
+            # experiments/kd_objectives.py (kept out of this file on purpose;
+            # this hook is the whole integration surface). Default "legacy"
+            # takes the untouched _kd_loss_term_topk path → byte-identical.
+            from experiments.kd_objectives import decoupled_topk_kd_loss
+            kd_loss = decoupled_topk_kd_loss(
+                logits, t_ids, t_logits, valid_kd.float(),
+                targets=y,
+                temperature=getattr(args, "kd_temperature", 2.0),
+                mass_weight=getattr(args, "kd_mass_weight", 1.0),
+                ce_mix=getattr(args, "kd_ce_mix", 0.0))
+        else:
+            kd_loss = _kd_loss_term_topk(logits, t_ids, t_logits,
+                                         valid_kd.float(), args.distill_temp)
     elif kd_teacher is not None and getattr(args, "distill_weight", 0.0) > 0.0:
         # The data stream may insert thinking_token_id (== base vocab size, i.e.
         # one PAST the teacher's last valid id) into the INPUTS when
@@ -300,7 +372,7 @@ def _nonthink_forward_loss(model, x, y, args, step, bracket_deltas,
         kd_loss = _kd_loss_term(s, teacher_logits, valid_kd.float(),
                                 args.distill_temp)
     return (logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss,
-            gist_loss, kd_loss)
+            gist_loss, kd_loss, triage_stats)
 
 
 def _z_loss_term(logits, weight):
@@ -308,6 +380,53 @@ def _z_loss_term(logits, weight):
     if weight <= 0.0:
         return logits.new_zeros(())
     return weight * (torch.logsumexp(logits, dim=-1) ** 2).mean()
+
+
+def _assert_store_alignment(store_input_ids, x, store=None):
+    """The offline-store row order MUST equal the trainer's flattened token
+    order (the #1 silent-corruption mode). Both the KD term and the token-triage
+    reference read the store in lockstep with the data iterator, so both assert
+    the stored input_ids match the live `x` for this block. Shared so the two
+    consumers can't diverge. `store_input_ids` and `x` are (B, T) int64."""
+    if torch.equal(store_input_ids, x.to(torch.int64)):
+        return
+    T = x.shape[1]
+    mism = (store_input_ids != x.to(torch.int64))
+    idx = int(mism.flatten().nonzero(as_tuple=False)[0].item())
+    bi, ti = idx // T, idx % T
+    raise RuntimeError(
+        "Offline-store alignment FAILED: the teacher logit / ref-CE store is out "
+        "of sync with the training token stream (the #1 silent-corruption mode). "
+        f"First mismatch at flat index {idx} (batch {bi}, pos {ti}): store "
+        f"input_id={int(store_input_ids[bi, ti])} vs live x={int(x[bi, ti])}. "
+        "The store and trainer must use the SAME data_mix / seed / T / batch / "
+        "num_workers / think_burst_prob. Store: "
+        f"{getattr(store, 'tokenizer_name', '?')} / "
+        f"{getattr(store, 'teacher_model', getattr(store, 'ref_model', '?'))}.")
+
+
+def _unpack_train_batch(batch, want_source_ids, device="cuda"):
+    """Unpack a MixedSourceStream batch into
+    (x, y, doc_ids, mem_read_mask, source_ids), moving tensors to `device`.
+
+    The train stream always emits doc_ids first; `emit_read_mask` (v14) adds a
+    read-mask channel and `emit_source_ids` (token-triage) adds a trailing
+    per-position source-index channel. When `want_source_ids` is False this is
+    BYTE-IDENTICAL to the historical
+    `doc_ids=_rest[0]; mem_read_mask=_rest[1] if len(_rest)>1 else None` unpack.
+    When True the source-id channel is the LAST element (any read-mask sits
+    between it and doc_ids), so it can never be mistaken for mem_read_mask."""
+    x, y, *rest = batch
+    x = x.to(device)
+    y = y.to(device)
+    doc_ids = rest[0].to(device) if len(rest) >= 1 else None
+    if want_source_ids and len(rest) >= 2:
+        source_ids = rest[-1].to(device)
+        mem_read_mask = rest[1].to(device) if len(rest) >= 3 else None
+    else:
+        source_ids = None
+        mem_read_mask = rest[1].to(device) if len(rest) >= 2 else None
+    return x, y, doc_ids, mem_read_mask, source_ids
 
 
 def _kd_loss_term(student_logits, teacher_logits, valid_mask, temp):
@@ -1014,6 +1133,16 @@ def main():
         )
     _kd_on = ((_kd_live or _kd_offline)
               and float(getattr(args, "distill_weight", 0.0)) > 0.0)
+    # The decoupled top-K objective (experiments/kd_objectives.py) is defined
+    # over the STORED top-K format only — the live-teacher branch has the full
+    # distribution and keeps the legacy full-vocab KL. Fail loudly rather than
+    # silently ignoring the flag.
+    if (getattr(args, "kd_objective", "legacy") != "legacy"
+            and _kd_live):
+        raise SystemExit(
+            "--kd_objective decoupled is implemented for the OFFLINE top-K "
+            "store path (--distill_logits_dir) only; the live-teacher path "
+            "(--distill_teacher_model) always uses the legacy full-vocab KL.")
     if _kd_on and args.enable_thinking_token:
         raise SystemExit(
             "--distill_teacher_model/--distill_logits_dir/--distill_weight "
@@ -1082,6 +1211,29 @@ def main():
             "burst). Forcing --think_burst_prob 0.0.",
             flush=True,
         )
+        args.think_burst_prob = 0.0
+
+    # TOKEN TRIAGE reads a reference store (teacher top-k, mode a, or a ref-CE
+    # cache, mode b) in the SAME lockstep as offline KD, so it inherits the same
+    # single-GPU / num_workers-0-or-1 / no-think-burst constraints. Mode a
+    # (--distill_logits_dir) is already covered by the _kd_offline guards above;
+    # this covers mode b (--triage_ref_ce_dir with no KD store).
+    _tri_refcache = (bool(getattr(args, "token_triage", False))
+                     and bool(getattr(args, "triage_ref_ce_dir", "")))
+    if _tri_refcache and is_ddp:
+        raise SystemExit(
+            "--triage_ref_ce_dir is single-GPU only (the ref-CE cache is one "
+            "deterministic stream; DDP ranks stream disjoint shards and would "
+            "desync the alignment assert). Run without torchrun.")
+    if _tri_refcache and int(getattr(args, "num_workers", 2)) not in (0, 1):
+        raise SystemExit(
+            "--triage_ref_ce_dir requires --num_workers 0 (or 1): the cache was "
+            f"generated at num_workers=0; you passed {args.num_workers}, which "
+            "would desync the alignment assert. Re-run with --num_workers 0.")
+    if _tri_refcache and float(getattr(args, "think_burst_prob", 0.0)) != 0.0:
+        print(f"[token-triage] WARNING: --think_burst_prob was "
+              f"{args.think_burst_prob} but the ref-CE cache alignment requires "
+              "bursts OFF. Forcing --think_burst_prob 0.0.", flush=True)
         args.think_burst_prob = 0.0
 
     # Engagement kill-gate, part 1: curricula-must-fit (recipe rule #2). Pure
@@ -1178,6 +1330,37 @@ def main():
         print(f"  {len(sources)} sources:")
         for s in sources:
             print(f"    - {s.name:30s} weight={s.weight:.3f}  id={s.dataset_id}")
+        # ---- FIM sentinel ids (any source with fim_rate>0). Resolved HERE
+        # (not left to the stream's internal default) so the MODEL vocab is
+        # guaranteed to cover the reserved ids — full LM loss on sentinels is
+        # the FIM convention, so they appear in `targets`. SmolLM2 default:
+        # think slot 49152 → sentinels 49153/49154/49155, inside the round64
+        # padding → model_vocab_size unchanged (ckpt shape-identical).
+        fim_sentinel_ids = None
+        if any(float(s.fim_rate) > 0.0 for s in sources):
+            from experiments.data_mix import resolve_fim_sentinel_ids
+            fim_sentinel_ids = resolve_fim_sentinel_ids(
+                tok, thinking_token_id=thinking_token_id)
+            _fim_max = max(fim_sentinel_ids)
+            if _fim_max >= model_vocab_size:
+                if int(getattr(args, "keep_base_vocab", 0)) > 0:
+                    raise SystemExit(
+                        f"--keep_base_vocab={args.keep_base_vocab} cannot fit "
+                        f"the reserved FIM sentinel ids {fim_sentinel_ids} "
+                        "(out-of-range ids would need a bigger embedding). "
+                        "Either set fim_rate: 0 in the mix YAML, drop "
+                        "--keep_base_vocab, or use a tokenizer with native "
+                        "FIM tokens (Qwen2.5).")
+                model_vocab_size = ((_fim_max + 1 + 63) // 64) * 64
+            print(f"  FIM sentinels (pre/suf/mid): {fim_sentinel_ids}  "
+                  f"model_vocab={model_vocab_size}")
+            if (bool(getattr(args, "distill_teacher_model", ""))
+                    or bool(getattr(args, "distill_logits_dir", ""))):
+                print("  [WARN] fim_rate>0 with KD: reserved FIM sentinel ids "
+                      "are out-of-range for a teacher that lacks them (the "
+                      "live-teacher clamp / an old logit store would corrupt "
+                      "context at sentinel positions). Regenerate the store "
+                      "on the FIM'd stream / use a FIM-aware teacher.")
         train_ds = MixedSourceStream(
             sources=sources, tokenizer=tok, block_size=args.T,
             thinking_token_id=thinking_token_id,
@@ -1191,7 +1374,14 @@ def main():
             # v14: emit the per-position recall read-mask as a 4th tuple element
             # (default off → 3-tuple, byte-identical to v12).
             emit_read_mask=bool(getattr(args, "emit_read_mask", False)),
+            # token-triage: emit a trailing per-position source-index channel so
+            # the drop mask is auditable per-source (the min_content_len lesson).
+            # Default off → byte-identical. Source is constant across a packed
+            # chunk (each chunk is drawn from a single source).
+            emit_source_ids=bool(getattr(args, "token_triage", False)),
+            fim_sentinel_ids=fim_sentinel_ids,
         )
+        _want_source_ids = bool(getattr(args, "token_triage", False))
         # Val: same sources, different seed, burst injection off so val PPL
         # reflects the clean data distribution.
         val_ds = MixedSourceStream(
@@ -1201,6 +1391,7 @@ def main():
             base_seed=args.seed + 999_983,
             mask_eos_in_targets=bool(args.mask_eos_in_targets),
             emit_doc_ids=True,
+            fim_sentinel_ids=fim_sentinel_ids,
         )
         train_loader = DataLoader(train_ds, batch_size=args.batch,
                                   num_workers=args.num_workers)
@@ -1231,6 +1422,8 @@ def main():
                                    text_field=args.text_field)
         val_ds = TokenisedStream(val_stream, tok, args.T,
                                  text_field=args.text_field)
+        # The plain dataset path yields (x, y) with no source channel.
+        _want_source_ids = False
         train_loader = DataLoader(train_ds, batch_size=args.batch,
                                    num_workers=args.num_workers)
         val_loader = DataLoader(val_ds, batch_size=args.batch, num_workers=1)
@@ -1326,11 +1519,18 @@ def main():
     # _nonthink_forward_loss. Default OFF (empty dir / weight 0) → stays None and
     # the loss path is byte-identical to a non-KD run.
     kd_logit_store = None
+    # Token triage may use the SAME offline store purely as a reference (even
+    # when --distill_weight == 0, i.e. no KD term), so open it if EITHER KD is on
+    # OR triage needs a store-derived reference.
+    _tri_on = bool(getattr(args, "token_triage", False))
+    _tri_needs_store = (_tri_on
+                        and not bool(getattr(args, "triage_ref_ce_dir", "")))
     if (bool(getattr(args, "distill_logits_dir", ""))
-            and float(getattr(args, "distill_weight", 0.0)) > 0.0):
+            and (float(getattr(args, "distill_weight", 0.0)) > 0.0
+                 or _tri_needs_store)):
         from experiments.teacher_logits_io import LogitStoreReader
         kd_logit_store = LogitStoreReader(args.distill_logits_dir)
-        print(f"Offline KD: opened logit store {args.distill_logits_dir}")
+        print(f"Offline KD/triage-ref: opened logit store {args.distill_logits_dir}")
         print(f"  teacher={kd_logit_store.teacher_model}  "
               f"tokenizer={kd_logit_store.tokenizer_name}  "
               f"k={kd_logit_store.k}  vocab={kd_logit_store.vocab_size}  "
@@ -1343,6 +1543,39 @@ def main():
                 f"offline-KD store vocab {kd_logit_store.vocab_size} exceeds the "
                 f"student model vocab {model_vocab_size} — top-k ids would be "
                 "out of range for the gather.")
+
+    # ---- Token triage (Rho-1 selective loss, experiments/token_triage.py).
+    # Build the config + optional precomputed ref-CE reader. Default OFF
+    # (--token_triage absent) → triage_cfg stays None, loss path byte-identical.
+    triage_cfg = None
+    triage_ref_reader = None
+    if _tri_on:
+        from experiments.token_triage import (
+            triage_config_from_args, RefCEStoreReader)
+        _ref_vocab = (kd_logit_store.vocab_size
+                      if kd_logit_store is not None else model_vocab_size)
+        triage_cfg = triage_config_from_args(args, vocab_size=_ref_vocab)
+        if bool(getattr(args, "triage_ref_ce_dir", "")):
+            triage_ref_reader = RefCEStoreReader(args.triage_ref_ce_dir)
+            print(f"Token triage: ref-CE cache {args.triage_ref_ce_dir} "
+                  f"(ref_model={triage_ref_reader.ref_model}, "
+                  f"tokens={len(triage_ref_reader):,})")
+        elif kd_logit_store is None:
+            raise SystemExit(
+                "--token_triage requires a reference: pass --triage_ref_ce_dir "
+                "(precomputed ref-CE cache) OR --distill_logits_dir (derive the "
+                "reference from the teacher top-k store).")
+        if not bool(args.data_mix):
+            raise SystemExit(
+                "--token_triage requires --data_mix (per-source audit + the "
+                "store lockstep alignment both assume the MixedSourceStream).")
+        print(f"Token triage ON: keep_frac={triage_cfg.keep_frac} "
+              f"easy_w={triage_cfg.w_ce_easy} "
+              f"kd_w={getattr(args, 'triage_kd_weight', -1.0)} "
+              f"entropy_cut={triage_cfg.entropy_cutoff} "
+              f"hard_ce_cut={triage_cfg.hard_ce_cutoff} "
+              f"stored_logprob={triage_cfg.stored_is_logprob} "
+              f"ref={'cache' if triage_ref_reader is not None else 'kd_store'}")
 
     if args.aux_brackets:
         print("Computing bracket-deltas table for tokenizer ...")
@@ -1946,13 +2179,13 @@ def main():
         except StopIteration:
             train_iter = iter(train_loader)
             batch = next(train_iter)
-        # Streams may yield (x, y), (x, y, doc_ids), or (x, y, doc_ids,
-        # mem_read_mask) [v14]; doc_ids drives cross-document state isolation;
-        # mem_read_mask (when present) drives the WM read at recall answer spans.
-        x, y, *_rest = batch
-        x, y = x.to("cuda"), y.to("cuda")
-        doc_ids = _rest[0].to("cuda") if _rest else None
-        mem_read_mask = _rest[1].to("cuda") if len(_rest) > 1 else None
+        # Streams may yield (x, y), (x, y, doc_ids), (x, y, doc_ids,
+        # mem_read_mask) [v14], or, under --token_triage, a trailing source-id
+        # channel; doc_ids drives cross-document state isolation; mem_read_mask
+        # (when present) drives the WM read at recall answer spans; source_ids
+        # (when present) drives the per-source triage audit.
+        x, y, doc_ids, mem_read_mask, source_ids = _unpack_train_batch(
+            batch, _want_source_ids)
         # K-self-feed curriculum: bypass FiLM (1-pass forward) until the
         # warmup boundary, then run the configured --feedback_self_k.
         if args.feedback_self_k_warmup_steps > 0:
@@ -2385,6 +2618,7 @@ def main():
             _meta_ttt_diag = None
             _gate_calib_diag = None
             _ctx_addr_diag = None
+            _triage_stats_last = None
             for micro in range(n_micro):
                 if micro > 0:
                     try:
@@ -2392,10 +2626,8 @@ def main():
                     except StopIteration:
                         train_iter = iter(train_loader)
                         batch = next(train_iter)
-                    x, y, *_rest = batch
-                    x, y = x.to("cuda"), y.to("cuda")
-                    doc_ids = _rest[0].to("cuda") if _rest else None
-                    mem_read_mask = _rest[1].to("cuda") if len(_rest) > 1 else None
+                    x, y, doc_ids, mem_read_mask, source_ids = \
+                        _unpack_train_batch(batch, _want_source_ids)
                 # DDP: only all-reduce grads on the LAST microbatch; no_sync()
                 # suppresses the reduce on the intermediates (correctness +
                 # avoids n_micro× redundant comms). nullcontext when single-GPU.
@@ -2404,13 +2636,22 @@ def main():
                              else contextlib.nullcontext())
                 with _sync_ctx:
                     logits, ce_per_token, lm_loss, aux_loss, gate_aux_loss, \
-                        gist_loss, kd_loss = _nonthink_forward_loss(
+                        gist_loss, kd_loss, triage_stats = \
+                        _nonthink_forward_loss(
                             model, x, y, args, step, bracket_deltas,
                             doc_ids=doc_ids, gist_horizons=gist_horizons,
                             fwd_model=ddp_model, mem_read_mask=mem_read_mask,
                             kd_teacher=kd_teacher,
                             kd_thinking_token_id=thinking_token_id,
-                            kd_logit_store=kd_logit_store)
+                            kd_logit_store=kd_logit_store,
+                            triage_cfg=triage_cfg,
+                            triage_ref_reader=triage_ref_reader,
+                            source_ids=source_ids)
+                    # Accumulate triage route stats over the log window (last
+                    # microbatch is representative; the reference read happens
+                    # every microbatch so this is a valid sample).
+                    if triage_stats is not None:
+                        _triage_stats_last = triage_stats
                     # Snapshot the MAIN-forward gate NOW, before any aux loss
                     # (latent_cotrain / gate_calibration) runs an extra forward
                     # that clobbers model._last_gate(_logits) — the documented
@@ -2458,9 +2699,18 @@ def main():
                     # Logit-KD: add lambda * KL(teacher || student). kd_loss is a
                     # zero scalar when KD is off (no live teacher AND no offline
                     # store / weight 0) → no change to the loss or backward graph.
+                    # Token-triage precedence: when --token_triage is on and
+                    # --triage_kd_weight >= 0, that weight REPLACES --distill_weight
+                    # as the KD scale (the KD term is already restricted to the
+                    # triage KD-route tokens inside _nonthink_forward_loss). A
+                    # negative --triage_kd_weight (default) reuses --distill_weight.
                     if ((kd_teacher is not None or kd_logit_store is not None)
                             and args.distill_weight > 0.0):
-                        loss = loss + args.distill_weight * kd_loss
+                        _kd_w = args.distill_weight
+                        if triage_cfg is not None and \
+                                float(getattr(args, "triage_kd_weight", -1.0)) >= 0.0:
+                            _kd_w = float(args.triage_kd_weight)
+                        loss = loss + _kd_w * kd_loss
                     # CTX-NAMEKEY addressing aux (learned WM addresser): train the
                     # ctx read attention to land on the binding the deterministic
                     # lexical code identifies as correct, ONLY at recall answer-
@@ -2685,6 +2935,19 @@ def main():
             if ((kd_teacher is not None or kd_logit_store is not None)
                     and args.distill_weight > 0.0):
                 line += f"  kd={kd_loss.item():.4f}"
+            if triage_cfg is not None and _triage_stats_last is not None:
+                from experiments.token_triage import format_triage_log
+                _ts = _triage_stats_last["stats"]
+                line += "  " + format_triage_log(_ts)
+                # Per-source drop audit (the min_content_len lesson): show each
+                # source's kept/drop fractions so a mask that eats a whole source
+                # is visible in the log.
+                _psrc = _triage_stats_last.get("per_source", {})
+                if _psrc:
+                    parts = [f"s{sid}:keep{100*rec['frac_kd']:.0f}/"
+                             f"drop{100*rec['frac_drop']:.0f}"
+                             for sid, rec in sorted(_psrc.items())]
+                    line += "  triage_src[" + " ".join(parts) + "]"
             if getattr(args, "latent_cotrain_weight", 0.0) > 0.0 and \
                     _latent_cotrain_diag is not None:
                 _d, _n = _latent_cotrain_diag

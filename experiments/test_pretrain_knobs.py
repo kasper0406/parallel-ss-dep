@@ -76,7 +76,7 @@ def _run_grad_accum_equivalence(output_gate: bool):
     # Single full batch.
     m_full = _MockLM(vocab, d)
     m_full.zero_grad(set_to_none=True)
-    _, _, lm_loss, aux_loss, _, _, _ = _nonthink_forward_loss(m_full, x, y, args, 0, None)
+    _, _, lm_loss, aux_loss, _, _, _, _ = _nonthink_forward_loss(m_full, x, y, args, 0, None)
     (lm_loss + args.aux_weight * aux_loss).backward()
     g_full = _grads(m_full)
 
@@ -86,7 +86,7 @@ def _run_grad_accum_equivalence(output_gate: bool):
     m_accum.zero_grad(set_to_none=True)
     n_micro = B
     for i in range(n_micro):
-        _, _, lm_loss_i, aux_loss_i, _, _, _ = _nonthink_forward_loss(
+        _, _, lm_loss_i, aux_loss_i, _, _, _, _ = _nonthink_forward_loss(
             m_accum, x[i:i + 1], y[i:i + 1], args, 0, None)
         ((lm_loss_i + args.aux_weight * aux_loss_i) / n_micro).backward()
     g_accum = _grads(m_accum)
@@ -158,7 +158,7 @@ def test_gate_entropy_aux_off_returns_zero():
     x = torch.randint(0, vocab, (B, T))
     y = torch.randint(0, vocab, (B, T))
     m = _MockLM(vocab, d)
-    _, _, _, _, gate_aux, _, _ = _nonthink_forward_loss(
+    _, _, _, _, gate_aux, _, _, _ = _nonthink_forward_loss(
         m, x, y, _args(output_gate=True, gate_entropy_aux_weight=0.0),
         0, None,
     )
@@ -211,7 +211,7 @@ def test_gate_entropy_aux_pushes_gate_against_uncertainty():
     x = torch.tensor([[5, 6, 7, 8]])
     y = torch.tensor([[5, 6, 7, 8]])
     m.zero_grad(set_to_none=True)
-    _, _, lm_loss, _, gate_aux, _, _ = _nonthink_forward_loss(m, x, y, args, 0, None)
+    _, _, lm_loss, _, gate_aux, _, _, _ = _nonthink_forward_loss(m, x, y, args, 0, None)
     # The entropy-aux must have positive loss (BCE on a non-degenerate target).
     assert float(gate_aux) > 0.0
     # Backward only on gate_aux: head must receive NO gradient (target is

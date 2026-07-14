@@ -937,6 +937,90 @@ def build_parser() -> argparse.ArgumentParser:
                         "teacher logits from disk in lockstep with the data "
                         "iterator — NO teacher in the loop. Mutually exclusive "
                         "with --distill_teacher_model. Empty (default) = off.")
+    # KD OBJECTIVE (offline top-K store path only; experiments/kd_objectives.py).
+    # "legacy" (default) = the original truncated top-k KL (_kd_loss_term_topk),
+    # byte-identical to pre-flag behaviour and still driven by --distill_temp.
+    # "decoupled" = LFM2-style tempered decoupled top-K: an UNTEMPERED binary
+    # term matching the student's total probability mass on the teacher's
+    # stored top-K set (-log m_S; fixes the support-mismatch instability of
+    # naive truncated+tempered KD) + a temperature-scaled KL WITHIN the top-K
+    # (x T^2), optionally mixed with hard-label CE. The decoupled knobs below
+    # are deliberately SEPARATE from --distill_temp so A/Bs can hold the
+    # legacy arm fixed.
+    p.add_argument("--kd_objective", choices=["legacy", "decoupled"],
+                   default="legacy",
+                   help="Offline top-K KD objective: 'legacy' (default, "
+                        "byte-identical truncated top-k KL at --distill_temp) "
+                        "or 'decoupled' (LFM2-style untempered top-K mass "
+                        "term + tempered within-top-K KL + optional hard-CE "
+                        "mix; see experiments/kd_objectives.py).")
+    p.add_argument("--kd_temperature", type=float, default=2.0,
+                   help="Temperature for the WITHIN-top-K KL of the decoupled "
+                        "objective (x T^2 Hinton scaling). The mass term is "
+                        "deliberately untempered. Only read when "
+                        "--kd_objective decoupled. Default 2.0.")
+    p.add_argument("--kd_mass_weight", type=float, default=1.0,
+                   help="Weight on the untempered top-K mass term "
+                        "(-log of the student's total probability on the "
+                        "teacher's stored top-K set) of the decoupled "
+                        "objective. Default 1.0.")
+    p.add_argument("--kd_ce_mix", type=float, default=0.0,
+                   help="Hard-label CE mix lambda in [0,1] for the decoupled "
+                        "objective: kd_loss = (1-lambda)*decoupled + "
+                        "lambda*CE. Default 0.0 (the trainer's main lm_loss "
+                        "already carries the hard-label CE; raise this only "
+                        "for pure-KD runs where --distill_weight dominates).")
+    # --- Rho-1-style TOKEN TRIAGE (selective loss; experiments/token_triage.py).
+    # Score every pretrain token by excess loss (student CE − reference CE) and
+    # route it: KD (teacher-confident & student-wrong → full CE + restricted KD),
+    # DROP (both-wrong / high teacher entropy → zero loss), EASY (both-right →
+    # low-weight CE). All default OFF → the loss path is byte-identical.
+    #
+    # Reference (excess-loss denominator) precedence, when --token_triage is set:
+    #   1. --triage_ref_ce_dir  (a precomputed per-token ref-CE cache; mode b),
+    #   2. else --distill_logits_dir (derive ref CE from the teacher top-k store;
+    #      mode a — the zero-extra-infra path — the store opens even at
+    #      --distill_weight 0 for reference-only use).
+    # KD composition: the KD term still fires only when --distill_weight > 0, but
+    # is RESTRICTED to the triage KD-route tokens; --triage_kd_weight (>=0)
+    # overrides --distill_weight as that term's scale (default -1 = reuse it).
+    p.add_argument("--token_triage", action="store_true",
+                   help="Enable Rho-1 selective-token-loss triage on the "
+                        "pretrain CE path. Requires --data_mix and a reference "
+                        "(--triage_ref_ce_dir or --distill_logits_dir). Off = "
+                        "byte-identical.")
+    p.add_argument("--triage_keep_frac", type=float, default=0.6,
+                   help="Fraction of VALID tokens routed to KD/kept (highest "
+                        "student−reference excess loss). The Rho-1 top-k%% knob. "
+                        "Default 0.6.")
+    p.add_argument("--triage_kd_weight", type=float, default=-1.0,
+                   help="KD-term scale on the triage KD-route tokens. >=0 "
+                        "overrides --distill_weight; -1 (default) reuses "
+                        "--distill_weight. Only meaningful when --distill_weight "
+                        "> 0 (the KD term must be enabled).")
+    p.add_argument("--triage_easy_weight", type=float, default=0.1,
+                   help="CE weight on EASY-route (both-right / already-learned) "
+                        "tokens. 0 drops them entirely; default 0.1 keeps a light "
+                        "gradient so they are not forgotten.")
+    p.add_argument("--triage_entropy_cutoff", type=float, default=-1.0,
+                   help="Teacher predictive-entropy (nats) above which a token is "
+                        "forced to DROP (unlearnable — the 'high teacher entropy' "
+                        "rule). <0 (default) = off. Only available in reference "
+                        "mode a (teacher top-k gives the entropy proxy).")
+    p.add_argument("--triage_hard_ce_cutoff", type=float, default=-1.0,
+                   help="Among NON-kept tokens, student CE >= this routes to DROP "
+                        "(both-wrong) instead of EASY. <0 (default) = off (all "
+                        "non-kept → EASY).")
+    p.add_argument("--triage_ref_ce_dir", type=str, default="",
+                   help="Directory of a precomputed per-token reference-CE cache "
+                        "(experiments/token_triage.py RefCEStore; e.g. SmolLM2-"
+                        "scored). When set it is the triage reference (mode b) "
+                        "instead of deriving from the KD store. Empty = mode a.")
+    p.add_argument("--triage_store_raw_logits", action="store_true",
+                   help="The teacher top-k store holds RAW logits (HF "
+                        "gen_teacher_logits.py) rather than log-softmax logprobs "
+                        "(the default vLLM gen_teacher_logits_vllm.py store). "
+                        "Flips ref-CE decoding to softmax-over-top-k.")
     # Trunk multi-horizon gist loss (v7, see experiments/gist_loss.py).
     p.add_argument("--gist_loss_weight", type=float, default=0.0,
                    help="Weight on the trunk multi-horizon gist loss: "

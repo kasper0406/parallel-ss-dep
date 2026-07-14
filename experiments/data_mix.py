@@ -154,7 +154,9 @@ class SourceConfig:
     filter_spec: str | dict | None = None
     skip_first: int = 0              # for shuffled streaming, optional
     fim_rate: float = 0.0            # PSM Fill-in-the-Middle augmentation rate
-                                      # (per-document); 0.0 disables.
+                                      # (per-document); 0.0 disables (default,
+                                      # byte-identical). See the FIM section
+                                      # below for the sentinel/loss/split spec.
     jsonl_path: str | None = None    # if set, stream rows from a local JSONL
                                       # file instead of HF. `text_field`
                                       # selects which field to extract.
@@ -189,37 +191,162 @@ class SourceConfig:
 
 
 # ---------------------------------------------------------------------------
-# Fill-in-the-Middle (PSM variant, per DeepSeek-Coder). Sentinels are
-# plain text strings — the tokenizer will encode them as multi-token
-# sequences and the model learns them as fixed patterns. No vocab change.
+# Fill-in-the-Middle (PSM variant, 2026-07-14 rewrite: single-token sentinels).
+#
+# Rendered document (token ids):
+#
+#     [FIM_PRE] prefix [FIM_SUF] suffix [FIM_MID] middle
+#
+# i.e. PSM order — the model reads prefix + suffix, then generates the middle.
+#
+# SENTINEL-TOKEN DECISION (investigated 2026-07-14). The SmolLM2/cosmo
+# tokenizer (49152 BPE) has NO reserved FIM tokens: its special set is the
+# StarCoder2-style {<|endoftext|>, <repo_name>, <file_sep>, <jupyter_*>, ...}
+# with zero 'fim'-named entries, and "<|fim_prefix|>" encodes to EIGHT plain
+# BPE tokens. The previous implementation spliced those strings into the text,
+# so every sentinel cost 8 tokens and gave the model no single-token anchor to
+# key the infilling behaviour on. The repo already has exactly one mechanism
+# for "a token the tokenizer doesn't have": the [THINKING] token, which is
+# assigned the first id ABOVE every real token (`max(tok.vocab_size, len(tok))`,
+# see train_lm.py) and lives in the model's round64 vocab padding — no
+# tokenizer surgery, checkpoints stay shape-identical when the padding already
+# covers the id. FIM sentinels use the SAME mechanism: the three ids default to
+# think_slot+1, +2, +3 (SmolLM2: 49153/49154/49155, inside the 49216 padded
+# vocab). EXCEPTION: tokenizers that ship native single-token FIM sentinels
+# (Qwen2.5: <|fim_prefix|>=151659, <|fim_middle|>=151660, <|fim_suffix|>=151661,
+# verified in the local cache) use those ids instead — they are real trained
+# special tokens and keep us compatible with the donor's FIM format for the
+# planned Qwen-tokenizer switch (#105). All three ids are configurable via
+# `MixedSourceStream(fim_sentinel_ids=...)`.
+#
+# LOSS CONVENTION: full LM loss on the ENTIRE rendered sequence — sentinels,
+# prefix, suffix AND middle — exactly like a plain document. This is the
+# standard FIM recipe: Bavarian et al. 2022 ("Efficient Training of Language
+# Models to Fill in the Middle") train FIM as a data transform with the
+# ordinary next-token objective over the whole transformed sequence, and the
+# StarCoder and Qwen2.5-Coder pretrains follow it. Restricting loss to the
+# middle would discard the prefix/suffix LM signal (FIM would no longer be
+# ~free at fixed token budget) and is NOT what any production recipe does.
+# Concretely: the rendered ids flow through the normal (inputs, targets) shift
+# with no extra masking, so sentinel ids appear in `targets` and get gradient.
+#
+# SPLIT POINTS: the middle span is chosen character-uniformly at 10–50% of the
+# document, then SNAPPED OUTWARD to line boundaries (middle = whole lines).
+# Why lines: (a) prefix/suffix/middle are tokenized SEPARATELY, so a cut in
+# the middle of an identifier splits a BPE merge and produces token sequences
+# that never occur in normal text — the model would burn capacity on byte-
+# splicing artifacts instead of infilling; newlines are token boundaries in
+# GPT-style BPE, so line-snapped cuts keep enc(prefix)+enc(middle)+enc(suffix)
+# ≈ enc(doc). (b) Code has strong line structure; whole-line middles match how
+# editing tools and infilling evals (SAFIM-style, HumanEval-infilling) present
+# the task. Documents without a usable line structure (single line) fall back
+# to the raw character split. PSM round-trip invariant everywhere:
+# prefix + middle + suffix == original text.
+#
+# PACKING: the transform happens PER-DOCUMENT inside `fill_buffer`, BEFORE
+# tokens enter the packing buffer — doc_ids / EOS / cu_seqlens machinery see a
+# rendered FIM doc as just another document (same length bookkeeping path).
+#
+# CAVEAT (offline/live KD): reserved sentinel ids are out-of-range for a
+# teacher that lacks them; combining fim_rate>0 with KD needs a store/teacher
+# aware of the sentinels (train_lm prints a warning).
 
-_FIM_PREFIX = "<|fim_prefix|>"
-_FIM_SUFFIX = "<|fim_suffix|>"
-_FIM_MIDDLE = "<|fim_middle|>"
+# Native single-token sentinel names probed first (Qwen2.5 convention),
+# in (prefix, suffix, middle) order matching the PSM render.
+_NATIVE_FIM_TOKEN_STRINGS = ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>")
 
 
-def maybe_apply_fim(text: str, *, rng: random.Random, fim_rate: float) -> str:
-    """With probability `fim_rate`, reformat `text` as PSM Fill-in-the-Middle:
+def resolve_fim_sentinel_ids(tokenizer, thinking_token_id: int | None = None
+                             ) -> tuple[int, int, int]:
+    """Default FIM sentinel ids (prefix, suffix, middle) for `tokenizer`.
 
-        <|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>{middle}
-
-    The split picks two distinct char boundaries (0 < a < b < len(text)).
-    Otherwise the text is returned unchanged. Short texts (< 4 chars) are
-    always returned unchanged since there is no room for prefix/middle/suffix.
+    1. If the tokenizer has all three native single-token FIM sentinels
+       (Qwen2.5-style ``<|fim_prefix|>`` / ``<|fim_suffix|>`` /
+       ``<|fim_middle|>``), use their ids.
+    2. Otherwise reserve out-of-vocab ids with the [THINKING]-token mechanism:
+       the think slot is ``max(tok.vocab_size, len(tok))`` (train_lm.py
+       convention) and the sentinels take the next three ids. The think slot
+       is skipped even when thinking is disabled so the sentinel ids are
+       stable across runs with/without the thinking token. If the caller's
+       `thinking_token_id` sits even higher (added special tokens), we start
+       above it.
     """
-    if fim_rate <= 0.0:
-        return text
-    if rng.random() >= fim_rate:
-        return text
+    try:
+        vocab = tokenizer.get_vocab()
+    except Exception:
+        vocab = None
+    if vocab is not None and all(t in vocab for t in _NATIVE_FIM_TOKEN_STRINGS):
+        return tuple(int(vocab[t]) for t in _NATIVE_FIM_TOKEN_STRINGS)
+    base = int(max(int(getattr(tokenizer, "vocab_size", 0) or 0),
+                   len(tokenizer)))
+    if thinking_token_id is not None:
+        base = max(base, int(thinking_token_id))
+    return (base + 1, base + 2, base + 3)
+
+
+def fim_split(text: str, *, rng: random.Random,
+              min_middle_frac: float = 0.10,
+              max_middle_frac: float = 0.50,
+              snap_to_lines: bool = True
+              ) -> tuple[str, str, str] | None:
+    """Pick a FIM middle span and return ``(prefix, middle, suffix)`` with the
+    round-trip invariant ``prefix + middle + suffix == text``.
+
+    The middle length is drawn character-uniformly as a fraction in
+    [min_middle_frac, max_middle_frac] of the document, its start position
+    uniformly; the span is then snapped OUTWARD to line boundaries (start of
+    the line containing the first char, through the end of the line containing
+    the last char, newline included in the middle). See the module comment for
+    why line snapping. If snapping degenerates to the whole document (e.g. a
+    single-line doc) the raw character split is kept instead. Returns None
+    when the text is too short (< 4 chars) or no non-degenerate split exists —
+    the caller falls back to the plain (non-FIM) document.
+    """
     n = len(text)
     if n < 4:
-        return text
-    # Two distinct boundaries in (0, n); sort to get (a, b) with a < b.
-    a, b = sorted(rng.sample(range(1, n), 2))
-    prefix = text[:a]
-    middle = text[a:b]
-    suffix = text[b:]
-    return f"{_FIM_PREFIX}{prefix}{_FIM_SUFFIX}{suffix}{_FIM_MIDDLE}{middle}"
+        return None
+    frac = rng.uniform(min_middle_frac, max_middle_frac)
+    L = max(1, min(n - 2, int(round(frac * n))))
+    a = rng.randint(1, n - L - 1)          # middle start; pre-snap all three
+    b = a + L                              # half-open [a, b) — non-empty
+    if snap_to_lines:
+        a2 = text.rfind("\n", 0, a) + 1    # start of the line containing a
+        nl = text.find("\n", b - 1)        # end of the line containing b-1
+        b2 = n if nl == -1 else nl + 1     # newline stays in the middle
+        if not (a2 == 0 and b2 == n):      # degenerate: whole doc → keep (a,b)
+            a, b = a2, b2
+    prefix, middle, suffix = text[:a], text[a:b], text[b:]
+    if not middle or not (prefix or suffix):
+        return None
+    return prefix, middle, suffix
+
+
+def render_fim_psm_ids(text: str, tokenizer, *, rng: random.Random,
+                       sentinel_ids: tuple[int, int, int],
+                       min_middle_frac: float = 0.10,
+                       max_middle_frac: float = 0.50,
+                       snap_to_lines: bool = True) -> list[int] | None:
+    """Render `text` as PSM FIM token ids:
+
+        [FIM_PRE] enc(prefix) [FIM_SUF] enc(suffix) [FIM_MID] enc(middle)
+
+    The three segments are tokenized separately (`add_special_tokens=False`)
+    and joined with the single-token sentinels. Returns None when no usable
+    split exists (caller falls back to the plain document).
+    """
+    parts = fim_split(text, rng=rng, min_middle_frac=min_middle_frac,
+                      max_middle_frac=max_middle_frac,
+                      snap_to_lines=snap_to_lines)
+    if parts is None:
+        return None
+    prefix, middle, suffix = parts
+    pre_id, suf_id, mid_id = (int(i) for i in sentinel_ids)
+
+    def enc(t: str) -> list[int]:
+        return tokenizer.encode(t, add_special_tokens=False) if t else []
+
+    return ([pre_id] + enc(prefix) + [suf_id] + enc(suffix)
+            + [mid_id] + enc(middle))
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +611,8 @@ class MixedSourceStream(IterableDataset):
                  mask_eos_in_targets: bool = False,
                  emit_doc_ids: bool = False,
                  emit_read_mask: bool = False,
+                 emit_source_ids: bool = False,
+                 fim_sentinel_ids: tuple[int, int, int] | None = None,
                  ):
         if not sources:
             raise ValueError("sources must be non-empty")
@@ -509,8 +638,74 @@ class MixedSourceStream(IterableDataset):
         self.emit_read_mask = bool(emit_read_mask)
         if self.emit_read_mask:
             emit_doc_ids = True
+        # token-triage: emit a trailing per-position source-index channel (the
+        # sampled source of the packed chunk — constant across the block). A
+        # parallel channel that does NOT change the token stream, so it is
+        # transparent to the offline-KD lockstep alignment (which only checks
+        # input_ids). Default off → yields are byte-identical. Implies
+        # emit_doc_ids so the source channel is ALWAYS the LAST element with
+        # doc_ids present (keeps the consumer unpack unambiguous — the source
+        # channel can never be mistaken for doc_ids/read_mask).
+        self.emit_source_ids = bool(emit_source_ids)
+        if self.emit_source_ids:
+            emit_doc_ids = True
         self.emit_doc_ids = bool(emit_doc_ids)
         self._filters = [_build_filter(s.filter_spec) for s in sources]
+        # ---- FIM sentinel resolution + validation (see module FIM section).
+        # `fim_sentinel_ids=None` + any source with fim_rate>0 → resolve the
+        # repo-default ids from the tokenizer ([THINKING]-slot convention, or
+        # the tokenizer's native FIM tokens). No FIM source → stays None and
+        # the stream is byte-identical to the pre-FIM path.
+        fim_needed = any(float(s.fim_rate) > 0.0 for s in self.sources)
+        for s in self.sources:
+            if float(s.fim_rate) > 0.0 and s.emit_read_mask:
+                raise ValueError(
+                    f"source {s.name!r}: fim_rate>0 is incompatible with "
+                    "emit_read_mask (the answer-span char offsets are computed "
+                    "on the ORIGINAL text; the PSM re-render would silently "
+                    "misalign the read mask). Disable one of the two.")
+        if fim_sentinel_ids is not None:
+            self.fim_sentinel_ids = tuple(int(i) for i in fim_sentinel_ids)
+        elif fim_needed:
+            self.fim_sentinel_ids = resolve_fim_sentinel_ids(
+                tokenizer, thinking_token_id=thinking_token_id)
+        else:
+            self.fim_sentinel_ids = None
+        if self.fim_sentinel_ids is not None:
+            sids = self.fim_sentinel_ids
+            if len(sids) != 3 or len(set(sids)) != 3 or min(sids) < 0:
+                raise ValueError(
+                    f"fim_sentinel_ids must be 3 distinct non-negative ids, "
+                    f"got {sids}")
+            if (thinking_token_id is not None
+                    and int(thinking_token_id) in sids):
+                raise ValueError(
+                    f"fim_sentinel_ids {sids} collide with "
+                    f"thinking_token_id={int(thinking_token_id)}")
+        # ---- Per-source accounting (the min_content_len mandate: a silently
+        # dead / silently un-FIM'd source must be visible in diagnostics).
+        # Counters accumulate across __iter__ calls; NOTE they live in the
+        # DataLoader *worker* process when num_workers>0 — read them from the
+        # dataset object only under num_workers=0 (the offline-KD requirement)
+        # or in the _smoke CLI, which iterates in-process.
+        self.source_docs = [0] * len(self.sources)      # accepted documents
+        self.source_fim_docs = [0] * len(self.sources)  # docs PSM-rendered
+        self.source_tokens = [0] * len(self.sources)    # tokens buffered (+EOS)
+
+    def source_stats(self) -> list[dict]:
+        """Per-source accounting snapshot: name, docs, fim_docs, fim_frac,
+        tokens. See the __init__ comment for the num_workers caveat."""
+        out = []
+        for i, s in enumerate(self.sources):
+            docs = self.source_docs[i]
+            out.append({
+                "name": s.name,
+                "docs": docs,
+                "fim_docs": self.source_fim_docs[i],
+                "fim_frac": (self.source_fim_docs[i] / docs) if docs else 0.0,
+                "tokens": self.source_tokens[i],
+            })
+        return out
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         info = torch.utils.data.get_worker_info()
@@ -565,20 +760,37 @@ class MixedSourceStream(IterableDataset):
                 text = _extract_text(ex, text_field, text_builder=text_builder)
                 if text is None:
                     continue
-                if fim_rate > 0.0:
-                    text = maybe_apply_fim(text, rng=rng, fim_rate=fim_rate)
-                # v14: build ids + answer read-mask together for recall sources
-                # (offset mapping needs the same encode call). Non-mask streams
-                # and non-recall sources take the plain encode path.
+                # PSM FIM re-render (per-document, BEFORE packing — doc_ids /
+                # EOS / cu_seqlens machinery below see the rendered doc as an
+                # ordinary document). Full LM loss on the whole rendered
+                # sequence (no extra masking) — the standard FIM recipe; see
+                # the module FIM section. Falls back to the plain document
+                # when no usable split exists (short / degenerate docs).
+                ids = None
                 rmask = None
-                if self.emit_read_mask and src.emit_read_mask:
-                    built = _build_read_mask(ex, text, src, tok)
-                    if built is not None:
-                        ids, rmask = built
+                fim_applied = False
+                if fim_rate > 0.0 and rng.random() < fim_rate:
+                    ids = render_fim_psm_ids(
+                        text, tok, rng=rng,
+                        sentinel_ids=self.fim_sentinel_ids)
+                    fim_applied = ids is not None
+                if ids is None:
+                    # v14: build ids + answer read-mask together for recall
+                    # sources (offset mapping needs the same encode call).
+                    # Non-mask streams and non-recall sources take the plain
+                    # encode path.
+                    if self.emit_read_mask and src.emit_read_mask:
+                        built = _build_read_mask(ex, text, src, tok)
+                        if built is not None:
+                            ids, rmask = built
+                        else:
+                            ids = tok.encode(text, add_special_tokens=False)
                     else:
                         ids = tok.encode(text, add_special_tokens=False)
-                else:
-                    ids = tok.encode(text, add_special_tokens=False)
+                self.source_docs[idx] += 1
+                if fim_applied:
+                    self.source_fim_docs[idx] += 1
+                self.source_tokens[idx] += len(ids) + 1   # +1 = EOS below
                 buffers[idx].extend(ids)
                 buffers[idx].append(eos)
                 if self.emit_doc_ids:
@@ -691,18 +903,28 @@ class MixedSourceStream(IterableDataset):
                 eos_mask = (targets == int(eos))
                 if eos_mask.any():
                     targets = targets.masked_fill(eos_mask, -100)
+            # token-triage per-position source index (LAST channel). The whole
+            # packed chunk is drawn from a single source `idx`, so it is constant
+            # across the block; appended last so it can never be confused with
+            # the read-mask / doc-ids channels on the consumer side.
+            src_row = (torch.full((inputs.shape[0],), int(idx), dtype=torch.long)
+                       if self.emit_source_ids else None)
             if self.emit_doc_ids:
                 # Align with `inputs` (drop the last position) and normalise
                 # to 0-based per chunk so doc_ids start at 0 in every row.
                 row = chunk_docids[:-1]
                 mn = min(row) if row else 0
                 doc_ids = torch.tensor([d - mn for d in row], dtype=torch.long)
+                out = (inputs, targets, doc_ids)
                 if self.emit_read_mask:
                     read_mask = torch.tensor(chunk_readmask[:-1],
                                              dtype=torch.long)
-                    yield inputs, targets, doc_ids, read_mask
-                else:
-                    yield inputs, targets, doc_ids
+                    out = out + (read_mask,)
+                if src_row is not None:
+                    out = out + (src_row,)
+                yield out
+            elif src_row is not None:
+                yield inputs, targets, src_row
             else:
                 yield inputs, targets
 
@@ -797,6 +1019,11 @@ def _smoke(args):
     print(f"  burst injection rate: {burst_hits}/{len(chunk_lens)} = "
           f"{burst_hits/max(1,len(chunk_lens)):.3f} "
           f"(target ~{args.think_burst_prob})")
+    print("\nPer-source accounting (docs / FIM'd frac / tokens):")
+    for st in ds.source_stats():
+        print(f"  - {st['name']:30s} docs={st['docs']:7d}  "
+              f"fim={st['fim_docs']:6d} ({st['fim_frac']:.3f})  "
+              f"tokens={st['tokens']:10d}")
     print("\nSample chunks:")
     for name, prev in samples:
         print(f"  [{name}] {prev}")

@@ -101,3 +101,19 @@ overfit consolidation. The N1→N1′ precedent applies: this kills the PILOT, n
 cleanly the mechanism. IF the bet is retried, the single-variable fix is a
 10–50× episode corpus (scan more of codeparrot; the 300k-row scan was a pilot
 slice) + early-stop on train-CE saturation. Otherwise: park per registration.
+
+## P1′ PRE-REGISTRATION (locked 2026-07-14, BEFORE corpus generation)
+
+Single retry of the pilot with the instrument fixed. Locked lines:
+1. **Corpus**: ≥5,000 train episodes from repos DISJOINT from the frozen P0
+   eval set (`data/repo_episodes/eval*.jsonl` is reused UNCHANGED for
+   comparability with the P0 baselines; the deterministic repo-hash split
+   guarantees new train repos exclude eval-side repos).
+2. **Engagement guard**: if train mttt CE saturates (<0.1 sustained) before
+   60% of the run, the run is VOID (instrument still too small) — it does not
+   count as a mechanism test either way.
+3. **Kill line unchanged**: held-out lift(shuffled−real) must CLEARLY exceed
+   the incidental baseline (+0.138 line / +0.246 span on stageA_executor).
+4. **No P1′′.** A valid kill parks meta-TTT; adaptivity falls back to the
+   state-cartridges/self-study tier (kept alive by the State-Algebra partial-
+   additivity result) + LoRA-sleep consolidation.

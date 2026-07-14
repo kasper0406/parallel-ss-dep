@@ -1,0 +1,235 @@
+# Microanneal arm-B mix (2026-07-14) — Tier-1 kill-test #1 (OLMo-2-style
+# microanneal A/B; ideas_2026_07_13/10_small_model_recipes.md element #1,
+# IDEAS_2026_07_13.md convergence #2).
+#
+# Composition: ~40% OpenCoder annealing corpus + ~10% FineMath-4plus + ~50%
+# the feature-pilot mix (configs/pretrain_mix_feature_pilot.yaml) with every
+# weight scaled by exactly 0.5. The control arm trains on the unscaled pilot
+# mix; the ONLY difference between arms is this data swap.
+#
+# !!! SCHEMA SWAP WARNING (verified against the local HF cache 2026-07-14,
+# snapshot 078e4bc1) — the opc-annealing-corpus HF *config names* do NOT
+# match their *contents*; two of the three are swapped:
+#   - config "synthetic_qa"        -> raw Stack-v2 algorithm FILES
+#     ({text, file_name, file_ext, file_size_in_byte, lang, program_lang}) =
+#     the paper's 12.4B-token ALGORITHMIC CORPUS (17G local, largest split).
+#   - config "algorithmic_corpus"  -> {type:"qa", lang, text} records
+#     ("Write a python function ... ```code``` ... tests") = the paper's
+#     synthetic QA (3.7G local).
+#   - config "synthetic_code_snippet" -> {type:"snippet", lang, text},
+#     matches its label (4.7G local).
+# Source names below follow CONTENT; hf_extra.name carries the (swapped)
+# upstream config name. All three expose a "text" field.
+#
+# opc sub-split weights are proportional to local raw size (17 : 4.7 : 3.7
+# scaled into the 0.40 share -> 0.268 / 0.074 / 0.058, rounded 0.27/0.07/0.06)
+# — which is also the OpenCoder-ablation-consistent emphasis on the
+# algorithmic corpus (2/3 of the opc share).
+#
+# FIM policy matches the pilot's per-source treatment: raw-code streams get
+# fim_rate 0.5 (like codeparrot), QA/instruction/prose streams get none.
+
+sources:
+
+  # ==== OpenCoder annealing corpus (~40%) ====
+
+  # CONTENT: algorithmic corpus (raw Stack-v2 algorithm files).
+  # NOTE the swapped upstream config name "synthetic_qa" — see header.
+  - name: opc_algorithmic
+    dataset_id: OpenCoder-LLM/opc-annealing-corpus
+    hf_extra: { name: "synthetic_qa" }
+    text_field: text
+    split: train
+    weight: 0.27
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  # CONTENT: synthetic code snippets (rewritten from algorithmic seeds).
+  - name: opc_synthetic_snippet
+    dataset_id: OpenCoder-LLM/opc-annealing-corpus
+    hf_extra: { name: "synthetic_code_snippet" }
+    text_field: text
+    split: train
+    weight: 0.07
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  # CONTENT: synthetic QA ("Write a python function..." + solution + tests).
+  # NOTE the swapped upstream config name "algorithmic_corpus" — see header.
+  - name: opc_synthetic_qa
+    dataset_id: OpenCoder-LLM/opc-annealing-corpus
+    hf_extra: { name: "algorithmic_corpus" }
+    text_field: text
+    split: train
+    weight: 0.06
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  # ==== FineMath 4+ (~10%) ====
+
+  - name: finemath_4plus
+    dataset_id: HuggingFaceTB/finemath
+    hf_extra: { name: "finemath-4plus" }
+    text_field: text
+    split: train
+    weight: 0.10
+    filter:
+      name: min_content_len
+      args: { min_chars: 200 }
+
+  # ==== Pilot mix, every weight x0.5 (~50%) ====
+  # Verbatim from configs/pretrain_mix_feature_pilot.yaml except the weights.
+
+  # -- recall-bearing --
+
+  - name: recall_diverse_train
+    jsonl_path: data/recall_diverse_train.jsonl
+    text_field: text
+    split: train
+    weight: 0.05
+    filter: always
+
+  - name: natural_reuse_recall
+    jsonl_path: data/natural_reuse_recall.jsonl
+    text_field: text
+    answer_field: text
+    answer_span_field: answer_char_span
+    split: train
+    weight: 0.04
+    filter: always
+    emit_read_mask: true
+
+  - name: multibind_recall_pretrain
+    jsonl_path: data/multibind_recall_pretrain.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.015
+    filter: always
+    emit_read_mask: true
+
+  - name: code_recall_train
+    jsonl_path: data/code_recall_train.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.01
+    filter: always
+    emit_read_mask: true
+    mask_first_occurrence: true
+
+  - name: agentic_recall_train
+    jsonl_path: data/agentic_recall_train.jsonl
+    text_field: [problem_prompt, qwen_completion]
+    split: train
+    weight: 0.01
+    filter: always
+    emit_read_mask: true
+    mask_first_occurrence: true
+
+  # -- raw code --
+
+  - name: codeparrot
+    dataset_id: codeparrot/codeparrot-clean
+    text_field: content
+    split: train
+    weight: 0.14
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 200 }
+
+  - name: python_codes_25k
+    dataset_id: flytech/python-codes-25k
+    text_field: text
+    split: train
+    weight: 0.035
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  # -- problem-solving instruction code --
+
+  - name: magicoder_oss
+    dataset_id: ise-uiuc/Magicoder-OSS-Instruct-75K
+    text_field: [problem, solution]
+    split: train
+    weight: 0.045
+    fim_rate: 0.5
+    filter:
+      name: min_content_len
+      args: { min_chars: 100 }
+
+  - name: code_exercises_jinaai
+    dataset_id: jinaai/code_exercises
+    text_field: [problem, solution]
+    split: train
+    weight: 0.01
+    fim_rate: 0.5
+    filter: always
+
+  - name: python_instr_18k_alpaca
+    dataset_id: iamtarun/python_code_instructions_18k_alpaca
+    text_field: [prompt, output]
+    split: train
+    weight: 0.025
+    filter: always
+
+  - name: codealpaca_20k
+    dataset_id: HuggingFaceH4/CodeAlpaca_20K
+    text_field: [prompt, completion]
+    split: train
+    weight: 0.02
+    filter: always
+
+  # -- CVE / vulnerability + fix --
+
+  - name: bigvul
+    dataset_id: bstee615/bigvul
+    text_builder: bigvul
+    split: train
+    weight: 0.03
+    filter: bigvul_vulnerable
+
+  - name: cybernative_vuln_dpo
+    dataset_id: CyberNative/Code_Vulnerability_Security_DPO
+    text_builder: cybernative_dpo
+    split: train
+    weight: 0.015
+    filter: always
+
+  # -- synthetic CS textbooks --
+
+  - name: textbooks_lite_sciphi
+    dataset_id: SciPhi/textbooks-are-all-you-need-lite
+    text_field: completion
+    split: train
+    weight: 0.015
+    filter:
+      name: min_content_len
+      args: { min_chars: 400 }
+
+  - name: textbook_quality_programming
+    dataset_id: vikp/textbook_quality_programming
+    text_field: markdown
+    split: train
+    weight: 0.015
+    filter:
+      name: min_content_len
+      args: { min_chars: 400 }
+
+  # -- Wikipedia (prose grounding) --
+
+  - name: wikipedia_en
+    dataset_id: wikimedia/wikipedia
+    hf_extra: { name: "20231101.en" }
+    text_field: text
+    split: train
+    weight: 0.025
+    filter:
+      name: min_content_len
+      args: { min_chars: 500 }

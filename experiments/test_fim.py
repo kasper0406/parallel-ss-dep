@@ -418,3 +418,52 @@ def test_sentinel_ids_must_be_three_distinct():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------------------------------------------------------- #
+# Legacy string-sentinel replay mode (2026-07-14: reinstated for lineage-
+# comparability continuations — see maybe_apply_fim's docstring).
+# --------------------------------------------------------------------------- #
+
+def test_legacy_maybe_apply_fim_verbatim_semantics():
+    import random as _r
+    from experiments.data_mix import maybe_apply_fim, _FIM_PREFIX, _FIM_SUFFIX, _FIM_MIDDLE
+    rng = _r.Random(7)
+    text = "abcdefghij"
+    out = maybe_apply_fim(text, rng=rng, fim_rate=1.0)
+    assert out.startswith(_FIM_PREFIX)
+    # reassembly: prefix + middle + suffix == original
+    body = out[len(_FIM_PREFIX):]
+    pfx, rest = body.split(_FIM_SUFFIX, 1)
+    sfx, mid = rest.split(_FIM_MIDDLE, 1)
+    assert pfx + mid + sfx == text
+    # rate=0 and short docs are unchanged
+    assert maybe_apply_fim(text, rng=_r.Random(0), fim_rate=0.0) is text
+    assert maybe_apply_fim("ab", rng=_r.Random(0), fim_rate=1.0) == "ab"
+
+
+def test_legacy_mode_stream_no_reserved_ids(tmp_path):
+    """fim_legacy_strings=True: no sentinel-id resolution (works on ckpts whose
+    embedding is exactly the base vocab), transform is text-level, and the
+    fim-doc accounting still fires."""
+    import json as _json
+    from experiments.data_mix import MixedSourceStream, SourceConfig
+    p = tmp_path / "docs.jsonl"
+    rows = [{"text": "x = 1\ny = 2\nz = x + y\nprint(z)\n" + "pad " * 30}
+            for _ in range(30)]
+    p.write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
+    tok = _CharTok() if "_CharTok" in globals() else None
+    if tok is None:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    src = SourceConfig(name="d", weight=1.0, dataset_id="",
+                       text_field="text", jsonl_path=str(p), fim_rate=1.0)
+    ms = MixedSourceStream(sources=[src], tokenizer=tok, block_size=128,
+                           thinking_token_id=None, think_burst_prob=0.0,
+                           base_seed=0, fim_legacy_strings=True)
+    assert ms.fim_sentinel_ids is None
+    it = iter(ms)
+    for _ in range(4):
+        next(it)
+    stats = ms.source_stats()
+    assert stats[0]["fim_docs"] > 0          # transform fired + accounted

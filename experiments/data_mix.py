@@ -255,6 +255,40 @@ class SourceConfig:
 # in (prefix, suffix, middle) order matching the PSM render.
 _NATIVE_FIM_TOKEN_STRINGS = ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>")
 
+# ---------------------------------------------------------------------------
+# LEGACY string-sentinel FIM (verbatim from the pre-2026-07-14 implementation,
+# git 77b92a0~1). Kept ONLY for lineage-comparability continuations: every run
+# from the v4 era through stageA/stageB/the attribution control's first leg
+# trained with THIS transform (marker strings splice as plain BPE — 8 tokens
+# per marker on SmolLM2 — char-level split, no line snapping). New runs should
+# use the token-sentinel path; this mode exists so a resumed/matched run keeps
+# its data distribution identical to its comparison lineage. It also needs no
+# reserved ids, so it works with --keep_base_vocab ckpts whose embedding is
+# exactly the base vocab (e.g. the lean linearized 49152-vocab lineage).
+# ---------------------------------------------------------------------------
+_FIM_PREFIX = "<|fim_prefix|>"
+_FIM_SUFFIX = "<|fim_suffix|>"
+_FIM_MIDDLE = "<|fim_middle|>"
+
+
+def maybe_apply_fim(text: str, *, rng: random.Random, fim_rate: float) -> str:
+    """LEGACY transform — with probability `fim_rate`, reformat `text` as
+    ``<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>{middle}``
+    (marker STRINGS, char-level split; see the legacy note above). Verbatim
+    from the pre-token-sentinel implementation for byte-faithful replay."""
+    if fim_rate <= 0.0:
+        return text
+    if rng.random() >= fim_rate:
+        return text
+    n = len(text)
+    if n < 4:
+        return text
+    a, b = sorted(rng.sample(range(1, n), 2))
+    prefix = text[:a]
+    middle = text[a:b]
+    suffix = text[b:]
+    return f"{_FIM_PREFIX}{prefix}{_FIM_SUFFIX}{suffix}{_FIM_MIDDLE}{middle}"
+
 
 def resolve_fim_sentinel_ids(tokenizer, thinking_token_id: int | None = None
                              ) -> tuple[int, int, int]:
@@ -613,6 +647,7 @@ class MixedSourceStream(IterableDataset):
                  emit_read_mask: bool = False,
                  emit_source_ids: bool = False,
                  fim_sentinel_ids: tuple[int, int, int] | None = None,
+                 fim_legacy_strings: bool = False,
                  ):
         if not sources:
             raise ValueError("sources must be non-empty")
@@ -664,7 +699,13 @@ class MixedSourceStream(IterableDataset):
                     "emit_read_mask (the answer-span char offsets are computed "
                     "on the ORIGINAL text; the PSM re-render would silently "
                     "misalign the read mask). Disable one of the two.")
-        if fim_sentinel_ids is not None:
+        self.fim_legacy_strings = bool(fim_legacy_strings)
+        if self.fim_legacy_strings:
+            # Legacy string-sentinel mode (lineage-comparability replay):
+            # the text-level `maybe_apply_fim` transform is used instead of
+            # the token-sentinel PSM render — no reserved ids to resolve.
+            self.fim_sentinel_ids = None
+        elif fim_sentinel_ids is not None:
             self.fim_sentinel_ids = tuple(int(i) for i in fim_sentinel_ids)
         elif fim_needed:
             self.fim_sentinel_ids = resolve_fim_sentinel_ids(
@@ -769,7 +810,15 @@ class MixedSourceStream(IterableDataset):
                 ids = None
                 rmask = None
                 fim_applied = False
-                if fim_rate > 0.0 and rng.random() < fim_rate:
+                if fim_rate > 0.0 and self.fim_legacy_strings:
+                    # Legacy replay: text-level string-sentinel transform
+                    # (rate draw happens INSIDE maybe_apply_fim, matching the
+                    # original implementation's rng-consumption order).
+                    new_text = maybe_apply_fim(text, rng=rng,
+                                               fim_rate=fim_rate)
+                    fim_applied = new_text is not text
+                    text = new_text
+                elif fim_rate > 0.0 and rng.random() < fim_rate:
                     ids = render_fim_psm_ids(
                         text, tok, rng=rng,
                         sentinel_ids=self.fim_sentinel_ids)

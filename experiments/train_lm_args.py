@@ -1150,6 +1150,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "Loss = CE on the remaining text+final + per-hop CE "
                         "decoding each latent slot to its intermediate. Default "
                         "off = the ordinary depth-matched path (byte-identical).")
+    p.add_argument("--fim_legacy_strings", action="store_true",
+                   help="LEGACY string-sentinel FIM (pre-2026-07-14 behavior: "
+                        "<|fim_prefix|> etc. spliced as plain BPE strings, "
+                        "char-level split). ONLY for lineage-comparability "
+                        "continuations of runs trained before the token-"
+                        "sentinel FIM (v4-era .. stageA/stageB/attribution-"
+                        "control-r1) and for --keep_base_vocab ckpts whose "
+                        "embedding cannot fit reserved sentinel ids. New runs "
+                        "should use the default token-sentinel path.")
     p.add_argument("--latent_reasoning_depth_weighted", action="store_true",
                    help="Stage-B hop-7+ cliff fix arm (2026-07-13): "
                         "depth-weighted curriculum sampling — consolidation "

@@ -1337,7 +1337,11 @@ def main():
         # think slot 49152 → sentinels 49153/49154/49155, inside the round64
         # padding → model_vocab_size unchanged (ckpt shape-identical).
         fim_sentinel_ids = None
-        if any(float(s.fim_rate) > 0.0 for s in sources):
+        _fim_legacy = bool(getattr(args, "fim_legacy_strings", False))
+        if _fim_legacy and any(float(s.fim_rate) > 0.0 for s in sources):
+            print("  FIM: LEGACY string-sentinel mode (lineage-comparability "
+                  "replay; no reserved ids, no vocab growth)")
+        elif any(float(s.fim_rate) > 0.0 for s in sources):
             from experiments.data_mix import resolve_fim_sentinel_ids
             fim_sentinel_ids = resolve_fim_sentinel_ids(
                 tok, thinking_token_id=thinking_token_id)
@@ -1380,6 +1384,7 @@ def main():
             # chunk (each chunk is drawn from a single source).
             emit_source_ids=bool(getattr(args, "token_triage", False)),
             fim_sentinel_ids=fim_sentinel_ids,
+            fim_legacy_strings=_fim_legacy,
         )
         _want_source_ids = bool(getattr(args, "token_triage", False))
         # Val: same sources, different seed, burst injection off so val PPL
@@ -1392,6 +1397,7 @@ def main():
             mask_eos_in_targets=bool(args.mask_eos_in_targets),
             emit_doc_ids=True,
             fim_sentinel_ids=fim_sentinel_ids,
+            fim_legacy_strings=_fim_legacy,
         )
         train_loader = DataLoader(train_ds, batch_size=args.batch,
                                   num_workers=args.num_workers)

@@ -48,6 +48,10 @@ class _CharTok:
     def encode(self, text, add_special_tokens=False):
         return [2 + (ord(c) % 200) for c in text]
 
+    def decode(self, ids, skip_special_tokens=False):
+        # inverse only for chars whose ord < 200 (digits/ascii — all we use)
+        return "".join(chr(i - 2) for i in ids)
+
 
 class _MockModel:
     """Minimal forward_step model: predicts (last input token + 1) % vocab,
@@ -214,11 +218,19 @@ def test_binding_context_overlap_construction():
 
 
 def test_line_and_query_ids_prefix_protocol():
+    """Trained-format contract (2026-07-14 fix — the first probe run used an
+    ad-hoc format and read a 0.000 sequential ceiling): line = `vN = DDDD\\n`,
+    query closes the program (`print(vN)...Answer:`), value = answer digits,
+    and query+value+newline tokenizes consistently with the query prefix."""
     tok = _CharTok()
-    l_ids, q_ids, v_ids = psa.line_and_query_ids(tok, "va007", "1234")
-    assert l_ids[: len(q_ids)] == q_ids                # query = line prefix
-    assert v_ids == tok.encode("1234")                 # newline stripped
-    assert l_ids == q_ids + v_ids + tok.encode("\n")
+    l_ids, q_ids, v_ids = psa.line_and_query_ids(tok, "v7", "1234")
+    assert l_ids == tok.encode("v7 = 1234\n")          # trained line format
+    full = tok.encode("print(v7)\n```\nThe program assigns variables. `v7` is set to 1234,\n")
+    assert full[: len(q_ids)] == q_ids                 # query = tail prefix
+    assert full[len(q_ids):] == v_ids + tok.encode(",\n")
+    # the decoded value tokens are exactly the digits (possibly with a
+    # leading space merged in by BPE — _CharTok has no merges, so exact)
+    assert tok.decode(v_ids).strip() == "1234"
 
 
 def test_build_trial_groups_and_scoring_targets():

@@ -98,7 +98,18 @@ def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
 # --------------------------------------------------------------------------- #
 
 def _mk_names(idxs) -> list[str]:
-    return [f"va{i:03d}" for i in idxs]
+    # Trained multibind naming (gen_multibind_recall.py): v0, v1, ...
+    return [f"v{i}" for i in idxs]
+
+
+# The TRAINED multibind rendering (gen_multibind_recall.py::_gen_multibind).
+# The first probe run used an ad-hoc `vaNNN=DDDD` format and read a 0.000
+# SEQUENTIAL ceiling — the probe-format trap (same ckpt, wrong rendering →
+# recall reads 0; cf. the WM-recall-probe post-mortem). Everything below
+# matches the trained format exactly: program wrapper, `vN = DDDD` lines,
+# `print(vN)` close, `Answer: NNNN` answer cue.
+_WRAPPER_HEAD = ("Run the following Python program and report what it "
+                 "prints.\n\n```python\n")
 
 
 def build_binding_contexts(n_bindings: int, rng: random.Random,
@@ -145,29 +156,32 @@ def build_binding_contexts(n_bindings: int, rng: random.Random,
 def line_and_query_ids(tok, name: str, value: str) -> tuple[list[int],
                                                             list[int],
                                                             list[int]]:
-    """Tokenize one binding line so the query prefix is EXACTLY the line's
-    leading tokens (first-occurrence protocol: the query replays the binding
-    line up to and including '='; the value tokens are the teacher-forced
-    targets). Context token streams are built by concatenating per-line ids,
-    so this consistency is exact by construction, no boundary-merge risk.
+    """Tokenize one binding line (TRAINED format `vN = DDDD\\n`) plus the
+    trained query/answer rendering: the query CLOSES the program with
+    `print(vN)\\n```\\n\\nAnswer:` and the value tokens are the teacher-forced
+    answer digits. The query/value split is chosen so query_ids is an exact
+    token prefix of query+value (two candidate splits tried — BPE may merge
+    the space after 'Answer:' into the first digit token).
 
     Returns (line_ids, query_ids, value_ids)."""
-    query = f"{name}="
-    line = f"{name}={value}\n"
-    q_ids = tok.encode(query, add_special_tokens=False)
+    line = f"{name} = {value}\n"
     l_ids = tok.encode(line, add_special_tokens=False)
-    if l_ids[: len(q_ids)] != q_ids:
-        raise ValueError(
-            f"tokenizer merges across the '=' boundary for {line!r}: "
-            f"{l_ids[:len(q_ids)]} != {q_ids}")
-    # value tokens = everything after the query prefix, minus the trailing \n
-    nl_ids = tok.encode("\n", add_special_tokens=False)
-    v_ids = l_ids[len(q_ids):]
-    if v_ids[-len(nl_ids):] == nl_ids:
-        v_ids = v_ids[: -len(nl_ids)]
-    if not v_ids:
-        raise ValueError(f"empty value-token span for {line!r}")
-    return l_ids, q_ids, v_ids
+    # First-occurrence answer cue in the TRAINED completion is the prose
+    # restatement ("`vN` is set to NNNN"), which precedes "Answer:".
+    stem = f"print({name})\n```\nThe program assigns variables. `{name}` is set to"
+    tail = f"{stem} {value},\n"
+    full_ids = tok.encode(tail, add_special_tokens=False)
+    nl_ids = tok.encode(",\n", add_special_tokens=False)
+    for query in (f"{stem} ", stem):
+        q_ids = tok.encode(query, add_special_tokens=False)
+        if full_ids[: len(q_ids)] == q_ids:
+            v_ids = full_ids[len(q_ids):]
+            if v_ids[-len(nl_ids):] == nl_ids:
+                v_ids = v_ids[: -len(nl_ids)]
+            if v_ids:
+                return l_ids, q_ids, v_ids
+    raise ValueError(
+        f"no query split is a token prefix of {tail!r} for this tokenizer")
 
 
 def build_trial(tok, n_bindings: int, rng: random.Random,
@@ -180,8 +194,9 @@ def build_trial(tok, n_bindings: int, rng: random.Random,
     `alt_value_ids` (shared only) is the A/earlier value for the
     interference diagnostic."""
     ctx = build_binding_contexts(n_bindings, rng, overlap_frac)
-    ids_a: list[int] = []
-    ids_b: list[int] = []
+    head_ids = tok.encode(_WRAPPER_HEAD, add_special_tokens=False)
+    ids_a: list[int] = list(head_ids)
+    ids_b: list[int] = list(head_ids)
     queries: list[dict] = []
     shared_names = {nm for nm, _, _ in ctx["shared"]}
 
@@ -209,7 +224,13 @@ def build_trial(tok, n_bindings: int, rng: random.Random,
             queries.append({"name": nm, "query_ids": rec["query_ids"],
                             "value_ids": rec["b_value_ids"],
                             "alt_value_ids": None, "group": "B"})
-    return {"ids_a": ids_a, "ids_b": ids_b, "queries": queries}
+    # seq = ONE well-formed program (wrapper + A lines + B lines); the merged
+    # arms each ingest their own full wrapped doc (that's what shard-merging
+    # means in practice).
+    n_head = len(head_ids)
+    ids_seq = list(head_ids) + ids_a[n_head:] + ids_b[n_head:]
+    return {"ids_a": ids_a, "ids_b": ids_b, "ids_seq": ids_seq,
+            "queries": queries}
 
 
 # --------------------------------------------------------------------------- #
@@ -463,7 +484,7 @@ def build_arm_states(model, trial: dict, device) -> dict:
     """(arm -> (states, seen)) for all MERGE_ARMS on one trial."""
     st_a, seen_a = ingest(model, trial["ids_a"], device)
     st_b, seen_b = ingest(model, trial["ids_b"], device)
-    st_seq, seen_seq = ingest(model, trial["ids_a"] + trial["ids_b"], device)
+    st_seq, seen_seq = ingest(model, trial["ids_seq"], device)
     seen_m = seen_a + seen_b                   # bookkeeping only (max_T==0)
     return {
         "seq": (st_seq, seen_seq),

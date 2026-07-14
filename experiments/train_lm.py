@@ -1270,11 +1270,12 @@ def main():
     # gate-calibration smoke, bug #1) as a hard crash mid-run. Auto-disable
     # compile rather than relying on every launcher remembering --no-compile.
     if bool(args.compile) and (getattr(args, "latent_cotrain_weight", 0.0) > 0.0
-                               or getattr(args, "latent_reasoning_weight", 0.0) > 0.0):
+                               or getattr(args, "latent_reasoning_weight", 0.0) > 0.0
+                               or getattr(args, "meta_ttt_weight", 0.0) > 0.0):
         print("[compile] AUTO-DISABLED: --latent_cotrain_weight/"
-              "--latent_reasoning_weight run variable-shape extra forwards "
-              "that crash Inductor under strict compile. Pass --no-compile "
-              "to silence this message.")
+              "--latent_reasoning_weight/--meta_ttt_weight run variable-shape "
+              "extra forwards that crash Inductor under strict compile. Pass "
+              "--no-compile to silence this message.")
         args.compile = False
     from experiments.speed_knobs import apply_speed_knobs
     apply_speed_knobs(model, bf16=bool(args.bf16), tf32=bool(args.tf32),
@@ -1554,6 +1555,33 @@ def main():
               f"batch_examples={_latent_reasoner.batch_examples} "
               f"(examples/rung: "
               f"{ {n: len(_latent_reasoner.data[n]) for n in _latent_reasoner.rungs} })")
+    # Meta-TTT episode co-train (repo-adaptive coder, Phase P1 — 2026-07-13).
+    # Loads the repo-episode corpus once; emits one answer-span CE loss per
+    # (every-K) optimizer step after chunked repo ingestion (state carried
+    # across the episode, truncated BPTT over the last --meta_ttt_grad_chunks
+    # chunks). Co-trained at low weight ALONGSIDE the --data_mix retention
+    # anchor. See experiments/meta_ttt_train.py.
+    _meta_ttt = None
+    if getattr(args, "meta_ttt_weight", 0.0) > 0.0:
+        from experiments.meta_ttt_train import MetaTTTEpisodeTrainer
+        _meta_ttt = MetaTTTEpisodeTrainer(
+            train_prefix=args.meta_ttt_train_prefix, tok=tok, device="cuda",
+            chunk_size=int(getattr(args, "meta_ttt_chunk_size", args.T)),
+            grad_chunks=int(args.meta_ttt_grad_chunks),
+            prefix_supervise_m=int(args.meta_ttt_prefix_supervise_m),
+            max_ctx_tokens=int(args.meta_ttt_max_ctx_tokens),
+            seed=int(args.seed))
+        _meta_ttt_every = max(1, int(getattr(args, "meta_ttt_every", 1)))
+        print(f"Meta-TTT episode co-train ON: weight={args.meta_ttt_weight} "
+              f"grad_chunks={_meta_ttt.grad_chunks} "
+              f"chunk_size={_meta_ttt.chunk_size} "
+              f"prefix_M={_meta_ttt.prefix_supervise_m} "
+              f"every={_meta_ttt_every} "
+              f"episodes={_meta_ttt.n_episodes} (dropped {_meta_ttt.n_dropped}) "
+              f"per-bucket="
+              f"{ {b: len(_meta_ttt.by_bucket[b]) for b in _meta_ttt.buckets} } "
+              f"from {_meta_ttt.path}")
+
     # Engagement kill-gate, part 2b: STARTUP construction assert (recipe rule
     # #1). If --latent_reasoning_weight>0 said "on", the reasoner object MUST
     # exist by here — this is exactly the Phase-1 arm-B failure mode (the
@@ -2354,6 +2382,7 @@ def main():
             n_micro = max(1, args.grad_accum)
             _latent_cotrain_diag = None
             _latent_reasoning_diag = None
+            _meta_ttt_diag = None
             _gate_calib_diag = None
             _ctx_addr_diag = None
             for micro in range(n_micro):
@@ -2541,6 +2570,21 @@ def main():
                         _latent_reason_all_finite = (
                             _latent_reason_all_finite
                             and math.isfinite(_latent_reasoning_diag[0]))
+                    # Meta-TTT episode co-train: one answer-span CE after chunked
+                    # repo ingestion (state carried across the episode; grad only
+                    # on the last --meta_ttt_grad_chunks chunks). Fires once/step
+                    # (last microbatch), every --meta_ttt_every steps at K x the
+                    # weight — same as --latent_reasoning_aux_every: scaled by
+                    # n_micro so the per-step gradient matches --meta_ttt_weight
+                    # after (loss / n_micro).backward(). Default weight 0 = OFF.
+                    if _meta_ttt is not None and _is_last_micro:
+                        _mt_fire, _mt_every_mult = _latent_reasoning_aux_every_gate(
+                            step, 0, int(getattr(args, "meta_ttt_every", 1)))
+                        if _mt_fire:
+                            _mt_loss, _mt_d = _meta_ttt.step(model)
+                            loss = loss + (n_micro * args.meta_ttt_weight
+                                           * _mt_every_mult) * _mt_loss
+                            _meta_ttt_diag = _mt_d
                     # Gate-calibration: train the OUTPUT GATE (not the trunk) to
                     # fire think exactly where a latent think raises
                     # logp(true_next). The BCE flows ONLY into the grad-carrying
@@ -2654,6 +2698,17 @@ def main():
                          f"R={_rr},ramp={_rmp:.2f}")
                 if getattr(_latent_reasoner, "trace_mode", False):
                     line += f",K={getattr(_latent_reasoner, 'last_K', -1)}"
+                line += ")"
+            if _meta_ttt is not None and _meta_ttt_diag is not None:
+                # ce = eval-matched task-line CE; ctx = ingested repo tokens;
+                # bkt = n_ctx bucket; gt = grad-window tokens (truncated BPTT).
+                _mspan = _meta_ttt_diag.get("span_ce")
+                line += (f"  mttt(ce={_meta_ttt_diag['ce']:.3f},"
+                         f"ctx={_meta_ttt_diag['ctx']},"
+                         f"bkt={_meta_ttt_diag['bkt']},"
+                         f"gt={_meta_ttt_diag['grad_tokens']}")
+                if _mspan is not None:
+                    line += f",span={_mspan:.3f}"
                 line += ")"
             if getattr(args, "gate_calibration_weight", 0.0) > 0.0 and \
                     _gate_calib_diag is not None:

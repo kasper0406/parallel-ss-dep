@@ -1073,6 +1073,45 @@ def build_parser() -> argparse.ArgumentParser:
                         "(which only receive gradient from deep-stage x "
                         "deep-rung draws) stop being starved. Default off = "
                         "the original uniform Stage-B recipe.")
+    # --- Meta-TTT episode co-train (repo-adaptive coder, Phase P1) ---
+    # Meta-trains DeltaNet's recurrent state into a test-time learner over
+    # full-repo ingestion: read a repo (4-32k tok) at O(1) cost, supervise CE
+    # ONLY on the cross-file usage task span. Aux path mirrors
+    # --latent_reasoning_weight; co-train alongside the --data_mix retention
+    # anchor. Truncated BPTT: the last --meta_ttt_grad_chunks context chunks are
+    # grad-enabled, earlier chunks no_grad (state carried, detached at the
+    # boundary). See experiments/meta_ttt_train.py + META_TTT_PLAN_2026_07_13.md.
+    # Default 0.0 = OFF (byte-identical). No thinking token / --no-compile needed
+    # for this path per se, but episodes need --T-independent long forwards, so
+    # keep --no-compile (variable ingest shapes).
+    p.add_argument("--meta_ttt_weight", type=float, default=0.0,
+                   help="Weight on the meta-TTT episode co-train (answer-span CE "
+                        "after chunked repo ingestion). 0 disables (default).")
+    p.add_argument("--meta_ttt_train_prefix", type=str,
+                   default="data/repo_episodes/train.jsonl",
+                   help="Path to the repo-episode train split (gen_repo_episodes "
+                        "output; a bare prefix gets '.jsonl' appended).")
+    p.add_argument("--meta_ttt_grad_chunks", type=int, default=2,
+                   help="Number of T-sized context chunks at the END of the "
+                        "episode that carry gradient (truncated-BPTT window; "
+                        "earlier chunks ingest under no_grad). 2 = ~4k grad "
+                        "tokens at --meta_ttt_chunk_size 2048. Raise as memory "
+                        "allows for a longer credit-assignment window.")
+    p.add_argument("--meta_ttt_chunk_size", type=int, default=2048,
+                   help="Chunk size (tokens) for the sequential state-carrying "
+                        "ingest. Defaults to the train --T. Bounds the per-chunk "
+                        "ingest activation memory.")
+    p.add_argument("--meta_ttt_every", type=int, default=1,
+                   help="Fire the meta-TTT aux only every K-th optimizer step, at "
+                        "K x the weight (same expected gradient, fewer of the "
+                        "expensive long-ingest forwards). Default 1 = every step.")
+    p.add_argument("--meta_ttt_prefix_supervise_m", type=int, default=0,
+                   help="Also supervise the last M tokens of task_prefix (in "
+                        "addition to task_line). Default 0 = task_line only, which "
+                        "matches eval_repo_adaptive's `real`-arm line CE exactly.")
+    p.add_argument("--meta_ttt_max_ctx_tokens", type=int, default=32000,
+                   help="Drop episodes whose n_ctx_tokens exceeds this (mirrors "
+                        "the eval's --max_ctx_tokens skip).")
     # --- Gate-calibration aux loss (latent "think only where helpful") ---
     # Trains the OUTPUT GATE (not the trunk) toward firing think exactly where
     # a latent think actually raises logp(true_next). Uses the shared latent

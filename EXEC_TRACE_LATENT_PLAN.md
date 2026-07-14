@@ -168,3 +168,35 @@ per-hop — answer EMISSION fails at the shallowest rung; inspect transcripts.
 **Bottom line: first working latent compression of a real computation in this
 project.** The staged path (teach in tokens, then compress) is what made the
 difference vs N1' — same data, same aux machinery, opposite outcome.
+
+## Depth-fix arm RESULT (2026-07-14) + horizon diagnosis
+
+Depth-weighted consolidation (1,200-step continuation,
+`--latent_reasoning_depth_weighted`): **the cliff moved, but did not vanish**
+(runs/stageB_depthfix_eval.json):
+- Heldout latent(R=K) answer vs original Stage B: K4 0.577 (was 0.630),
+  K5 0.613 (0.633), K6 0.653 (0.587), K7 **0.613 (0.497 — now clears the
+  0.55 bar)**, K8 **0.453 (0.333)**. Success bar now fails ONLY at K=8.
+  Per-hop @K4 0.86; NOT killed (lifts +33.0..+50.7pp).
+- Length-gen: latent lift tripled (K9 +16.0 / K10 +15.0 / K12 +10.7pp vs
+  +4.7/+3.7/+3.0), per-hop 0.66/0.57/0.48.
+- Trade: shallow rungs paid slightly (K4 −5pp) — expected under reweighting.
+
+**Horizon diagnosis (`probe_latent_exposure_bias.py`,
+runs/probe_latent_exposure_bias.json): SLOT_DEPTH_COLLAPSE, not error
+propagation.** Even with a fully-correct prefix, slot-7 decode is 0.343 and
+slot-8 is 0.170 (vs 0.126/0.021 with a wrong prefix — propagation hurts too,
+but the clean-prefix ceiling itself collapses). ⟹ more deep-stage exposure has
+diminishing returns; the residual cliff is consistent with the published
+~6-continuous-token Coconut limit (Soft-Tokens-Hard-Truths 2509.19170) and the
+Depth Ceiling line (2604.06427) — cite, don't fight. The remaining paths to
+deeper latent execution are architectural (latent microcode / commit-op
+composition; per-step op-selector), not curricular.
+
+**State-Algebra probe (2026-07-14, trained-format fix applied):** mean-merged
+DeltaNet states from DISJOINT shards retain **72% of sequential recall**
+(0.407 vs ceiling 0.567, floor 0.000, n=6 bindings x 25 trials; sum 0.380;
+normmax 0.120; overlap arm noisy-low). Partial additivity — parallel shard
+ingestion / state cartridges are viable with modest loss; NOT order-entangled.
+First run of this probe read a 0.000 ceiling from an off-distribution task
+rendering — the probe-format trap again; fixed to the trained multibind format.

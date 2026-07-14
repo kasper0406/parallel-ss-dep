@@ -1,0 +1,4460 @@
+{
+  "aggregate": {
+    "overall": {
+      "real_line_ce": 1.7933402177365496,
+      "real_span_ce": 1.962689972535627,
+      "none_line_ce": 1.2091740252642194,
+      "none_span_ce": 1.4688929464280955,
+      "shuffled_line_ce": 1.8396777870606942,
+      "shuffled_span_ce": 2.088538207991684,
+      "n_shuffled": 150,
+      "lift_none_minus_real_line": -0.5841661924723303,
+      "lift_shuffled_minus_real_line": 0.04633756932414447,
+      "lift_none_minus_real_span": -0.49379702610753157,
+      "lift_shuffled_minus_real_span": 0.1258482354560571,
+      "n": 150
+    },
+    "by_bucket": {
+      "4-8k": {
+        "real_line_ce": 1.1974762735458522,
+        "real_span_ce": 0.5875374233715914,
+        "none_line_ce": 1.0607547368854284,
+        "none_span_ce": 0.47392779950818154,
+        "shuffled_line_ce": 1.1997855775631392,
+        "shuffled_span_ce": 0.664349637020048,
+        "n_shuffled": 26,
+        "lift_none_minus_real_line": -0.13672153666042364,
+        "lift_shuffled_minus_real_line": 0.002309304017287034,
+        "lift_none_minus_real_span": -0.1136096238634099,
+        "lift_shuffled_minus_real_span": 0.07681221364845651,
+        "n": 26
+      },
+      "8-16k": {
+        "real_line_ce": 1.644712516938203,
+        "real_span_ce": 1.93020927654485,
+        "none_line_ce": 1.15181505721869,
+        "none_span_ce": 1.508335873519358,
+        "shuffled_line_ce": 1.6645166847631525,
+        "shuffled_span_ce": 2.0229685825487445,
+        "n_shuffled": 49,
+        "lift_none_minus_real_line": -0.492897459719513,
+        "lift_shuffled_minus_real_line": 0.019804167824949384,
+        "lift_none_minus_real_span": -0.421873403025492,
+        "lift_shuffled_minus_real_span": 0.09275930600389463,
+        "n": 49
+      },
+      "16-32k": {
+        "real_line_ce": 2.0970098162442445,
+        "real_span_ce": 2.460630244293134,
+        "none_line_ce": 1.2981005710252793,
+        "none_span_ce": 1.788044818327374,
+        "shuffled_line_ce": 2.1759456731875737,
+        "shuffled_span_ce": 2.6250957345512385,
+        "n_shuffled": 75,
+        "lift_none_minus_real_line": -0.7989092452189652,
+        "lift_shuffled_minus_real_line": 0.07893585694332918,
+        "lift_none_minus_real_span": -0.6725854259657595,
+        "lift_shuffled_minus_real_span": 0.16446549025810478,
+        "n": 75
+      }
+    },
+    "none_stratified_by_identifier_in_prefix": {
+      "True": {
+        "n": 144,
+        "none_line_ce": 1.1957200055805717,
+        "real_line_ce": 1.7640905906624136,
+        "lift_none_minus_real_line": -0.5683705850818418,
+        "none_span_ce": 1.455444937764393,
+        "real_span_ce": 1.8750711983854746
+      },
+      "False": {
+        "n": 6,
+        "none_line_ce": 1.5320704976717632,
+        "real_line_ce": 2.495331267515818,
+        "lift_none_minus_real_line": -0.9632607698440552,
+        "none_span_ce": 1.7916451543569565,
+        "real_span_ce": 4.065540552139282
+      }
+    },
+    "none_stratified_by_identifier_nonimport": {
+      "True": {
+        "n": 71,
+        "none_line_ce": 1.1329728261318426,
+        "real_line_ce": 1.8006334957522405,
+        "lift_none_minus_real_line": -0.667660669620398,
+        "none_span_ce": 1.3118594291515018,
+        "real_span_ce": 1.871467354536025
+      },
+      "False": {
+        "n": 79,
+        "none_line_ce": 1.277658647269267,
+        "real_line_ce": 1.7867854995199162,
+        "lift_none_minus_real_line": -0.5091268522506491,
+        "none_span_ce": 1.610024335372882,
+        "real_span_ce": 2.044674857066915
+      }
+    },
+    "meta": {
+      "ckpt": "checkpoints/meta_ttt_P1.pt",
+      "n_episodes": 150,
+      "device": "cuda",
+      "bf16": true,
+      "has_controls": true,
+      "elapsed_s": 46.5,
+      "ctx_length_mismatches": 0,
+      "n_shuffled_used": 150
+    }
+  },
+  "per_episode": [
+    {
+      "repo_name": "Jaemu/haiku.py",
+      "identifier": "find_corpus_fileids",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 9419,
+      "identifier_in_task_prefix": false,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.8420984745025635,
+        "span_ce": 2.786729335784912,
+        "n_line": 28,
+        "n_span": 6
+      },
+      "none": {
+        "line_ce": 2.871494770050049,
+        "span_ce": 3.032027006149292,
+        "n_line": 28,
+        "n_span": 6
+      },
+      "shuffled": {
+        "line_ce": 2.8712973594665527,
+        "span_ce": 3.7517480850219727,
+        "n_line": 28,
+        "n_span": 6
+      },
+      "_ctx_len_real": 8200,
+      "_ctx_len_shuffled": 8200,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "wfxiang08/django178",
+      "identifier": "add",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 11677,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.0432003736495972,
+        "span_ce": 0.5953141450881958,
+        "n_line": 16,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.0554026365280151,
+        "span_ce": 0.5122811794281006,
+        "n_line": 16,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.045558214187622,
+        "span_ce": 0.572119951248169,
+        "n_line": 16,
+        "n_span": 1
+      },
+      "_ctx_len_real": 1954,
+      "_ctx_len_shuffled": 1954,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jeffrey4l/nova",
+      "identifier": "action",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 13150,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.967822253704071,
+        "span_ce": 4.021271705627441,
+        "n_line": 25,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.6337122917175293,
+        "span_ce": 1.239889144897461,
+        "n_line": 25,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.0116348266601562,
+        "span_ce": 4.587296009063721,
+        "n_line": 25,
+        "n_span": 1
+      },
+      "_ctx_len_real": 11183,
+      "_ctx_len_shuffled": 11183,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "gusai-francelabs/datafari",
+      "identifier": "message_from_file",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 12136,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.3785618543624878,
+        "span_ce": 1.0089811086654663,
+        "n_line": 13,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 1.0487202405929565,
+        "span_ce": 0.8281828165054321,
+        "n_line": 13,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 1.3152793645858765,
+        "span_ce": 0.9245966076850891,
+        "n_line": 13,
+        "n_span": 5
+      },
+      "_ctx_len_real": 9757,
+      "_ctx_len_shuffled": 9757,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "ghchinoy/tensorflow",
+      "identifier": "loss_fn",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 25808,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.9926835894584656,
+        "span_ce": 0.7837201952934265,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.722508430480957,
+        "span_ce": 0.11029600352048874,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.0342299938201904,
+        "span_ce": 0.6464008092880249,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "_ctx_len_real": 25417,
+      "_ctx_len_shuffled": 25417,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "ghchinoy/tensorflow",
+      "identifier": "save",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 21523,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 3.1185455322265625,
+        "span_ce": 1.9285598993301392,
+        "n_line": 16,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.8686132431030273,
+        "span_ce": 2.941394329071045,
+        "n_line": 16,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 3.272932529449463,
+        "span_ce": 1.8461673259735107,
+        "n_line": 16,
+        "n_span": 1
+      },
+      "_ctx_len_real": 20625,
+      "_ctx_len_shuffled": 20625,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "gskachkov/phantomjs",
+      "identifier": "MockHost",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 7052,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.8347269296646118,
+        "span_ce": 1.6131227016448975,
+        "n_line": 7,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 0.48805737495422363,
+        "span_ce": 0.6132820844650269,
+        "n_line": 7,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 0.78291255235672,
+        "span_ce": 1.5375748872756958,
+        "n_line": 7,
+        "n_span": 2
+      },
+      "_ctx_len_real": 6420,
+      "_ctx_len_shuffled": 6420,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "j00bar/ansible",
+      "identifier": "do_load_resource",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 23733,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.0086162090301514,
+        "span_ce": 1.1638484001159668,
+        "n_line": 27,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 0.8850505948066711,
+        "span_ce": 1.3463793992996216,
+        "n_line": 27,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 2.324232578277588,
+        "span_ce": 1.3051238059997559,
+        "n_line": 27,
+        "n_span": 5
+      },
+      "_ctx_len_real": 22184,
+      "_ctx_len_shuffled": 22184,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "j00bar/ansible",
+      "identifier": "get_aos_session",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 12234,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.113311529159546,
+        "span_ce": 0.5441309213638306,
+        "n_line": 19,
+        "n_span": 6
+      },
+      "none": {
+        "line_ce": 0.4422324001789093,
+        "span_ce": 0.032563261687755585,
+        "n_line": 19,
+        "n_span": 6
+      },
+      "shuffled": {
+        "line_ce": 1.2169259786605835,
+        "span_ce": 0.7381323575973511,
+        "n_line": 19,
+        "n_span": 6
+      },
+      "_ctx_len_real": 10481,
+      "_ctx_len_shuffled": 10481,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "j00bar/ansible",
+      "identifier": "content_to_dict",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 14996,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.0769118070602417,
+        "span_ce": 1.767830491065979,
+        "n_line": 18,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 1.0444676876068115,
+        "span_ce": 1.0730403661727905,
+        "n_line": 18,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 0.9990663528442383,
+        "span_ce": 1.5634855031967163,
+        "n_line": 18,
+        "n_span": 5
+      },
+      "_ctx_len_real": 13172,
+      "_ctx_len_shuffled": 13172,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "vktr/CouchPotatoServer",
+      "identifier": "CPLog",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 4255,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.0975291728973389,
+        "span_ce": 0.0013300541322678328,
+        "n_line": 9,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 1.0807292461395264,
+        "span_ce": 0.00047182373236864805,
+        "n_line": 9,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.3037655353546143,
+        "span_ce": 0.012778769247233868,
+        "n_line": 9,
+        "n_span": 3
+      },
+      "_ctx_len_real": 4184,
+      "_ctx_len_shuffled": 4184,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "mistio/libcloud",
+      "identifier": "JoyentContainerDriver",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 21419,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.9134194850921631,
+        "span_ce": 0.9616998434066772,
+        "n_line": 21,
+        "n_span": 4
+      },
+      "none": {
+        "line_ce": 0.5976506471633911,
+        "span_ce": 0.0063484469428658485,
+        "n_line": 21,
+        "n_span": 4
+      },
+      "shuffled": {
+        "line_ce": 0.8471810817718506,
+        "span_ce": 0.983686625957489,
+        "n_line": 21,
+        "n_span": 4
+      },
+      "_ctx_len_real": 21055,
+      "_ctx_len_shuffled": 21055,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "aaxelb/osf.io",
+      "identifier": "Auth",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 20657,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.4640659093856812,
+        "span_ce": 0.00314896646887064,
+        "n_line": 13,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 0.8344919085502625,
+        "span_ce": 0.009695124812424183,
+        "n_line": 13,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 1.488900065422058,
+        "span_ce": 0.007133474573493004,
+        "n_line": 13,
+        "n_span": 2
+      },
+      "_ctx_len_real": 20514,
+      "_ctx_len_shuffled": 20514,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "aaxelb/osf.io",
+      "identifier": "Auth",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 20885,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.690362811088562,
+        "span_ce": 7.65118408203125,
+        "n_line": 22,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.8451893925666809,
+        "span_ce": 5.28363561630249,
+        "n_line": 22,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.6293058395385742,
+        "span_ce": 6.799741744995117,
+        "n_line": 22,
+        "n_span": 1
+      },
+      "_ctx_len_real": 19887,
+      "_ctx_len_shuffled": 19887,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "aaxelb/osf.io",
+      "identifier": "bulk_update",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 19385,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.5145221948623657,
+        "span_ce": 1.4187101125717163,
+        "n_line": 8,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 1.232175350189209,
+        "span_ce": 2.0966248512268066,
+        "n_line": 8,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.7307127714157104,
+        "span_ce": 1.840761661529541,
+        "n_line": 8,
+        "n_span": 3
+      },
+      "_ctx_len_real": 17208,
+      "_ctx_len_shuffled": 17208,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "sinraf96/electrum",
+      "identifier": "CTransaction",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 14189,
+      "identifier_in_task_prefix": false,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.6018345355987549,
+        "span_ce": 2.113912582397461,
+        "n_line": 8,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 1.0861502885818481,
+        "span_ce": 1.3323733806610107,
+        "n_line": 8,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 1.754075527191162,
+        "span_ce": 2.4983041286468506,
+        "n_line": 8,
+        "n_span": 2
+      },
+      "_ctx_len_real": 13380,
+      "_ctx_len_shuffled": 13380,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "sinraf96/electrum",
+      "identifier": "COutPoint",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 14284,
+      "identifier_in_task_prefix": false,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 3.234144926071167,
+        "span_ce": 7.226386547088623,
+        "n_line": 43,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.8143499493598938,
+        "span_ce": 0.321010559797287,
+        "n_line": 43,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 3.4247841835021973,
+        "span_ce": 6.567286491394043,
+        "n_line": 43,
+        "n_span": 3
+      },
+      "_ctx_len_real": 13380,
+      "_ctx_len_shuffled": 13380,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "sinraf96/electrum",
+      "identifier": "CTxIn",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 19439,
+      "identifier_in_task_prefix": false,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.995636224746704,
+        "span_ce": 6.0622477531433105,
+        "n_line": 43,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.8143499493598938,
+        "span_ce": 0.2716227173805237,
+        "n_line": 43,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 3.9522907733917236,
+        "span_ce": 8.96491813659668,
+        "n_line": 43,
+        "n_span": 3
+      },
+      "_ctx_len_real": 18535,
+      "_ctx_len_shuffled": 18535,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "fxfitz/ansible",
+      "identifier": "run_commands",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 18151,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.6087639331817627,
+        "span_ce": 0.8116196393966675,
+        "n_line": 14,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.9558321833610535,
+        "span_ce": 2.9935786724090576,
+        "n_line": 14,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 0.5859322547912598,
+        "span_ce": 0.7491094470024109,
+        "n_line": 14,
+        "n_span": 3
+      },
+      "_ctx_len_real": 12936,
+      "_ctx_len_shuffled": 12936,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "fxfitz/ansible",
+      "identifier": "get_connection",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 29041,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.7444872856140137,
+        "span_ce": 4.782972812652588,
+        "n_line": 8,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 1.855591058731079,
+        "span_ce": 3.903017997741699,
+        "n_line": 8,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 2.7485225200653076,
+        "span_ce": 4.819701671600342,
+        "n_line": 8,
+        "n_span": 3
+      },
+      "_ctx_len_real": 26182,
+      "_ctx_len_shuffled": 26182,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "fxfitz/ansible",
+      "identifier": "load_fixture",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 9401,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.611803412437439,
+        "span_ce": 0.0600118413567543,
+        "n_line": 22,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.13172800838947296,
+        "span_ce": 0.01997300051152706,
+        "n_line": 22,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 0.509096622467041,
+        "span_ce": 0.026153583079576492,
+        "n_line": 22,
+        "n_span": 3
+      },
+      "_ctx_len_real": 8933,
+      "_ctx_len_shuffled": 8933,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "leki75/ansible",
+      "identifier": "load_fixture",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 17743,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.4692128896713257,
+        "span_ce": 2.556879997253418,
+        "n_line": 25,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.10564669966697693,
+        "span_ce": 0.2369876503944397,
+        "n_line": 25,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.5029619932174683,
+        "span_ce": 2.5658273696899414,
+        "n_line": 25,
+        "n_span": 3
+      },
+      "_ctx_len_real": 17286,
+      "_ctx_len_shuffled": 17286,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "zvezdan/pip",
+      "identifier": "parse",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 8412,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.7424764633178711,
+        "span_ce": 1.2413976192474365,
+        "n_line": 8,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.7224668860435486,
+        "span_ce": 1.864355444908142,
+        "n_line": 8,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 0.7540764808654785,
+        "span_ce": 1.4889793395996094,
+        "n_line": 8,
+        "n_span": 1
+      },
+      "_ctx_len_real": 7432,
+      "_ctx_len_shuffled": 7432,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jupierce/openshift-tools",
+      "identifier": "ServiceAccount",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 15516,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.508536458015442,
+        "span_ce": 0.5960769057273865,
+        "n_line": 19,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 1.3182337284088135,
+        "span_ce": 3.1319587230682373,
+        "n_line": 19,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 1.9158090353012085,
+        "span_ce": 1.0733953714370728,
+        "n_line": 19,
+        "n_span": 2
+      },
+      "_ctx_len_real": 15204,
+      "_ctx_len_shuffled": 15204,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "mzizzi/ansible",
+      "identifier": "Parameters",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 14597,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.696943998336792,
+        "span_ce": 3.691100835800171,
+        "n_line": 8,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.7025551795959473,
+        "span_ce": 0.8890799283981323,
+        "n_line": 8,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.4516704082489014,
+        "span_ce": 3.833177328109741,
+        "n_line": 8,
+        "n_span": 1
+      },
+      "_ctx_len_real": 13762,
+      "_ctx_len_shuffled": 13762,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "mzizzi/ansible",
+      "identifier": "ModuleManager",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 4800,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.7911601662635803,
+        "span_ce": 0.04815490543842316,
+        "n_line": 9,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 0.9162362217903137,
+        "span_ce": 0.05150024965405464,
+        "n_line": 9,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 0.8494208455085754,
+        "span_ce": 0.07261083275079727,
+        "n_line": 9,
+        "n_span": 2
+      },
+      "_ctx_len_real": 3197,
+      "_ctx_len_shuffled": 3197,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "mzizzi/ansible",
+      "identifier": "Parameters",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 18768,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.6525704860687256,
+        "span_ce": 1.9605482816696167,
+        "n_line": 8,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.7469741106033325,
+        "span_ce": 0.17663197219371796,
+        "n_line": 8,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.5561294555664062,
+        "span_ce": 2.636960506439209,
+        "n_line": 8,
+        "n_span": 1
+      },
+      "_ctx_len_real": 17918,
+      "_ctx_len_shuffled": 17918,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "sgml/popcorn_maker",
+      "identifier": "CodingStateMachine",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 8586,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.8248227834701538,
+        "span_ce": 0.20578208565711975,
+        "n_line": 18,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.5274574160575867,
+        "span_ce": 0.026074375957250595,
+        "n_line": 18,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.9357560873031616,
+        "span_ce": 0.35092854499816895,
+        "n_line": 18,
+        "n_span": 3
+      },
+      "_ctx_len_real": 8215,
+      "_ctx_len_shuffled": 8215,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "pantsbuild/pants",
+      "identifier": "rule",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 16936,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 3.6926686763763428,
+        "span_ce": 9.080827713012695,
+        "n_line": 22,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 2.8281569480895996,
+        "span_ce": 7.94566535949707,
+        "n_line": 22,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 3.9660069942474365,
+        "span_ce": 12.853377342224121,
+        "n_line": 22,
+        "n_span": 1
+      },
+      "_ctx_len_real": 16710,
+      "_ctx_len_shuffled": 16710,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "pantsbuild/pants",
+      "identifier": "group_by_dir",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 21169,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.7800776958465576,
+        "span_ce": 1.2186825275421143,
+        "n_line": 23,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 0.5333228707313538,
+        "span_ce": 0.6927377581596375,
+        "n_line": 23,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 2.384937047958374,
+        "span_ce": 0.8548008799552917,
+        "n_line": 23,
+        "n_span": 5
+      },
+      "_ctx_len_real": 20765,
+      "_ctx_len_shuffled": 20765,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "pantsbuild/pants",
+      "identifier": "collect_rules",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 17730,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.350048780441284,
+        "span_ce": 1.9097139835357666,
+        "n_line": 7,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 2.453324556350708,
+        "span_ce": 1.9741408824920654,
+        "n_line": 7,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.9628406763076782,
+        "span_ce": 1.5412052869796753,
+        "n_line": 7,
+        "n_span": 3
+      },
+      "_ctx_len_real": 17280,
+      "_ctx_len_shuffled": 17280,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "rbaumg/trac",
+      "identifier": "datetime_now",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 27941,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 3.2247183322906494,
+        "span_ce": 4.069047451019287,
+        "n_line": 22,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 1.323120355606079,
+        "span_ce": 0.7219185829162598,
+        "n_line": 22,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 3.216193437576294,
+        "span_ce": 3.7004878520965576,
+        "n_line": 22,
+        "n_span": 3
+      },
+      "_ctx_len_real": 26377,
+      "_ctx_len_shuffled": 26377,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "rbaumg/trac",
+      "identifier": "to_utimestamp",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 19793,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.581162691116333,
+        "span_ce": 4.873782634735107,
+        "n_line": 22,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 1.323120355606079,
+        "span_ce": 2.2543671131134033,
+        "n_line": 22,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 2.7890164852142334,
+        "span_ce": 4.7908854484558105,
+        "n_line": 22,
+        "n_span": 5
+      },
+      "_ctx_len_real": 18229,
+      "_ctx_len_shuffled": 18229,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "rbaumg/trac",
+      "identifier": "format_datetime",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 26274,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 3.0694644451141357,
+        "span_ce": 3.8860788345336914,
+        "n_line": 22,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 2.5102689266204834,
+        "span_ce": 2.477433204650879,
+        "n_line": 22,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 3.1627750396728516,
+        "span_ce": 4.113697052001953,
+        "n_line": 22,
+        "n_span": 3
+      },
+      "_ctx_len_real": 24300,
+      "_ctx_len_shuffled": 24300,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "sunny94/temp",
+      "identifier": "Integral",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 21590,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.358262777328491,
+        "span_ce": 2.0359203815460205,
+        "n_line": 12,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 1.5665321350097656,
+        "span_ce": 0.3946339190006256,
+        "n_line": 12,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 2.358696937561035,
+        "span_ce": 2.2395572662353516,
+        "n_line": 12,
+        "n_span": 2
+      },
+      "_ctx_len_real": 13172,
+      "_ctx_len_shuffled": 13172,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "sunny94/temp",
+      "identifier": "Integral",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 14319,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.7827260494232178,
+        "span_ce": 6.646144866943359,
+        "n_line": 52,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 1.7573702335357666,
+        "span_ce": 5.2311506271362305,
+        "n_line": 52,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 2.908052921295166,
+        "span_ce": 7.104348182678223,
+        "n_line": 52,
+        "n_span": 2
+      },
+      "_ctx_len_real": 13172,
+      "_ctx_len_shuffled": 13172,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "carnell69/kuma",
+      "identifier": "UnitMixer",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 24233,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.9128122329711914,
+        "span_ce": 2.222917079925537,
+        "n_line": 28,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 2.251633644104004,
+        "span_ce": 0.4844987094402313,
+        "n_line": 28,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 2.8507375717163086,
+        "span_ce": 1.6808241605758667,
+        "n_line": 28,
+        "n_span": 3
+      },
+      "_ctx_len_real": 23761,
+      "_ctx_len_shuffled": 23761,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "itsjeyd/edx-platform",
+      "identifier": "data",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 22278,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 3.813493251800537,
+        "span_ce": 4.419463157653809,
+        "n_line": 25,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 2.826512336730957,
+        "span_ce": 2.286057949066162,
+        "n_line": 25,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 4.401442050933838,
+        "span_ce": 5.638721942901611,
+        "n_line": 25,
+        "n_span": 1
+      },
+      "_ctx_len_real": 21288,
+      "_ctx_len_shuffled": 21288,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "itsjeyd/edx-platform",
+      "identifier": "TabNavPage",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 5467,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.2187093496322632,
+        "span_ce": 1.5755105018615723,
+        "n_line": 16,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 1.3195888996124268,
+        "span_ce": 1.7289235591888428,
+        "n_line": 16,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.1645209789276123,
+        "span_ce": 1.4882266521453857,
+        "n_line": 16,
+        "n_span": 3
+      },
+      "_ctx_len_real": 1108,
+      "_ctx_len_shuffled": 1108,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "itsjeyd/edx-platform",
+      "identifier": "data",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 21665,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.308229446411133,
+        "span_ce": 4.4248199462890625,
+        "n_line": 5,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.1075177192687988,
+        "span_ce": 3.6806344985961914,
+        "n_line": 5,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.352959156036377,
+        "span_ce": 5.535251617431641,
+        "n_line": 5,
+        "n_span": 1
+      },
+      "_ctx_len_real": 21288,
+      "_ctx_len_shuffled": 21288,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "menify/sandbox",
+      "identifier": "Node",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 10539,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.0093448162078857,
+        "span_ce": 1.6614750623703003,
+        "n_line": 15,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.7513128519058228,
+        "span_ce": 1.3086000680923462,
+        "n_line": 15,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.931189775466919,
+        "span_ce": 2.420957326889038,
+        "n_line": 15,
+        "n_span": 1
+      },
+      "_ctx_len_real": 9627,
+      "_ctx_len_shuffled": 9627,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "menify/sandbox",
+      "identifier": "BatchNode",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 23087,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.6475446224212646,
+        "span_ce": 3.753706932067871,
+        "n_line": 13,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 1.033876895904541,
+        "span_ce": 4.105687141418457,
+        "n_line": 13,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 1.752527117729187,
+        "span_ce": 3.549898862838745,
+        "n_line": 13,
+        "n_span": 2
+      },
+      "_ctx_len_real": 18075,
+      "_ctx_len_shuffled": 18075,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "spartonia/django-oscar",
+      "identifier": "get_product_search_handler_class",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 9174,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.3681470155715942,
+        "span_ce": 1.3775620460510254,
+        "n_line": 19,
+        "n_span": 9
+      },
+      "none": {
+        "line_ce": 0.6342591047286987,
+        "span_ce": 0.8235688805580139,
+        "n_line": 19,
+        "n_span": 9
+      },
+      "shuffled": {
+        "line_ce": 1.3270119428634644,
+        "span_ce": 1.2051187753677368,
+        "n_line": 19,
+        "n_span": 9
+      },
+      "_ctx_len_real": 7880,
+      "_ctx_len_shuffled": 7880,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "HuaweiSwitch/ansible",
+      "identifier": "check_args",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 13698,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.0014174102107062936,
+        "span_ce": 3.0199003958841786e-05,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.0001720154396025464,
+        "span_ce": 8.498624083586037e-05,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 0.0020812645088881254,
+        "span_ce": 4.096723205293529e-05,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "_ctx_len_real": 11647,
+      "_ctx_len_shuffled": 11647,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "HuaweiSwitch/ansible",
+      "identifier": "check_args",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 13854,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.0013189018936827779,
+        "span_ce": 2.292757562827319e-05,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.00019495628657750785,
+        "span_ce": 7.271049980772659e-05,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 0.0016066341195255518,
+        "span_ce": 3.147064126096666e-05,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "_ctx_len_real": 11963,
+      "_ctx_len_shuffled": 11963,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "HuaweiSwitch/ansible",
+      "identifier": "check_args",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 14052,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.0007767751812934875,
+        "span_ce": 2.9205735700088553e-05,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.0002898155653383583,
+        "span_ce": 8.427188004134223e-05,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 0.0011863956460729241,
+        "span_ce": 5.153634992893785e-05,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "_ctx_len_real": 11977,
+      "_ctx_len_shuffled": 11977,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "nhicher/ansible",
+      "identifier": "to_text",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 11617,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 3.0830183029174805,
+        "span_ce": 0.8041849136352539,
+        "n_line": 24,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 2.075606107711792,
+        "span_ce": 0.4401896893978119,
+        "n_line": 24,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 3.1818652153015137,
+        "span_ce": 1.1368944644927979,
+        "n_line": 24,
+        "n_span": 3
+      },
+      "_ctx_len_real": 10172,
+      "_ctx_len_shuffled": 10172,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "nhicher/ansible",
+      "identifier": "to_text",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 11508,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.3363280296325684,
+        "span_ce": 2.8429441452026367,
+        "n_line": 19,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.8016434907913208,
+        "span_ce": 1.9819544553756714,
+        "n_line": 19,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.3978328704833984,
+        "span_ce": 3.0156571865081787,
+        "n_line": 19,
+        "n_span": 3
+      },
+      "_ctx_len_real": 10325,
+      "_ctx_len_shuffled": 10325,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "nhicher/ansible",
+      "identifier": "parse",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 22589,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.4547160863876343,
+        "span_ce": 0.5160742402076721,
+        "n_line": 20,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.855394184589386,
+        "span_ce": 4.069911479949951,
+        "n_line": 20,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.5079959630966187,
+        "span_ce": 0.25062063336372375,
+        "n_line": 20,
+        "n_span": 1
+      },
+      "_ctx_len_real": 21748,
+      "_ctx_len_shuffled": 21748,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "fhaoquan/kbengine",
+      "identifier": "Text",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 23476,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.6793818473815918,
+        "span_ce": 0.8998680710792542,
+        "n_line": 12,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.3996771275997162,
+        "span_ce": 0.35899749398231506,
+        "n_line": 12,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 0.8041610717773438,
+        "span_ce": 0.9138568639755249,
+        "n_line": 12,
+        "n_span": 1
+      },
+      "_ctx_len_real": 23258,
+      "_ctx_len_shuffled": 23258,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "fhaoquan/kbengine",
+      "identifier": "unlink",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 18984,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.6706535816192627,
+        "span_ce": 2.1788034439086914,
+        "n_line": 8,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 0.386283278465271,
+        "span_ce": 1.2430826425552368,
+        "n_line": 8,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 1.3286992311477661,
+        "span_ce": 1.587200403213501,
+        "n_line": 8,
+        "n_span": 2
+      },
+      "_ctx_len_real": 18824,
+      "_ctx_len_shuffled": 18824,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "fhaoquan/kbengine",
+      "identifier": "assert_python_ok",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 22502,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 3.702420949935913,
+        "span_ce": 5.833970546722412,
+        "n_line": 18,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 3.510077953338623,
+        "span_ce": 5.47561502456665,
+        "n_line": 18,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 3.707775592803955,
+        "span_ce": 5.923832893371582,
+        "n_line": 18,
+        "n_span": 5
+      },
+      "_ctx_len_real": 3916,
+      "_ctx_len_shuffled": 3916,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "mbayon/TFG-MachineLearning",
+      "identifier": "LabelEncoder",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 18635,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 3.0300722122192383,
+        "span_ce": 9.876660346984863,
+        "n_line": 26,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 2.630995035171509,
+        "span_ce": 9.470880508422852,
+        "n_line": 26,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 3.0633299350738525,
+        "span_ce": 10.16532039642334,
+        "n_line": 26,
+        "n_span": 2
+      },
+      "_ctx_len_real": 8044,
+      "_ctx_len_shuffled": 8044,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "laurentgo/pants",
+      "identifier": "Repository",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 16633,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.8972527980804443,
+        "span_ce": 0.0088820680975914,
+        "n_line": 13,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 1.5839042663574219,
+        "span_ce": 0.005860920995473862,
+        "n_line": 13,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 3.0051417350769043,
+        "span_ce": 0.02355225384235382,
+        "n_line": 13,
+        "n_span": 2
+      },
+      "_ctx_len_real": 16490,
+      "_ctx_len_shuffled": 16490,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "nathanial/lettuce",
+      "identifier": "get_object_or_404",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 19163,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.732001543045044,
+        "span_ce": 0.0015736737987026572,
+        "n_line": 20,
+        "n_span": 9
+      },
+      "none": {
+        "line_ce": 0.47810420393943787,
+        "span_ce": 0.0032686558552086353,
+        "n_line": 20,
+        "n_span": 9
+      },
+      "shuffled": {
+        "line_ce": 1.8289715051651,
+        "span_ce": 0.0012074261903762817,
+        "n_line": 20,
+        "n_span": 9
+      },
+      "_ctx_len_real": 18944,
+      "_ctx_len_shuffled": 18944,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "nathanial/lettuce",
+      "identifier": "get_list_or_404",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 23205,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.1031254529953003,
+        "span_ce": 0.2125176638364792,
+        "n_line": 27,
+        "n_span": 9
+      },
+      "none": {
+        "line_ce": 0.5487815141677856,
+        "span_ce": 0.005576389376074076,
+        "n_line": 27,
+        "n_span": 9
+      },
+      "shuffled": {
+        "line_ce": 1.1487133502960205,
+        "span_ce": 0.32187747955322266,
+        "n_line": 27,
+        "n_span": 9
+      },
+      "_ctx_len_real": 22600,
+      "_ctx_len_shuffled": 22600,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "nathanial/lettuce",
+      "identifier": "Person",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 5001,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.39718660712242126,
+        "span_ce": 0.010495702736079693,
+        "n_line": 24,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.31147685647010803,
+        "span_ce": 0.008599629625678062,
+        "n_line": 24,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 0.4307560622692108,
+        "span_ce": 0.022567011415958405,
+        "n_line": 24,
+        "n_span": 1
+      },
+      "_ctx_len_real": 4754,
+      "_ctx_len_shuffled": 4754,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "ctk3b/msibi",
+      "identifier": "MSIBI",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 5072,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.6002092361450195,
+        "span_ce": 0.10001301765441895,
+        "n_line": 16,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 1.56581711769104,
+        "span_ce": 0.06498154997825623,
+        "n_line": 16,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.638447880744934,
+        "span_ce": 0.07147565484046936,
+        "n_line": 16,
+        "n_span": 3
+      },
+      "_ctx_len_real": 5019,
+      "_ctx_len_shuffled": 5019,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "pombreda/git-git.code.sf.net-p-rpmlint-code",
+      "identifier": "printWarning",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 10670,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 3.028099536895752,
+        "span_ce": 1.729734182357788,
+        "n_line": 20,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 2.34554123878479,
+        "span_ce": 3.492201089859009,
+        "n_line": 20,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 3.214921236038208,
+        "span_ce": 1.5980952978134155,
+        "n_line": 20,
+        "n_span": 2
+      },
+      "_ctx_len_real": 10262,
+      "_ctx_len_shuffled": 10262,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jcpowermac/ansible",
+      "identifier": "ansible_environment",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 24903,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.752840280532837,
+        "span_ce": 1.6779558658599854,
+        "n_line": 11,
+        "n_span": 4
+      },
+      "none": {
+        "line_ce": 1.096326470375061,
+        "span_ce": 1.467408537864685,
+        "n_line": 11,
+        "n_span": 4
+      },
+      "shuffled": {
+        "line_ce": 1.7642009258270264,
+        "span_ce": 1.6863698959350586,
+        "n_line": 11,
+        "n_span": 4
+      },
+      "_ctx_len_real": 17931,
+      "_ctx_len_shuffled": 17931,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jcpowermac/ansible",
+      "identifier": "ShippableChanges",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 22113,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.9267399311065674,
+        "span_ce": 2.9942805767059326,
+        "n_line": 13,
+        "n_span": 4
+      },
+      "none": {
+        "line_ce": 1.812517523765564,
+        "span_ce": 2.6530542373657227,
+        "n_line": 13,
+        "n_span": 4
+      },
+      "shuffled": {
+        "line_ce": 1.9106700420379639,
+        "span_ce": 2.9309496879577637,
+        "n_line": 13,
+        "n_span": 4
+      },
+      "_ctx_len_real": 13182,
+      "_ctx_len_shuffled": 13182,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jcpowermac/ansible",
+      "identifier": "LocalChanges",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 10732,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.1172246932983398,
+        "span_ce": 1.234062910079956,
+        "n_line": 11,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 1.059312343597412,
+        "span_ce": 1.1836779117584229,
+        "n_line": 11,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 1.148333191871643,
+        "span_ce": 1.345371127128601,
+        "n_line": 11,
+        "n_span": 2
+      },
+      "_ctx_len_real": 1628,
+      "_ctx_len_shuffled": 1628,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "ShiYw/Sigil",
+      "identifier": "escape",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 8448,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.5552194118499756,
+        "span_ce": 0.07633691281080246,
+        "n_line": 21,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 2.095431089401245,
+        "span_ce": 0.08943743258714676,
+        "n_line": 21,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.699341297149658,
+        "span_ce": 0.13438400626182556,
+        "n_line": 21,
+        "n_span": 1
+      },
+      "_ctx_len_real": 6974,
+      "_ctx_len_shuffled": 6974,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "ShiYw/Sigil",
+      "identifier": "unescape",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 6919,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.7475792765617371,
+        "span_ce": 0.01778757944703102,
+        "n_line": 22,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 0.5025287866592407,
+        "span_ce": 0.03705586493015289,
+        "n_line": 22,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 0.7673417925834656,
+        "span_ce": 0.01468191109597683,
+        "n_line": 22,
+        "n_span": 2
+      },
+      "_ctx_len_real": 5315,
+      "_ctx_len_shuffled": 5315,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "ShiYw/Sigil",
+      "identifier": "quoteattr",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 5199,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.7935543656349182,
+        "span_ce": 0.06140318140387535,
+        "n_line": 14,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 0.7945663332939148,
+        "span_ce": 0.11044380813837051,
+        "n_line": 14,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 0.7856780886650085,
+        "span_ce": 0.08253446966409683,
+        "n_line": 14,
+        "n_span": 2
+      },
+      "_ctx_len_real": 3416,
+      "_ctx_len_shuffled": 3416,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jlegendary/youtube-dl",
+      "identifier": "unified_strdate",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 24833,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.9840121269226074,
+        "span_ce": 0.24312086403369904,
+        "n_line": 24,
+        "n_span": 4
+      },
+      "none": {
+        "line_ce": 0.6240173578262329,
+        "span_ce": 0.010971269570291042,
+        "n_line": 24,
+        "n_span": 4
+      },
+      "shuffled": {
+        "line_ce": 1.2822444438934326,
+        "span_ce": 0.32937777042388916,
+        "n_line": 24,
+        "n_span": 4
+      },
+      "_ctx_len_real": 24245,
+      "_ctx_len_shuffled": 24245,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jlegendary/youtube-dl",
+      "identifier": "parse_duration",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 29265,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.5823776721954346,
+        "span_ce": 0.42113733291625977,
+        "n_line": 20,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.6305603384971619,
+        "span_ce": 0.20337805151939392,
+        "n_line": 20,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 2.6717469692230225,
+        "span_ce": 0.3066304326057434,
+        "n_line": 20,
+        "n_span": 3
+      },
+      "_ctx_len_real": 28601,
+      "_ctx_len_shuffled": 28601,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jlegendary/youtube-dl",
+      "identifier": "str_to_int",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 24929,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.063054084777832,
+        "span_ce": 2.920051336288452,
+        "n_line": 18,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 0.6666824221611023,
+        "span_ce": 0.853767991065979,
+        "n_line": 18,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 2.370248317718506,
+        "span_ce": 3.478238821029663,
+        "n_line": 18,
+        "n_span": 5
+      },
+      "_ctx_len_real": 24245,
+      "_ctx_len_shuffled": 24245,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "francois-contat/scapy",
+      "identifier": "FlagsField",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 23646,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 4.109776973724365,
+        "span_ce": 3.1040191650390625,
+        "n_line": 26,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 2.79996919631958,
+        "span_ce": 2.1214866638183594,
+        "n_line": 26,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 4.733099460601807,
+        "span_ce": 3.6237053871154785,
+        "n_line": 26,
+        "n_span": 3
+      },
+      "_ctx_len_real": 23429,
+      "_ctx_len_shuffled": 23429,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "francois-contat/scapy",
+      "identifier": "StrLenField",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 23811,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 3.4575936794281006,
+        "span_ce": 3.0046920776367188,
+        "n_line": 9,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 2.217409133911133,
+        "span_ce": 2.568115472793579,
+        "n_line": 9,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 3.4934892654418945,
+        "span_ce": 3.2418928146362305,
+        "n_line": 9,
+        "n_span": 3
+      },
+      "_ctx_len_real": 23429,
+      "_ctx_len_shuffled": 23429,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "francois-contat/scapy",
+      "identifier": "BitField",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 23919,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.7103888988494873,
+        "span_ce": 2.5268442630767822,
+        "n_line": 14,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 1.5904877185821533,
+        "span_ce": 2.108309030532837,
+        "n_line": 14,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 2.8356401920318604,
+        "span_ce": 2.809401750564575,
+        "n_line": 14,
+        "n_span": 2
+      },
+      "_ctx_len_real": 23429,
+      "_ctx_len_shuffled": 23429,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "shootstar/novatest",
+      "identifier": "authorize",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 6878,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.47506532073020935,
+        "span_ce": 3.8980677345534787e-05,
+        "n_line": 7,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.2023828774690628,
+        "span_ce": 0.001632430125027895,
+        "n_line": 7,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 0.4687415659427643,
+        "span_ce": 8.928377064876258e-05,
+        "n_line": 7,
+        "n_span": 1
+      },
+      "_ctx_len_real": 6437,
+      "_ctx_len_shuffled": 6437,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "shootstar/novatest",
+      "identifier": "authorize",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 6062,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.9121284484863281,
+        "span_ce": 0.021245751529932022,
+        "n_line": 10,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.5741603970527649,
+        "span_ce": 0.014533021487295628,
+        "n_line": 10,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.0624669790267944,
+        "span_ce": 0.07017063349485397,
+        "n_line": 10,
+        "n_span": 1
+      },
+      "_ctx_len_real": 5420,
+      "_ctx_len_shuffled": 5420,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "nelsonsar/ansible",
+      "identifier": "Conditional",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 10432,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.7109348773956299,
+        "span_ce": 0.42590034008026123,
+        "n_line": 13,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 1.653050422668457,
+        "span_ce": 2.0348148345947266,
+        "n_line": 13,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 1.7241219282150269,
+        "span_ce": 0.16560271382331848,
+        "n_line": 13,
+        "n_span": 2
+      },
+      "_ctx_len_real": 9956,
+      "_ctx_len_shuffled": 9956,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "pjg101/SickRage",
+      "identifier": "unpack",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 18792,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.6859939098358154,
+        "span_ce": 7.4261932373046875,
+        "n_line": 11,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.1920877695083618,
+        "span_ce": 6.089389801025391,
+        "n_line": 11,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.77791166305542,
+        "span_ce": 6.985662937164307,
+        "n_line": 11,
+        "n_span": 1
+      },
+      "_ctx_len_real": 17961,
+      "_ctx_len_shuffled": 17961,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "pjg101/SickRage",
+      "identifier": "conflict_solver",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 5429,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.5930708646774292,
+        "span_ce": 1.1311408281326294,
+        "n_line": 18,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 1.125508189201355,
+        "span_ce": 0.20588746666908264,
+        "n_line": 18,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 2.0400967597961426,
+        "span_ce": 1.784234881401062,
+        "n_line": 18,
+        "n_span": 3
+      },
+      "_ctx_len_real": 4855,
+      "_ctx_len_shuffled": 4855,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "hugobranquinho/ines",
+      "identifier": "OutputSchemaView",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 8365,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.25368818640708923,
+        "span_ce": 0.08231765031814575,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.02213185466825962,
+        "span_ce": 0.04161182418465614,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 0.11829222738742828,
+        "span_ce": 0.025676723569631577,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "_ctx_len_real": 6876,
+      "_ctx_len_shuffled": 6876,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "david672orford/pykarta",
+      "identifier": "dbopen",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 4254,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.7684776782989502,
+        "span_ce": 1.6327980756759644,
+        "n_line": 21,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 1.9553024768829346,
+        "span_ce": 2.3527605533599854,
+        "n_line": 21,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 1.6632229089736938,
+        "span_ce": 1.638883113861084,
+        "n_line": 21,
+        "n_span": 2
+      },
+      "_ctx_len_real": 626,
+      "_ctx_len_shuffled": 626,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "burzillibus/RobHome",
+      "identifier": "set_script_prefix",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 17574,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.7620786428451538,
+        "span_ce": 2.067443609237671,
+        "n_line": 16,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 0.9617703557014465,
+        "span_ce": 1.4157710075378418,
+        "n_line": 16,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 1.6782639026641846,
+        "span_ce": 1.8380488157272339,
+        "n_line": 16,
+        "n_span": 5
+      },
+      "_ctx_len_real": 16073,
+      "_ctx_len_shuffled": 16073,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "burzillibus/RobHome",
+      "identifier": "join",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 10515,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.4102847576141357,
+        "span_ce": 2.586183547973633,
+        "n_line": 18,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.7449969053268433,
+        "span_ce": 2.3008434772491455,
+        "n_line": 18,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.3956422805786133,
+        "span_ce": 2.3875274658203125,
+        "n_line": 18,
+        "n_span": 1
+      },
+      "_ctx_len_real": 7185,
+      "_ctx_len_shuffled": 7185,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "sameetb-cuelogic/edx-platform-test",
+      "identifier": "UserFactory",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 6942,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.4116024374961853,
+        "span_ce": 0.056055668741464615,
+        "n_line": 9,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 0.550386905670166,
+        "span_ce": 0.005085890181362629,
+        "n_line": 9,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 0.4483727812767029,
+        "span_ce": 0.07274855673313141,
+        "n_line": 9,
+        "n_span": 2
+      },
+      "_ctx_len_real": 6656,
+      "_ctx_len_shuffled": 6656,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "sameetb-cuelogic/edx-platform-test",
+      "identifier": "CourseModeFactory",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 27608,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.4673840999603271,
+        "span_ce": 3.288416624069214,
+        "n_line": 31,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.37591052055358887,
+        "span_ce": 1.1655457019805908,
+        "n_line": 31,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.5791058540344238,
+        "span_ce": 3.426335334777832,
+        "n_line": 31,
+        "n_span": 3
+      },
+      "_ctx_len_real": 25452,
+      "_ctx_len_shuffled": 25452,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "sameetb-cuelogic/edx-platform-test",
+      "identifier": "UserFactory",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 4923,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.3178305625915527,
+        "span_ce": 0.022918878123164177,
+        "n_line": 7,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 1.45768141746521,
+        "span_ce": 0.01124662347137928,
+        "n_line": 7,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 1.223729133605957,
+        "span_ce": 0.05525537207722664,
+        "n_line": 7,
+        "n_span": 2
+      },
+      "_ctx_len_real": 3660,
+      "_ctx_len_shuffled": 3660,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "gquirozbogner/contentbox-master",
+      "identifier": "render",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 21592,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.5086685419082642,
+        "span_ce": 0.29900091886520386,
+        "n_line": 18,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.9132383465766907,
+        "span_ce": 0.46854516863822937,
+        "n_line": 18,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.693410873413086,
+        "span_ce": 0.20675013959407806,
+        "n_line": 18,
+        "n_span": 1
+      },
+      "_ctx_len_real": 21499,
+      "_ctx_len_shuffled": 21499,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "andyzsf/edx",
+      "identifier": "cache_if_anonymous",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 4739,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.519740879535675,
+        "span_ce": 0.47121626138687134,
+        "n_line": 9,
+        "n_span": 6
+      },
+      "none": {
+        "line_ce": 0.7086348533630371,
+        "span_ce": 0.11038508266210556,
+        "n_line": 9,
+        "n_span": 6
+      },
+      "shuffled": {
+        "line_ce": 0.630919873714447,
+        "span_ce": 0.46239399909973145,
+        "n_line": 9,
+        "n_span": 6
+      },
+      "_ctx_len_real": 4497,
+      "_ctx_len_shuffled": 4497,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "MridulS/sympy",
+      "identifier": "flatten",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 12498,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.9348251819610596,
+        "span_ce": 6.8829665184021,
+        "n_line": 12,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.823451042175293,
+        "span_ce": 5.873931884765625,
+        "n_line": 12,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.7697889804840088,
+        "span_ce": 7.790477752685547,
+        "n_line": 12,
+        "n_span": 1
+      },
+      "_ctx_len_real": 12195,
+      "_ctx_len_shuffled": 12195,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jbfavre/exabgp",
+      "identifier": "read",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 4420,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.2806894779205322,
+        "span_ce": 1.0050524473190308,
+        "n_line": 12,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.0275177955627441,
+        "span_ce": 0.18457499146461487,
+        "n_line": 12,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.411567211151123,
+        "span_ce": 1.8579069375991821,
+        "n_line": 12,
+        "n_span": 1
+      },
+      "_ctx_len_real": 4196,
+      "_ctx_len_shuffled": 4196,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "bovenyan/hsa",
+      "identifier": "compress_wildcard_list",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 8022,
+      "identifier_in_task_prefix": false,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.448740839958191,
+        "span_ce": 4.201175689697266,
+        "n_line": 25,
+        "n_span": 6
+      },
+      "none": {
+        "line_ce": 1.297230839729309,
+        "span_ce": 4.175594806671143,
+        "n_line": 25,
+        "n_span": 6
+      },
+      "shuffled": {
+        "line_ce": 1.4273420572280884,
+        "span_ce": 4.231065273284912,
+        "n_line": 25,
+        "n_span": 6
+      },
+      "_ctx_len_real": 4738,
+      "_ctx_len_shuffled": 4738,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "zamattiac/osf.io",
+      "identifier": "redirect",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 22496,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.626894235610962,
+        "span_ce": 2.945035934448242,
+        "n_line": 17,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.7790437340736389,
+        "span_ce": 1.956323266029358,
+        "n_line": 17,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.75675368309021,
+        "span_ce": 3.0798778533935547,
+        "n_line": 17,
+        "n_span": 1
+      },
+      "_ctx_len_real": 21917,
+      "_ctx_len_shuffled": 21917,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "mbernasocchi/inasafe",
+      "identifier": "get_version",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 11387,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.23744408786296844,
+        "span_ce": 0.0032458826899528503,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.3991413116455078,
+        "span_ce": 0.9498015642166138,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 0.13382259011268616,
+        "span_ce": 0.0025933999568223953,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "_ctx_len_real": 11087,
+      "_ctx_len_shuffled": 11087,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "idlead/scikit-learn",
+      "identifier": "_gs_decorrelation",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 12048,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.23894464969635,
+        "span_ce": 1.73147451877594,
+        "n_line": 16,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 1.0803890228271484,
+        "span_ce": 1.8039690256118774,
+        "n_line": 16,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 1.3050572872161865,
+        "span_ce": 1.4781345129013062,
+        "n_line": 16,
+        "n_span": 5
+      },
+      "_ctx_len_real": 11692,
+      "_ctx_len_shuffled": 11692,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "idlead/scikit-learn",
+      "identifier": "fastica",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 15474,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.188303232192993,
+        "span_ce": 1.285151481628418,
+        "n_line": 31,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 1.4220283031463623,
+        "span_ce": 0.24629555642604828,
+        "n_line": 31,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 2.1097681522369385,
+        "span_ce": 1.248320460319519,
+        "n_line": 31,
+        "n_span": 3
+      },
+      "_ctx_len_real": 14153,
+      "_ctx_len_shuffled": 14153,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "idlead/scikit-learn",
+      "identifier": "FastICA",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 23837,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.0998835563659668,
+        "span_ce": 1.1624890565872192,
+        "n_line": 23,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 0.7695936560630798,
+        "span_ce": 0.034924108535051346,
+        "n_line": 23,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 1.1272906064987183,
+        "span_ce": 1.5742422342300415,
+        "n_line": 23,
+        "n_span": 2
+      },
+      "_ctx_len_real": 22485,
+      "_ctx_len_shuffled": 22485,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "PythonCharmers/bokeh",
+      "identifier": "create_chart",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 7605,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.3534866571426392,
+        "span_ce": 0.03568369895219803,
+        "n_line": 18,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.9254022240638733,
+        "span_ce": 0.021468251943588257,
+        "n_line": 18,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.195343255996704,
+        "span_ce": 0.019747236743569374,
+        "n_line": 18,
+        "n_span": 3
+      },
+      "_ctx_len_real": 5879,
+      "_ctx_len_shuffled": 5879,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "PythonCharmers/bokeh",
+      "identifier": "create_chart",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 7343,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.8809869289398193,
+        "span_ce": 0.701020359992981,
+        "n_line": 14,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 3.051814317703247,
+        "span_ce": 1.5188926458358765,
+        "n_line": 14,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 2.7346599102020264,
+        "span_ce": 0.5182987451553345,
+        "n_line": 14,
+        "n_span": 3
+      },
+      "_ctx_len_real": 6865,
+      "_ctx_len_shuffled": 6865,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "elkingtonmcb/sympy",
+      "identifier": "sign",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 17268,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.2987589836120605,
+        "span_ce": 11.073424339294434,
+        "n_line": 16,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.7399752140045166,
+        "span_ce": 11.766801834106445,
+        "n_line": 16,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.3060789108276367,
+        "span_ce": 11.863136291503906,
+        "n_line": 16,
+        "n_span": 1
+      },
+      "_ctx_len_real": 13464,
+      "_ctx_len_shuffled": 13464,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "kapilt/cloud-custodian",
+      "identifier": "factory",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 18414,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.8244925737380981,
+        "span_ce": 0.7853646278381348,
+        "n_line": 7,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.09907148778438568,
+        "span_ce": 0.0032646951731294394,
+        "n_line": 7,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 0.6981271505355835,
+        "span_ce": 0.46014291048049927,
+        "n_line": 7,
+        "n_span": 1
+      },
+      "_ctx_len_real": 18064,
+      "_ctx_len_shuffled": 18064,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "kapilt/cloud-custodian",
+      "identifier": "factory",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 16510,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.3501381874084473,
+        "span_ce": 0.0008996253600344062,
+        "n_line": 6,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.794995665550232,
+        "span_ce": 0.0009559590835124254,
+        "n_line": 6,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.509742498397827,
+        "span_ce": 0.00024196557933464646,
+        "n_line": 6,
+        "n_span": 1
+      },
+      "_ctx_len_real": 16249,
+      "_ctx_len_shuffled": 16249,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "kapilt/cloud-custodian",
+      "identifier": "factory",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 8169,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.6332088708877563,
+        "span_ce": 1.045313835144043,
+        "n_line": 10,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.5908244848251343,
+        "span_ce": 2.5395867824554443,
+        "n_line": 10,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.7541321516036987,
+        "span_ce": 1.3422170877456665,
+        "n_line": 10,
+        "n_span": 1
+      },
+      "_ctx_len_real": 7149,
+      "_ctx_len_shuffled": 7149,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "suvarnaraju/robotframework",
+      "identifier": "escape",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 11608,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.278442144393921,
+        "span_ce": 0.017753735184669495,
+        "n_line": 15,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.6354222893714905,
+        "span_ce": 0.09816379100084305,
+        "n_line": 15,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.2408195734024048,
+        "span_ce": 0.049334701150655746,
+        "n_line": 15,
+        "n_span": 1
+      },
+      "_ctx_len_real": 9706,
+      "_ctx_len_shuffled": 9706,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "suvarnaraju/robotframework",
+      "identifier": "split_from_equals",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 11945,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.2222461700439453,
+        "span_ce": 1.3818631172180176,
+        "n_line": 20,
+        "n_span": 6
+      },
+      "none": {
+        "line_ce": 1.1281336545944214,
+        "span_ce": 1.053229808807373,
+        "n_line": 20,
+        "n_span": 6
+      },
+      "shuffled": {
+        "line_ce": 1.0373200178146362,
+        "span_ce": 0.8317786455154419,
+        "n_line": 20,
+        "n_span": 6
+      },
+      "_ctx_len_real": 9706,
+      "_ctx_len_shuffled": 9706,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "roadmapper/ansible",
+      "identifier": "exec_command",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 18079,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.7658970952033997,
+        "span_ce": 9.209985728375614e-05,
+        "n_line": 18,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.39445963501930237,
+        "span_ce": 0.024133680388331413,
+        "n_line": 18,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 0.687279462814331,
+        "span_ce": 0.0001398894819431007,
+        "n_line": 18,
+        "n_span": 3
+      },
+      "_ctx_len_real": 16845,
+      "_ctx_len_shuffled": 16845,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "roadmapper/ansible",
+      "identifier": "set_nc_config",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 15800,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.3242250978946686,
+        "span_ce": 0.2512218654155731,
+        "n_line": 21,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 0.18133290112018585,
+        "span_ce": 0.12757357954978943,
+        "n_line": 21,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 0.24154436588287354,
+        "span_ce": 0.17345789074897766,
+        "n_line": 21,
+        "n_span": 5
+      },
+      "_ctx_len_real": 12822,
+      "_ctx_len_shuffled": 12822,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "roadmapper/ansible",
+      "identifier": "execute_nc_action",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 13388,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.8483728766441345,
+        "span_ce": 3.020109176635742,
+        "n_line": 20,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 0.41266965866088867,
+        "span_ce": 1.5365341901779175,
+        "n_line": 20,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 0.7996135950088501,
+        "span_ce": 2.823749303817749,
+        "n_line": 20,
+        "n_span": 5
+      },
+      "_ctx_len_real": 10070,
+      "_ctx_len_shuffled": 10070,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "blondegeek/pymatgen",
+      "identifier": "ComputedEntry",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 10600,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.9807208776474,
+        "span_ce": 1.321231722831726,
+        "n_line": 26,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 1.6786781549453735,
+        "span_ce": 0.936110258102417,
+        "n_line": 26,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 2.005803346633911,
+        "span_ce": 1.3538706302642822,
+        "n_line": 26,
+        "n_span": 3
+      },
+      "_ctx_len_real": 5087,
+      "_ctx_len_shuffled": 5087,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "Shaswat27/sympy",
+      "identifier": "CGate",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 13029,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 3.8347039222717285,
+        "span_ce": 0.6053042411804199,
+        "n_line": 16,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 2.484478235244751,
+        "span_ce": 0.8894595503807068,
+        "n_line": 16,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 3.8710098266601562,
+        "span_ce": 0.5982847809791565,
+        "n_line": 16,
+        "n_span": 2
+      },
+      "_ctx_len_real": 11709,
+      "_ctx_len_shuffled": 11709,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "Shaswat27/sympy",
+      "identifier": "decompose_power",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 16826,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.967113971710205,
+        "span_ce": 2.249703884124756,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.9925978183746338,
+        "span_ce": 0.24593695998191833,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 2.093216896057129,
+        "span_ce": 2.378220796585083,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "_ctx_len_real": 14463,
+      "_ctx_len_shuffled": 14463,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "Shaswat27/sympy",
+      "identifier": "decompose_power_rat",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 16870,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.6040844917297363,
+        "span_ce": 2.8901844024658203,
+        "n_line": 14,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 0.6813685894012451,
+        "span_ce": 1.0799635648727417,
+        "n_line": 14,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 1.6520222425460815,
+        "span_ce": 2.7936432361602783,
+        "n_line": 14,
+        "n_span": 5
+      },
+      "_ctx_len_real": 14463,
+      "_ctx_len_shuffled": 14463,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "tanium/pytan",
+      "identifier": "int_to_bytes",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 4346,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.9121279716491699,
+        "span_ce": 0.7905676364898682,
+        "n_line": 24,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 0.7956592440605164,
+        "span_ce": 0.8719571232795715,
+        "n_line": 24,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 0.9252419471740723,
+        "span_ce": 0.8816999793052673,
+        "n_line": 24,
+        "n_span": 5
+      },
+      "_ctx_len_real": 1885,
+      "_ctx_len_shuffled": 1885,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "tanium/pytan",
+      "identifier": "signature",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 26012,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.417417287826538,
+        "span_ce": 2.590398073196411,
+        "n_line": 13,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.3005926609039307,
+        "span_ce": 2.8821611404418945,
+        "n_line": 13,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.424649953842163,
+        "span_ce": 3.3996405601501465,
+        "n_line": 13,
+        "n_span": 1
+      },
+      "_ctx_len_real": 25332,
+      "_ctx_len_shuffled": 25332,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "typemytype/Mechanic",
+      "identifier": "LocationParseError",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 6469,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.2820570468902588,
+        "span_ce": 0.2828705310821533,
+        "n_line": 9,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 1.0396181344985962,
+        "span_ce": 0.5790543556213379,
+        "n_line": 9,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.1606627702713013,
+        "span_ce": 0.3664819598197937,
+        "n_line": 9,
+        "n_span": 3
+      },
+      "_ctx_len_real": 4843,
+      "_ctx_len_shuffled": 4843,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jfmartinez64/test",
+      "identifier": "find_xpath_attr",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 26096,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 3.059659004211426,
+        "span_ce": 1.0809383392333984,
+        "n_line": 27,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 1.8123620748519897,
+        "span_ce": 0.5263780355453491,
+        "n_line": 27,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 3.0882511138916016,
+        "span_ce": 1.2897915840148926,
+        "n_line": 27,
+        "n_span": 5
+      },
+      "_ctx_len_real": 25761,
+      "_ctx_len_shuffled": 25761,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jfmartinez64/test",
+      "identifier": "unified_strdate",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 16755,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.5948007106781006,
+        "span_ce": 0.907618522644043,
+        "n_line": 18,
+        "n_span": 4
+      },
+      "none": {
+        "line_ce": 0.552051305770874,
+        "span_ce": 0.5657520294189453,
+        "n_line": 18,
+        "n_span": 4
+      },
+      "shuffled": {
+        "line_ce": 0.4646337926387787,
+        "span_ce": 0.6849302053451538,
+        "n_line": 18,
+        "n_span": 4
+      },
+      "_ctx_len_real": 15552,
+      "_ctx_len_shuffled": 15552,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jfmartinez64/test",
+      "identifier": "qualities",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 16808,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 3.65319561958313,
+        "span_ce": 6.7670369148254395,
+        "n_line": 22,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 2.6987063884735107,
+        "span_ce": 4.6695051193237305,
+        "n_line": 22,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 3.870187282562256,
+        "span_ce": 8.213191986083984,
+        "n_line": 22,
+        "n_span": 1
+      },
+      "_ctx_len_real": 15552,
+      "_ctx_len_shuffled": 15552,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "diofant/diofant",
+      "identifier": "exp",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 15699,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.2687485218048096,
+        "span_ce": 0.4799607992172241,
+        "n_line": 10,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.3844311237335205,
+        "span_ce": 1.9790966510772705,
+        "n_line": 10,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.510751485824585,
+        "span_ce": 0.8942574262619019,
+        "n_line": 10,
+        "n_span": 1
+      },
+      "_ctx_len_real": 14098,
+      "_ctx_len_shuffled": 14098,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "diofant/diofant",
+      "identifier": "Pow",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 21606,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 3.662721872329712,
+        "span_ce": 3.8489859104156494,
+        "n_line": 16,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 3.049370765686035,
+        "span_ce": 2.896800994873047,
+        "n_line": 16,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 3.584916114807129,
+        "span_ce": 3.7065834999084473,
+        "n_line": 16,
+        "n_span": 2
+      },
+      "_ctx_len_real": 14098,
+      "_ctx_len_shuffled": 14098,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "diofant/diofant",
+      "identifier": "exp",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 18527,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.635143518447876,
+        "span_ce": 1.9673038721084595,
+        "n_line": 17,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 2.174245595932007,
+        "span_ce": 2.59320330619812,
+        "n_line": 17,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.729752540588379,
+        "span_ce": 2.670151710510254,
+        "n_line": 17,
+        "n_span": 1
+      },
+      "_ctx_len_real": 14098,
+      "_ctx_len_shuffled": 14098,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "adamchainz/ansible",
+      "identifier": "Display",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 17938,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.06366585195064545,
+        "span_ce": 0.0339084267616272,
+        "n_line": 6,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.39191359281539917,
+        "span_ce": 0.038834892213344574,
+        "n_line": 6,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 0.11110904067754745,
+        "span_ce": 0.02696811780333519,
+        "n_line": 6,
+        "n_span": 1
+      },
+      "_ctx_len_real": 17564,
+      "_ctx_len_shuffled": 17564,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "adamchainz/ansible",
+      "identifier": "check_args",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 28639,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.018264135345816612,
+        "span_ce": 8.701816841494292e-05,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.00016539460921194404,
+        "span_ce": 0.00011128498590551317,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 0.07788374274969101,
+        "span_ce": 0.0002499694237485528,
+        "n_line": 10,
+        "n_span": 3
+      },
+      "_ctx_len_real": 26911,
+      "_ctx_len_shuffled": 26911,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "adamchainz/ansible",
+      "identifier": "run_commands",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 6004,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.23483815789222717,
+        "span_ce": 0.0500616729259491,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.03463132306933403,
+        "span_ce": 0.01038595475256443,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 0.459082692861557,
+        "span_ce": 0.09600211679935455,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "_ctx_len_real": 4167,
+      "_ctx_len_shuffled": 4167,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "itdxer/neupy",
+      "identifier": "Convolution",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 5786,
+      "identifier_in_task_prefix": false,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.8495326042175293,
+        "span_ce": 2.002791404724121,
+        "n_line": 18,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 2.308847188949585,
+        "span_ce": 1.617242455482483,
+        "n_line": 18,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 2.805525064468384,
+        "span_ce": 2.021306276321411,
+        "n_line": 18,
+        "n_span": 2
+      },
+      "_ctx_len_real": 5330,
+      "_ctx_len_shuffled": 5330,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "kantel/processingpy",
+      "identifier": "MPIntervalContext",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 17002,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.8098424077033997,
+        "span_ce": 0.4118224084377289,
+        "n_line": 7,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.08824626356363297,
+        "span_ce": 0.01163488533347845,
+        "n_line": 7,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 0.9406210780143738,
+        "span_ce": 0.7242984771728516,
+        "n_line": 7,
+        "n_span": 3
+      },
+      "_ctx_len_real": 16938,
+      "_ctx_len_shuffled": 16938,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "quarckster/cfme_tests",
+      "identifier": "soft_assert",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 24954,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 4.209794998168945,
+        "span_ce": 2.2092432975769043,
+        "n_line": 25,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 3.282066583633423,
+        "span_ce": 1.5185588598251343,
+        "n_line": 25,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 4.343080997467041,
+        "span_ce": 2.4535627365112305,
+        "n_line": 25,
+        "n_span": 3
+      },
+      "_ctx_len_real": 23313,
+      "_ctx_len_shuffled": 23313,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "leonardowolf/bookfree",
+      "identifier": "method",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 12779,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.2815426588058472,
+        "span_ce": 4.594392776489258,
+        "n_line": 13,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.34912410378456116,
+        "span_ce": 1.7082160711288452,
+        "n_line": 13,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.6089953184127808,
+        "span_ce": 6.692839622497559,
+        "n_line": 13,
+        "n_span": 1
+      },
+      "_ctx_len_real": 11941,
+      "_ctx_len_shuffled": 11941,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "Salat-Cx65/python-for-android",
+      "identifier": "read",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 25835,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.5980947017669678,
+        "span_ce": 2.59399676322937,
+        "n_line": 27,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.5091428756713867,
+        "span_ce": 0.6790374517440796,
+        "n_line": 27,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.5887043476104736,
+        "span_ce": 2.755629539489746,
+        "n_line": 27,
+        "n_span": 1
+      },
+      "_ctx_len_real": 18397,
+      "_ctx_len_shuffled": 18397,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "sstjohn/pox",
+      "identifier": "Timer",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 13026,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.6134462356567383,
+        "span_ce": 0.3914128541946411,
+        "n_line": 23,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 1.7655494213104248,
+        "span_ce": 0.19060347974300385,
+        "n_line": 23,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 2.781083106994629,
+        "span_ce": 0.6070791482925415,
+        "n_line": 23,
+        "n_span": 2
+      },
+      "_ctx_len_real": 10578,
+      "_ctx_len_shuffled": 10578,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "tensorflow/tfx",
+      "identifier": "BeamDagRunner",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 15801,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.7394890785217285,
+        "span_ce": 3.504608631134033,
+        "n_line": 9,
+        "n_span": 4
+      },
+      "none": {
+        "line_ce": 2.6618404388427734,
+        "span_ce": 3.5707192420959473,
+        "n_line": 9,
+        "n_span": 4
+      },
+      "shuffled": {
+        "line_ce": 2.5854475498199463,
+        "span_ce": 3.1236438751220703,
+        "n_line": 9,
+        "n_span": 4
+      },
+      "_ctx_len_real": 13733,
+      "_ctx_len_shuffled": 13733,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "ravibhure/ansible",
+      "identifier": "FcoeNetworkModule",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 11375,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.4619216918945312,
+        "span_ce": 2.0502989292144775,
+        "n_line": 9,
+        "n_span": 4
+      },
+      "none": {
+        "line_ce": 1.6439971923828125,
+        "span_ce": 1.8475037813186646,
+        "n_line": 9,
+        "n_span": 4
+      },
+      "shuffled": {
+        "line_ce": 2.470959186553955,
+        "span_ce": 2.0603363513946533,
+        "n_line": 9,
+        "n_span": 4
+      },
+      "_ctx_len_real": 10755,
+      "_ctx_len_shuffled": 10755,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "ebukoz/thrive",
+      "identifier": "get_account_currency",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 15196,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.8333702087402344,
+        "span_ce": 0.7746803164482117,
+        "n_line": 18,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 0.7124302387237549,
+        "span_ce": 0.5523544549942017,
+        "n_line": 18,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 0.8363361954689026,
+        "span_ce": 0.7914671301841736,
+        "n_line": 18,
+        "n_span": 5
+      },
+      "_ctx_len_real": 4498,
+      "_ctx_len_shuffled": 4498,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "ebukoz/thrive",
+      "identifier": "get_account_currency",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 16082,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.0109590291976929,
+        "span_ce": 0.2554960548877716,
+        "n_line": 23,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 0.8804559707641602,
+        "span_ce": 0.18361587822437286,
+        "n_line": 23,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 1.003228783607483,
+        "span_ce": 0.2553583085536957,
+        "n_line": 23,
+        "n_span": 5
+      },
+      "_ctx_len_real": 4498,
+      "_ctx_len_shuffled": 4498,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "kevinthesun/mxnet",
+      "identifier": "score",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 4393,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.3414673805236816,
+        "span_ce": 0.36517250537872314,
+        "n_line": 12,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.9183945655822754,
+        "span_ce": 0.04973369836807251,
+        "n_line": 12,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.0745923519134521,
+        "span_ce": 0.21004429459571838,
+        "n_line": 12,
+        "n_span": 1
+      },
+      "_ctx_len_real": 3868,
+      "_ctx_len_shuffled": 3868,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "kevinthesun/mxnet",
+      "identifier": "get_symbol",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 23898,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.2738914489746094,
+        "span_ce": 0.42386770248413086,
+        "n_line": 24,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.8785758018493652,
+        "span_ce": 0.30900144577026367,
+        "n_line": 24,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.2748849391937256,
+        "span_ce": 0.20579278469085693,
+        "n_line": 24,
+        "n_span": 3
+      },
+      "_ctx_len_real": 23020,
+      "_ctx_len_shuffled": 23020,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "chetan51/nupic",
+      "identifier": "aggregationDivide",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 16234,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.079582929611206,
+        "span_ce": 2.9100024700164795,
+        "n_line": 14,
+        "n_span": 4
+      },
+      "none": {
+        "line_ce": 1.4936281442642212,
+        "span_ce": 2.212751865386963,
+        "n_line": 14,
+        "n_span": 4
+      },
+      "shuffled": {
+        "line_ce": 2.283597946166992,
+        "span_ce": 2.538919687271118,
+        "n_line": 14,
+        "n_span": 4
+      },
+      "_ctx_len_real": 13163,
+      "_ctx_len_shuffled": 13163,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "frankrousseau/weboob",
+      "identifier": "id2url",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 17275,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.098043918609619,
+        "span_ce": 1.3934850692749023,
+        "n_line": 17,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 1.480713129043579,
+        "span_ce": 0.6678718328475952,
+        "n_line": 17,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.9448946714401245,
+        "span_ce": 1.5821244716644287,
+        "n_line": 17,
+        "n_span": 3
+      },
+      "_ctx_len_real": 16774,
+      "_ctx_len_shuffled": 16774,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "leopittelli/Django-on-App-Engine-Example",
+      "identifier": "urlquote",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 15568,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 0.519122838973999,
+        "span_ce": 1.8879772424697876,
+        "n_line": 11,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 0.311528742313385,
+        "span_ce": 1.3887395858764648,
+        "n_line": 11,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 0.533932626247406,
+        "span_ce": 2.0498297214508057,
+        "n_line": 11,
+        "n_span": 2
+      },
+      "_ctx_len_real": 12456,
+      "_ctx_len_shuffled": 12456,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "nvoron23/statsmodels",
+      "identifier": "reduce",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 10299,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 4.530529499053955,
+        "span_ce": 7.723478317260742,
+        "n_line": 14,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 4.093917369842529,
+        "span_ce": 8.57904052734375,
+        "n_line": 14,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 4.4882307052612305,
+        "span_ce": 7.887289047241211,
+        "n_line": 14,
+        "n_span": 1
+      },
+      "_ctx_len_real": 5847,
+      "_ctx_len_shuffled": 5847,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "danieljaouen/ansible",
+      "identifier": "Scaleway",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 5547,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.3432016372680664,
+        "span_ce": 2.2714576721191406,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.9919883608818054,
+        "span_ce": 1.289118766784668,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.3686368465423584,
+        "span_ce": 2.3280348777770996,
+        "n_line": 12,
+        "n_span": 3
+      },
+      "_ctx_len_real": 3772,
+      "_ctx_len_shuffled": 3772,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "danieljaouen/ansible",
+      "identifier": "patch",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 15433,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.243959665298462,
+        "span_ce": 4.92631196975708,
+        "n_line": 31,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 0.11971407383680344,
+        "span_ce": 0.1306925266981125,
+        "n_line": 31,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 1.142149567604065,
+        "span_ce": 3.479081153869629,
+        "n_line": 31,
+        "n_span": 1
+      },
+      "_ctx_len_real": 15110,
+      "_ctx_len_shuffled": 15110,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "danieljaouen/ansible",
+      "identifier": "patch",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 16310,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.95029878616333,
+        "span_ce": 3.9436535835266113,
+        "n_line": 29,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 1.516312837600708,
+        "span_ce": 1.899209976196289,
+        "n_line": 29,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.7449071407318115,
+        "span_ce": 3.6218931674957275,
+        "n_line": 29,
+        "n_span": 1
+      },
+      "_ctx_len_real": 14946,
+      "_ctx_len_shuffled": 14946,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "mungerd/plastex",
+      "identifier": "getLogger",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 6056,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.0248608589172363,
+        "span_ce": 0.0005389765719883144,
+        "n_line": 6,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 0.9085445404052734,
+        "span_ce": 0.0003051755193155259,
+        "n_line": 6,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 0.6379740834236145,
+        "span_ce": 0.016460027545690536,
+        "n_line": 6,
+        "n_span": 2
+      },
+      "_ctx_len_real": 6000,
+      "_ctx_len_shuffled": 6000,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "crazy-cat/incubator-mxnet",
+      "identifier": "parse_args",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 28897,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 0.36852777004241943,
+        "span_ce": 0.011721499264240265,
+        "n_line": 8,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 0.32948893308639526,
+        "span_ce": 0.014363748952746391,
+        "n_line": 8,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 0.4841776490211487,
+        "span_ce": 0.014506306499242783,
+        "n_line": 8,
+        "n_span": 3
+      },
+      "_ctx_len_real": 25696,
+      "_ctx_len_shuffled": 25696,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "crazy-cat/incubator-mxnet",
+      "identifier": "sym_gen",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 17645,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.3734937906265259,
+        "span_ce": 1.7745881080627441,
+        "n_line": 22,
+        "n_span": 3
+      },
+      "none": {
+        "line_ce": 1.0136301517486572,
+        "span_ce": 1.418259620666504,
+        "n_line": 22,
+        "n_span": 3
+      },
+      "shuffled": {
+        "line_ce": 1.7805633544921875,
+        "span_ce": 2.201385021209717,
+        "n_line": 22,
+        "n_span": 3
+      },
+      "_ctx_len_real": 17009,
+      "_ctx_len_shuffled": 17009,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "maxlikely/scikit-learn",
+      "identifier": "pairwise_kernels",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 17950,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.7237861156463623,
+        "span_ce": 3.226794719696045,
+        "n_line": 19,
+        "n_span": 4
+      },
+      "none": {
+        "line_ce": 1.382595419883728,
+        "span_ce": 1.5962330102920532,
+        "n_line": 19,
+        "n_span": 4
+      },
+      "shuffled": {
+        "line_ce": 2.7616636753082275,
+        "span_ce": 2.964529275894165,
+        "n_line": 19,
+        "n_span": 4
+      },
+      "_ctx_len_real": 13809,
+      "_ctx_len_shuffled": 13809,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jeroendierckx/Camelot",
+      "identifier": "get_signal_handler",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 16237,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.006532073020935,
+        "span_ce": 0.015286343172192574,
+        "n_line": 12,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 0.9959944486618042,
+        "span_ce": 0.00611919118091464,
+        "n_line": 12,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 1.320328950881958,
+        "span_ce": 0.009310198947787285,
+        "n_line": 12,
+        "n_span": 5
+      },
+      "_ctx_len_real": 15614,
+      "_ctx_len_shuffled": 15614,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "jeroendierckx/Camelot",
+      "identifier": "variant_to_pyobject",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 16771,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 2.9984164237976074,
+        "span_ce": 1.349083662033081,
+        "n_line": 25,
+        "n_span": 6
+      },
+      "none": {
+        "line_ce": 1.850182294845581,
+        "span_ce": 1.1466484069824219,
+        "n_line": 25,
+        "n_span": 6
+      },
+      "shuffled": {
+        "line_ce": 3.192020893096924,
+        "span_ce": 1.2763876914978027,
+        "n_line": 25,
+        "n_span": 6
+      },
+      "_ctx_len_real": 16314,
+      "_ctx_len_shuffled": 16314,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "bloyl/mne-python",
+      "identifier": "_create_meg_coils",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 17818,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 3.2327117919921875,
+        "span_ce": 2.2687277793884277,
+        "n_line": 21,
+        "n_span": 7
+      },
+      "none": {
+        "line_ce": 2.5328571796417236,
+        "span_ce": 2.14638614654541,
+        "n_line": 21,
+        "n_span": 7
+      },
+      "shuffled": {
+        "line_ce": 3.126742362976074,
+        "span_ce": 2.2831220626831055,
+        "n_line": 21,
+        "n_span": 7
+      },
+      "_ctx_len_real": 16210,
+      "_ctx_len_shuffled": 16210,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "bloyl/mne-python",
+      "identifier": "make_forward_solution",
+      "bucket": "8-16k",
+      "n_ctx_tokens": 14426,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 1.6276073455810547,
+        "span_ce": 1.1744658946990967,
+        "n_line": 25,
+        "n_span": 5
+      },
+      "none": {
+        "line_ce": 0.9223412871360779,
+        "span_ce": 0.5001392364501953,
+        "n_line": 25,
+        "n_span": 5
+      },
+      "shuffled": {
+        "line_ce": 1.6509002447128296,
+        "span_ce": 1.1009920835494995,
+        "n_line": 25,
+        "n_span": 5
+      },
+      "_ctx_len_real": 11740,
+      "_ctx_len_shuffled": 11740,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "bloyl/mne-python",
+      "identifier": "make_forward_dipole",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 27458,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.350978374481201,
+        "span_ce": 1.0909698009490967,
+        "n_line": 26,
+        "n_span": 6
+      },
+      "none": {
+        "line_ce": 1.627051830291748,
+        "span_ce": 0.5901724696159363,
+        "n_line": 26,
+        "n_span": 6
+      },
+      "shuffled": {
+        "line_ce": 2.433988332748413,
+        "span_ce": 1.155662178993225,
+        "n_line": 26,
+        "n_span": 6
+      },
+      "_ctx_len_real": 20286,
+      "_ctx_len_shuffled": 20286,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "dgarciam/Sick-Beard",
+      "identifier": "Bit",
+      "bucket": "4-8k",
+      "n_ctx_tokens": 7216,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": true,
+      "real": {
+        "line_ce": 2.1525630950927734,
+        "span_ce": 1.007524013519287,
+        "n_line": 17,
+        "n_span": 1
+      },
+      "none": {
+        "line_ce": 2.0241475105285645,
+        "span_ce": 0.8625997304916382,
+        "n_line": 17,
+        "n_span": 1
+      },
+      "shuffled": {
+        "line_ce": 2.160745143890381,
+        "span_ce": 1.5708820819854736,
+        "n_line": 17,
+        "n_span": 1
+      },
+      "_ctx_len_real": 6233,
+      "_ctx_len_shuffled": 6233,
+      "ctx_length_match": true
+    },
+    {
+      "repo_name": "ric2b/Vivaldi-browser",
+      "identifier": "iteritems",
+      "bucket": "16-32k",
+      "n_ctx_tokens": 27204,
+      "identifier_in_task_prefix": true,
+      "identifier_in_prefix_nonimport": false,
+      "real": {
+        "line_ce": 1.3567477464675903,
+        "span_ce": 0.8834514617919922,
+        "n_line": 14,
+        "n_span": 2
+      },
+      "none": {
+        "line_ce": 0.7704323530197144,
+        "span_ce": 2.265521764755249,
+        "n_line": 14,
+        "n_span": 2
+      },
+      "shuffled": {
+        "line_ce": 1.7343406677246094,
+        "span_ce": 0.9834729433059692,
+        "n_line": 14,
+        "n_span": 2
+      },
+      "_ctx_len_real": 26138,
+      "_ctx_len_shuffled": 26138,
+      "ctx_length_match": true
+    }
+  ]
+}

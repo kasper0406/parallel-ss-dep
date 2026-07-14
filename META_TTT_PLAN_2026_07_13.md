@@ -83,3 +83,21 @@ curve-bending signature (EdgeBench log-sigmoid framing,
   stronger linearized base as part of P3.
 - **Full lean run (task #5)**: superseded in priority by P1 unless meta-TTT
   parks again.
+
+## P1 RESULT (2026-07-14): KILLED as pre-registered — with an instrument caveat
+
+Pilot (launch_meta_ttt_P1.sh, 2,300 steps / ~301M tok from stageA_executor,
+500 train episodes): held-out kill-test (results/repo_adaptive_meta_ttt_P1.json)
+**lift(shuffled−real) = +0.046 line / +0.126 span — HALF the incidental
+baseline (+0.138/+0.246) the kill line required it to clearly exceed. KILL.**
+Real-context CE on novel repos DEGRADED (1.79 vs untrained 1.65) while
+no-context improved (1.21 vs 1.32): the model got worse at using unseen repo
+context.
+
+**Autopsy — the instrument failed before the hypothesis was tested:** training
+mttt CE hit 0.000 by step ~700 (500 episodes fully memorized at ~30% of the
+run) → 70% of the run delivered zero gradient on the meta objective and pure
+overfit consolidation. The N1→N1′ precedent applies: this kills the PILOT, not
+cleanly the mechanism. IF the bet is retried, the single-variable fix is a
+10–50× episode corpus (scan more of codeparrot; the 300k-row scan was a pilot
+slice) + early-stop on train-CE saturation. Otherwise: park per registration.

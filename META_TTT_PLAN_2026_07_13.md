@@ -117,3 +117,28 @@ Single retry of the pilot with the instrument fixed. Locked lines:
 4. **No P1′′.** A valid kill parks meta-TTT; adaptivity falls back to the
    state-cartridges/self-study tier (kept alive by the State-Algebra partial-
    additivity result) + LoRA-sleep consolidation.
+
+## P1′ RESULT (2026-07-14): VALID KILL — meta-TTT PARKED
+
+The instrument-fixed retry (6,000 episodes / 2,458 repos, zero eval overlap,
+legacy-FIM lineage-matched) PASSED the engagement guard (mttt CE 0.5–1.6
+through the whole run, no saturation) and still failed the kill line:
+held-out lift(shuffled−real) = **+0.073 line / +0.174 span vs the incidental
+bar +0.138/+0.246** (results/repo_adaptive_meta_ttt_P1prime.json). Real
+context still hurts vs none (−0.20 line, improved from −0.32 untrained /
+−0.58 P1). Bucket profile: structure signal decays 4–8k → 16–32k.
+
+**Conclusion: with this recipe (0.1-weight aux, truncated BPTT with gradient
+through only the final ~4k ingestion tokens, 300M tok on a 2048-trained
+base), meta-training does not shape the state dynamics toward better
+novel-repo use — it mildly dulls the incidental signal while improving the
+no-context path. Per the locked registration: NO P1′′; meta-TTT is PARKED.**
+
+If ever revisited (bigger compute era), the known mechanistic suspects, in
+order: (1) the truncated gradient — state-producing weights for EARLY context
+never receive gradient (grad_chunks=2 was a memory compromise; true
+state-shaping likely needs gradient through the full ingestion, i.e. BPTT
+memory we don't have); (2) T=2048-trained base dynamics at 8–32k; (3) the
+aux-weight/mix balance. Adaptivity pillar falls back to: state cartridges /
+self-study (kept alive by the State-Algebra partial-additivity result) and
+LoRA-sleep consolidation.

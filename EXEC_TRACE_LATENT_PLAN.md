@@ -180,7 +180,7 @@ Depth-weighted consolidation (1,200-step continuation,
   Per-hop @K4 0.86; NOT killed (lifts +33.0..+50.7pp).
 - Length-gen: latent lift tripled (K9 +16.0 / K10 +15.0 / K12 +10.7pp vs
   +4.7/+3.7/+3.0), per-hop 0.66/0.57/0.48.
-- Trade: shallow rungs paid slightly (K4 −5pp) — expected under reweighting.
+- Trade: shallow rungs paid REAL costs under reweighting — K4 −5.3pp (0.630→0.577) and K3 −22.3pp (0.590→0.367); K2 anomaly persists (0.153). Depth-fix wins deep (K6–8 + lengen), loses shallow — a short uniform-mix rebalance round is the obvious follow-up if one ckpt must serve all K.
 
 **Horizon diagnosis (`probe_latent_exposure_bias.py`,
 runs/probe_latent_exposure_bias.json): SLOT_DEPTH_COLLAPSE, not error

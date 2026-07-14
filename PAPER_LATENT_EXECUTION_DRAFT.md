@@ -41,8 +41,15 @@ We report the limits plainly: the mechanism does not transfer zero-shot to
 out-of-distribution real programs (CRUXEval latent arms ≈1.5–4%), though a
 direct-answer *internalization* signal on CRUXEval rises 0.0688→0.1050
 (z=2.58, n=800) — a promising but token-count-confounded observation whose
-control is in flight. Latent state saturates at a ~6-hop horizon. Results are a
-single model, single scale, single seed.
+control is in flight. Latent state saturates at a ~6-hop horizon; an
+exposure-controlled follow-up (depth-weighted consolidation sampling) extends
+the reliable range by one hop (K=7 answer 0.497→0.613, clearing the bar) but
+does not remove the cliff, and a controlled exposure-vs-capacity probe
+attributes the residual cliff to per-slot *capacity* collapse — deep slots
+decode at ≈0.17–0.34 even on error-free prefixes — providing what is, to our
+knowledge, the first controlled separation of exposure bias from capacity for
+the ~6-continuous-token limit reported for Coconut-style training (§4.6).
+Results are a single model, single scale, single seed.
 
 ---
 
@@ -140,8 +147,10 @@ Think?" (2512.21711) and 2411.15862 question whether latent tokens perform real
 computation or act as placeholders; "Soft Tokens, Hard Truths" (2509.19170)
 reports a practical ~6-continuous-token limit for Coconut-style training. Our
 staging cell is the controlled empirical instance of the 2602.01148 prediction;
-our depth-true signature answers the placeholder critique; our ~6-hop horizon is
-suspiciously close to the Soft-Tokens limit (§5).
+our depth-true signature answers the placeholder critique; and our ~6-hop
+horizon — which a controlled exposure-vs-capacity probe attributes to per-slot
+capacity rather than error propagation (§4.6) — is suspiciously close to the
+Soft-Tokens limit (§5).
 
 **Execution traces and neural interpreters.** The Neural Programmer-Interpreter
 (Reed & de Freitas, 2016) learned to imitate execution traces of algorithms;
@@ -369,6 +378,12 @@ competence is necessary. (On the confound that "the latent-first base is just
 weaker," see §5 — the three checkpoints are matched on general code competence
 to within ~0.015 HE-CE.)
 
+The numbers in this section are the **pre-registered Stage-B run**
+(`stageB_latent_trace.pt`); they remain the primary claim. A later
+exposure-controlled follow-up (`stageB_depthfix.pt`) is the best latent model
+we have and extends the reliable horizon by one hop, but it is a horizon
+analysis rather than a swap of the headline — see §4.6.
+
 ### 4.5 Depth-true signature
 
 The latent computation is genuinely sequential, not a bag of placeholder
@@ -382,7 +397,92 @@ hops 1–5 decode at 0.78–0.96 across every K, with the drop always at the *la
 required hop (e.g. K=8: [0.947, 0.917, 0.893, 0.857, 0.773, 0.577, 0.093,
 0.000]).
 
-### 4.6 Transfer to CRUXEval — the negative, and an internalization signal
+### 4.6 Anatomy of the depth horizon
+
+Stage B's answer accuracy passes only to K≈6 because per-hop decode falls off a
+cliff at hop 7+ (§4.4, §4.5). Two follow-ups on the *same* Stage-B lineage
+isolate whether that cliff is a curable training-exposure artifact or a
+structural per-slot capacity limit. Both run on the exposure-controlled
+checkpoint `stageB_depthfix.pt`.
+
+**The depth-fix arm — depth-weighted consolidation.** We continue Stage B for
+~1,200 steps with depth-weighted stage sampling
+(`latent_reasoning_cotrain.py --latent_reasoning_depth_weighted`), which
+up-weights the rare deep-slot draws (deep slots 7–8 otherwise receive gradient
+only from the (K≥7 rung) × (s≥7 stage) intersection, while slots 1–5 train in
+every s≥1 draw). **Source: `runs/stageB_depthfix_eval.json`** (n=300/rung; the
+`latent R=K (Stage B)` column reproduces the §4.4 pre-registered numbers for
+comparison, all other columns are the depth-fix checkpoint).
+
+| K | direct | latent R=K — Stage B (pre-reg) | latent R=K — depth-fix | per-hop (depth-fix) | kill lift (pp) |
+|---|---|---|---|---|---|
+| 2 | 0.1933 | 0.140 | 0.1533 | 0.9183 | — |
+| 3 | 0.2267 | 0.590 | 0.3667 | 0.9067 | — |
+| 4 | 0.150 | 0.630 | 0.5767 | 0.860 | +42.7 |
+| 5 | 0.1167 | 0.6333 | 0.6133 | 0.8567 | +49.7 |
+| 6 | 0.1467 | 0.5867 | 0.6533 | 0.8372 | +50.7 |
+| 7 | 0.1333 | 0.4967 | 0.6133 | 0.7990 | +48.0 |
+| 8 | 0.1233 | 0.3333 | 0.4533 | 0.7146 | +33.0 |
+
+(`direct`, `per-hop`, and `kill lift` are all depth-fix; kill lift = depth-fix
+latent R=K − depth-fix direct.)
+
+**The cliff moved, but did not vanish.** K=7 answer rises 0.497→0.613 —
+**clearing the ~0.55 success bar** — and K=8 rises 0.333→0.453; the arm is not
+killed at any K (K≥4 lifts +33.0..+50.7pp; per-hop @K4 0.86; mechanism gate
+still passes). The success bar (R=K answer ≥ ~0.55 at every K∈4–8) now fails at
+**only K=8** (0.453), vs K=7 *and* K=8 for the pre-registered run.
+Length-generalization improves markedly: the latent−direct lift roughly triples
+(K=9 +16.0 / K=10 +15.0 / K=12 +10.7pp, vs +4.7/+3.7/+3.0pp for Stage B; per-hop
+0.66/0.57/0.48 at K=9/10/12). The reweighting is not free — it trades shallow
+depth: K=4 answer 0.630→0.577 (−5.3pp) and K=3 0.590→0.367 (−22.3pp) — and it
+does not resolve the K=2 emission anomaly (0.140→0.1533, still below the direct
+baseline despite 0.918 per-hop; §5). **This is now the best latent model in the
+project**, but the pre-registered Stage-B run (§4.4) stays the primary claim;
+the depth-fix arm is the horizon analysis.
+
+**Exposure vs capacity — a controlled separation.** To decide *why* the residual
+cliff persists, we stratify each latent slot's decode accuracy by whether the
+model's own earlier slots (1..j−1, in the growing thread) all decoded correctly
+(`prefix-correct`) or contained at least one error (`prefix-error`)
+(`experiments/probe_latent_exposure_bias.py`). This is a stratification of the
+same per-hop reads, not an intervention — there is no token-level teacher
+forcing to remove in a continuous thread. **Source:
+`runs/probe_latent_exposure_bias.json`** (pooled over K∈{6,7,8,9,10,12}).
+
+| slot j | uncond | acc \| prefix-correct | acc \| prefix-error | n(correct) / n(error) |
+|---|---|---|---|---|
+| 2 | 0.9392 | 0.9638 | 0.2051 | 1161 / 39 |
+| 3 | 0.9108 | 0.9660 | 0.1481 | 1119 / 81 |
+| 4 | 0.8983 | 0.9695 | 0.2521 | 1081 / 119 |
+| 5 | 0.8808 | 0.9647 | 0.3026 | 1048 / 152 |
+| 6 | 0.7383 | 0.8289 | 0.2540 | 1011 / 189 |
+| 7 | 0.2890 | 0.3426 | 0.1255 | 753 / 247 |
+| 8 | 0.0625 | 0.1704 | 0.0208 | 223 / 577 |
+
+(Slot 1 has no prefix; slots ≥9 sit at ≈0 with negligible clean-prefix strata,
+e.g. slot 9 prefix-correct 0.033 at n=30.)
+
+**Both effects are present, but capacity dominates.** For hops 1–5, the
+clean-prefix decode is 0.96–0.97 — near ceiling — so the mild unconditional
+slope there is almost entirely *error propagation* (prefix-error drops to
+0.15–0.30). But at hop 7 the clean-prefix decode itself collapses to **0.343**,
+and at hop 8 to **0.170**, even though those slots inherited an error-free
+prefix — while the corresponding prefix-error strata sit at 0.126 / 0.021. The
+diagnostic reading (verdict `SLOT_DEPTH_COLLAPSE` at slots 7 and 8): error
+propagation hurts, but the *ceiling itself* falls at deep slots, so the horizon
+is a per-slot capacity / training-exposure limit, not merely accumulated
+error. This is consistent with the depth-fix arm — pouring more gradient into
+deep slots bought one hop and improved length-gen but could not remove the
+cliff. To our knowledge this is the first controlled exposure-vs-capacity
+separation for the ~6-continuous-token practical limit reported for
+Coconut-style training (Soft Tokens, Hard Truths, 2509.19170); it lands squarely
+in the regime the Depth Ceiling paper (2604.06427) predicts latent planning
+capacity barely scales through. The implication is that the remaining paths to
+deeper latent execution are **architectural** (a per-step op-selector / latent
+microcode that composes committed operations), not curricular.
+
+### 4.7 Transfer to CRUXEval — the negative, and an internalization signal
 
 We probe whether the executor mechanism transfers to real, out-of-distribution
 programs using CRUXEval-style output prediction.
@@ -435,28 +535,33 @@ We state every weak point the novelty assessment flagged.
 
 - **Synthetic programs only; mechanism does not transfer.** The executor is
   trained on our `gen_exec_traces` generator and does not fire on CRUXEval
-  (§4.6, latent arms ≈1.5–4%). The direct-answer internalization signal
+  (§4.7, latent arms ≈1.5–4%). The direct-answer internalization signal
   (0.0688→0.1050, z=2.58) is promising but token-count-confounded; its control
   is running. Until the mechanism transfers to real, unseen program
   distributions, the positive result is a controlled-setting demonstration, not
   a general capability.
 
-- **A ~6-hop latent horizon.** Latent state decodes cleanly for hops 1–5
+- **A ~6-hop latent horizon (partly curable, partly structural).** In the
+  pre-registered Stage-B run, latent state decodes cleanly for hops 1–5
   (0.78–0.96 at every K, including length-gen K=9–12) but hop 6 sits at ~0.60
   and hop 7+ falls off a cliff (≤0.28 → 0.00), so the answer — which needs the
   *last* hop — passes only to K≈6 (§4.4) and length-gen lift collapses past the
-  horizon (latent−direct +4.7/+3.7/+3.0pp at K=9/10/12). We diagnose this as a
-  training-exposure artifact rather than a hard wall: deep slots (7–8) receive
-  gradient only from the rare (K≥7 rung) × (s≥7 stage) draws, while slots 1–5
-  train in every s≥1 draw; the hop CE was still falling at run end. This is
-  suspiciously close to the ~6-continuous-token practical limit reported for
-  Coconut (Soft Tokens, Hard Truths, 2509.19170), and it is exactly the regime
-  the Depth Ceiling paper (2604.06427) predicts latent planning capacity barely
-  scales through. A depth-weighted consolidation-sampling arm (and possibly
-  c=2 slots/step at higher aux weight) is running to distinguish exposure from
-  structure. **[PENDING: depth-fix results — depth-weighted stage sampling;
-  report whether the hop-7+ cliff lifts and K=7/8 answer clears ~0.55. Relate
-  the outcome to Soft-Tokens' ~6-token limit and the Depth Ceiling either way.]**
+  horizon (latent−direct +4.7/+3.7/+3.0pp at K=9/10/12). We resolved this into
+  its exposure and capacity components (§4.6). A depth-weighted
+  consolidation-sampling arm moved the cliff by one hop — K=7 answer 0.497→0.613
+  (clears the ~0.55 bar), K=8 0.333→0.453 (still below), length-gen lift roughly
+  tripled to +16.0/+15.0/+10.7pp at K=9/10/12 — at a small shallow-rung cost, but
+  did **not** remove it. The exposure-vs-capacity probe explains why: even on an
+  error-free prefix, deep-slot decode collapses (hop 7 clean-prefix 0.343, hop 8
+  0.170, vs 0.126/0.021 on error-carrying prefixes; verdict
+  `SLOT_DEPTH_COLLAPSE`), so the residual cliff is a per-slot *capacity* limit,
+  not just error propagation. This lands suspiciously close to the
+  ~6-continuous-token practical limit reported for Coconut (Soft Tokens, Hard
+  Truths, 2509.19170), and squarely in the regime the Depth Ceiling paper
+  (2604.06427) predicts latent planning capacity barely scales through. We read
+  this as: the curriculum lever (depth-weighted exposure) is real but bounded,
+  and further depth is an *architectural* problem (per-step op-selector / latent
+  microcode composing committed operations), not a curricular one.
 
 - **Single model, single scale, single seed.** All results are one 402M
   DeltaNet checkpoint, seed 0. SIM-CoT reports that GPT-2-scale latent results
@@ -560,5 +665,7 @@ long-horizon coding agents — once it generalizes beyond the synthetic setting.
 | Stage A trace/answer/lift | table §4.3 | `runs/stageA_executor_eval.json` |
 | Stage B answer / per-hop / kill lift | table §4.4 | `runs/stageB_latent_trace_eval.json` |
 | Stage B per-hop (re-measured) | 0.925…0.632 | `runs/stageB_perhop_remeasure.json` |
-| CRUXEval mechanism transfer | table §4.6 | `results/cruxeval_transfer_*.json` |
+| Depth-fix arm answer / per-hop / kill lift / lengen | table §4.6 | `runs/stageB_depthfix_eval.json` |
+| Depth-horizon exposure-vs-capacity probe | table §4.6 | `runs/probe_latent_exposure_bias.json` |
+| CRUXEval mechanism transfer | table §4.7 | `results/cruxeval_transfer_*.json` |
 | CRUXEval direct internalization | 0.0688 / 0.0813 / 0.1050 | `results/cruxeval_direct800_*.json` |

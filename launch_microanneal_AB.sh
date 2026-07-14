@@ -40,6 +40,7 @@ CUDA_VISIBLE_DEVICES=$GPU nohup .venv/bin/python -u experiments/train_lm.py \
   --load_ckpt checkpoints/stageA_executor.pt --keep_base_vocab 49152 \
   --feedback none \
   --data_mix $MIX \
+  --fim_legacy_strings \
   --tokenizer HuggingFaceTB/SmolLM2-135M \
   --think_burst_prob 0 --mask_eos_in_targets \
   --T 2048 --batch 2 --grad_accum 32 \

@@ -380,7 +380,7 @@ to within ~0.015 HE-CE.)
 
 The numbers in this section are the **pre-registered Stage-B run**
 (`stageB_latent_trace.pt`); they remain the primary claim. A later
-exposure-controlled follow-up (`stageB_depthfix.pt`) is the best latent model
+exposure-controlled follow-up (`stageB_depthfix. (Code guard: the depth-fix checkpoint's HumanEval-solution CE is 0.7704, exceeding the pre-registered 0.755 bound that Stage B met at 0.7491 — the depth-weighted arm trades code competence and shallow-rung accuracy for depth; we therefore report it as the horizon analysis, with Stage B remaining the guard-compliant primary model. Source: runs/stageB_depthfix_hece.log.)pt`) is the best latent model
 we have and extends the reliable horizon by one hop, but it is a horizon
 analysis rather than a swap of the headline — see §4.6.
 

@@ -575,3 +575,16 @@ alone was NOT sufficient (N1').
   discrimination gate FAIL (all ckpts 0.0 — below action-protocol floor;
   needs few-shot protocol prompt or protocol-SFT before it's a usable dev
   signal); Tier-1 microanneal A/B control arm launched.
+
+## 2026-07-16 — Two-GPU allreduce bench: MANUAL-ALLREDUCE verdict (Tier-0 #3 closed)
+
+- GPU0 bus-wedge (second incident in 5 days) cleared by driver/PCIe reset +
+  reboot; both 5090s healthy again.
+- **Bench result** (`bench_two_gpu_allreduce.py`, 402M params, NCCL, P2P over
+  PCIe): flat all_reduce of the full 0.80 GB grad = **93.8 ms** (8.6 GB/s
+  algo-bw); 11×64 MB buckets = 108.7 ms. Unoverlapped comm = **1.9% of a 5 s
+  step** → decisively under the pre-registered 15% bar → **manual bucketed
+  allreduce**, DiLoCo unnecessary. A hand-rolled allreduce has no DDP hooks →
+  no static_graph requirement → compatible with the latent reentrant adapter
+  and curriculum graph changes that block DDP. The ~1.9× two-GPU lever is
+  validated for every subsequent production run (incl. task #5).

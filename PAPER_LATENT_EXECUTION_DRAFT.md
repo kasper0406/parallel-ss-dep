@@ -343,6 +343,11 @@ column re-measured in `runs/stageB_perhop_remeasure.json`; see below).**
 | 7 | 0.8876 | 0.760 | 0.1333 | 0.4967 | 0.1267 | 0.2167 | 0.7252 | +36.3 |
 | 8 | 0.8467 | 0.7267 | 0.1367 | 0.3333 | 0.0467 | 0.260 | 0.6321 | +19.7 |
 
+The K=2 answer cell (0.140) is an emission-rendering artifact, not a depth
+effect — transcript analysis shows the correct answer is the first emitted
+token in 89% of K=2 records and the parsed `# final:` line contradicts the
+model's own recovered state; scored on state readout K=2 is ~0.89 (§5).
+
 Against the pre-registered lines:
 
 - **KILL line — NOT tripped.** Full-latent R=K answer beats the *same
@@ -595,12 +600,28 @@ We state every weak point the novelty assessment flagged.
   competence by the N1′ failure from the token-incompetent base, rather than by
   a single fully-matched A/B.
 
-- **Open anomaly at K=2.** Latent R=K answer at K=2 is 0.140 — *below* both the
-  direct baseline (0.2567) and its own 0.925 per-hop decode — whereas K=3–6 sit
-  at 0.59–0.63. The per-hop state is recovered but answer *emission* fails at the
-  shallowest rung; we have not resolved the cause. **[PENDING: K=2 anomaly —
-  inspect transcripts; determine whether this is an emission/format failure at
-  R=2 or a genuine shallow-depth effect.]**
+- **The K=2 anomaly is an emission-rendering artifact, not a depth effect**
+  (resolved by transcript inspection, n=300 per rung;
+  `experiments/probe_k2_anomaly.py`, `runs/probe_k2_anomaly.json`). Latent R=K
+  answer at K=2 reads 0.140 — below the 0.2567 direct baseline — while K=3–6
+  sit at 0.59–0.63. Transcripts show the model *has* the answer: because the
+  per-hop convention supervises the last latent slot's unshifted logits to
+  decode the final value, and those same logits are the first emission step,
+  the first emitted token is the correct answer digit in 89.0% of K=2 records
+  (exactly the slot-2 per-hop rate, 267/300). The failure is downstream: after
+  emitting that bare digit — a token sequence never seen in training, where
+  slots are always followed by `# final:` — the K=2 continuation derails, and
+  the `# final:` line it then writes contradicts the model's own correct state
+  in 226/267 cases (often reading as one *further* execution step). At K=4 the
+  same first-token collision occurs (first token = answer in 63.0% of records,
+  again exactly the slot-4 per-hop rate) but the rendered line stays faithful:
+  only 2/189 slot-correct records emit a wrong number (56 more are correct but
+  unparseable, e.g. `9 final: 9`). Scored on state readout rather than the
+  parsed line, K=2 is ~0.89 — the depth story of §4 is unaffected, and the
+  headline K=2 answer cell *understates* the model. The collision itself (one
+  position serving both the per-hop decode and the first emission step) is a
+  harness/format defect to fix in future work, e.g. by shifting the per-hop
+  read or reserving an emission boundary token.
 
 - **Single-token intermediate values.** The per-hop loss currently consumes
   single-BPE-token (mod-10) values. Multi-token per-hop decode is future work

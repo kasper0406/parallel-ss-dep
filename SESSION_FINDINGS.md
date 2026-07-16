@@ -588,3 +588,17 @@ alone was NOT sufficient (N1').
   no static_graph requirement → compatible with the latent reentrant adapter
   and curriculum graph changes that block DDP. The ~1.9× two-GPU lever is
   validated for every subsequent production run (incl. task #5).
+
+## 2026-07-16 — K=2 anomaly resolved: emission-rendering artifact (paper's last PENDING closed)
+
+- Transcript probe (`probe_k2_anomaly.py`, n=300/rung, stageB ckpt): the
+  first emitted token after the latent slots IS the correct answer digit in
+  89.0% of K=2 records — exactly the slot-2 per-hop rate — because the last
+  slot's unshifted logits double as the per-hop answer decode AND the first
+  emission step. The bare digit is off-distribution (training always
+  continues `# final:`), and at K=2 the continuation derails: the parsed
+  `# final:` line contradicts the model's own correct state in 226/267
+  cases. K=4 contrast: same collision (first tok == answer in 63.0% ==
+  slot-4 per-hop) but faithful rendering (2/189 wrong). Effective K=2
+  answer knowledge ≈ 0.89, not 0.14; depth story unaffected; headline table
+  footnoted. Paper §5 block replaced — no [PENDING] items remain.

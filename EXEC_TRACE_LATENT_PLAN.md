@@ -162,8 +162,17 @@ K=9/10/12) — consistent with the horizon (answer needs the LAST hop).
 Text-trace on the B ckpt also degraded at lengen (0.12-0.21), and heldout text
 answer fell ~0.95 -> 0.73-0.83 vs Stage A — a real but bounded text-skill cost.
 
-Open anomaly: K=2 latent answer 0.14 (vs 0.59-0.63 at K=3-6) despite 0.925
-per-hop — answer EMISSION fails at the shallowest rung; inspect transcripts.
+K=2 anomaly RESOLVED (2026-07-16, `probe_k2_anomaly.py`, n=300/rung): it is an
+emission-RENDERING artifact, not a depth effect. The last latent slot's
+unshifted logits double as (a) the per-hop answer decode and (b) the first
+emission step, so the model emits the correct answer as a bare digit in 89.0%
+of K=2 records (== slot-2 per-hop rate) — but the bare digit after slots is
+off-distribution (training always continues `# final:`), and the K=2
+continuation then derails: the parsed `# final:` line contradicts the model's
+own correct state in 226/267 cases (often one further execution step). At K=4
+the same first-token collision occurs (63.0% == slot-4 per-hop) but rendering
+stays faithful (2/189 wrong). Scored on state readout, K=2 ≈ 0.89. Fix if it
+ever matters: shift the per-hop read or reserve an emission-boundary token.
 
 **Bottom line: first working latent compression of a real computation in this
 project.** The staged path (teach in tokens, then compress) is what made the

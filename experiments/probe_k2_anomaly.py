@@ -14,6 +14,14 @@ transcripts and classifies every failure:
 
 Also cross-tabs failure vs per-hop correctness and prints sample transcripts.
 Reuses the committed eval harness functions verbatim (no re-implementation).
+
+Note on `first_tok_is_answer`: it re-encodes the decoded text, which in
+principle can split differently from the generated ids — but the first
+emitted token is by construction the greedy argmax at the last slot position
+(the same logits `latent_perhop_reads` scores for slot K, modulo the
+thinking-id mask), so the stat is anchored by the per-hop read; the observed
+exact agreement (267/300 both, K=2) confirms the re-encode path introduces
+no misclassification in practice.
 """
 
 import argparse

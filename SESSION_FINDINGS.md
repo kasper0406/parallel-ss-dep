@@ -602,3 +602,20 @@ alone was NOT sufficient (N1').
   slot-4 per-hop) but faithful rendering (2/189 wrong). Effective K=2
   answer knowledge ≈ 0.89, not 0.14; depth story unaffected; headline table
   footnoted. Paper §5 block replaced — no [PENDING] items remain.
+
+## 2026-07-17 — PRODUCTION RUN SHIPPED: production_lean_anneal03.pt, HE-CE 0.6688 (best base ever, −0.065 in one campaign)
+
+- 3B-token composition run (task #5): 2.56B plateau (26h, GPU1, crash-free,
+  hot-state HE-CE flat = no peak-LR erosion) + pre-registered decay A/B
+  (459M tokens each).
+- Decay results: control 0.6980 (plateau alone −0.027 vs KT-1 control);
+  0.4x anneal 0.6624 but depdist +0.0146 → guard VETO; registered 0.3x
+  retry 0.6688 with depdist +0.0079 → ALL CRITERIA PASS → **ships**.
+- Durable lesson: anneal-strength/naturalness trade is ~2x steeper at
+  production scale than the 300M micro-run projected — never port a
+  calibrated mix strength across scales; the guard-first registration
+  (fallback ladder 0.4x→0.3x→control) converted what would have been a
+  costly misfire into a 4.7h re-run.
+- Composition confirmed: plateau tokens + anneal-decay stack additively
+  (−0.027 then −0.029), no interactions. Remaining gap to SmolLM2-360M
+  donor (0.614): 0.055.

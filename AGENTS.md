@@ -56,10 +56,18 @@ Two live trunk shapes:
 - **Linearized inherited base (the competent-base path)** — SmolLM2-360M weights
   copied into a 32L×960d DeltaNet (bit-exact embed/MLP/norms + MOHAWK attn
   transfer + e2e KD): HE-solution CE 0.759 lean (`checkpoints/linearize/
-  linearized_stage3.pt`), preserves O(1) decode. Best code trunks to date are
-  fine-tunes of `feature_pilot_A.pt` (0.7429) and `stageA_executor.pt` (0.7343).
-  The stronger Qwen2.5-Coder-0.5B donor was tried and **refuted** (+0.276 tax,
-  only 15/164) — inheritance buys a cost substrate, not a free quality jump.
+  linearized_stage3.pt`), preserves O(1) decode. **The production base is
+  `checkpoints/production_lean_anneal03.pt` (HE-CE 0.6688, 2026-07-17)**: the
+  3B-token composition run — 2.56B-token constant-LR plateau on the pilot mix
+  from `stageA_executor.pt` (0.7343) + 459M-token WSD decay on a 0.3x-strength
+  curated anneal mix (`anneal_mix_v4.yaml`), guard-clean on depdist (+0.0079 ≤
+  +0.01). Anneal strength does NOT transfer across scales (0.4x passed the
+  micro-run projection but tripped the production guard at +0.0146) —
+  re-calibrate per run; full trade curve in IDEAS_2026_07_13.md Tier-1 log.
+  Earlier trunks `feature_pilot_A.pt` (0.7429) / `stageA_executor.pt` (0.7343)
+  remain for lineage A/Bs. The stronger Qwen2.5-Coder-0.5B donor was tried and
+  **refuted** (+0.276 tax, only 15/164) — inheritance buys a cost substrate,
+  not a free quality jump.
 
 Validated mechanisms (each earns its place on its OWN matched probe, NOT on the
 noisy HumanEval headline):

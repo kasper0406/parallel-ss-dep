@@ -57,7 +57,10 @@ Two live trunk shapes:
   copied into a 32L×960d DeltaNet (bit-exact embed/MLP/norms + MOHAWK attn
   transfer + e2e KD): HE-solution CE 0.759 lean (`checkpoints/linearize/
   linearized_stage3.pt`), preserves O(1) decode. **The production base is
-  `checkpoints/production_lean_anneal03.pt` (HE-CE 0.6688, 2026-07-17)**: the
+  `checkpoints/production_lean_soup3.pt` (HE-CE 0.6614, 2026-07-18)**: an
+  equal-weight soup of three 0.3x-anneal decay seeds — beats every single
+  seed AND the control on BOTH axes (depdist 0.8126 vs control 0.8254, every
+  stratum improved); N-seed decay + soup is now the standard anneal recipe: the
   3B-token composition run — 2.56B-token constant-LR plateau on the pilot mix
   from `stageA_executor.pt` (0.7343) + 459M-token WSD decay on a 0.3x-strength
   curated anneal mix (`anneal_mix_v4.yaml`), guard-clean on depdist (+0.0079 ≤

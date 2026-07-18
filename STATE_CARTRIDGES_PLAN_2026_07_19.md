@@ -102,3 +102,23 @@ production base (absorbs old task #18).
      scoped to repo boundaries) — the prerequisite this experiment exposed,
      and equally the prerequisite for the repo-agent north star. Then the
      original 8–32k experiment on that base.
+
+## RUN 2 RESULT (2026-07-19, short-context amendment): span gate VOID again — but line-CE retention ≈ 0.8–1.0 and cartridges BEAT sequential on span
+
+150 fresh 1.5–6k-context episodes (`data/repo_episodes_short`, all-eval
+routing, pretrain-decontaminated), K∈{2,4}:
+- Span gate: lift(sequential) = +0.0043 < 0.15 → formally VOID (the gate did
+  its job: retention ratio over a ~zero denominator is uninterpretable).
+- **Line-CE (real signal: lift(seq) = +0.114): cartridge retention 0.99
+  [0.82–1.40] @K=2, 0.82 [0.62–1.31] @K=4** — at the model's working scale,
+  mean-merged parallel states retain essentially all of sequential
+  ingestion's benefit.
+- **Span-CE absolute: cartridge lift +0.059/+0.061 where sequential is
+  +0.004** — merged segment-states outperform one long sequential state
+  outright on the hard tokens. Lead worth keeping: merging may act as a
+  better-conditioned summary.
+- Structure check PASS at both K (cartridge > shuffled, +0.10/+0.05).
+- Interpretation: the mechanism works at working scale; the missing
+  substrate for the full claim is the base's own sequential long-context
+  capability → `LONGCTX_PLAN_2026_07_19.md` is the registered critical path
+  (its success metric IS run 1's failed gate).

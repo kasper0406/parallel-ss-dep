@@ -1414,7 +1414,7 @@ def main():
             # IterableDataset (rank-strided sampling has no finite index space).
             base_seed=args.seed + ddp_rank * 100_003,
             mask_eos_in_targets=bool(args.mask_eos_in_targets),
-            emit_doc_ids=True,
+            emit_doc_ids=not bool(getattr(args, "no_doc_isolation", False)),
             # v14: emit the per-position recall read-mask as a 4th tuple element
             # (default off → 3-tuple, byte-identical to v12).
             emit_read_mask=bool(getattr(args, "emit_read_mask", False)),
@@ -1435,7 +1435,7 @@ def main():
             think_burst_prob=0.0,
             base_seed=args.seed + 999_983,
             mask_eos_in_targets=bool(args.mask_eos_in_targets),
-            emit_doc_ids=True,
+            emit_doc_ids=not bool(getattr(args, "no_doc_isolation", False)),
             fim_sentinel_ids=fim_sentinel_ids,
             fim_legacy_strings=_fim_legacy,
         )

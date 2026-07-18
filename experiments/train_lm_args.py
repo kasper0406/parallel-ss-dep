@@ -370,6 +370,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "e.g. 'ortho,deltanet,deltanet,deltanet,ortho,...'. "
                         "Overrides --arch.")
     p.add_argument("--T", type=int, default=512)
+    p.add_argument("--no_doc_isolation", action="store_true",
+                   help="Disable cross-document state isolation (emit_doc_ids "
+                        "off -> no cu_seqlens resets): recurrent state flows "
+                        "across doc boundaries within each T-window. Required "
+                        "for LONG-CONTEXT state-accumulation training (the "
+                        "T2048+isolation lineage never accumulates state past "
+                        "one doc; STATE_CARTRIDGES_PLAN run-1 wall). Default "
+                        "OFF = the validated isolation behavior.")
     p.add_argument("--max_T", type=int, default=0,
                    help="Max sequence length for the (optional) absolute "
                         "positional embedding. Set to >= --T (e.g. equal) "

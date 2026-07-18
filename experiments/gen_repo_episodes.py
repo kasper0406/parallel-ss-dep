@@ -597,7 +597,9 @@ def build_corpus(scan_rows: int, n_train: int, n_eval: int, tok,
         for link in links:
             if built_this_repo >= max_per_repo:
                 break
-            ep = build_episode(rn, files, link, tok, seed=seed)
+            ep = build_episode(rn, files, link, tok, seed=seed,
+                               max_ctx_tokens=MAX_CTX_TOKENS,
+                               min_ctx_tokens=MIN_CTX_TOKENS)
             if ep is None:
                 stats["rejected_budget"] += 1
                 continue
@@ -663,6 +665,7 @@ def _write_jsonl(path: str, rows: list[dict]):
 
 
 def main():
+    global MIN_CTX_TOKENS, MAX_CTX_TOKENS, BUCKETS
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out_dir", default="data/repo_episodes")
@@ -685,8 +688,21 @@ def main():
     ap.add_argument("--max_copies", type=int, default=None,
                     help="drop files whose codeparrot 'copies' > this "
                          "(widely-duplicated → more memorised); de-contam knob")
+    ap.add_argument("--min_ctx_tokens", type=int, default=MIN_CTX_TOKENS,
+                    help="context token-budget floor (default %(default)s)")
+    ap.add_argument("--max_ctx_tokens", type=int, default=MAX_CTX_TOKENS,
+                    help="context token-budget cap (default %(default)s). "
+                         "NB build_episode/assemble_context defaults bind at "
+                         "def time — main threads these explicitly.")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
+
+    MIN_CTX_TOKENS = args.min_ctx_tokens
+    MAX_CTX_TOKENS = args.max_ctx_tokens
+    if args.max_ctx_tokens != 32000 or args.min_ctx_tokens != 4000:
+        span = args.max_ctx_tokens - args.min_ctx_tokens
+        mid = args.min_ctx_tokens + span // 2
+        BUCKETS = [("lo", args.min_ctx_tokens, mid), ("hi", mid, args.max_ctx_tokens)]
 
     if args.smoke:
         args.scan_rows = min(args.scan_rows, 40000)

@@ -106,7 +106,12 @@ noisy HumanEval headline):
   recurrence absorbs the recall the code path needs (realistic N≤24, below WM's
   validated N≥48 niche); frozen it's dead weight, forcing it on crashes recall
   99%→35%. Keep WM only for the synthetic-recall research probe and the meta-TTT
-  substrate; do NOT reflexively bolt it onto code. Discrete lexical-hash and VQ
+  substrate; do NOT reflexively bolt it onto code. **Attach-to-converged is
+  REFUTED both ways (2026-07-19, fair pre-warm protocol): standard-mix
+  pre-warm → trunk declines uptake; recall-dense pre-warm → engages and
+  HARMS (+0.095 HE-CE, +0.162 depdist vs control — always-read injection
+  is open noise on natural code). FiLM attach likewise declined. Day-1
+  co-train is the only path these features have.** Discrete lexical-hash and VQ
   keys are dead (spelling-locked) — the right key is the continuous name-span
   key. Open gap: the copy head only fires on data-provided masks, not at
   inference (self-calibrating trigger being wired, 58c7e70).

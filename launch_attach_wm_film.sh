@@ -37,7 +37,7 @@ FREEZE=""
 case "$ARM" in
   control) ;;
   wm)
-    FREEZE="--freeze_trunk_steps 1000"
+    FREEZE="--freeze_trunk_steps ${FREEZE_STEPS:-1000}"
     FEATURE_FLAGS="--use_memory --mem_size 1024 --mem_decoupled_kv --mem_ctx_namekey --ctx_namekey_dim 192 \
       --ctx_namekey_match_threshold 0.5 --mem_always_read --use_copy_head --mem_copy_require_match \
       --mem_discrete_key_match_window 32 --copy_gate_bias_init -2.0 --emit_read_mask \
@@ -60,7 +60,7 @@ CUDA_VISIBLE_DEVICES=$GPU nohup .venv/bin/python -u experiments/train_lm.py \
   --load_ckpt $BASE --keep_base_vocab 49152 \
   $FREEZE --feature_lr_mult 10.0 \
   $FEATURE_FLAGS \
-  --data_mix configs/pretrain_mix_feature_pilot.yaml \
+  --data_mix ${MIX:-configs/pretrain_mix_feature_pilot.yaml} \
   --fim_legacy_strings \
   --tokenizer HuggingFaceTB/SmolLM2-135M \
   --think_burst_prob 0 --mask_eos_in_targets \

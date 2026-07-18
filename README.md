@@ -1,10 +1,61 @@
 # state-dep-parallel
 
-A **small, efficient code model** built to punch above its weight on coding
-benchmarks under tight compute (2× RTX 5090, 32 GB each, no NVLink).
-Architectural research feeds that target. Engineering details and the running
-work log live in [`AGENTS.md`](AGENTS.md); project framing in
+A **cheap, bounded-state coding agent** research program on tight compute
+(2× RTX 5090): the moat is **COST** (O(1)/constant-memory decode) and
+**ADAPTIVITY**, not benchmark rank. Engineering details and the resolved
+current state live in [`AGENTS.md`](AGENTS.md); framing in
+[`NORTH_STAR_2026_06_30.md`](NORTH_STAR_2026_06_30.md) and
 [`THESIS.md`](THESIS.md).
+
+## Key findings & results
+
+1. **O(1) decode is a real, unbounded memory moat.** Flat 8.2 MiB recurrent
+   state and ~919 MiB decode peak from 512 to 131k context, vs a
+   transformer's KV cache growing 20→5121 MiB (6.45× at 131k, still
+   widening). → [`DECODE_COST_BENCH.md`](DECODE_COST_BENCH.md),
+   [`SCOREBOARD.md`](SCOREBOARD.md)
+2. **Latent Execution: externalize before you internalize.** Latent-first
+   training provably fails; text-scratchpad-first then Coconut-style
+   compression carries ~6 hops of real program state in continuous thoughts
+   (per-hop decode 0.844, depth-true R-signature; the ~6-hop horizon matches
+   two independently published continuous-thought limits). Full paper draft:
+   → [`PAPER_LATENT_EXECUTION_DRAFT.md`](PAPER_LATENT_EXECUTION_DRAFT.md),
+   program log [`EXEC_TRACE_LATENT_PLAN.md`](EXEC_TRACE_LATENT_PLAN.md)
+3. **Inheritance + anneal campaign: a competent bounded-state base.**
+   SmolLM2-360M linearized into DeltaNet (bit-exact MLP/embed copy + MOHAWK
+   + KD), then a 3B-token plateau + 0.3x curated anneal decay + 3-seed soup:
+   HumanEval-solution CE 0.969 (scratch) → **0.6614**, 0.047 from the
+   softmax donor, at O(1) decode. Recipe laws found on the way: anneal
+   strength does NOT transfer across scales; N-seed decay-soup strictly
+   dominates. → [`IDEAS_2026_07_13.md`](IDEAS_2026_07_13.md) (Tier-1
+   kill-tests log)
+4. **Token-poverty is the binding constraint, not architecture.** Half-size
+   SmolLM2-135M beats our 287M from-scratch trunk on code CE from a
+   ~400–800× token deficit — inheritance/KD is the only coherent path to a
+   competent sub-1B base at this budget.
+   → [`STRATEGY_2026_06_28.md`](STRATEGY_2026_06_28.md)
+5. **Converged trunks defend themselves.** Attaching WM/FiLM to a converged
+   base fails in BOTH possible directions under a fair frozen-trunk pre-warm
+   protocol: standard-mix pre-warm → the trunk suppresses the feature;
+   niche-dense pre-warm → the feature engages and *harms* the base. Day-1
+   co-training is the only path these mechanisms have.
+   → [`IDEAS_2026_07_13.md`](IDEAS_2026_07_13.md) (attach registrations)
+6. **Delta-rule states are mean-mergeable.** States computed over disjoint
+   shards retain ~72% of sequential-ingestion recall when averaged — the
+   basis of the state-cartridges direction (parallel O(1) repo ingestion).
+   → [`experiments/probe_state_algebra.py`](experiments/probe_state_algebra.py)
+7. **Meta-TTT: two clean kills.** Meta-training the recurrent state into a
+   deliberate test-time learner did not beat incidental state-learning on
+   held-out repos (pre-registered, engagement-guarded).
+   → [`META_TTT_PLAN_2026_07_13.md`](META_TTT_PLAN_2026_07_13.md)
+8. **RL sharpens, it doesn't create.** The pass@k envelope (~18–21/164) is
+   set by the SFT/base distribution; grader-RL moves greedy (3→7) inside it.
+   Verifier-arbitrated best-of-N is the cheap win.
+   → [`AGENTS_HISTORY.md`](AGENTS_HISTORY.md)
+
+Full chronological arc and superseded claims:
+[`AGENTS_HISTORY.md`](AGENTS_HISTORY.md) ·
+[`SESSION_FINDINGS.md`](SESSION_FINDINGS.md)
 
 ## Architecture
 

@@ -46,8 +46,11 @@ case "$ARM" in
       --ctx_addr_aux_weight 0.2 --ctx_addr_aux_warmup_steps 400 --ctx_addr_aux_start_step 0" ;;
   film)
     FREEZE="--freeze_trunk_steps 1000"
+    # NO K-warmup bypass: with the trunk frozen, a film-only arm has no other
+    # trainable param, so the bypass leaves the loss with no grad_fn (crashed
+    # 2026-07-18). K=3 self-feed active from step 1 instead.
     FEATURE_FLAGS="--feedback film --feedback_pairs 0,16;4,20;8,24;12,28 \
-      --feedback_self_k 3 --feedback_self_k_warmup_steps 100 \
+      --feedback_self_k 3 --feedback_self_k_warmup_steps 0 \
       --feedback_alpha_init 0.02" ;;
   *) echo "ARM must be control|wm|film, got '$ARM'" >&2; exit 1 ;;
 esac

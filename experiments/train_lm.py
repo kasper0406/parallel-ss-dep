@@ -1026,7 +1026,13 @@ def main():
     ddp_world_size = int(_os.environ.get("WORLD_SIZE", "1"))
     ddp_rank = int(_os.environ.get("RANK", "0"))
     ddp_local_rank = int(_os.environ.get("LOCAL_RANK", "0"))
-    is_ddp = ddp_world_size > 1
+    # --manual_allreduce is the DDP-free 2-GPU mode (bucketed grad all_reduce at
+    # the grad-accum boundary; no autograd hooks / no static_graph → latent-
+    # safe). It and the env-driven DDP wrap are mutually exclusive; when manual
+    # is on we take the manual path (is_ddp stays False so no DDP wrapper).
+    manual_ar = bool(getattr(args, "manual_allreduce", False))
+    is_ddp = ddp_world_size > 1 and not manual_ar
+    is_manual = manual_ar and ddp_world_size > 1
     is_main = ddp_rank == 0
     if is_ddp:
         if args.enable_thinking_token:
@@ -1040,6 +1046,33 @@ def main():
         print(f"[ddp] rank {ddp_rank}/{ddp_world_size} "
               f"local_rank={ddp_local_rank} device=cuda:{ddp_local_rank}",
               flush=True)
+    _manual_dev = None
+    _manual_bucket_bytes = int(getattr(args, "manual_allreduce_bucket_mb", 64)) \
+        * 1024 * 1024
+    if manual_ar:
+        if args.ddp_no_bf16_compress:
+            raise SystemExit(
+                "--manual_allreduce and the DDP path are mutually exclusive: "
+                "--ddp_no_bf16_compress only affects the DDP comm hook, which "
+                "the manual (un-wrapped) path never installs. Drop one.")
+        if args.enable_thinking_token:
+            raise SystemExit(
+                "--manual_allreduce is wired for the non-thinking-token "
+                "(pretrain / latent) path only; the thinking-token queue path "
+                "desyncs per-rank. Run it single-GPU.")
+        if is_manual:
+            import datetime as _dt
+            _backend = "nccl" if torch.cuda.is_available() else "gloo"
+            if torch.cuda.is_available():
+                torch.cuda.set_device(ddp_local_rank)
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(
+                    backend=_backend, timeout=_dt.timedelta(minutes=30))
+            _manual_dev = (torch.device("cuda", ddp_local_rank)
+                           if torch.cuda.is_available() else torch.device("cpu"))
+            print(f"[manual-ddp] rank {ddp_rank}/{ddp_world_size} "
+                  f"local_rank={ddp_local_rank} backend={_backend} "
+                  "(DDP-free bucketed all_reduce)", flush=True)
 
     def _mainprint(*a, **k):
         if is_main:
@@ -1154,13 +1187,14 @@ def main():
     # DISJOINT shard (base_seed = args.seed + ddp_rank*100003) while all ranks
     # open the same single-seed store at cursor 0 — so rank>=1's live tokens can
     # never match the store and the alignment assertion would abort mid-run.
-    # Fail at startup with the fix instead of wasting a launch.
-    if _kd_offline and is_ddp:
+    # Fail at startup with the fix instead of wasting a launch. --manual_allreduce
+    # shares the disjoint-shard behavior, so it hits the same desync.
+    if _kd_offline and (is_ddp or is_manual):
         raise SystemExit(
-            "Offline KD (--distill_logits_dir) is single-GPU only: each DDP "
+            "Offline KD (--distill_logits_dir) is single-GPU only: each "
             f"rank streams a disjoint data shard (base_seed+rank*100003) but the "
             f"store is a single deterministic stream, so rank>=1 would desync "
-            f"and abort. You launched under torchrun with WORLD_SIZE="
+            f"and abort. You launched multi-rank with WORLD_SIZE="
             f"{ddp_world_size}. Run offline KD without torchrun (single GPU), or "
             "generate one per-rank store per rank's seed and load the matching "
             "one — the latter is not yet implemented."
@@ -1220,11 +1254,12 @@ def main():
     # this covers mode b (--triage_ref_ce_dir with no KD store).
     _tri_refcache = (bool(getattr(args, "token_triage", False))
                      and bool(getattr(args, "triage_ref_ce_dir", "")))
-    if _tri_refcache and is_ddp:
+    if _tri_refcache and (is_ddp or is_manual):
         raise SystemExit(
             "--triage_ref_ce_dir is single-GPU only (the ref-CE cache is one "
-            "deterministic stream; DDP ranks stream disjoint shards and would "
-            "desync the alignment assert). Run without torchrun.")
+            "deterministic stream; multi-rank DDP/--manual_allreduce ranks "
+            "stream disjoint shards and would desync the alignment assert). "
+            "Run without torchrun.")
     if _tri_refcache and int(getattr(args, "num_workers", 2)) not in (0, 1):
         raise SystemExit(
             "--triage_ref_ce_dir requires --num_workers 0 (or 1): the cache was "
@@ -1371,7 +1406,12 @@ def main():
             think_burst_prob=args.think_burst_prob,
             think_max_bursts=args.think_max_bursts,
             think_max_burst_depth=args.think_max_burst_depth,
-            # Per-rank seed offset → each DDP rank streams a disjoint shard.
+            # Per-rank seed offset → each rank streams a disjoint shard. Used by
+            # BOTH the DDP path and --manual_allreduce (ddp_rank is the env RANK
+            # in either mode): the streams are infinite and independently
+            # shuffled, so a large-prime seed offset gives effectively
+            # independent shards — the correct choice for this non-indexable
+            # IterableDataset (rank-strided sampling has no finite index space).
             base_seed=args.seed + ddp_rank * 100_003,
             mask_eos_in_targets=bool(args.mask_eos_in_targets),
             emit_doc_ids=True,
@@ -1663,6 +1703,15 @@ def main():
             print("[ddp] bf16_compress_hook registered (PCIe-bound link)",
                   flush=True)
         print(f"[ddp] wrapped model on cuda:{ddp_local_rank}", flush=True)
+
+    # Manual-allreduce: broadcast rank-0 weights so every rank starts identical
+    # (robust vs. a shared seed — different RNG consumption during build could
+    # desync). Buffers too. Done before the optimizer captures param refs.
+    if is_manual:
+        from experiments.manual_allreduce import broadcast_module
+        broadcast_module(model, ddp_world_size, src=0)
+        _mainprint("[manual-ddp] broadcast rank-0 weights to all ranks",
+                   flush=True)
 
     # Optimizer construction — see experiments/optim_utils.py.
     from experiments.optim_utils import build_optimizer
@@ -2154,6 +2203,10 @@ def main():
     # freeze window we ONLY force non-feature (trunk) params off; feature params
     # keep their original requires_grad (so a pinned WM read-α stays pinned).
     _orig_requires_grad = {nm: p.requires_grad for nm, p in model.named_parameters()}
+
+    # Manual-allreduce loop state: one-time grad-set handshake + coordinated stop.
+    _manual_handshake_done = False
+    _manual_auto_stop = False
 
     for step in range(args.start_step + 1, args.steps + 1):
         # Freeze-trunk window: for steps 1..N freeze every non-feature param;
@@ -2889,6 +2942,19 @@ def main():
                         _pkm_mon._last_slot_idx = main_pkm_slot_idx
                         _pkm_mon._last_weights = main_pkm_weights
                     (loss / n_micro).backward()
+            # Manual DDP-free grad sync: average grads across ranks at the
+            # grad-accum boundary (after the last microbatch's backward, BEFORE
+            # clip/step). No autograd hooks / no static_graph → latent-safe.
+            if is_manual:
+                from experiments.manual_allreduce import (
+                    allreduce_gradients, check_grad_param_handshake)
+                _mparams = list(model.parameters())
+                if not _manual_handshake_done:
+                    check_grad_param_handshake(
+                        _mparams, ddp_world_size, _manual_dev)
+                    _manual_handshake_done = True
+                allreduce_gradients(_mparams, ddp_world_size,
+                                    bucket_bytes=_manual_bucket_bytes)
         _engagement_check_now = (int(getattr(args, "engagement_check_step", 0)) > 0
                                  and step == int(args.engagement_check_step))
         # Force the log-diagnostics block to also run at the engagement-check
@@ -2908,6 +2974,21 @@ def main():
             o.step()
         for s in scheds:
             s.step()
+        # Manual-allreduce drift check: identical averaged grads must keep every
+        # rank's weights in lockstep. Every N steps, compare a reference param's
+        # norm across ranks; on divergence, warn loudly and re-broadcast rank 0.
+        # ALL ranks run this (step is rank-invariant) — never gate it on is_main.
+        if (is_manual and args.manual_drift_check_every > 0
+                and step % args.manual_drift_check_every == 0):
+            from experiments.manual_allreduce import drift_check, broadcast_module
+            _ref_param = next(model.parameters())
+            _ok, _spread = drift_check(_ref_param, ddp_world_size, _manual_dev)
+            if not _ok:
+                print(f"[manual-ddp] !!! RANK DRIFT at step {step}: reference "
+                      f"param norm spread {_spread:.3e} > 1e-4 across ranks — "
+                      "re-broadcasting rank-0 weights. Investigate a non-"
+                      "deterministic op or a missed all_reduce.", flush=True)
+                broadcast_module(model, ddp_world_size, src=0)
         _blk_uratios = (_block_update_ratios(model, _blk_wsnap)
                         if _log_this_step else None)
         losses.append(lm_loss.item())  # track LM loss alone for comparison
@@ -3710,6 +3791,24 @@ def main():
                       f"Last {args.auto_stop_k} intervals each gained "
                       f"<{args.auto_stop_threshold:.3f}. Stopping at "
                       f"step={step} tokens={tokens_seen:,}.")
+                # Manual mode: only rank 0 runs mid-eval, so break through the
+                # coordinated stop below (a direct break here would leave the
+                # other ranks hanging at the next grad all_reduce).
+                if is_manual:
+                    _manual_auto_stop = True
+                else:
+                    break
+
+        # Manual-allreduce end-of-step barrier + coordinated stop: rank 0 owns
+        # the (long, is_main-only) val / mid-eval / checkpoint work; this cheap
+        # 1-element all_reduce lets the other ranks wait it out here rather than
+        # blocking mid-way through the next step, and broadcasts rank 0's
+        # auto-stop decision so every rank exits the loop together.
+        if is_manual:
+            _stop_t = torch.tensor(
+                [1.0 if _manual_auto_stop else 0.0], device=_manual_dev)
+            torch.distributed.all_reduce(_stop_t)
+            if _stop_t.item() > 0:
                 break
 
     secs = time.perf_counter() - t0
@@ -3840,7 +3939,7 @@ def main():
         torch.save(ckpt, args.save_ckpt)
         print(f"Checkpoint saved to {args.save_ckpt}")
 
-    if is_ddp:
+    if is_ddp or is_manual:
         torch.distributed.barrier()
         torch.distributed.destroy_process_group()
 

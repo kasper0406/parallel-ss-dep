@@ -1283,6 +1283,30 @@ def build_parser() -> argparse.ArgumentParser:
                         "before all-reduce to halve cross-GPU bytes on a "
                         "P2P-less PCIe link (~4 GB/s on this rig). No effect "
                         "single-GPU.")
+    p.add_argument("--manual_allreduce", action="store_true",
+                   help="DDP-FREE 2-GPU data parallelism: run under `torchrun "
+                        "--nproc_per_node=2` with a plain (un-wrapped) model on "
+                        "each rank and average gradients via a manual bucketed "
+                        "all_reduce at the grad-accum boundary. Unlike DDP this "
+                        "installs NO autograd hooks and needs NO static_graph, "
+                        "so it composes with the latent-thinking path (which "
+                        "DDP cannot). Ranks start from a rank-0 broadcast of the "
+                        "weights and stream disjoint data shards (base_seed + "
+                        "rank*100003, the existing offset). Mutually exclusive "
+                        "with the env-driven DDP path and --enable_thinking_"
+                        "token. Off (default) = byte-identical single-GPU path "
+                        "(no torch.distributed touched).")
+    p.add_argument("--manual_allreduce_bucket_mb", type=int, default=64,
+                   help="Bucket size (MiB) for --manual_allreduce grad "
+                        "reduction. 64 matches the bench default (flat reduce "
+                        "was already ~1.9%% of a step; bucketing is for "
+                        "future overlap, not a bottleneck today).")
+    p.add_argument("--manual_drift_check_every", type=int, default=500,
+                   help="Under --manual_allreduce, every N steps all_reduce the "
+                        "L2 norm of a fixed reference param and assert its "
+                        "cross-rank spread stays < 1e-4 (identical averaged "
+                        "grads must keep weights in lockstep). On failure: "
+                        "print loudly and re-broadcast from rank 0. 0 disables.")
     p.add_argument("--alpha_wd", type=float, default=0.0,
                    help="Weight-decay applied to FiLM α scalars (matched by "
                         "name suffix '.alpha' inside any feedback container). "

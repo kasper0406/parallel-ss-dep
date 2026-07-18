@@ -74,3 +74,31 @@ Search-native decoding: state-checkpointed program tree search with the
 Stage-A/B neural interpreter as value function on non-executable prefixes —
 the high-risk/high-novelty composition. Prereq: exec-trace re-attach on the
 production base (absorbs old task #18).
+
+## RUN 1 RESULT (2026-07-19): VOID per sanity gate — and the void is the finding
+
+- lift(sequential) = **−0.5437 span-CE** (gate required ≥ +0.15): full 8–32k
+  repo ingestion makes the task WORSE on `production_lean_soup3`. Run VOID;
+  retention ratios undefined (negative lifts). 150/150 episodes, GPU1, 215s.
+  (First attempt crashed on GPU0 — Triton "unspecified launch failure",
+  third GPU0 under-load incident; GPU1 clean.)
+- Diagnostic pattern (real, even in a void run): cartridge@8 −0.075 vs
+  sequential −0.544 (7x less harm; segments are ~2k = in-distribution
+  forwards) and shuffled worse than cartridge at every K (structure signal
+  exists). 
+- **Diagnosis: trained-context wall.** Every pretrain ran T=2048 WITH
+  cross-document state isolation — the model has literally never accumulated
+  >~2k tokens of state. The O(1) decode moat is mechanical; USABLE context
+  of the current base ≈ 2k. (Consistent with meta-TTT P0's "context hurts
+  at >8k".)
+- **Amended plan (registered before any re-run):**
+  1. Short-context probe (cheap, current base): regenerate episodes at
+     2–6k context (NEW eval set — the frozen 8–32k set stays untouched for
+     the eventual long-context re-run), segments ~1k; same bars
+     (0.60/0.75/0.35) with the same sanity gate. Measures retention at the
+     model's working scale.
+  2. **Long-context continued-pretrain** of the production base
+     (T 2048→8192+, repo-level concatenated documents, cross-doc isolation
+     scoped to repo boundaries) — the prerequisite this experiment exposed,
+     and equally the prerequisite for the repo-agent north star. Then the
+     original 8–32k experiment on that base.

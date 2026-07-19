@@ -61,3 +61,20 @@ are known.
 
 Each phase gates the next; phase-2 failure kills the program at ~zero search
 -infra cost. GPU0 flakiness: all runs use periodic ckpts + START_STEP resume.
+
+## PHASE 2 RESULT (2026-07-19, run on stageA_executor while phase 1 trains): DECISIVE PASS
+
+- Pooled (n=837, K∈{4,6,8}): executor ranking accuracy **0.956**
+  [0.940–0.969] vs logprob 0.226 [0.198–0.256] vs random 0.257 —
+  **executor − logprob = +73.0pp** (bar ≥10pp; ties-as-failures headline).
+  Per-K: 0.98/0.96/0.92 — no depth cliff through K=8.
+- Log-prob is AT RANDOM: the single-edit semantic mutations (constant/op
+  changes) are exactly the surface-plausible traps a likelihood signal
+  cannot see and a genuine interpreter can. The value-function claim holds
+  on-distribution.
+- Caveat carried forward: this is the executor's home distribution
+  (synthetic exec traces). Phase 3's real risk is transfer to natural code
+  (MBPP/HumanEval) — the CRUXEval mechanism-transfer failure is the prior.
+  Phase-3 bars must be set with that in mind; re-run this harness on
+  `executor_longctx.pt` when phase 1 lands (same bar, both results
+  reported).

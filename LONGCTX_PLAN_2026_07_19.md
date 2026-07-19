@@ -49,3 +49,20 @@ Success = the frozen 8–32k cartridge experiment's sanity gate flips:
 
 Line-CE lift on the frozen set; the short-context set re-run (should not
 regress); per-source CE at val; VAL trajectory at T8192.
+
+## RUN 1 RESULT (2026-07-19): primary FAIL, guards PASS-with-improvement → registered 2x escalation launched
+
+- Primary (frozen 8–32k set): lift(sequential) span **−0.1330** — big move
+  from soup3's −0.5437 (75% of the harm removed by 720M tokens) but short
+  of the +0.15 gate. Line-CE lift flipped positive (+0.0127, was −0.1094).
+  Structure check improved at every K.
+- Guards: HE-CE 0.6675 (≤0.6714 ✓, +0.006 vs soup3); depdist total
+  **0.7948 — BETTER than soup3's 0.8126** (long-context packing improves
+  natural-code CE outright). Long-ctx training is currently guard-free.
+- Manual-allreduce production debut: 5,500 steps, 50.4k tok/s sustained
+  (1.9x), zero drift warnings, clean finish. The 2-GPU mode is now
+  production-validated.
+- **Escalation (per registered rule #4, the ONE permitted): 11,000 steps =
+  1.44B tokens from the same soup3 start → `production_lean_longctx2.pt`.**
+  Same gate, same guards. If it fails: wall not exposure-fixable at this
+  budget; re-scope per the plan.

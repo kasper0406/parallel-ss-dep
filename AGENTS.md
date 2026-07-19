@@ -67,8 +67,16 @@ Two live trunk shapes:
   +0.01). Anneal strength does NOT transfer across scales (0.4x passed the
   micro-run projection but tripped the production guard at +0.0146) —
   re-calibrate per run; full trade curve in IDEAS_2026_07_13.md Tier-1 log.
-  Earlier trunks `feature_pilot_A.pt` (0.7429) / `stageA_executor.pt` (0.7343)
-  remain for lineage A/Bs. The stronger Qwen2.5-Coder-0.5B donor was tried and
+  **Long-context variants (2026-07-19):** `production_lean_longctx.pt`
+  (0.6675 HE / 0.7948 depdist) and `production_lean_longctx2.pt` (0.6728 /
+  0.7778 — best natural-code CE ever) trained T=8192 `--no_doc_isolation`;
+  longctx is the AGENT-preferred base (75% less long-context harm). KNOWN
+  WALL: state accumulation saturates at the training window (T2048 lineage
+  usable ctx ≈2k; T8192-trained ≈8k; 2x tokens = flat — LONGCTX_PLAN).
+  Cartridges finding: mean-merged per-segment states ≈ free (retention ~1.0
+  at working scale) — sequential accumulation, not merging, is the
+  bottleneck (STATE_CARTRIDGES_PLAN). Earlier trunks `feature_pilot_A.pt`
+  (0.7429) / `stageA_executor.pt` (0.7343) remain for lineage A/Bs. The stronger Qwen2.5-Coder-0.5B donor was tried and
   **refuted** (+0.276 tax, only 15/164) — inheritance buys a cost substrate,
   not a free quality jump.
 

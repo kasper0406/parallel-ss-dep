@@ -619,3 +619,39 @@ alone was NOT sufficient (N1').
 - Composition confirmed: plateau tokens + anneal-decay stack additively
   (−0.027 then −0.029), no interactions. Remaining gap to SmolLM2-360M
   donor (0.614): 0.055.
+
+## 2026-07-18/19 — Attach program closed; cartridges + long-context arc: merging is free, sequential accumulation is the wall
+
+- **WM+FiLM attach-to-converged: REFUTED in both failure directions** under
+  the fair frozen-trunk pre-warm protocol. Standard-mix pre-warm → the
+  converged trunk SUPPRESSES the feature (FiLM strongest pair's effect
+  0.169→0.016; WM α stalls) — v1 kill. Recall-dense pre-warm → WM engages
+  (α 2x, gate PASS) and then HARMS the base (+0.095 HE / +0.162 depdist vs
+  control) — v2 kill. The trunk's suppression is self-defense, not
+  reluctance. Day-1 co-train is the only path FiLM/WM have. AGENTS.md
+  updated; combined arm moot.
+- **State cartridges (pre-registered, 4 arms + K-sweep, frozen episode
+  evals):** at working scale (1.5–6k ctx) mean-merged per-segment states
+  retain line-CE 0.99 [0.82–1.40] @K=2 / 0.82 @K=4 of sequential
+  ingestion's benefit and BEAT sequential outright on span tokens
+  (+0.059 vs +0.004); structure check passes at every K (cartridge >
+  shuffled). At 8–32k ALL context arms void: sequential ingestion HURTS
+  (−0.54 span) — the T2048+isolation lineage never accumulated >1 doc of
+  state.
+- **Long-context program (T=8192, --no_doc_isolation, 2-GPU manual
+  allreduce production debut at 50.4k tok/s sustained):** 720M tokens
+  removed 75% of the long-context harm (−0.54→−0.13) with guards IMPROVED
+  (depdist 0.7948); the registered 2x escalation (1.44B tokens) was FLAT
+  (−0.162) → saturation exactly at the training window. **The wall is
+  window-bounded state extrapolation, not exposure.** longctx2 posted the
+  best depdist ever (0.7778) with HE-CE 0.6728 (photo-finish +0.0014 over
+  guard, inside seed σ).
+- Re-scoped publishable claim: "delta-rule states compose in parallel;
+  sequential state accumulation, not merging, is the bottleneck" — plus the
+  quantified window-saturation law. `production_lean_longctx.pt` = the
+  agent-preferred variant (75% less long-ctx harm, depdist better, HE
+  within σ); `soup3` remains the official registration-clean base.
+- Ops: GPU0 4th+5th under-load incidents (Triton/CUDA launch failures,
+  recovers on its own; physical reseat overdue); one HF-CDN dataloader
+  crash mid-run — START_STEP crash-resume added to the longctx launcher and
+  used successfully (step-9156 resume, schedule-continuous).

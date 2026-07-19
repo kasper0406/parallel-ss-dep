@@ -40,10 +40,16 @@ current state live in [`AGENTS.md`](AGENTS.md); framing in
    niche-dense pre-warm → the feature engages and *harms* the base. Day-1
    co-training is the only path these mechanisms have.
    → [`IDEAS_2026_07_13.md`](IDEAS_2026_07_13.md) (attach registrations)
-6. **Delta-rule states are mean-mergeable.** States computed over disjoint
-   shards retain ~72% of sequential-ingestion recall when averaged — the
-   basis of the state-cartridges direction (parallel O(1) repo ingestion).
-   → [`experiments/probe_state_algebra.py`](experiments/probe_state_algebra.py)
+6. **Delta-rule states compose in parallel; sequential accumulation is the
+   bottleneck.** Mean-merged per-segment "cartridge" states retain ~all of
+   sequential ingestion's benefit at working scale (line-CE retention 0.99
+   [CI 0.82–1.40]) and beat one long sequential state on hard tokens — but
+   sequential ingestion itself HURTS beyond the trained window (−0.54
+   span-CE at 8–32k), improves 75% with T=8192 packing training, then
+   saturates exactly at the window (2x tokens = flat). Merging is free; the
+   wall is window-bounded state extrapolation.
+   → [`STATE_CARTRIDGES_PLAN_2026_07_19.md`](STATE_CARTRIDGES_PLAN_2026_07_19.md),
+   [`LONGCTX_PLAN_2026_07_19.md`](LONGCTX_PLAN_2026_07_19.md)
 7. **Meta-TTT: two clean kills.** Meta-training the recurrent state into a
    deliberate test-time learner did not beat incidental state-learning on
    held-out repos (pre-registered, engagement-guarded).

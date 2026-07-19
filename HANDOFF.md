@@ -171,3 +171,17 @@ To beat the robust ~14/164, pick a real investment:
   push the stale local branch).
 - Anneal corpora downloading (opc-annealing, finemath-4plus) for the Tier-1
   KD-through-anneal campaign.
+
+## 2026-07-19 session close (production campaign + attach + cartridges/longctx arc)
+
+Shipped: production_lean_soup3.pt (official base, 0.6614/0.8126); longctx
+variants (agent-preferred longctx 0.6675/0.7948; longctx2 best-depdist
+0.7778); manual allreduce production-validated (50k tok/s 2-GPU, crash-resume
+proven). Closed: WM/FiLM attach (refuted both directions — day-1 only),
+meta-TTT (parked final), cartridges phase 1 (re-scoped: merging free,
+sequential accumulation is the wall, window-saturation law measured).
+Paper-ready: Latent Execution draft final; cartridges/wall findings drafted
+across STATE_CARTRIDGES_PLAN + LONGCTX_PLAN. In flight next: search-native
+decoding (task #21; SEARCH_NATIVE plan; prereq = exec-trace re-attach on the
+longctx base). Ops: GPU0 flaky under load (5 incidents) — physical reseat
+recommended at next case-open.

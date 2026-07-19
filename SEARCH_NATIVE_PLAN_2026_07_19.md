@@ -78,3 +78,36 @@ Each phase gates the next; phase-2 failure kills the program at ~zero search
   Phase-3 bars must be set with that in mind; re-run this harness on
   `executor_longctx.pt` when phase 1 lands (same bar, both results
   reported).
+
+## PHASE 1 RESULT (2026-07-19): ALL BARS PASS — with one important negative finding
+
+- Exec heldout answer-with-trace: **0.94–0.99 across K=2..8** (bar ≥0.90);
+  trace state-acc 0.97–1.00; lifts +78–86pp over direct.
+- HE-CE 0.6773 ≤ 0.6775 (photo-finish pass). `executor_longctx.pt` is the
+  Phase-3 executor.
+- Value-function re-check on the new executor: pooled 0.962 [0.949–0.974],
+  **+70.0pp over logprob** — the value-function property survives the base
+  swap essentially unchanged.
+- **Negative finding (secondary read): sequential capability-stacking
+  fails.** The T=2048+isolation Stage-A fine-tune ERASED the longctx window
+  gains (frozen-set sequential lift −0.133 → −0.48). Same lesson as the
+  attach program, now at the data level: capabilities must be CO-TRAINED
+  (exec traces inside the long-context mix), not layered sequentially.
+  Tolerable for Phase 3 (short search contexts); rules this ckpt out as an
+  agent base; the eventual agent base needs a joint mix.
+
+## PHASE 3 GATES (registered now that phase-2 effect sizes are known)
+
+- **3a. Natural-code transfer probe (BEFORE any search infra; the CRUXEval
+  prior says this is where it dies).** Ready-made natural mutations exist:
+  the repair corpus (`gen_repair_triples`, 2,389 heldout buggy/fixed/error
+  triples on executable MBPP-style tasks). Two-way ranking: does an
+  executor-derived score rank FIXED above BUGGY better than mean log-prob
+  does? **Bar: executor − logprob ≥ +10pp ranking accuracy** (same bar,
+  hostile distribution). If FAIL: the search program is killed for the cost
+  of one eval, and the on-distribution +73pp result stands alone as a
+  scoped finding.
+- **3b. Search harness (only if 3a passes):** state-checkpointed tree
+  search, pass@matched-forward-budget vs best-of-N on MBPP subset +
+  HumanEval, memory-per-node vs KV baseline. Quantitative 3b bars set after
+  3a's effect size is known.

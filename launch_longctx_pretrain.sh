@@ -14,6 +14,11 @@ mkdir -p runs checkpoints
 STEPS=${STEPS:-5500}
 TAG=${TAG:-production_lean_longctx}
 BASE=${BASE:-checkpoints/production_lean_soup3.pt}
+# Crash-resume (GPU0 is flaky under sustained load — 4 incidents): relaunch
+# with BASE=<latest periodic ckpt> START_STEP=<its step>; WSD schedule and
+# token accounting continue from there (re-pass everything else unchanged,
+# per the resume mandate).
+START_STEP=${START_STEP:-0}
 
 nohup .venv/bin/torchrun --nproc_per_node=2 experiments/train_lm.py \
   --arch deltanet --d_model 960 --n_layers 32 --n_heads 15 --d_head 64 --d_ff 2560 --tie_embeddings \
@@ -27,7 +32,7 @@ nohup .venv/bin/torchrun --nproc_per_node=2 experiments/train_lm.py \
   --optimizer muon --lr 6e-5 --lr_muon 2e-4 --alpha_wd 0.0 --wd 0.01 \
   --grad_clip 1.0 --z_loss 1e-4 \
   --lr_schedule wsd --warmup_steps 50 --lr_decay_frac 0.3 \
-  --steps $STEPS --val_every 250 --log_every 20 --seed 0 \
+  --steps $STEPS --start_step $START_STEP --val_every 250 --log_every 20 --seed 0 \
   --mid_eval_every_tokens 100000000 --mid_eval_save_only --mid_eval_min_free_gib 2.0 \
   --save_ckpt checkpoints/${TAG}.pt --tb_dir runs/tb/${TAG} \
   > runs/${TAG}.log 2>&1 &

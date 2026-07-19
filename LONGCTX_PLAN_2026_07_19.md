@@ -66,3 +66,30 @@ regress); per-source CE at val; VAL trajectory at T8192.
   1.44B tokens from the same soup3 start → `production_lean_longctx2.pt`.**
   Same gate, same guards. If it fails: wall not exposure-fixable at this
   budget; re-scope per the plan.
+
+## ESCALATION RESULT / PROGRAM CLOSED at this rung (2026-07-19)
+
+- Primary: lift(sequential) span **−0.1624** (run 1: −0.1330) — the extra
+  720M tokens moved NOTHING. The −0.54 → −0.13 gain saturated. Per rule #4:
+  the wall is not exposure-fixable at this budget with T=8192 packing.
+- Guards: depdist **0.7778 — best natural-code CE ever measured here**
+  (soup3 0.8126, longctx1 0.7948); HE-CE 0.6728 = photo-finish MISS of the
+  ≤0.6714 bar (+0.0014, inside seed σ≈0.007; formal miss recorded).
+- **Mechanistic read of the saturation:** training window T=8192 can only
+  teach state accumulation UP TO 8k — the frozen eval's episodes are 8–32k,
+  so 75%-harm-removal-then-saturation is exactly "fixed within the window,
+  can't extrapolate past it". Revisit-suspect: a T=32k rung (new
+  registration required; memory feasibility unverified).
+- Base status: `production_lean_soup3.pt` REMAINS the official base
+  (registration-clean). `production_lean_longctx.pt` (0.6675/0.7948, both
+  guards passed at its rung, 75% less long-context harm) is the
+  long-context-preferred variant — promotion is a strategy call, not a
+  registered outcome; flagged to the user.
+- **Cartridges re-scope (what survives, all measured):** (a) working-scale
+  line-CE retention 0.99/0.82 — merging is essentially FREE; (b) merged
+  cartridges BEAT one sequential state on span at working scale; (c) at
+  8–32k cartridges hurt 5–7x less than sequential; (d) structure-carrying
+  at every scale tested; (e) the quantified trained-context wall itself
+  (state-accumulation OOD saturates under packing). Honest paper framing:
+  "delta-rule states compose in parallel; sequential state accumulation,
+  not merging, is the bottleneck."

@@ -158,3 +158,28 @@ Design (CWM-style, scaled to 402M):
    likely needs pooled sim-acc ≳ 0.65 — a high bar at 402M; the internal
    gate exists so a weak simulator kills the attempt for the cost of one
    cheap eval, not a wasted re-run.
+
+## REVIVAL ATTEMPT A RESULT (2026-07-20): KILLED at the internal gate — died of data diversity, not mechanism
+
+- Internal gate: natural-heldout sim exact-match **24/83 = 0.289 < 0.30**
+  (photo-finish miss, but substantively decisive: the registered prediction
+  needs ≳0.65 for the 3a bar, so the re-run would have failed regardless —
+  the gate saved it).
+- What the attempt PROVED: **0.000 → 0.289 unseen-program simulation from
+  only 616 unique natural examples** (old executor: exactly 0.000 on the
+  same eval). The interpreter mechanism learns real Python; 616 unique
+  programs is just ~10-100x too few. Synthetic retention stayed 0.93–0.99
+  (≥0.85 ✓) — both capabilities coexist under 50/50 co-training,
+  consistent with the day-1-co-train law.
+- **Program CLOSED.** Final ledger of search-native decoding:
+  (1) interpreter value-function on-distribution: +73pp over logprob
+  (logprob at random) — validated;
+  (2) natural-code transfer: −9.6pp untrained, 0.289 sim after 616-program
+  training — the boundary is DATA, with a clean 0.000→0.289 scaling signal;
+  (3) state-checkpointed search: never built — correctly gated out.
+- Registered future option (needs a real data build, not a retry):
+  codeparrot-scale trace mining — arbitrary real functions + synthesized
+  inputs + settrace, targeting 10k–100k UNIQUE traced programs (the CWM
+  direction at 402M). The 0.000→0.289-from-616 point predicts the scaling
+  curve is worth measuring IF the agent program wants a code-simulator
+  component later.

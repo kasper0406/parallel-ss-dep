@@ -655,3 +655,29 @@ alone was NOT sufficient (N1').
   recovers on its own; physical reseat overdue); one HF-CDN dataloader
   crash mid-run — START_STEP crash-resume added to the longctx launcher and
   used successfully (step-9156 resume, schedule-continuous).
+
+## 2026-07-20 — Search-native decoding: full program arc closed (3 gates, 2 kills, 1 validated mechanism + a scaling signal)
+
+- Phase 1 (executor re-attach on longctx): PASS (answer-with-trace
+  0.94–0.99; HE-CE 0.6773). Negative finding: the T2048 fine-tune ERASED
+  the longctx window gains — sequential capability-stacking fails at the
+  data level too; co-train or lose it.
+- Phase 2 (value function, on-distribution): DECISIVE PASS — executor
+  ranking 0.956 vs logprob 0.226 (**+73pp; logprob at random against
+  single-edit semantic mutations**).
+- Phase 3a (natural-code transfer, 2,169 verified fixed/buggy pairs):
+  FAIL −9.6pp; executor simulates real code at 1.6% (fluent traces,
+  hallucinated values). Program killed at the gate — one eval, zero search
+  infra wasted. (Ops: one pathological pair CPU-wedged the first full run
+  13.5h; fixed with a per-pair SIGALRM watchdog.)
+- Revival A (natural traces from repair-train programs, 50/50 mix):
+  KILLED at the internal gate 0.289 < 0.30 — but **0.000 → 0.289
+  unseen-program simulation from only 616 unique examples**, with synthetic
+  retention intact (0.93–0.99). The boundary is DATA DIVERSITY with a clean
+  scaling signal; codeparrot-scale trace mining (10k–100k unique programs)
+  is the registered future option.
+- Durable claims for the writeup: interpreter-supervised value functions
+  work exactly as far as the interpreter's training distribution extends
+  (+73pp on / −10pp off), and the distribution is extendable with data
+  (0→0.29 from 616 programs). RL-vs-search framing sharpened: the pass@k
+  envelope is reachable by verifier-selection, not by policy gradient.

@@ -101,13 +101,14 @@ Full chronological arc and superseded claims:
 
 ## Current status (honest)
 
-- **Best HumanEval pass@1: ~13–15/164** (`rl_grader_phase_c_v2_step300`,
-  KL-stable GRPO on the Chinchilla-completed 287 M base). **Honest caveat**:
-  greedy HumanEval-164 is a noisy dev signal at this scale — a same-config
-  re-measurement clusters runs at ~13–15 **with SFT ≈ RL** (the SFT→RL gain ≈ 0),
-  and the historical "16" is not robustly reproducible (one draw from a ~13–17
-  noise band). Treat ≥1-point deltas with suspicion; use temp-sampled pass@k or a
-  larger bench for real comparisons. See `STRATEGY_2026_06_28.md`.
+- **Production base: `production_lean_soup3.pt`, HumanEval-solution CE
+  0.6614** (0.047 from the SmolLM2-360M softmax donor, at O(1) decode);
+  `production_lean_longctx.pt` is the agent-preferred variant (75% less
+  long-context harm, best natural-code depdist). Historical HumanEval
+  pass@1 on the old 287M lineage clustered ~13–15/164 with SFT ≈ RL —
+  greedy HumanEval-164 is a noisy dev signal at this scale; CE-based
+  metrics (HE-solution CE + dep-distance-stratified CE) are the standing
+  dev signals. See `STRATEGY_2026_06_28.md`, `AGENTS.md`.
 - **Validated primitives**: FiLM (−3–5 % PPL), PKM (−5 HumanEval ablation),
   WM (first-occurrence recall 0.03→0.98 leak-free, co-trained). These earn their
   place on their own metrics — *not* on the HumanEval headline.

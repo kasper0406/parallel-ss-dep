@@ -48,7 +48,9 @@ current state live in [`AGENTS.md`](AGENTS.md); framing in
    span-CE at 8–32k), improves 75% with T=8192 packing training, then
    saturates exactly at the window (2x tokens = flat). Merging is free; the
    wall is window-bounded state extrapolation.
-   → [`STATE_CARTRIDGES_PLAN_2026_07_19.md`](STATE_CARTRIDGES_PLAN_2026_07_19.md),
+   Full paper draft:
+   → [`PAPER_STATE_COMPOSITION_DRAFT.md`](PAPER_STATE_COMPOSITION_DRAFT.md);
+   program logs [`STATE_CARTRIDGES_PLAN_2026_07_19.md`](STATE_CARTRIDGES_PLAN_2026_07_19.md),
    [`LONGCTX_PLAN_2026_07_19.md`](LONGCTX_PLAN_2026_07_19.md)
 7. **Meta-TTT: two clean kills.** Meta-training the recurrent state into a
    deliberate test-time learner did not beat incidental state-learning on

@@ -133,3 +133,28 @@ Each phase gates the next; phase-2 failure kills the program at ~zero search
   32B). The on-distribution result proves the mechanism learns; whether it
   learns messy real code at 402M is an open, cheap, well-posed question:
   trace-gen (CPU) + one Stage-A-style run (~2h) + re-run this exact gate.
+
+## REVIVAL ATTEMPT A (2026-07-20, PRE-REGISTERED): teach the interpreter real Python
+
+Design (CWM-style, scaled to 402M):
+1. **Natural-trace corpus**: `sys.settrace` line-level traces over the
+   repair-corpus TRAIN-split fixed programs (~20k verified-executing
+   functions with known literal call args) — per-step changed-local values
+   rendered as literals (capped), `# final: <return>` — in the Stage-A trace
+   format so the protocol transfers. **Contamination guard: zero
+   problem_key overlap with the heldout triples the 3a gate scores**
+   (train/heldout split already disjoint by construction; assert it).
+2. **Training**: Stage-A-style run from `production_lean_longctx.pt`
+   (2,300 steps / 300M tokens, single-GPU recipe), exec-trace stream =
+   ~50/50 synthetic/natural (keeps the on-distribution capability for the
+   paper contrast) → `executor_natural.pt`.
+3. **Internal gate**: natural-trace HELDOUT (train-split holdback, not the
+   3a triples) final-answer exact-match **≥ 0.30** to proceed; < 0.30 =
+   kill (simulation too weak to move ranking; record). Synthetic heldout
+   answer-with-trace must stay ≥ 0.85 (don't lose the home distribution).
+4. **The decisive re-run**: the SAME frozen 3a gate (2,169 pairs, same
+   command, same ≥ +10pp bar). Honest prediction recorded: ranking-acc ≈
+   sim-acc + tie effects, so clearing +10pp over logprob (~0.57–0.66)
+   likely needs pooled sim-acc ≳ 0.65 — a high bar at 402M; the internal
+   gate exists so a weak simulator kills the attempt for the cost of one
+   cheap eval, not a wasted re-run.

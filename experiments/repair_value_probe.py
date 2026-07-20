@@ -600,12 +600,39 @@ def aggregate(scored: list[dict], seed: int, n_boot: int) -> dict:
 # Driver.
 # --------------------------------------------------------------------------- #
 
+class _PairTimeout(Exception):
+    pass
+
+
+def _alarm_handler(signum, frame):
+    raise _PairTimeout()
+
+
 def score_all(model, tok, eos_id, pairs: list[dict], seed: int,
-              max_gen: int) -> list[dict]:
+              max_gen: int, per_pair_timeout_s: int = 60) -> list[dict]:
+    # Per-pair SIGALRM watchdog: one pathological pair (the 2026-07-19 full
+    # run CPU-wedged after model load with zero progress for 13.5h) must cost
+    # 60s + a recorded skip, not the run. Progress every 50 pairs.
+    import signal
+    signal.signal(signal.SIGALRM, _alarm_handler)
     scored = []
+    n_timeout = 0
     for i, pair in enumerate(pairs):
-        ex_keys, ex_dbg = score_pair_executor(model, tok, eos_id, pair, max_gen)
-        lp_keys = score_pair_logprob(model, tok, pair)
+        if i % 50 == 0:
+            print(f"[score] pair {i}/{len(pairs)} (timeouts so far: {n_timeout})",
+                  flush=True)
+        try:
+            signal.alarm(per_pair_timeout_s)
+            ex_keys, ex_dbg = score_pair_executor(model, tok, eos_id, pair,
+                                                  max_gen)
+            lp_keys = score_pair_logprob(model, tok, pair)
+        except _PairTimeout:
+            n_timeout += 1
+            print(f"[score] TIMEOUT ({per_pair_timeout_s}s) on pair {i} "
+                  f"task_id={pair['task_id']!r} — skipped", flush=True)
+            continue
+        finally:
+            signal.alarm(0)
         rand_rng = random.Random(_stable_hash(pair["task_id"]) ^ (seed + 999))
         rd_keys = score_pair_random(pair, rand_rng)
         keys_by_vf = {"executor": ex_keys, "logprob": lp_keys, "random": rd_keys}

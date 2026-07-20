@@ -111,3 +111,25 @@ Each phase gates the next; phase-2 failure kills the program at ~zero search
   search, pass@matched-forward-budget vs best-of-N on MBPP subset +
   HumanEval, memory-per-node vs KV baseline. Quantitative 3b bars set after
   3a's effect size is known.
+
+## PHASE 3a RESULT (2026-07-20): FAIL — PROGRAM KILLED AT THE GATE, per registration
+
+- Full run (2,169 verified fixed/buggy pairs, per-pair watchdog, 0 timeouts
+  after the wedge fix): executor − logprob = **−9.6pp** (0.496–0.595 by
+  type vs logprob 0.569–0.663; bar ≥ +10pp). The executor value function is
+  WORSE than mean log-prob on natural code.
+- Mechanism: executor exact-match simulation on the FIXED candidate =
+  **1.6% pooled** (int 2.9%, str/list/other 0.0%) — well-formed traces,
+  hallucinated synthetic-style values. The interpreter simulates its
+  training distribution, not Python.
+- Scoped conclusion (both results stand): **interpreter-supervised value
+  functions work exactly as far as the interpreter's training distribution
+  extends** — +73pp over log-prob on-distribution, −10pp off. The gate
+  design did its job: the program died for the cost of one eval, zero
+  search infrastructure built.
+- Registered revival path (NOT launched; separate decision): train the
+  executor on NATURAL-code traces — `sys.settrace` over real MBPP/repo
+  functions (the gen_exec_traces machinery generalizes; CWM did this at
+  32B). The on-distribution result proves the mechanism learns; whether it
+  learns messy real code at 402M is an open, cheap, well-posed question:
+  trace-gen (CPU) + one Stage-A-style run (~2h) + re-run this exact gate.

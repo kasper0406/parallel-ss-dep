@@ -37,11 +37,20 @@ trajectory, and the sharpest empirical statement to date of the
 theoretically-predicted necessity of token-space competence *before* latent
 internalization (2602.01148).
 
-We report the limits plainly: the mechanism does not transfer zero-shot to
-out-of-distribution real programs (CRUXEval latent arms ≈1.5–4%), though a
-direct-answer *internalization* signal on CRUXEval rises 0.0688→0.1050
-(z=2.58, n=800) — a promising but token-count-confounded observation whose
-control is in flight. Latent state saturates at a ~6-hop horizon; an
+We report the limits plainly, and quantify them two-sidedly. The mechanism
+does not transfer zero-shot to out-of-distribution real programs (CRUXEval
+latent arms ≈1.5–4%); a token-matched control shows Stage A's CRUXEval gain
+is fully explained by generic exposure, while Stage B retains a paired
++2.1pp direct-answer edge (McNemar 37-vs-20, z=2.25). Used as a *value
+function over partial programs*, the trained executor exposes the transfer
+boundary sharply: it ranks true continuations against verified semantic
+mutations at 0.956 on-distribution — where mean log-probability is
+statistically at chance (0.226) — yet ranks real fixed-vs-buggy programs
+*below* the log-prob baseline (−9.6pp), simulating real code at 1.6%.
+Fine-tuning on line-level traces of only 616 unique real functions lifts
+unseen-real-program simulation 0.000→0.289 with synthetic capability
+retained — the boundary is training data, not mechanism. Latent state
+saturates at a ~6-hop horizon; an
 exposure-controlled follow-up (depth-weighted consolidation sampling) extends
 the reliable range by one hop (K=7 answer 0.497→0.613, clearing the bar) but
 does not remove the cliff, and a controlled exposure-vs-capacity probe
@@ -542,6 +551,51 @@ exec-trace stream + latent-compression co-training); these arms cannot
 separate the two components, and the result is single-seed — both caveats
 stand.
 
+### 4.8 The executor as a value function — a two-sided transfer law
+
+A trained interpreter suggests a downstream use beyond emission: a *value
+function over partial programs* for search — scoring continuations where
+real execution is impossible. We tested this with a pre-registered
+three-gate protocol (`SEARCH_NATIVE_PLAN_2026_07_19.md`), and the result is
+the sharpest characterization of the transfer boundary in this paper.
+
+**On-distribution, the value function is decisive.** We truncate heldout
+synthetic programs at step k of K and rank the true continuation against
+three single-edit semantic mutations (a changed constant or a swapped
+operator — each verified by execution to yield a different final answer, and
+each surface-plausible by construction). Ranking accuracy, pooled over 837
+items (K∈{4,6,8}): **executor 0.956** [0.940–0.969] vs mean-log-prob
+**0.226** [0.198–0.256] vs random 0.257 — a **+73pp** margin with no depth
+cliff through K=8 (`runs/value_function_stageA.json`; the result is
+unchanged on a re-based executor, 0.962/+70.0pp). The baseline is the
+finding: *log-probability is statistically at chance against semantic
+mutations* — likelihood cannot see meaning-changing single edits that an
+execution-supervised model ranks near-perfectly.
+
+**One distribution over, the same value function is useless.** On 2,169
+verified fixed/buggy program pairs from real MBPP-style repair data (ground
+truth established by executing both candidates against a parsed assert),
+the executor ranks the fixed program *worse than log-prob does*
+(executor−logprob = **−9.6pp**; `results/repair_value_probe_full.json`).
+The mechanism is visible in the transcripts: the executor emits fluent,
+well-formed traces whose values are hallucinated from the synthetic
+training distribution — 1.6% exact-match simulation of real programs. This
+confirms and sharpens §4.7's CRUXEval result at the task level.
+
+**The boundary is data, and it moves.** Fine-tuning the executor on
+line-level `sys.settrace` traces of real programs — only **616 unique
+functions** were minable from existing assets — lifted unseen-real-program
+simulation from **0.000 to 0.289** (24/83 heldout programs;
+`runs/eval_natural_sim.json`) while fully retaining synthetic capability
+(0.93–0.99) under 50/50 co-training. This did not clear our pre-registered
+bar for the search application (which back-of-envelope requires ~0.65), and
+the search harness was therefore never built — but it establishes the law
+this section is named for: **interpreter-supervised value functions work
+exactly as far as the interpreter's training distribution extends, and that
+distribution is extendable with data** — a scaling question (10k–100k
+unique traced programs, the CWM direction at small scale), not a mechanism
+question.
+
 ---
 
 ## 5. Limitations
@@ -642,12 +696,17 @@ latent-first training with the identical data and loss pins at the value prior.
 The durable methodology finding is the staging cell: *externalize before you
 internalize* is not just theoretically predicted but empirically load-bearing,
 and dense per-step supervision alone does not substitute for it. The honest
-frontier is transfer: the mechanism does not yet fire on out-of-distribution
-programs, the latent horizon saturates near six hops, and the encouraging
-direct-answer internalization signal awaits its token-matched control. In a
-model whose decode state is O(1) and whose latent steps cost no context,
-internalized execution points toward zero-context-cost deliberation for
-long-horizon coding agents — once it generalizes beyond the synthetic setting.
+frontier is transfer, and we can now state it as a law rather than a caveat:
+the trained interpreter is a near-perfect semantic value function exactly on
+its training distribution (+73pp over a log-prob baseline that semantic
+mutations reduce to chance) and worse than that baseline one distribution
+over — with a measured 0.000→0.289 movement of the boundary from only 616
+unique real traced programs. The latent horizon saturates near six hops for
+capacity, not exposure, reasons. In a model whose decode state is O(1) and
+whose latent steps cost no context, internalized execution points toward
+zero-context-cost deliberation — and toward search over program
+continuations at 8.2 MiB per branch — for long-horizon coding agents, once
+the interpreter's distribution is extended to real code at scale.
 
 ---
 
@@ -700,3 +759,7 @@ long-horizon coding agents — once it generalizes beyond the synthetic setting.
 | Depth-horizon exposure-vs-capacity probe | table §4.6 | `runs/probe_latent_exposure_bias.json` |
 | CRUXEval mechanism transfer | table §4.7 | `results/cruxeval_transfer_*.json` |
 | CRUXEval direct internalization | 0.0688 / 0.0813 / 0.1050 | `results/cruxeval_direct800_*.json` |
+| Value-fn on-distribution (§4.8) | 0.956 vs 0.226, +73.0pp | `runs/value_function_stageA.json` (re-base: `runs/value_function_executor_longctx.json`) |
+| Value-fn natural-code transfer (§4.8) | −9.6pp, sim 1.6% | `results/repair_value_probe_full.json` |
+| Natural-trace fine-tune sim (§4.8) | 0.000 → 0.289 (24/83) | `runs/eval_natural_sim.json` (baseline: old executor 0/12 smoke + 0.000 full) |
+| Synthetic retention after natural mix (§4.8) | 0.93–0.99 | `runs/exec_trace_executor_natural.json` |

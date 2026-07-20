@@ -137,7 +137,7 @@ Each phase gates the next; phase-2 failure kills the program at ~zero search
 ## REVIVAL ATTEMPT A (2026-07-20, PRE-REGISTERED): teach the interpreter real Python
 
 Design (CWM-style, scaled to 402M):
-1. **Natural-trace corpus**: `sys.settrace` line-level traces over the
+1. **Natural-trace corpus** (BUILT: 12,250 records but only 695 UNIQUE fixed programs — 616/88 train/heldout unique diversity at ~18x multiplicity; multiplicity = epochs, the ≥0.30 heldout gate over unseen problems carries the kill decision): `sys.settrace` line-level traces over the
    repair-corpus TRAIN-split fixed programs (~20k verified-executing
    functions with known literal call args) — per-step changed-local values
    rendered as literals (capped), `# final: <return>` — in the Stage-A trace
